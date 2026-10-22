@@ -584,45 +584,36 @@ describe("login and consent pages", () => {
     expect(logged).not.toContain("wrong password!");
   });
 
-  it("rate-limits sign-ins per address and per client; a flood never ends a signed-in session", async () => {
-    const clients: Array<string> = [];
-    for (let i = 0; i < 6; i++) clients.push(String((await register(harness, [LOOPBACK_REDIRECT])).body.client_id));
-    const start = (clientId: string, peer: string) =>
+  it("rate-limits sign-ins per address; a flood ends neither a signed-in session nor another client's sign-in", async () => {
+    const flooder = String((await register(harness, [LOOPBACK_REDIRECT])).body.client_id);
+    const start = (peer: string) =>
       new Browser(harness, { [PEER_HEADER]: peer }).get(
         authorizationUrl({
           response_type: "code",
-          client_id: clientId,
+          client_id: flooder,
           redirect_uri: LOOPBACK_REDIRECT,
           code_challenge: pkcePair().challenge,
           code_challenge_method: "S256",
           resource: RESOURCE,
         }),
       );
-    // The admin signs in, and a second sign-in is left at the password page.
+    // The admin signs in, and a second sign-in (another client) waits at the password page.
     const { browser: admin } = await begin({ [PEER_HEADER]: "192.0.2.10" });
     const csrf = await csrfOf(await admin.get("/login"));
     expect((await admin.post("/login", { csrf, password: PASSWORD })).status).toBe(303);
     const { browser: waiting } = await begin({ [PEER_HEADER]: "192.0.2.11" });
-    // 120 sign-ins from 120 addresses through 6 clients: more than the 100 pending sessions held.
-    for (let i = 0; i < 120; i++) {
-      expect((await start(clients[i % 6] ?? "", `198.51.100.${i}`)).status, `sign-in ${i}`).toBe(303);
-    }
+    // 150 sign-ins from 150 addresses: more than the 100 sign-ins held.
+    for (let i = 0; i < 150; i++) expect((await start(`198.51.100.${i}`)).status, `sign-in ${i}`).toBe(303);
     expect((await admin.get("/consent")).status).toBe(200);
-    expect((await waiting.get("/login")).status).toBe(400);
-    // Each client has used its 20 sign-ins for the window...
-    const perClient = await start(clients[0] ?? "", "203.0.113.1");
-    expect(perClient.status).toBe(429);
-    expect(Number(perClient.headers.get("retry-after"))).toBeGreaterThan(0);
-    // ...and one address may start 20 whatever the client.
-    const fresh = String((await register(harness, [LOOPBACK_REDIRECT])).body.client_id);
-    const another = String((await register(harness, [LOOPBACK_REDIRECT])).body.client_id);
-    for (let i = 0; i < LIMITS.authorizationsPerAddress; i++) {
-      expect((await start(i % 2 === 0 ? fresh : another, "203.0.113.2")).status).toBe(303);
-    }
-    expect((await start(fresh, "203.0.113.2")).status).toBe(429);
+    expect((await waiting.get("/login")).status).toBe(200);
+    // One address may start 20 sign-ins per 10 minutes.
+    for (let i = 0; i < LIMITS.authorizationsPerAddress; i++) expect((await start("203.0.113.2")).status).toBe(303);
+    const refused = await start("203.0.113.2");
+    expect(refused.status).toBe(429);
+    expect(Number(refused.headers.get("retry-after"))).toBeGreaterThan(0);
+    expect((await start("203.0.113.3")).status).toBe(303);
     harness.clock.advance(LIMITS.authorizationWindowMs);
-    expect((await start(fresh, "203.0.113.2")).status).toBe(303);
-    expect((await start(clients[0] ?? "", "203.0.113.3")).status).toBe(303);
+    expect((await start("203.0.113.2")).status).toBe(303);
   });
 
   it("throttles logins per client behind a trusted proxy, and per peer otherwise", async () => {

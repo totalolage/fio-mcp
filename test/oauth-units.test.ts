@@ -127,6 +127,17 @@ describe("authorization sessions", () => {
       assert.isTrue(Option.isSome(yield* sessions.find(Redacted.value(more[0]?.cookie ?? Redacted.make("")))));
     }),
   );
+
+  it.effect("makes room among the sign-ins of the client with the most in progress", () =>
+    Effect.gen(function* () {
+      const sessions = yield* makeSessions();
+      const other = yield* sessions.start({ ...request, clientId: "other" });
+      const flooded = yield* sessions.start(request);
+      for (let i = 0; i < MAX_SESSIONS.pending * 2; i++) yield* sessions.start(request);
+      assert.isTrue(Option.isSome(yield* sessions.find(Redacted.value(other.cookie))));
+      assert.isTrue(Option.isNone(yield* sessions.find(Redacted.value(flooded.cookie))));
+    }),
+  );
 });
 
 describe("window limiter", () => {

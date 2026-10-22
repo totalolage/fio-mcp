@@ -13,9 +13,11 @@ export const SESSION_COOKIE = "__Host-fio-mcp-auth";
 export const SESSION_TTL_MS = 10 * 60_000;
 /**
  * Sessions held at once. Anyone can start one, so sign-ins in progress are
- * capped apart from signed-in ones (which need the password): at the cap
- * the oldest of the same kind makes room, so starting sign-ins never ends a
- * signed-in session.
+ * capped apart from signed-in ones (which need the password); starting
+ * sign-ins never ends a signed-in session. At the cap a signed-in session
+ * replaces the oldest signed-in one, and a sign-in replaces the oldest
+ * sign-in of the client with the most in progress, so a flood through one
+ * client displaces its own sign-ins first.
  */
 export const MAX_SESSIONS = { pending: 100, signedIn: 20 } as const;
 
@@ -48,13 +50,28 @@ export const makeSessions = Effect.fn("AuthSessions.make")(function* () {
   const key = yield* newSigningKey;
   const sessions = new Map<string, AuthSession>();
 
-  /** Drops expired sessions, then the oldest of `loggedIn`'s kind until one more fits. */
+  /** The session to drop for room among `sameKind` (oldest first). */
+  const victim = (sameKind: ReadonlyArray<AuthSession>, loggedIn: boolean) => {
+    if (loggedIn) return sameKind[0];
+    const counts = new Map<string, number>();
+    for (const session of sameKind) counts.set(session.request.clientId, (counts.get(session.request.clientId) ?? 0) + 1);
+    let busiest: string | undefined;
+    for (const [clientId, count] of counts) if (busiest === undefined || count > (counts.get(busiest) ?? 0)) busiest = clientId;
+    return sameKind.find((session) => session.request.clientId === busiest);
+  };
+
+  /** Drops expired sessions, then makes room for one more of `loggedIn`'s kind. */
   const prune = (now: number, loggedIn: boolean) => {
     for (const [id, session] of sessions) if (session.expiresAt <= now) sessions.delete(id);
     const cap = loggedIn ? MAX_SESSIONS.signedIn : MAX_SESSIONS.pending;
     // Insertion order is age order: a signed-in session is re-inserted at login.
-    const sameKind = [...sessions.values()].filter((session) => session.loggedIn === loggedIn);
-    for (const session of sameKind.slice(0, Math.max(0, sameKind.length - cap + 1))) sessions.delete(session.key);
+    let sameKind = [...sessions.values()].filter((session) => session.loggedIn === loggedIn);
+    while (sameKind.length >= cap) {
+      const dropped = victim(sameKind, loggedIn);
+      if (dropped === undefined) break;
+      sessions.delete(dropped.key);
+      sameKind = sameKind.filter((session) => session !== dropped);
+    }
   };
 
   const issue = Effect.fnUntraced(function* (request: PendingAuthorization, loggedIn: boolean, expiresAt?: number) {

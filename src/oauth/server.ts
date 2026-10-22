@@ -65,9 +65,8 @@ export const LIMITS = {
   maxClientName: 100,
   maxState: 1024,
   maxBodyBytes: 16 * 1024,
-  /** Sign-ins (/authorize requests that start a session) per client address, and per client, per window. */
+  /** Sign-ins (/authorize requests that start a session) per client address per window. */
   authorizationsPerAddress: 20,
-  authorizationsPerClient: 20,
   authorizationWindowMs: 10 * 60_000,
 } as const;
 
@@ -223,11 +222,6 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
     limit: LIMITS.authorizationsPerAddress,
     windowMs: LIMITS.authorizationWindowMs,
     maxKeys: 10_000,
-  });
-  const authorizationsByClient = makeWindowLimiter({
-    limit: LIMITS.authorizationsPerClient,
-    windowMs: LIMITS.authorizationWindowMs,
-    maxKeys: LIMITS.maxClients * 2,
   });
   const trustedProxies = settings.trustedProxies ?? [];
   const addressOf = (request: HttpServerRequest.HttpServerRequest) => clientAddress(request, trustedProxies);
@@ -439,13 +433,14 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
     }
     const pending = yield* Effect.result(authorizationRequest(params, target.client, target.redirectUri));
     if (Result.isFailure(pending)) return errorRedirect(target.redirectUri, state, pending.failure);
-    // Anyone can start sign-ins; each holds memory for SESSION_TTL_MS.
+    // Anyone can start sign-ins; each holds memory for SESSION_TTL_MS. Not
+    // limited per client: client ids are public, so anyone could block the
+    // admin's client (sessions.ts makes room per client instead).
     const now = yield* Clock.currentTimeMillis;
     const address = addressOf(request);
-    const clientId = target.client.clientId;
-    const wait = Math.max(authorizationsByAddress.retryAfter(address, now), authorizationsByClient.retryAfter(clientId, now));
+    const wait = authorizationsByAddress.retryAfter(address, now);
     if (wait > 0) {
-      yield* Effect.logDebug("oauth: refused a sign-in: too many started from one address or for one client");
+      yield* Effect.logDebug("oauth: refused a sign-in: too many started from one address");
       return yield* new PageError({
         status: 429,
         title: "Too many sign-in attempts",
@@ -454,7 +449,6 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
       });
     }
     authorizationsByAddress.record(address, now);
-    authorizationsByClient.record(clientId, now);
     const issued = yield* sessions.start(pending.success);
     return redirect("/login", sessionCookie(Redacted.value(issued.cookie), SESSION_TTL_MS));
   });
