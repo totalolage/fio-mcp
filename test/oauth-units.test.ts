@@ -17,8 +17,8 @@ import {
 } from "../src/oauth/crypto.js";
 import { DEFAULT_THROTTLE, delayAfter, makeLoginGuard } from "../src/oauth/login.js";
 import { escapeHtml } from "../src/oauth/pages.js";
-import { makeOAuthServer } from "../src/oauth/server.js";
 import { makeWindowLimiter } from "../src/oauth/rate-limit.js";
+import { makeOAuthServer } from "../src/oauth/server.js";
 import { MAX_SESSIONS, makeSessions, type PendingAuthorization } from "../src/oauth/sessions.js";
 import { makeOAuthStore } from "../src/oauth/store.js";
 import { isResource, parsePublicUrl, redirectUriMatches, redirectUriProblem } from "../src/oauth/urls.js";
@@ -83,7 +83,7 @@ describe("authorization endpoint request target", () => {
     Effect.gen(function* () {
       const parsed = parsePasswordHash(yield* hashPassword(Redacted.make("correct horse battery"), FAST));
       if (!("hash" in parsed)) return assert.fail("hash did not parse");
-      const server = yield* makeOAuthServer({ publicUrl: "https://fio.example.net", passwordHash: Redacted.make(parsed.hash) });
+      const server = yield* makeOAuthServer({ publicUrl: "https://fio.example.net", passwordHash: Redacted.make(parsed) });
       const authorize = server.routes.find((route) => route.method === "GET" && route.path === "/authorize");
       if (authorize === undefined) return assert.fail("no /authorize route");
       // The Node adapter keeps a target it cannot parse as is, and the router still routes `GET http://[/authorize` here.
