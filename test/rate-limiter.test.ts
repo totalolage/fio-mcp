@@ -30,6 +30,18 @@ const flaky = Effect.fnUntraced(function* (conflicts: number, delayMs = 0) {
   return { calls, request };
 });
 
+/** A request that records its label and start time. */
+const labelled = Effect.fnUntraced(function* () {
+  const starts = yield* Ref.make<ReadonlyArray<readonly [string, number]>>([]);
+  const t0 = yield* Clock.currentTimeMillis;
+  const job = (label: string) =>
+    Clock.currentTimeMillis.pipe(
+      Effect.tap((t) => Ref.update(starts, (s) => [...s, [label, t - t0] as const])),
+      Effect.as(label),
+    );
+  return { starts, job };
+});
+
 const limiter = (options: RateLimiterOptions) => makeRateLimiter(options);
 
 /** Lets forked fibers run up to their next suspension. */
@@ -231,6 +243,95 @@ describe("RateLimiter", () => {
       yield* TestClock.adjust(30_000);
       assert.strictEqual(yield* Fiber.join(bg), "bg");
       assert.deepStrictEqual(yield* Ref.get(starts), [30_000, 60_000]);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("lets a starved background call in once it has waited the time bound", () =>
+    Effect.gen(function* () {
+      const rl = yield* limiter({ intervalMs: 30_000, maxWaitMs: 1_000_000 });
+      const { starts, job } = yield* labelled();
+      yield* rl.run(KEY, "interactive", Effect.succeed("first"));
+      const bg = yield* Effect.forkChild(rl.run(KEY, "background", job("bg")));
+      const fg = yield* Effect.forEach(["i1", "i2", "i3"], (v) => Effect.forkChild(rl.run(KEY, "interactive", job(v))));
+      yield* settle;
+      yield* TestClock.adjust(120_000);
+      yield* Effect.forEach([bg, ...fg], Fiber.join);
+      // i1 overtakes it at 30 s; by 60 s it has waited 60 s and goes before i2.
+      assert.deepStrictEqual(yield* Ref.get(starts), [
+        ["i1", 30_000],
+        ["bg", 60_000],
+        ["i2", 90_000],
+        ["i3", 120_000],
+      ]);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("lets a starved background call in after the interactive calls that may overtake it", () =>
+    Effect.gen(function* () {
+      const rl = yield* limiter({ intervalMs: 30_000, maxWaitMs: 1_000_000, backgroundMaxWaitMs: 600_000 });
+      const { starts, job } = yield* labelled();
+      yield* rl.run(KEY, "interactive", Effect.succeed("first"));
+      const bg = yield* Effect.forkChild(rl.run(KEY, "background", job("bg")));
+      const fg = yield* Effect.forEach(["i1", "i2", "i3"], (v) => Effect.forkChild(rl.run(KEY, "interactive", job(v))));
+      yield* settle;
+      yield* TestClock.adjust(120_000);
+      yield* Effect.forEach([bg, ...fg], Fiber.join);
+      // Two interactive calls overtake it; the third waits for it.
+      assert.deepStrictEqual(yield* Ref.get(starts), [
+        ["i1", 30_000],
+        ["i2", 60_000],
+        ["bg", 90_000],
+        ["i3", 120_000],
+      ]);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("keeps each priority class in arrival order while the bound interleaves them", () =>
+    Effect.gen(function* () {
+      const rl = yield* limiter({ intervalMs: 30_000, maxWaitMs: 1_000_000 });
+      const { starts, job } = yield* labelled();
+      yield* rl.run(KEY, "interactive", Effect.succeed("first"));
+      const background = yield* Effect.forEach(["b1", "b2"], (v) => Effect.forkChild(rl.run(KEY, "background", job(v))));
+      const interactive = yield* Effect.forEach(["i1", "i2", "i3"], (v) =>
+        Effect.forkChild(rl.run(KEY, "interactive", job(v))),
+      );
+      yield* settle;
+      yield* TestClock.adjust(150_000);
+      yield* Effect.forEach([...background, ...interactive], Fiber.join);
+      // b2's wait counts from b1's start, so it does not jump ahead of i2.
+      assert.deepStrictEqual(yield* Ref.get(starts), [
+        ["i1", 30_000],
+        ["b1", 60_000],
+        ["i2", 90_000],
+        ["b2", 120_000],
+        ["i3", 150_000],
+      ]);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("fails an interactive call fast at arrival when a due background call takes its slot", () =>
+    Effect.gen(function* () {
+      const rl = yield* limiter({ intervalMs: 30_000, maxWaitMs: 25_000 });
+      const { starts, job } = yield* labelled();
+      yield* rl.run(KEY, "interactive", Effect.succeed("first"));
+      const bg = yield* Effect.forkChild(rl.run(KEY, "background", job("bg")));
+      yield* TestClock.adjust(10_000);
+      const i1 = yield* Effect.forkChild(rl.run(KEY, "interactive", job("i1")));
+      yield* settle;
+      yield* TestClock.adjust(20_000);
+      assert.strictEqual(yield* Fiber.join(i1), "i1");
+      yield* TestClock.adjust(10_000);
+      // At 40 s the 60 s slot belongs to the background call, so i2 would start at 90 s.
+      assert.strictEqual((yield* rl.state(KEY)).nextSlotInSeconds, 50);
+      const error = yield* Effect.flip(rl.run(KEY, "interactive", job("i2")));
+      assert.instanceOf(error, RateLimited);
+      assert.strictEqual(error.retryAfterSeconds, 50);
+      yield* TestClock.adjust(20_000);
+      assert.strictEqual(yield* Fiber.join(bg), "bg");
+      assert.deepStrictEqual(yield* Ref.get(starts), [
+        ["i1", 30_000],
+        ["bg", 60_000],
+      ]);
     }).pipe(Effect.scoped),
   );
 
