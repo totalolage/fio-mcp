@@ -138,6 +138,18 @@ describe("authorization sessions", () => {
       assert.isTrue(Option.isNone(yield* sessions.find(Redacted.value(flooded.cookie))));
     }),
   );
+
+  it.effect("breaks ties against the client adding a sign-in", () =>
+    Effect.gen(function* () {
+      const sessions = yield* makeSessions();
+      // A full pool, one sign-in per client; the admin's is the oldest.
+      const admin = yield* sessions.start({ ...request, clientId: "admin" });
+      for (let i = 1; i < MAX_SESSIONS.pending; i++) yield* sessions.start({ ...request, clientId: `client-${i}` });
+      const own = yield* sessions.start({ ...request, clientId: "client-1" });
+      assert.isTrue(Option.isSome(yield* sessions.find(Redacted.value(admin.cookie))));
+      assert.isTrue(Option.isSome(yield* sessions.find(Redacted.value(own.cookie))));
+    }),
+  );
 });
 
 describe("window limiter", () => {

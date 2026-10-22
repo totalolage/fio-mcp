@@ -16,8 +16,9 @@ export const SESSION_TTL_MS = 10 * 60_000;
  * capped apart from signed-in ones (which need the password); starting
  * sign-ins never ends a signed-in session. At the cap a signed-in session
  * replaces the oldest signed-in one, and a sign-in replaces the oldest
- * sign-in of the client with the most in progress, so a flood through one
- * client displaces its own sign-ins first.
+ * sign-in of the client with the most in progress (counting the new one,
+ * ties going against the new one's client), so a flood through one client
+ * displaces its own sign-ins first.
  */
 export const MAX_SESSIONS = { pending: 100, signedIn: 20 } as const;
 
@@ -50,24 +51,29 @@ export const makeSessions = Effect.fn("AuthSessions.make")(function* () {
   const key = yield* newSigningKey;
   const sessions = new Map<string, AuthSession>();
 
-  /** The session to drop for room among `sameKind` (oldest first). */
-  const victim = (sameKind: ReadonlyArray<AuthSession>, loggedIn: boolean) => {
+  /**
+   * The session to drop for room among `sameKind` (oldest first) before one
+   * for `clientId` is added: the oldest of the client with the most,
+   * counting the new one and breaking ties against `clientId`.
+   */
+  const victim = (sameKind: ReadonlyArray<AuthSession>, loggedIn: boolean, clientId: string) => {
     if (loggedIn) return sameKind[0];
-    const counts = new Map<string, number>();
+    const counts = new Map<string, number>([[clientId, 1]]);
     for (const session of sameKind) counts.set(session.request.clientId, (counts.get(session.request.clientId) ?? 0) + 1);
-    let busiest: string | undefined;
-    for (const [clientId, count] of counts) if (busiest === undefined || count > (counts.get(busiest) ?? 0)) busiest = clientId;
-    return sameKind.find((session) => session.request.clientId === busiest);
+    let busiest = clientId;
+    for (const [candidate, count] of counts) if (count > (counts.get(busiest) ?? 0)) busiest = candidate;
+    // Without one of its own (every client holds one), the oldest goes.
+    return sameKind.find((session) => session.request.clientId === busiest) ?? sameKind[0];
   };
 
-  /** Drops expired sessions, then makes room for one more of `loggedIn`'s kind. */
-  const prune = (now: number, loggedIn: boolean) => {
+  /** Drops expired sessions, then makes room for one more of `loggedIn`'s kind for `clientId`. */
+  const prune = (now: number, loggedIn: boolean, clientId: string) => {
     for (const [id, session] of sessions) if (session.expiresAt <= now) sessions.delete(id);
     const cap = loggedIn ? MAX_SESSIONS.signedIn : MAX_SESSIONS.pending;
     // Insertion order is age order: a signed-in session is re-inserted at login.
     let sameKind = [...sessions.values()].filter((session) => session.loggedIn === loggedIn);
     while (sameKind.length >= cap) {
-      const dropped = victim(sameKind, loggedIn);
+      const dropped = victim(sameKind, loggedIn, clientId);
       if (dropped === undefined) break;
       sessions.delete(dropped.key);
       sameKind = sameKind.filter((session) => session !== dropped);
@@ -76,7 +82,7 @@ export const makeSessions = Effect.fn("AuthSessions.make")(function* () {
 
   const issue = Effect.fnUntraced(function* (request: PendingAuthorization, loggedIn: boolean, expiresAt?: number) {
     const now = yield* Clock.currentTimeMillis;
-    prune(now, loggedIn);
+    prune(now, loggedIn, request.clientId);
     const id = Redacted.value(yield* randomSecret(""));
     const session: AuthSession = {
       key: hashSecret(id),
