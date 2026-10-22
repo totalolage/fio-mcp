@@ -234,7 +234,14 @@ describe("payment validation", () => {
   ];
 
   it("rejects characters outside XML 1.0's Char production in every text field", () => {
-    const invalid = { "U+FFFF": "\uffff", "U+FFFE": "\ufffe", "high surrogate": "\ud800", "low surrogate": "\udc00" };
+    const invalid = {
+      "U+FFFF": "\uffff",
+      "U+FFFE": "\ufffe",
+      "high surrogate": "\ud800",
+      "last high surrogate": "\udbff",
+      "low surrogate": "\udc00",
+      "last low surrogate": "\udfff",
+    };
     for (const [order, field] of textFields) {
       for (const [what, ch] of Object.entries({ ...invalid, "U+0001": "\u0001", "reversed pair": "\ude00\ud83d" })) {
         expect(paymentOrderSchema.safeParse({ ...order, [field]: `a${ch}b` }).success, `${order.type}.${field} ${what}`).toBe(
@@ -248,7 +255,7 @@ describe("payment validation", () => {
 
   it("accepts astral characters as surrogate pairs and keeps them in the XML", () => {
     for (const [order, field] of textFields) {
-      const value = "Kůň 😀 €";
+      const value = "Kůň 😀 € \u{10000}\u{10ffff}";
       const [parsed] = parseAll([{ ...order, [field]: value }]);
       expect(buildImportXml([parsed!], payer), `${order.type}.${field}`).toContain(`<${field}>${value}</${field}>`);
     }

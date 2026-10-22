@@ -342,11 +342,10 @@ describe("payment tools", () => {
     expect(upload).toMatchObject({ method: "POST", path: "/import/", tokenInUrl: false, tokenOutsideTokenField: false });
     expect(upload?.fields).toMatchObject({ type: "xml", token: "<token>", lng: "en" });
     expect(upload?.files).toEqual([
+      // `text` is the UTF-8 decoding of the uploaded file, so equality means the bytes are preview.xml's UTF-8
+      // with nothing replaced by U+FFFD.
       expect.objectContaining({ field: "file", filename: "orders.xml", text: preview.xml }),
     ]);
-    // The recorded text is the UTF-8 decoding of the uploaded file, so equal encodings mean equal bytes.
-    const encode = (value: string) => new TextEncoder().encode(value);
-    expect(encode(upload?.files[0]?.text ?? "")).toEqual(encode(preview.xml));
     expect(submitted.result).toMatchObject({ accepted: true, batchIds: ["105545555"] });
     expect(submitted.nextStep).toMatch(/NOT executed/);
   });
