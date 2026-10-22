@@ -283,10 +283,12 @@ HTTP mode is protected by OAuth, with fio-mcp as its own authorization server (M
 
 ### Setup
 
-1. Create the admin password hash. It asks twice and does not echo; a piped password is read once. Minimum 12 characters.
+1. Create the admin password hash. On a terminal it asks twice and does not echo; a piped password is read once. Minimum 12 characters. Only the hash goes to standard output; prompts and errors go to standard error. With Docker, pipe the password in with `-i` and leave out `-t`: a TTY merges both streams, so the prompts would land in the file and fio-mcp would reject it.
 
    ```sh
-   docker run --rm -it <image> hash-password > admin.hash      # or: fio-mcp hash-password > admin.hash
+   read -rs -p 'Admin password: ' pw && echo
+   printf '%s\n' "$pw" | docker run --rm -i <image> hash-password > admin.hash; unset pw
+   # or, outside Docker: fio-mcp hash-password > admin.hash
    ```
 
 2. Set `FIO_MCP_PUBLIC_URL` and `FIO_MCP_ADMIN_PASSWORD_HASH_FILE` (see [HTTP transport](#http-transport)). Without both, HTTP mode refuses to start.
@@ -311,13 +313,13 @@ Every tool stays listed. A call outside the grant answers "You don't have permis
 | `/login`, `/consent` | Sign-in and consent pages |
 | `/token` | Code exchange and refresh |
 | `/revoke` | Token revocation (RFC 7009) |
-| `/mcp` | MCP; `Authorization: Bearer <access token>`. Without a valid token: 401 with `WWW-Authenticate: Bearer resource_metadata="<public url>/.well-known/oauth-protected-resource/mcp"` |
+| `/mcp` | MCP; `Authorization: Bearer <access token>`. Without a valid token: 401 with `WWW-Authenticate: Bearer resource_metadata="<public url>/.well-known/oauth-protected-resource/mcp", scope="fio:read"`, followed by `, error="invalid_request"` for a malformed `Authorization` header or `, error="invalid_token"` for an unknown, expired or revoked token |
 
 - **Clients** register without a secret. Redirect URIs must be https, or http on a loopback address (`127.0.0.1`, `[::1]`, `localhost`) on any port; they must match exactly except for the loopback port. Client ID metadata documents are not supported, because the server never fetches URLs. At most 100 clients and 20 registrations per hour; a client that never completes a sign-in is removed after an hour, and one without a live grant 24 hours after its last use.
 - **Tokens** are random and stored only as SHA-256 hashes. Authorization codes are single-use and live 60 s; access tokens 1 hour; refresh tokens 30 days, rotated on every use. Reusing an old refresh token or an authorization code revokes the whole grant. Tokens are bound to the audience `<public url>/mcp`, and every token request, refresh included, must name it as `resource`.
 - **MCP sessions** are bound to the grant that opened them; another grant presenting the session id gets 404. Each grant may hold 32 sessions and the server 1,000. When full, a session unused for an hour is ended (its id then answers 404) to make room; otherwise new sessions are refused (429 for the grant, 503 for the server).
 - **Limits on /mcp:** request bodies up to 1 MiB (413 beyond; a 100-order payment import is about 100 KB), initialize requests up to 64 KiB, and 16 requests in progress per grant (429).
-- **Sign-in** compares the password against the scrypt hash in constant time, one check at a time. After 5 failures from a client address, attempts wait 1, 2, 4 and 8 s; the 10th consecutive failure locks the address out for 15 minutes. An address may start 20 sign-ins per 10 minutes (429). Up to 100 sign-ins in progress and 20 signed-in sessions are kept; starting sign-ins never ends a signed-in one, and a flood through one client displaces that client's own sign-ins first. Behind a reverse proxy, set `FIO_MCP_TRUSTED_PROXIES`, or every browser shares the proxy's address: one person's failed logins lock everyone out, and 20 sign-ins block new ones for everyone for 10 minutes. Logs record counts only.
+- **Sign-in** compares the password against the scrypt hash in constant time, one check at a time across all clients; a sign-in that arrives during a check gets 429 instead of waiting, so a flood cannot stack scrypt's memory. Each check needs about 128 MiB of scrypt workspace with the `hash-password` defaults (N=2^17, r=8, p=1; hashes needing more than 256 MiB are refused), and the container peaked at about 256 MiB during one. The trade-off: sign-ins from many addresses can keep the check busy and delay yours. After 5 failures from a client address, attempts wait 1, 2, 4 and 8 s; the 10th consecutive failure locks the address out for 15 minutes. An address may start 20 sign-ins per 10 minutes (429). Up to 100 sign-ins in progress and 20 signed-in sessions are kept; starting sign-ins never ends a signed-in one, and a flood through one client displaces that client's own sign-ins first. Behind a reverse proxy, set `FIO_MCP_TRUSTED_PROXIES`, or every browser shares the proxy's address: one person's failed logins lock everyone out, and 20 sign-ins block new ones for everyone for 10 minutes. Logs record counts only.
 - **Pages** use a short-lived, server-side, signed cookie (`HttpOnly`, `Secure`, `SameSite=Lax`, 10 minutes), a CSRF token on every form, an Origin check, and strict headers (CSP with `frame-ancestors 'none'`, `no-store`).
 
 ### Administration
@@ -332,7 +334,12 @@ docker exec <container> node dist/main.js tokens revoke-all
 
 Forward the whole host, or at least `/mcp`, `/.well-known/oauth-protected-resource`, `/.well-known/oauth-protected-resource/mcp`, `/.well-known/oauth-authorization-server`, `/register`, `/authorize`, `/login`, `/consent`, `/token`, `/revoke`, and optionally `/healthz`. TLS must terminate at the proxy, because the sign-in cookie is `Secure`. If `FIO_MCP_ALLOWED_HOSTS` is set, it must include the public host.
 
-Set `FIO_MCP_TRUSTED_PROXIES` to the proxy's address as fio-mcp sees it. For Traefik on the same Docker network, that is Traefik's container address on that network (`docker inspect <traefik> --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}'`). Give it a static address, or trust the network's subnet (`docker network inspect <network> --format '{{(index .IPAM.Config 0).Subnet}}'`); then any container on that network can choose its own throttling key, so prefer a network shared only by Traefik and fio-mcp. Traefik appends the client's address to `X-Forwarded-For`; addresses a client adds itself sit further left and are ignored.
+Set `FIO_MCP_TRUSTED_PROXIES` to the proxy's address as fio-mcp sees it:
+
+- **Traefik connects through a published port** (Docker NAT, as on TrueNAS): connections arrive from the gateway of fio-mcp's Docker network, not from Traefik's container (`docker network inspect <network> --format '{{(index .IPAM.Config 0).Gateway}}'`). `172.16.0.0/12` covers the 172.17.0.0/16 to 172.31.0.0/16 networks that Docker hands out first from its default address pools, so it keeps working when the network is recreated with another subnet (later networks come from 192.168.0.0/16; check the gateway). Trade-off: any container on those networks can choose its own throttling key.
+- **Traefik shares a Docker network with fio-mcp** and connects to the container directly: use Traefik's container address on that network (`docker inspect <traefik> --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}'`). Give it a static address, or trust the network's subnet (`docker network inspect <network> --format '{{(index .IPAM.Config 0).Subnet}}'`); then any container on that network can choose its own throttling key, so prefer a network shared only by Traefik and fio-mcp.
+
+Traefik appends the client's address to `X-Forwarded-For`; addresses a client adds itself sit further left and are ignored.
 
 ## Container and NAS deployment
 
@@ -354,12 +361,15 @@ services:
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
+    mem_limit: 512m                                    # a sign-in or hash-password peaks at about 256 MiB
+    ports:
+      - "3000:3000"                                    # Traefik connects through this published port
     environment:
       FIO_TOKEN_FILE: /run/secrets/fio_token          # or FIO_ACCOUNTS_FILE
       FIO_MCP_PUBLIC_URL: https://fio.nas.kalny.net
       FIO_MCP_ADMIN_PASSWORD_HASH_FILE: /run/secrets/fio_mcp_admin_hash
       FIO_MCP_ALLOWED_HOSTS: fio.nas.kalny.net
-      FIO_MCP_TRUSTED_PROXIES: 172.18.0.2                # Traefik's address on the shared network
+      FIO_MCP_TRUSTED_PROXIES: 172.16.0.0/12             # Docker bridge gateways (Traefik via the published port)
       FIO_SYNC_INTERVAL_MINUTES: "60"
     volumes:
       - /mnt/local-hdd/Applications/fio-mcp:/data     # writable by the container user
