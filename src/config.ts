@@ -155,9 +155,9 @@ const secretVar = Effect.fn("config.secretVar")(function* (key: string) {
     const fs = yield* FileSystem.FileSystem;
     const content = yield* fs
       .readFileString(file.value)
-      .pipe(Effect.mapError(() => new ConfigError({ detail: `${key}_FILE: cannot read ${file.value}` })));
+      .pipe(Effect.mapError(() => new ConfigError({ detail: `${key}_FILE: file not readable` })));
     const trimmed = content.replace(/\r?\n$/, "").trim();
-    if (trimmed === "") return yield* fail(`${key}_FILE: ${file.value} is empty`);
+    if (trimmed === "") return yield* fail(`${key}_FILE: file is empty`);
     return Option.some(Redacted.make(trimmed));
   }
   return Option.map(direct, (value) => Redacted.make(value));
@@ -296,14 +296,14 @@ const loadHttpAuth = Effect.fn("config.loadHttpAuth")(function* () {
   const fs = yield* FileSystem.FileSystem;
   const content = yield* fs
     .readFileString(hashFile.value)
-    .pipe(Effect.mapError(() => new ConfigError({ detail: `FIO_MCP_ADMIN_PASSWORD_HASH_FILE: cannot read ${hashFile.value}` })));
+    .pipe(Effect.mapError(() => new ConfigError({ detail: "FIO_MCP_ADMIN_PASSWORD_HASH_FILE: file not readable" })));
   const lines = content.split(/\r?\n/).filter((line) => line.trim() !== "");
   if (lines.length !== 1) {
-    return yield* fail(`FIO_MCP_ADMIN_PASSWORD_HASH_FILE: ${hashFile.value} must contain exactly one hash line`);
+    return yield* fail("FIO_MCP_ADMIN_PASSWORD_HASH_FILE: file must contain exactly one hash line");
   }
   const hash = parsePasswordHash(lines[0] ?? "");
   if (hash instanceof PasswordHashError) {
-    return yield* fail(`FIO_MCP_ADMIN_PASSWORD_HASH_FILE: ${hashFile.value} ${hash.detail}`);
+    return yield* fail(`FIO_MCP_ADMIN_PASSWORD_HASH_FILE: file ${hash.detail}`);
   }
   return { kind: "oauth", publicUrl: parsedUrl.origin, passwordHash: Redacted.make(hash) } satisfies HttpAuthConfig;
 });
