@@ -13,8 +13,8 @@ import { RateLimited, type TokenBusy } from "./errors.js";
  * Priority is bounded so that steady tool calls cannot starve sync: the
  * background head takes the next slot once `backgroundMaxOvertakes`
  * interactive calls have started ahead of it, or once it has waited
- * `backgroundMaxWaitMs`, whichever comes first. Its wait counts from its
- * arrival or the previous background start, whichever is later.
+ * `backgroundMaxWaitMs`, whichever comes first. Both count from its arrival
+ * or the previous background start, whichever is later.
  *
  * Interactive calls have a wait budget (`maxWaitMs` from arrival). A call that
  * cannot start within it fails with a retry-after hint instead of hanging past
@@ -36,7 +36,7 @@ export interface RateLimiterOptions {
   readonly maxWaitMs: number;
   /** Interactive starts that may overtake the background head (default 2). */
   readonly backgroundMaxOvertakes?: number;
-  /** Wait after which the background head goes next (default 60 s). */
+  /** Wait after which the background head goes next (default two intervals). */
   readonly backgroundMaxWaitMs?: number;
 }
 
@@ -57,6 +57,8 @@ interface Waiter {
   readonly deadline: number;
   /** When the call joined its queue (epoch ms). */
   readonly enqueuedAt: number;
+  /** `TokenState.interactiveStarts` when the call joined its queue. */
+  readonly startsBefore: number;
   readonly grant: Deferred.Deferred<void, RateLimited>;
 }
 
@@ -64,9 +66,11 @@ interface TokenState {
   readonly lastStart: number;
   readonly blockedUntil: number;
   readonly last409At: number | undefined;
+  /** Interactive calls started so far; overtakes are counted against it. */
+  readonly interactiveStarts: number;
   readonly lastBackgroundStart: number;
-  /** Interactive starts since the background head's wait began. */
-  readonly overtaken: number;
+  /** `interactiveStarts` at the last background start. */
+  readonly startsBeforeLastBackground: number;
   readonly interactive: ReadonlyArray<Waiter>;
   readonly background: ReadonlyArray<Waiter>;
 }
@@ -106,8 +110,9 @@ const initialState: TokenState = {
   lastStart: Number.NEGATIVE_INFINITY,
   blockedUntil: 0,
   last409At: undefined,
+  interactiveStarts: 0,
   lastBackgroundStart: Number.NEGATIVE_INFINITY,
-  overtaken: 0,
+  startsBeforeLastBackground: 0,
   interactive: [],
   background: [],
 };
@@ -115,12 +120,21 @@ const initialState: TokenState = {
 export const makeRateLimiter = Effect.fn("RateLimiter.make")(function* (options: RateLimiterOptions) {
   const scope = yield* Effect.scope;
   const limiters = yield* SynchronizedRef.make(new Map<string, TokenLimiter>());
-  const { intervalMs, maxWaitMs, backgroundMaxOvertakes = 2, backgroundMaxWaitMs = 60_000 } = options;
+  const { intervalMs, maxWaitMs, backgroundMaxOvertakes = 2, backgroundMaxWaitMs = 2 * intervalMs } = options;
 
   const readyAt = (s: TokenState) => Math.max(s.lastStart + intervalMs, s.blockedUntil);
 
-  /** When the background head's wait began (arrival or the previous background start). */
-  const backgroundSince = (s: TokenState) => Math.max(s.background[0]?.enqueuedAt ?? 0, s.lastBackgroundStart);
+  /**
+   * When the background head's wait began (its arrival or the previous
+   * background start) and how many interactive calls have started since.
+   */
+  const headWait = (s: TokenState) => {
+    const head = s.background[0];
+    return {
+      since: Math.max(head?.enqueuedAt ?? 0, s.lastBackgroundStart),
+      overtaken: s.interactiveStarts - Math.max(head?.startsBefore ?? 0, s.startsBeforeLastBackground),
+    };
+  };
 
   const backgroundDue = (overtaken: number, waitedMs: number) =>
     overtaken >= backgroundMaxOvertakes || waitedMs >= backgroundMaxWaitMs;
@@ -133,8 +147,7 @@ export const makeRateLimiter = Effect.fn("RateLimiter.make")(function* (options:
     let at = Math.max(now, readyAt(s));
     let interactive = ahead;
     let background = s.background.length;
-    let overtaken = s.overtaken;
-    let since = backgroundSince(s);
+    let { since, overtaken } = headWait(s);
     for (;;) {
       if (background > 0 && backgroundDue(overtaken, at - since)) {
         background--;
@@ -162,9 +175,8 @@ export const makeRateLimiter = Effect.fn("RateLimiter.make")(function* (options:
    * One dispatcher step, decided atomically on the current state: drop the
    * interactive waiters a 409 or a due background call pushed past their
    * budget, then either grant the next slot or report how long until it
-   * opens. Arrivals that happen while
-   * the dispatcher runs are never lost, because nothing is decided on a
-   * stale snapshot.
+   * opens. Arrivals that happen while the dispatcher runs are never lost,
+   * because nothing is decided on a stale snapshot.
    */
   const step = (now: number) =>
     (s: TokenState): [DispatchStep, TokenState] => {
@@ -182,14 +194,21 @@ export const makeRateLimiter = Effect.fn("RateLimiter.make")(function* (options:
       const pruned: TokenState = { ...s, interactive: survivors };
       if (ready > now) return [{ rejected, grant: undefined, waitMs: ready - now }, pruned];
       const [background, ...laterBackground] = s.background;
-      if (background !== undefined && (survivors.length === 0 || backgroundDue(s.overtaken, now - backgroundSince(s)))) {
-        const next: TokenState = { ...pruned, background: laterBackground, lastStart: now, lastBackgroundStart: now, overtaken: 0 };
+      const wait = headWait(s);
+      if (background !== undefined && (survivors.length === 0 || backgroundDue(wait.overtaken, now - wait.since))) {
+        const next: TokenState = {
+          ...pruned,
+          background: laterBackground,
+          lastStart: now,
+          lastBackgroundStart: now,
+          startsBeforeLastBackground: s.interactiveStarts,
+        };
         return [{ rejected, grant: background, waitMs: undefined }, next];
       }
       const [head, ...rest] = survivors;
       if (head === undefined) return [{ rejected, grant: undefined, waitMs: undefined }, pruned];
-      const overtaken = background === undefined ? 0 : s.overtaken + 1;
-      return [{ rejected, grant: head, waitMs: undefined }, { ...pruned, interactive: rest, lastStart: now, overtaken }];
+      const next: TokenState = { ...pruned, interactive: rest, lastStart: now, interactiveStarts: s.interactiveStarts + 1 };
+      return [{ rejected, grant: head, waitMs: undefined }, next];
     };
 
   /** Hands out slots; fails interactive waiters a 409 pushed past their budget. */
@@ -236,24 +255,22 @@ export const makeRateLimiter = Effect.fn("RateLimiter.make")(function* (options:
     const ahead = priority === "interactive" && !front ? s.interactive.length : 0;
     const projected = priority === "interactive" ? projectStart(s, now, ahead) : now;
     if (projected > deadline) return yield* tooLate(projected - now, reason);
-    const waiter: Waiter = { deadline, enqueuedAt: now, grant: yield* Deferred.make<void, RateLimited>() };
+    const grant = yield* Deferred.make<void, RateLimited>();
     const queue = priority === "interactive" ? "interactive" : "background";
     const leave = Ref.update(limiter.state, (current) => ({
       ...current,
-      interactive: current.interactive.filter((w) => w !== waiter),
-      background: current.background.filter((w) => w !== waiter),
+      interactive: current.interactive.filter((w) => w.grant !== grant),
+      background: current.background.filter((w) => w.grant !== grant),
     })).pipe(Effect.andThen(signal(limiter)));
     // Enqueue without interruption, then wait interruptibly: an interrupted
     // caller always leaves the queue, so no orphan waiter takes a slot.
     yield* Effect.uninterruptibleMask((restore) =>
-      Ref.update(limiter.state, (current) => ({
-        ...current,
-        [queue]: front ? [waiter, ...current[queue]] : [...current[queue], waiter],
-        // A new background head starts with a clean count.
-        overtaken: queue === "background" && current.background.length === 0 ? 0 : current.overtaken,
-      })).pipe(
+      Ref.update(limiter.state, (current) => {
+        const waiter: Waiter = { deadline, enqueuedAt: now, startsBefore: current.interactiveStarts, grant };
+        return { ...current, [queue]: front ? [waiter, ...current[queue]] : [...current[queue], waiter] };
+      }).pipe(
         Effect.andThen(signal(limiter)),
-        Effect.andThen(restore(Deferred.await(waiter.grant)).pipe(Effect.onInterrupt(() => leave))),
+        Effect.andThen(restore(Deferred.await(grant)).pipe(Effect.onInterrupt(() => leave))),
       ),
     );
   });

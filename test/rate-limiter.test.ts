@@ -335,6 +335,95 @@ describe("RateLimiter", () => {
     }).pipe(Effect.scoped),
   );
 
+  it.effect("scales the default time bound with the interval", () =>
+    Effect.gen(function* () {
+      const rl = yield* limiter({ intervalMs: 60_000, maxWaitMs: 1_000_000 });
+      const { starts, job } = yield* labelled();
+      yield* rl.run(KEY, "interactive", Effect.succeed("first"));
+      const background = yield* Effect.forEach(["b1", "b2"], (v) => Effect.forkChild(rl.run(KEY, "background", job(v))));
+      const interactive = yield* Effect.forEach(["i1", "i2", "i3"], (v) =>
+        Effect.forkChild(rl.run(KEY, "interactive", job(v))),
+      );
+      yield* settle;
+      yield* TestClock.adjust(300_000);
+      yield* Effect.forEach([...background, ...interactive], Fiber.join);
+      // With a 60 s interval the bound is 120 s, so background calls do not take every slot.
+      assert.deepStrictEqual(yield* Ref.get(starts), [
+        ["i1", 60_000],
+        ["b1", 120_000],
+        ["i2", 180_000],
+        ["b2", 240_000],
+        ["i3", 300_000],
+      ]);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("counts overtakes for the next background call only from its own arrival", () =>
+    Effect.gen(function* () {
+      const rl = yield* limiter({ intervalMs: 30_000, maxWaitMs: 25_000 });
+      const { starts, job } = yield* labelled();
+      yield* rl.run(KEY, "interactive", Effect.succeed("first"));
+      yield* TestClock.adjust(1_000);
+      const b1 = yield* Effect.forkChild(rl.run(KEY, "background", job("b1")));
+      yield* TestClock.adjust(9_000);
+      const i1 = yield* Effect.forkChild(rl.run(KEY, "interactive", job("i1")));
+      yield* settle;
+      yield* TestClock.adjust(21_000);
+      assert.strictEqual(yield* Fiber.join(i1), "i1");
+      // b2 arrives at 31 s, after i1 overtook b1.
+      const b2 = yield* Effect.forkChild(rl.run(KEY, "background", job("b2")));
+      yield* TestClock.adjust(9_000);
+      const i2 = yield* Effect.forkChild(rl.run(KEY, "interactive", job("i2")));
+      yield* settle;
+      yield* TestClock.adjust(20_000);
+      assert.strictEqual(yield* Fiber.join(i2), "i2");
+      yield* TestClock.adjust(1_000);
+      yield* Fiber.interrupt(b1);
+      // b2 has been overtaken once and waited 59 s by the 90 s slot, so i3 still gets it.
+      yield* TestClock.adjust(9_000);
+      assert.strictEqual((yield* rl.state(KEY)).nextSlotInSeconds, 20);
+      const i3 = yield* Effect.forkChild(rl.run(KEY, "interactive", job("i3")));
+      yield* settle;
+      yield* TestClock.adjust(50_000);
+      yield* Effect.forEach([i3, b2], Fiber.join);
+      assert.deepStrictEqual(yield* Ref.get(starts), [
+        ["i1", 30_000],
+        ["i2", 60_000],
+        ["i3", 90_000],
+        ["b2", 120_000],
+      ]);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("fails a queued interactive call when a 409 delays its slot past a background call's bound", () =>
+    Effect.gen(function* () {
+      const rl = yield* limiter({ intervalMs: 30_000, maxWaitMs: 40_000, backgroundMaxWaitMs: 70_000 });
+      const { starts, job } = yield* labelled();
+      yield* rl.run(KEY, "interactive", Effect.succeed("first"));
+      const bg = yield* Effect.forkChild(rl.run(KEY, "background", job("bg")));
+      // i1 starts at 30 s and gets a 409 at 40 s, blocking the token until 70 s.
+      const { request } = yield* flaky(5, 10_000);
+      yield* TestClock.adjust(10_000);
+      const i1 = yield* Effect.forkChild(Effect.flip(rl.run(KEY, "interactive", request)));
+      yield* settle;
+      yield* TestClock.adjust(25_000);
+      // i2 arrives at 35 s for the 60 s slot, which fits its 75 s deadline.
+      const i2 = yield* Effect.forkChild(Effect.flip(rl.run(KEY, "interactive", job("i2"))));
+      yield* settle;
+      assert.strictEqual((yield* rl.state(KEY)).queued, 1);
+      yield* TestClock.adjust(5_000);
+      yield* settle;
+      // By 70 s the background call has waited 70 s and takes that slot; i2 would start at 100 s.
+      assert.instanceOf(yield* Fiber.join(i1), RateLimited);
+      const error = yield* Fiber.join(i2);
+      assert.instanceOf(error, RateLimited);
+      assert.strictEqual(error.retryAfterSeconds, 60);
+      yield* TestClock.adjust(30_000);
+      assert.strictEqual(yield* Fiber.join(bg), "bg");
+      assert.deepStrictEqual(yield* Ref.get(starts), [["bg", 70_000]]);
+    }).pipe(Effect.scoped),
+  );
+
   it.effect("background calls wait past the interactive budget", () =>
     Effect.gen(function* () {
       const rl = yield* limiter({ intervalMs: 30_000, maxWaitMs: 0 });
