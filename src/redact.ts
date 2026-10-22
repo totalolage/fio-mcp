@@ -33,6 +33,18 @@ export function redact(text: string): string {
   return out.replace(TOKEN_PATH, (_match, segment: string) => `/${segment}/${REDACTED}`);
 }
 
+/** Redacts every string (and object key) in a JSON-like value, e.g. an outgoing MCP message. */
+export function redactDeep<T>(value: T): T {
+  if (typeof value === "string") return redact(value) as T;
+  if (Array.isArray(value)) return value.map((item) => redactDeep(item)) as T;
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, item]) => [redact(key), redactDeep(item)]),
+    ) as T;
+  }
+  return value;
+}
+
 function format(value: unknown): string {
   if (value instanceof Error) {
     const cause = value.cause === undefined ? "" : ` (cause: ${format(value.cause)})`;

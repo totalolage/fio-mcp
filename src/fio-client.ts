@@ -126,10 +126,13 @@ function causeText(error: Error): string {
 
 /** Short, single-line, token-free excerpt of a response body for error messages. */
 export function excerpt(body: string): string {
-  const text = body
-    .replace(/<[^>]+>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  const short = text.length > EXCERPT_LENGTH ? `${text.slice(0, EXCERPT_LENGTH)}…` : text;
-  return redact(short);
+  // Redact before stripping tags and again before truncating: a cut could leave
+  // a token prefix that redact no longer recognizes.
+  const text = redact(
+    redact(body)
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim(),
+  );
+  return text.length > EXCERPT_LENGTH ? `${text.slice(0, EXCERPT_LENGTH)}…` : text;
 }

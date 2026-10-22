@@ -1,7 +1,7 @@
 {
   "name": "fio-mcp",
   "version": "0.1.0",
-  "description": "MCP server for FIO Bank's API Bankovnictví that exposes only the tools its tokens are permitted to use",
+  "description": "MCP server for FIO Bank's API Bankovnictví: transactions, statements, and payment orders",
   "type": "module",
   "license": "MIT",
   "bin": {

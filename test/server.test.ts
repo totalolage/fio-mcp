@@ -57,7 +57,7 @@ async function connect(config: ServerConfig, route: Route = () => ok(STATEMENT_J
   const fio = createFioServer(config, { fetch: mock.fetch });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "test-client", version: "1.0.0" });
-  await Promise.all([fio.server.connect(serverTransport), client.connect(clientTransport)]);
+  await Promise.all([fio.connect(serverTransport), client.connect(clientTransport)]);
   const tools = async () => (await client.listTools()).tools;
   const names = async () => (await tools()).map((t) => t.name).sort();
   const call = async (name: string, args: Record<string, unknown> = {}) =>
@@ -214,6 +214,26 @@ describe("read tools", () => {
     const result = await call("get_transactions", { dateFrom: "2024-01-01", dateTo: "2024-01-31" });
     expect(text(result)).toMatch(/token does not exist or is inactive/);
     expect(text(result)).not.toContain(PERMISSION_DENIED);
+  });
+});
+
+describe("token redaction at the MCP boundary", () => {
+  it("redacts tokens echoed by the SDK's input validation", async () => {
+    const { call, fetch } = await connect(baseConfig([readAccount()]));
+    const result = await call("get_last_statement", { [READ_TOKEN]: READ_TOKEN });
+    expect(result.isError).toBe(true);
+    expect(text(result)).not.toContain(READ_TOKEN);
+    expect(text(result)).not.toContain(READ_TOKEN.slice(0, 20));
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("redacts tokens that cross the error excerpt boundary", async () => {
+    const body = `${"x".repeat(280)}${READ_TOKEN} tail`;
+    const { call } = await connect(baseConfig([readAccount()]), () => status(404, body));
+    const result = await call("get_last_statement");
+    expect(result.isError).toBe(true);
+    expect(text(result)).not.toContain(READ_TOKEN.slice(0, 20));
+    expect(text(result)).toContain("x***");
   });
 });
 

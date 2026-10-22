@@ -1,4 +1,5 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { CallToolResult, ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { Account, AccountRegistry } from "./accounts.js";
@@ -7,7 +8,7 @@ import { FioApiError, PermissionDeniedError, RateLimitedError, ToolInputError } 
 import { MERCHANT_FORMATS, MOVEMENT_FORMATS, STATEMENT_FORMATS, type FetchFn } from "./fio-client.js";
 import { looksLikeMissingPaymentPermission, parseImportResponse } from "./import-response.js";
 import { buildImportXml, paymentOrdersSchema, summarizeOrders, type PaymentOrder } from "./payments.js";
-import { log, redact } from "./redact.js";
+import { log, redact, redactDeep } from "./redact.js";
 import { parseLastStatement, parseStatementJson } from "./statement.js";
 
 export const SERVER_NAME = "fio-mcp";
@@ -94,6 +95,19 @@ export interface FioServer {
   server: McpServer;
   registry: AccountRegistry;
   toolNames(): string[];
+  /** Connects with every outgoing message redacted. Use this instead of server.connect. */
+  connect(transport: Transport): Promise<void>;
+}
+
+/**
+ * Redacts tokens from everything the server sends. Tool handlers redact their
+ * own output too, but some text never reaches them, e.g. the SDK's input
+ * validation errors, which echo argument names and values.
+ */
+export function redactingTransport(transport: Transport): Transport {
+  const send = transport.send.bind(transport);
+  transport.send = (message, options) => send(redactDeep(message), options);
+  return transport;
 }
 
 export function createFioServer(config: ServerConfig, options: { fetch?: FetchFn } = {}): FioServer {
@@ -385,5 +399,6 @@ export function createFioServer(config: ServerConfig, options: { fetch?: FetchFn
   );
 
   const toolNames = () => [...definitions.map((d) => d.name), "get_server_status"];
-  return { server, registry, toolNames };
+  const connect = (transport: Transport) => server.connect(redactingTransport(transport));
+  return { server, registry, toolNames, connect };
 }
