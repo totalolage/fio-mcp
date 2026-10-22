@@ -1,6 +1,7 @@
 import { NodeFileSystem } from "@effect/platform-node";
 import { assert, describe, it } from "@effect/vitest";
-import { type Cause, Clock, Effect, Layer, Option, Queue, Redacted, Sink, Stdio, Stream, Terminal } from "effect";
+import { type Cause, Clock, Effect, Fiber, Layer, Option, Queue, Redacted, Sink, Stdio, Stream, Terminal } from "effect";
+import { SqlClient } from "effect/sql";
 import { TestClock } from "effect/testing";
 import { databaseLayer, SERVER_MIGRATIONS } from "../src/cache/db.js";
 import { CommandFailed, hashPasswordCommand, listClientsCommand, revokeAllTokensCommand, revokeClientCommand } from "../src/oauth/cli.js";
@@ -14,7 +15,7 @@ import {
 } from "../src/oauth/crypto.js";
 import { DEFAULT_THROTTLE, delayAfter, makeLoginGuard } from "../src/oauth/login.js";
 import { escapeHtml } from "../src/oauth/pages.js";
-import { makeOAuthStore } from "../src/oauth/store.js";
+import { makeOAuthStore, ROTATED_KEPT } from "../src/oauth/store.js";
 import { isResource, parsePublicUrl, redirectUriMatches, redirectUriProblem } from "../src/oauth/urls.js";
 
 const FAST = { ln: 14, r: 8, p: 1 } as const;
@@ -43,7 +44,7 @@ describe("URL rules", () => {
     for (const ok of ["https://app.example/cb", "http://127.0.0.1:1234/cb", "http://[::1]/cb", "http://localhost:8080/cb?x=1"]) {
       assert.isUndefined(redirectUriProblem(ok), ok);
     }
-    for (const bad of ["http://app.example/cb", "http://127.0.0.2/cb", "myapp://cb", "https://app.example/cb#f", "https://u@app.example/cb", "https://"]) {
+    for (const bad of ["http://app.example/cb", "http://127.0.0.2/cb", "myapp://cb", "https://app.example/cb#f", "https://u@app.example/cb", "https://", "https://app.example/\u001b]52;c;x\u0007", "https://app.example/a b"]) {
       assert.isDefined(redirectUriProblem(bad), bad);
     }
   });
@@ -120,6 +121,23 @@ describe("login throttling", () => {
       // Success resets the count.
       assert.strictEqual((yield* guard.attempt("10.0.0.1", wrong))._tag, "Rejected");
       assert.strictEqual((yield* guard.attempt("10.0.0.1", right))._tag, "Accepted");
+    }),
+  );
+
+  it.effect("keeps the permit and counts the failure when the caller is interrupted mid-check", () =>
+    Effect.gen(function* () {
+      const parsed = parsePasswordHash(yield* hashPassword(Redacted.make("the right password"), FAST));
+      if (parsed instanceof PasswordHashError) return assert.fail("hash did not parse");
+      const guard = yield* makeLoginGuard(Redacted.make(parsed));
+      const wrong = Redacted.make("the wrong password");
+      const fiber = yield* Effect.forkChild(guard.attempt("a", wrong));
+      yield* Effect.yieldNow;
+      // While the first check runs, others are turned away rather than run in parallel.
+      assert.strictEqual((yield* guard.attempt("b", wrong))._tag, "Throttled");
+      // Interruption waits for the admitted check, which still counts as a failure.
+      yield* Fiber.interrupt(fiber);
+      for (let i = 0; i < 5; i++) assert.strictEqual((yield* guard.attempt("a", wrong))._tag, "Rejected");
+      assert.strictEqual((yield* guard.attempt("a", Redacted.make("the right password")))._tag, "Throttled");
     }),
   );
 
@@ -231,12 +249,35 @@ describe("hash-password", () => {
 describe("admin commands", () => {
   const db = databaseLayer(":memory:", SERVER_MIGRATIONS).pipe(Layer.provide(NodeFileSystem.layer));
 
+  it.effect("keeps only the newest rotated refresh tokens per grant, and still detects recent reuse", () =>
+    Effect.gen(function* () {
+      const store = yield* makeOAuthStore();
+      const sql = yield* SqlClient.SqlClient;
+      const now = yield* Clock.currentTimeMillis;
+      const clientId = "fio_client_r";
+      yield* store.insertClient({ clientId, clientName: null, redirectUris: ["https://a.example/cb"], createdAt: now, lastUsedAt: null }, 10);
+      const grant = { grantId: "grant_r", clientId, scopes: ["fio:read"], accounts: ["main"], resource: "https://fio.example.test/mcp" };
+      yield* store.createGrant(grant, { codeHash: "c", clientId, redirectUri: "https://a.example/cb", codeChallenge: "x", expiresAt: now + 60_000 }, now);
+      const pair = (n: number) => ({ accessHash: `a${n}`, accessExpiresAt: now + 3_600_000, refreshHash: `r${n}`, refreshExpiresAt: now + 3_600_000 });
+      yield* store.insertTokens(grant.grantId, pair(0));
+      for (let n = 1; n <= ROTATED_KEPT + 10; n++) {
+        const rotated = yield* store.rotateRefresh(`r${n - 1}`, clientId, now + n, () => pair(n));
+        assert.strictEqual(rotated._tag, "Rotated");
+      }
+      const [count] = yield* sql<{ total: number }>`SELECT COUNT(*) AS total FROM oauth_tokens WHERE grant_id = 'grant_r'`;
+      // The kept rotated tokens, the live refresh token, and its access token.
+      assert.strictEqual(count?.total, ROTATED_KEPT + 2);
+      const reused = yield* store.rotateRefresh(`r${ROTATED_KEPT + 5}`, clientId, now + 100, () => pair(99));
+      assert.strictEqual(reused._tag, "Reused");
+    }).pipe(Effect.provide(db)),
+  );
+
   it.effect("lists clients, revokes one, and revokes every token", () =>
     Effect.gen(function* () {
       const store = yield* makeOAuthStore();
       const now = yield* Clock.currentTimeMillis;
       for (const clientId of ["fio_client_a", "fio_client_b"]) {
-        yield* store.insertClient({ clientId, clientName: `App ${clientId}`, redirectUris: ["https://a.example/cb"], createdAt: now, lastUsedAt: null });
+        yield* store.insertClient({ clientId, clientName: `App ${clientId}`, redirectUris: ["https://a.example/cb"], createdAt: now, lastUsedAt: null }, 10);
         const grantId = `grant_${clientId}`;
         yield* store.createGrant(
           { grantId, clientId, scopes: ["fio:read"], accounts: ["main"], resource: "https://fio.example.test/mcp" },
@@ -257,6 +298,7 @@ describe("admin commands", () => {
       assert.include(listed, "fio_client_a");
       assert.include(listed, "fio_client_b");
       assert.include(listed, "active_grants=1");
+      assert.include(listed, 'redirect_uris=["https://a.example/cb"]');
 
       const revoke = fakeStdio("", false);
       yield* revokeClientCommand("fio_client_a").pipe(Effect.provide(revoke.layer));

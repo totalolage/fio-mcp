@@ -49,6 +49,7 @@ export function isResource(presented: string, resource: string): boolean {
  */
 export function redirectUriProblem(raw: string): string | undefined {
   if (raw.length > MAX_REDIRECT_URI_LENGTH) return `redirect URIs must be at most ${MAX_REDIRECT_URI_LENGTH} characters`;
+  if (/[\p{Cc}\s]/u.test(raw)) return "redirect URIs must not contain whitespace or control characters";
   const url = parse(raw);
   if (url === undefined) return "redirect URIs must be absolute URLs";
   if (raw.includes("#")) return "redirect URIs must not contain a fragment";

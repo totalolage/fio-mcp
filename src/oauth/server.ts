@@ -304,14 +304,9 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
         retryAfterSeconds: retry,
       });
     }
-    yield* purge;
-    if ((yield* store.countClients) >= LIMITS.maxClients) {
-      return yield* new TemporarilyUnavailable({
-        description: "the client registry is full; remove unused clients with `fio-mcp clients revoke <id>`",
-        retryAfterSeconds: LIMITS.unusedClientMs / 1000,
-      });
-    }
+    // Reserved before anything yields, so concurrent requests cannot exceed the window.
     registrations.push(now);
+    yield* purge;
     const name = client_name?.replace(UNSAFE_NAME_CHARS, "").trim().slice(0, LIMITS.maxClientName);
     const client: Client = {
       clientId: yield* randomId("fio_client_"),
@@ -320,7 +315,12 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
       createdAt: now,
       lastUsedAt: null,
     };
-    yield* store.insertClient(client);
+    if (!(yield* store.insertClient(client, LIMITS.maxClients))) {
+      return yield* new TemporarilyUnavailable({
+        description: "the client registry is full; remove unused clients with `fio-mcp clients revoke <id>`",
+        retryAfterSeconds: LIMITS.unusedClientMs / 1000,
+      });
+    }
     yield* Effect.logInfo(`oauth: registered client ${client.clientId}`);
     return json(
       {

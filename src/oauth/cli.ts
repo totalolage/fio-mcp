@@ -91,7 +91,8 @@ export const listClientsCommand = Effect.fn("cli.listClients")(function* () {
       `registered=${iso(client.createdAt)}`,
       `last_authorized=${iso(client.lastUsedAt)}`,
       `active_grants=${client.liveGrants}`,
-      `redirect_uris=${client.redirectUris.join(",")}`,
+      // JSON-escaped: names and URIs come from unauthenticated registrations.
+      `redirect_uris=${JSON.stringify(client.redirectUris)}`,
     ].join("  "),
   );
   yield* write("stdout", `${lines.join("\n")}\n`);

@@ -92,6 +92,8 @@ const unknownSession = HttpServerResponse.empty({ status: 404 });
 const MCP_SESSION_HEADER = "mcp-session-id";
 /** Tracked MCP sessions; beyond this the oldest are forgotten (their clients re-initialize). */
 const MAX_TRACKED_SESSIONS = 10_000;
+/** Sessions per subject; a client that keeps initializing loses its own oldest, not others'. */
+const MAX_SESSIONS_PER_SUBJECT = 32;
 
 /**
  * Every route: response redaction, and (except /healthz) the Host allowlist.
@@ -132,6 +134,8 @@ const mcpAuth = HttpRouter.middleware(
     const owners = new Map<string, string>();
     const bind = (session: string, subject: string) => {
       owners.set(session, subject);
+      const own = [...owners].filter(([, owner]) => owner === subject);
+      for (const [oldest] of own.slice(0, Math.max(0, own.length - MAX_SESSIONS_PER_SUBJECT))) owners.delete(oldest);
       while (owners.size > MAX_TRACKED_SESSIONS) {
         const oldest = owners.keys().next();
         if (oldest.done === true) break;

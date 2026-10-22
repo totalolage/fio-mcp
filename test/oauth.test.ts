@@ -253,6 +253,20 @@ describe("metadata and the /mcp challenge", () => {
     expect(foreign.status).toBe(404);
     const made = await postMcp(harness, { "mcp-session-id": "made-up", authorization: `Bearer ${alice.access}` }, "/mcp", list);
     expect(made.status).toBe(404);
+
+    // A grant that keeps initializing loses its own oldest sessions, not other grants'.
+    const bobInit = await postMcp(harness, { authorization: `Bearer ${bob.access}` });
+    const bobSession = bobInit.headers.get("mcp-session-id") ?? "";
+    for (let i = 0; i < 32; i++) await postMcp(harness, { authorization: `Bearer ${alice.access}` });
+    const evicted = await postMcp(harness, { ...headers, authorization: `Bearer ${alice.access}` }, "/mcp", list);
+    expect(evicted.status).toBe(404);
+    const bobStill = await postMcp(
+      harness,
+      { "mcp-session-id": bobSession, "mcp-protocol-version": "2025-11-25", authorization: `Bearer ${bob.access}` },
+      "/mcp",
+      list,
+    );
+    expect(bobStill.status).toBe(200);
   });
 });
 
@@ -286,6 +300,15 @@ describe("dynamic client registration", () => {
       body: JSON.stringify({ redirect_uris: ["https://a.example/cb"], grant_types: ["client_credentials"] }),
     });
     expect((await readJson(bad)).error).toBe("invalid_client_metadata");
+  });
+
+  it("enforces the registration rate limit under concurrent requests", async () => {
+    const results = await Promise.all(
+      Array.from({ length: LIMITS.registrationsPerWindow + 5 }, () => register(harness, ["https://app.example.test/cb"])),
+    );
+    const statuses = results.map((r) => r.response.status);
+    expect(statuses.filter((s) => s === 201)).toHaveLength(LIMITS.registrationsPerWindow);
+    expect(statuses.filter((s) => s === 429)).toHaveLength(5);
   });
 
   it("rate-limits registrations and expires clients that never authorize", async () => {

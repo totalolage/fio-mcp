@@ -120,6 +120,9 @@ export interface TokenPair {
   readonly refreshExpiresAt: number;
 }
 
+/** Rotated refresh tokens remembered per grant for reuse detection. */
+export const ROTATED_KEPT = 20;
+
 const StringList = Schema.fromJsonString(Schema.Array(Schema.String));
 const decodeList = Schema.decodeUnknownSync(StringList);
 const encodeList = Schema.encodeSync(StringList);
@@ -175,21 +178,26 @@ export const makeOAuthStore = Effect.fn("OAuthStore.make")(function* () {
     )
   `;
 
-  const countClients = sql<{ total: number }>`SELECT COUNT(*) AS total FROM oauth_clients`.pipe(
-    Effect.map(([row]) => row?.total ?? 0),
-    failure("count clients"),
-  );
-
-  const insertClient = (client: Client) =>
-    sql`
-      INSERT INTO oauth_clients ${sql.insert({
-        client_id: client.clientId,
-        client_name: client.clientName,
-        redirect_uris_json: encodeList(client.redirectUris),
-        created_at: client.createdAt,
-        last_used_at: client.lastUsedAt,
-      })}
-    `.pipe(Effect.asVoid, failure("register the client"));
+  /** Inserts the client unless `maxClients` are registered; false when full. */
+  const insertClient = (client: Client, maxClients: number) =>
+    sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const [row] = yield* sql<{ total: number }>`SELECT COUNT(*) AS total FROM oauth_clients`;
+          if ((row?.total ?? 0) >= maxClients) return false;
+          yield* sql`
+            INSERT INTO oauth_clients ${sql.insert({
+              client_id: client.clientId,
+              client_name: client.clientName,
+              redirect_uris_json: encodeList(client.redirectUris),
+              created_at: client.createdAt,
+              last_used_at: client.lastUsedAt,
+            })}
+          `;
+          return true;
+        }),
+      )
+      .pipe(failure("register the client"));
 
   const client = (clientId: string) =>
     sql<ClientRow>`SELECT * FROM oauth_clients WHERE client_id = ${clientId}`.pipe(
@@ -350,6 +358,17 @@ export const makeOAuthStore = Effect.fn("OAuthStore.make")(function* () {
               { token_hash: pair.refreshHash, grant_id: grant.grantId, kind: "refresh", expires_at: pair.refreshExpiresAt, rotated_at: null },
             ])}
           `;
+          // Reuse detection keeps the newest rotated tokens only, so a client
+          // that refreshes in a loop cannot grow the database without bound.
+          yield* sql`
+            DELETE FROM oauth_tokens
+            WHERE grant_id = ${grant.grantId} AND kind = 'refresh' AND rotated_at IS NOT NULL
+              AND token_hash NOT IN (
+                SELECT token_hash FROM oauth_tokens
+                WHERE grant_id = ${grant.grantId} AND kind = 'refresh' AND rotated_at IS NOT NULL
+                ORDER BY rotated_at DESC LIMIT ${ROTATED_KEPT}
+              )
+          `;
           yield* sql`UPDATE oauth_clients SET last_used_at = ${now} WHERE client_id = ${grant.clientId}`;
           return { _tag: "Rotated", grant } satisfies Rotation as Rotation;
         }),
@@ -421,7 +440,6 @@ export const makeOAuthStore = Effect.fn("OAuthStore.make")(function* () {
       .pipe(failure("purge expired authorizations"));
 
   return {
-    countClients,
     insertClient,
     client,
     listClients,

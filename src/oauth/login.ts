@@ -109,8 +109,11 @@ export const makeLoginGuard = Effect.fn("LoginGuard.make")(function* (
     return { _tag: "Rejected" } satisfies LoginResult;
   });
 
+  // Uninterruptible once admitted: scrypt keeps running natively after an
+  // interruption (a dropped connection), so the permit is held and the
+  // failure counted until it ends.
   const attempt = (address: string, password: Redacted.Redacted<string>): Effect.Effect<LoginResult> =>
-    lock.withPermitsIfAvailable(1)(check(address, password)).pipe(
+    lock.withPermitsIfAvailable(1)(Effect.uninterruptible(check(address, password))).pipe(
       Effect.map(Option.getOrElse((): LoginResult => ({ _tag: "Throttled", retryAfterSeconds: 1 }))),
     );
 
