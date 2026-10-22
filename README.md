@@ -90,6 +90,7 @@ FIO issues one token per account. To use several, set `FIO_ACCOUNTS` to a JSON a
 | `FIO_MCP_ALLOW_UNAUTHENTICATED` | `false` | `true` runs HTTP mode without OAuth: every caller gets full access, and a security warning is logged at startup. Only for a trusted test setup. |
 | `FIO_MCP_ALLOWED_HOSTS` | any | Comma-separated `Host` values accepted (DNS-rebinding defence); an entry without a port matches any port. Include the public host. |
 | `FIO_MCP_ALLOWED_ORIGINS` | none | Browser `Origin` values accepted on `/mcp`. Requests without `Origin` (ordinary MCP clients) are always accepted. |
+| `FIO_MCP_TRUSTED_PROXIES` | none | Comma-separated IP addresses or CIDR networks (e.g. `172.18.0.5` or `172.18.0.0/16`) of reverse proxies in front of fio-mcp. Only for requests from these addresses, the client address for sign-in throttling is taken from `X-Forwarded-For` (the rightmost address that is not itself a trusted proxy). It is never used for URLs, the issuer or the resource. Empty trusts no one. |
 
 In HTTP mode the OAuth tables live in the same SQLite file as the cache, so `FIO_DB_PATH` is needed even with `FIO_CACHE_ENABLED=false`.
 
@@ -313,9 +314,10 @@ Every tool stays listed. A call outside the grant answers "You don't have permis
 | `/mcp` | MCP; `Authorization: Bearer <access token>`. Without a valid token: 401 with `WWW-Authenticate: Bearer resource_metadata="<public url>/.well-known/oauth-protected-resource/mcp"` |
 
 - **Clients** register without a secret. Redirect URIs must be https, or http on a loopback address (`127.0.0.1`, `[::1]`, `localhost`) on any port; they must match exactly except for the loopback port. Client ID metadata documents are not supported, because the server never fetches URLs. At most 100 clients and 20 registrations per hour; a client that never completes a sign-in is removed after an hour, and one without a live grant 24 hours after its last use.
-- **Tokens** are random and stored only as SHA-256 hashes. Authorization codes are single-use and live 60 s; access tokens 1 hour; refresh tokens 30 days, rotated on every use. Reusing an old refresh token or an authorization code revokes the whole grant. Tokens are bound to the audience `<public url>/mcp`.
-- **MCP sessions** are bound to the grant that opened them; another grant presenting the session id gets 404. Each grant may hold 32 sessions; when full, one idle for an hour makes room.
-- **Sign-in** compares the password against the scrypt hash in constant time. After 5 failures, attempts wait 1, 2, 4 and 8 s; the 10th consecutive failure locks the address out for 15 minutes. Behind a reverse proxy all browsers share the proxy's address. Logs record counts only.
+- **Tokens** are random and stored only as SHA-256 hashes. Authorization codes are single-use and live 60 s; access tokens 1 hour; refresh tokens 30 days, rotated on every use. Reusing an old refresh token or an authorization code revokes the whole grant. Tokens are bound to the audience `<public url>/mcp`, and every token request, refresh included, must name it as `resource`.
+- **MCP sessions** are bound to the grant that opened them; another grant presenting the session id gets 404. Each grant may hold 32 sessions and the server 1,000. When full, a session unused for an hour is ended (its id then answers 404) to make room; otherwise new sessions are refused (429 for the grant, 503 for the server).
+- **Limits on /mcp:** request bodies up to 1 MiB (413 beyond; a 100-order payment import is about 100 KB), initialize requests up to 64 KiB, and 16 requests in progress per grant (429).
+- **Sign-in** compares the password against the scrypt hash in constant time, one check at a time. After 5 failures from a client address, attempts wait 1, 2, 4 and 8 s; the 10th consecutive failure locks the address out for 15 minutes. An address may start 20 sign-ins per 10 minutes (429). Up to 100 sign-ins in progress and 20 signed-in sessions are kept; starting sign-ins never ends a signed-in one, and a flood through one client displaces that client's own sign-ins first. Behind a reverse proxy, set `FIO_MCP_TRUSTED_PROXIES`, or every browser shares the proxy's address: one person's failed logins lock everyone out, and 20 sign-ins block new ones for everyone for 10 minutes. Logs record counts only.
 - **Pages** use a short-lived, server-side, signed cookie (`HttpOnly`, `Secure`, `SameSite=Lax`, 10 minutes), a CSRF token on every form, an Origin check, and strict headers (CSP with `frame-ancestors 'none'`, `no-store`).
 
 ### Administration
@@ -329,6 +331,8 @@ docker exec <container> node dist/main.js tokens revoke-all
 ### Reverse proxy
 
 Forward the whole host, or at least `/mcp`, `/.well-known/oauth-protected-resource`, `/.well-known/oauth-protected-resource/mcp`, `/.well-known/oauth-authorization-server`, `/register`, `/authorize`, `/login`, `/consent`, `/token`, `/revoke`, and optionally `/healthz`. TLS must terminate at the proxy, because the sign-in cookie is `Secure`. If `FIO_MCP_ALLOWED_HOSTS` is set, it must include the public host.
+
+Set `FIO_MCP_TRUSTED_PROXIES` to the proxy's address as fio-mcp sees it. For Traefik on the same Docker network, that is Traefik's container address on that network (`docker inspect <traefik> --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}'`). Give it a static address, or trust the network's subnet (`docker network inspect <network> --format '{{(index .IPAM.Config 0).Subnet}}'`); then any container on that network can choose its own throttling key, so prefer a network shared only by Traefik and fio-mcp. Traefik appends the client's address to `X-Forwarded-For`; addresses a client adds itself sit further left and are ignored.
 
 ## Container and NAS deployment
 
@@ -355,6 +359,7 @@ services:
       FIO_MCP_PUBLIC_URL: https://fio.nas.kalny.net
       FIO_MCP_ADMIN_PASSWORD_HASH_FILE: /run/secrets/fio_mcp_admin_hash
       FIO_MCP_ALLOWED_HOSTS: fio.nas.kalny.net
+      FIO_MCP_TRUSTED_PROXIES: 172.18.0.2                # Traefik's address on the shared network
       FIO_SYNC_INTERVAL_MINUTES: "60"
     volumes:
       - /mnt/local-hdd/Applications/fio-mcp:/data     # writable by the container user
@@ -458,3 +463,7 @@ Tests mock HTTP and make no network calls.
 
 - The response body of `lastStatement` and the read-only upload response are undocumented. The parsing and classification above are best effort.
 - Only the Fio XML import format is used. ABO and SEPA `pain.001`/`pain.008` uploads are not exposed.
+- Every OAuth client sees all configured account names in the tool schemas, whatever accounts its grant covers. Names are not secrets; calls for other accounts are refused.
+- A call without the needed scope answers the tool error "You don't have permissions to do that." instead of HTTP 403 `insufficient_scope` (MCP authorization's step-up flow). To widen a grant, remove and re-add the server in the client.
+- MCP authorization 2026-07-28 prefers Client ID Metadata Documents; fio-mcp supports only Dynamic Client Registration because it never fetches URLs.
+- Effect's MCP server always sends all four tool annotation hints, so tools that previously omitted `destructiveHint`/`idempotentHint` now state them explicitly (with the same meaning).
