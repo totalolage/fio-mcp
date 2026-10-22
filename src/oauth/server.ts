@@ -1,10 +1,12 @@
 import { ByteSize, Clock, Effect, Layer, Option, Redacted, Result, Schedule, Schema } from "effect";
 import { Cookies, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
+import type { IpNetwork } from "effect/net";
 import type { SqlClient } from "effect/sql";
 import { Accounts } from "../accounts.js";
 import type { HttpAuthConfig } from "../config.js";
 import { SCOPE_PAYMENTS, SCOPE_READ, SCOPES } from "../mcp/permissions.js";
 import { Auth, AuthUnavailable, Unauthorized } from "../transport/auth.js";
+import { clientAddress } from "../transport/client-address.js";
 import type { Principal } from "../transport/principal.js";
 import { CODE_CHALLENGE, hashSecret, pkceMatches, randomId, randomSecret, safeEqual } from "./crypto.js";
 import {
@@ -81,6 +83,8 @@ export interface OAuthSettings {
   readonly publicUrl: string;
   readonly passwordHash: Extract<HttpAuthConfig, { kind: "oauth" }>["passwordHash"];
   readonly throttle?: ThrottlePolicy | undefined;
+  /** Proxies whose X-Forwarded-For names the client address (see clientAddress). */
+  readonly trustedProxies?: ReadonlyArray<IpNetwork.IpNetwork> | undefined;
 }
 
 const ACCESS_PREFIX = "fio_at_";
@@ -204,6 +208,8 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
   const resourceMetadataUrl = `${issuer}${PROTECTED_RESOURCE_PATH}${MCP_RESOURCE_PATH}`;
   const accountNames = accounts.list.map((account) => account.name);
   const registrations: Array<number> = [];
+  const trustedProxies = settings.trustedProxies ?? [];
+  const addressOf = (request: HttpServerRequest.HttpServerRequest) => clientAddress(request, trustedProxies);
 
   const challenge = (error?: string) =>
     `Bearer resource_metadata="${resourceMetadataUrl}", scope="${SCOPE_READ}"${error === undefined ? "" : `, error="${error}"`}`;
@@ -485,8 +491,7 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
     yield* checkForm(request, session, form);
     if (session.loggedIn) return redirect("/consent");
     const password = Result.getOrUndefined(single(form, "password")) ?? "";
-    const address = Option.getOrElse(request.remoteAddress, () => "unknown");
-    const result = yield* guard.attempt(address, Redacted.make(password));
+    const result = yield* guard.attempt(addressOf(request), Redacted.make(password));
     switch (result._tag) {
       case "Accepted": {
         const next = yield* sessions.login(session);

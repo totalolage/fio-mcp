@@ -4,6 +4,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { Clock, Effect, Redacted } from "effect";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { hashSecret, randomSecret } from "../src/oauth/crypto.js";
+import { DEFAULT_THROTTLE } from "../src/oauth/login.js";
 import { LIMITS } from "../src/oauth/server.js";
 import { MAX_BODY_BYTES, MAX_CONCURRENT_REQUESTS, SESSION_LIMITS } from "../src/transport/http.js";
 import {
@@ -15,6 +16,7 @@ import {
   LOOPBACK_REDIRECT,
   type OAuthHarness,
   PASSWORD,
+  PEER_HEADER,
   PUBLIC_URL,
   pkcePair,
   postMcp,
@@ -500,9 +502,9 @@ describe("authorization endpoint", () => {
 });
 
 describe("login and consent pages", () => {
-  const begin = async () => {
+  const begin = async (headers: Record<string, string> = {}) => {
     const { body } = await register(harness, [LOOPBACK_REDIRECT], "<script>alert(1)</script>");
-    const browser = new Browser(harness);
+    const browser = new Browser(harness, headers);
     const start = await browser.get(
       authorizationUrl({
         response_type: "code",
@@ -580,6 +582,31 @@ describe("login and consent pages", () => {
     const logged = harness.logs.join("\n");
     expect(logged).toContain("admin login failed");
     expect(logged).not.toContain("wrong password!");
+  });
+
+  it("throttles logins per client behind a trusted proxy, and per peer otherwise", async () => {
+    await harness.close();
+    const throttle = { ...DEFAULT_THROTTLE, freeFailures: 1, lockoutFailures: 2 };
+    harness = await startOAuth({ throttle, trustedProxies: ["172.18.0.0/16"] });
+    const via = (peer: string, forwardedFor: string) => ({ [PEER_HEADER]: peer, "x-forwarded-for": forwardedFor });
+    const login = async (headers: Record<string, string>, password: string) => {
+      const { browser } = await begin(headers);
+      const csrf = await csrfOf(await browser.get("/login"));
+      return (await browser.post("/login", { csrf, password })).status;
+    };
+    // Two failures lock the client at 203.0.113.9 out...
+    expect(await login(via("172.18.0.2", "203.0.113.9"), "wrong password!")).toBe(401);
+    expect(await login(via("172.18.0.2", "203.0.113.9"), "wrong password!")).toBe(401);
+    expect(await login(via("172.18.0.2", "203.0.113.9"), PASSWORD)).toBe(429);
+    // ...including when it prepends another address; Traefik appends the real one.
+    expect(await login(via("172.18.0.3", "198.51.100.7, 203.0.113.9"), PASSWORD)).toBe(429);
+    // The admin behind the same proxy is not affected.
+    expect(await login(via("172.18.0.2", "198.51.100.7"), PASSWORD)).toBe(303);
+    // An untrusted peer's X-Forwarded-For is ignored: the peer is the client.
+    expect(await login(via("10.9.9.9", "192.0.2.1"), "wrong password!")).toBe(401);
+    expect(await login(via("10.9.9.9", "192.0.2.2"), "wrong password!")).toBe(401);
+    expect(await login(via("10.9.9.9", "192.0.2.3"), PASSWORD)).toBe(429);
+    expect(harness.logs.join("\n")).not.toMatch(/203\.0\.113\.9|10\.9\.9\.9|172\.18\./);
   });
 });
 

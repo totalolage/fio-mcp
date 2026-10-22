@@ -13,8 +13,8 @@ import type {
   OAuthClientMetadata,
   OAuthTokens,
 } from "@modelcontextprotocol/sdk/shared/auth.js";
-import { Clock, type Context, Deferred, Duration, Effect, Exit, Layer, Logger, Redacted, Scope } from "effect";
-import { HttpRouter, HttpServer } from "effect/http";
+import { Clock, type Context, Deferred, Duration, Effect, Exit, Layer, Logger, Option, Redacted, Scope } from "effect";
+import { HttpRouter, HttpServer, HttpServerRequest } from "effect/http";
 import type { SqlClient } from "effect/sql";
 import { SERVER_INFO, ToolsLive } from "../../src/app.js";
 import { databaseLayer, SERVER_MIGRATIONS } from "../../src/cache/db.js";
@@ -23,6 +23,7 @@ import { hashPassword, type PasswordHash, parsePasswordHash } from "../../src/oa
 import type { ThrottlePolicy } from "../../src/oauth/login.js";
 import { OAuthLive } from "../../src/oauth/server.js";
 import { makeOAuthStore, type OAuthStore } from "../../src/oauth/store.js";
+import { parseTrustedProxy } from "../../src/transport/client-address.js";
 import { type HttpTransportConfig, httpRouterApp } from "../../src/transport/http.js";
 import { testConfig, testServices } from "./transport.js";
 
@@ -72,8 +73,14 @@ export interface OAuthHarness {
   readonly close: () => Promise<void>;
 }
 
-export async function startOAuth(options: { throttle?: ThrottlePolicy } = {}): Promise<OAuthHarness> {
+/** Requests carrying this header appear to come from that socket peer address. */
+export const PEER_HEADER = "x-test-peer";
+
+export async function startOAuth(
+  options: { throttle?: ThrottlePolicy; trustedProxies?: ReadonlyArray<string> } = {},
+): Promise<OAuthHarness> {
   const hash = await passwordHash();
+  const trustedProxies = (options.trustedProxies ?? []).flatMap((entry) => parseTrustedProxy(entry) ?? []);
   const auth: HttpAuthConfig = { kind: "oauth", publicUrl: PUBLIC_URL, passwordHash: Redacted.make(hash) };
   const transport: HttpTransportConfig = {
     kind: "http",
@@ -82,6 +89,7 @@ export async function startOAuth(options: { throttle?: ThrottlePolicy } = {}): P
     auth,
     allowedOrigins: [],
     allowedHosts: [],
+    trustedProxies,
   };
   const config = testConfig(transport);
   const scope = await Effect.runPromise(Scope.make());
@@ -94,11 +102,19 @@ export async function startOAuth(options: { throttle?: ThrottlePolicy } = {}): P
   const capture = Logger.make<unknown, void>((entry) => {
     logs.push(Logger.formatLogFmt.log(entry));
   });
-  const oauth = OAuthLive({ publicUrl: PUBLIC_URL, passwordHash: Redacted.make(hash), throttle: options.throttle });
+  const oauth = OAuthLive({ publicUrl: PUBLIC_URL, passwordHash: Redacted.make(hash), throttle: options.throttle, trustedProxies });
   // Request handlers run with the router's context, not the layer's: clock and logger are provided per request.
   const captureLayer = Logger.layer([capture]);
   const withClock = HttpRouter.middleware(
-    (httpEffect) => httpEffect.pipe(Effect.provideService(Clock.Clock, clock), Effect.provide(captureLayer)),
+    (httpEffect) =>
+      httpEffect.pipe(
+        Effect.updateService(HttpServerRequest.HttpServerRequest, (request) => {
+          const peer = request.headers[PEER_HEADER];
+          return peer === undefined ? request : request.modify({ remoteAddress: Option.some(peer), peerAddress: Option.some(peer) });
+        }),
+        Effect.provideService(Clock.Clock, clock),
+        Effect.provide(captureLayer),
+      ),
     { global: true },
   );
   const app = httpRouterApp(Layer.mergeAll(ToolsLive, withClock), oauth, SERVER_INFO, transport).pipe(
@@ -133,7 +149,11 @@ export const pkcePair = () => {
 /** A user agent that keeps the session cookie and does not follow redirects. */
 export class Browser {
   cookie: string | undefined;
-  constructor(private readonly harness: OAuthHarness) {}
+  constructor(
+    private readonly harness: OAuthHarness,
+    /** Sent with every request (e.g. PEER_HEADER, X-Forwarded-For). */
+    private readonly extra: Record<string, string> = {},
+  ) {}
 
   private absorb(response: Response) {
     for (const header of response.headers.getSetCookie()) {
@@ -145,7 +165,7 @@ export class Browser {
   }
 
   async get(url: string | URL) {
-    const headers: Record<string, string> = this.cookie === undefined ? {} : { cookie: this.cookie };
+    const headers: Record<string, string> = this.cookie === undefined ? { ...this.extra } : { ...this.extra, cookie: this.cookie };
     return this.absorb(await this.harness.fetch(new URL(url, PUBLIC_URL), { headers }));
   }
 
@@ -154,7 +174,7 @@ export class Browser {
     for (const [key, value] of Object.entries(form)) {
       for (const item of typeof value === "string" ? [value] : value) body.append(key, item);
     }
-    const headers: Record<string, string> = { "content-type": "application/x-www-form-urlencoded" };
+    const headers: Record<string, string> = { ...this.extra, "content-type": "application/x-www-form-urlencoded" };
     if (this.cookie !== undefined) headers.cookie = this.cookie;
     if (origin !== undefined) headers.origin = origin;
     return this.absorb(await this.harness.fetch(new URL(path, PUBLIC_URL), { method: "POST", headers, body }));

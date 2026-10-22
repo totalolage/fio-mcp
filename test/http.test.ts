@@ -28,6 +28,7 @@ const transport = (overrides: Partial<HttpTransportConfig> = {}): HttpTransportC
   auth: { kind: "unauthenticated" },
   allowedOrigins: [],
   allowedHosts: [],
+  trustedProxies: [],
   ...overrides,
 });
 
@@ -172,6 +173,7 @@ describe("HTTP transport", () => {
       const { base } = yield* startServer(
         transport({
           allowedHosts: ["fio.example.test"],
+          trustedProxies: [],
           allowedOrigins: ["https://fio.example.test"],
         }),
         Layer.succeed(

@@ -1,7 +1,9 @@
 import { Config, Context, Effect, FileSystem, Layer, Option, Predicate, Redacted, Schema } from "effect";
+import type { IpNetwork } from "effect/net";
 import { ConfigError } from "./errors.js";
 import { type PasswordHash, PasswordHashError, parsePasswordHash } from "./oauth/crypto.js";
 import { parsePublicUrl } from "./oauth/urls.js";
+import { parseTrustedProxy } from "./transport/client-address.js";
 
 /**
  * Configuration from the environment, through Effect's ConfigProvider.
@@ -34,6 +36,11 @@ export type TransportConfig =
       readonly allowedOrigins: ReadonlyArray<string>;
       /** Accepted Host header values (host or host:port). Empty accepts any. */
       readonly allowedHosts: ReadonlyArray<string>;
+      /**
+       * Reverse proxies whose X-Forwarded-For names the client address for
+       * login and authorization throttling. Empty trusts no one.
+       */
+      readonly trustedProxies: ReadonlyArray<IpNetwork.IpNetwork>;
     };
 
 /**
@@ -301,6 +308,20 @@ const loadHttpAuth = Effect.fn("config.loadHttpAuth")(function* () {
   return { kind: "oauth", publicUrl: parsedUrl.origin, passwordHash: Redacted.make(hash) } satisfies HttpAuthConfig;
 });
 
+const loadTrustedProxies = Effect.fn("config.loadTrustedProxies")(function* () {
+  const networks: Array<IpNetwork.IpNetwork> = [];
+  for (const [index, entry] of (yield* listVar("FIO_MCP_TRUSTED_PROXIES")).entries()) {
+    const network = parseTrustedProxy(entry);
+    if (network === undefined) {
+      return yield* fail(
+        `FIO_MCP_TRUSTED_PROXIES entry ${index + 1} must be an IP address or a CIDR network such as 172.18.0.0/16`,
+      );
+    }
+    networks.push(network);
+  }
+  return networks;
+});
+
 const loadTransport = Effect.fn("config.loadTransport")(function* () {
   const kind = Option.getOrElse(yield* optionalVar("FIO_MCP_TRANSPORT"), () => "stdio").toLowerCase();
   if (kind === "stdio") return { kind: "stdio" } satisfies TransportConfig;
@@ -315,6 +336,7 @@ const loadTransport = Effect.fn("config.loadTransport")(function* () {
     auth: yield* loadHttpAuth(),
     allowedOrigins: yield* listVar("FIO_MCP_ALLOWED_ORIGINS"),
     allowedHosts: (yield* listVar("FIO_MCP_ALLOWED_HOSTS")).map((h) => h.toLowerCase()),
+    trustedProxies: yield* loadTrustedProxies(),
   } satisfies TransportConfig;
 });
 

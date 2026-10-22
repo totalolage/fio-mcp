@@ -56,6 +56,7 @@ export async function connect(config: AppConfigShape, route: FioHttpHandler | Fi
     auth: { kind: "unauthenticated" },
     allowedOrigins: [],
     allowedHosts: [],
+    trustedProxies: [],
   } as const;
   const app = httpRouterApp(ToolsLive, Auth.layerOpen, SERVER_INFO, httpConfig).pipe(
     Layer.provide(ServicesLive),
