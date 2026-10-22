@@ -31,7 +31,16 @@ function escapeXmlText(value: string): string {
  * coincide today; they stay as defence in depth.
  */
 function tokenForms(token: string): ReadonlyArray<string> {
-  return [...new Set([token, JSON.stringify(token).slice(1, -1), escapeXmlText(token), encodeURIComponent(token)])];
+  return [...new Set([token, JSON.stringify(token).slice(1, -1), escapeXmlText(token), ...uriForm(token)])];
+}
+
+/** A lone surrogate has no URI form; redaction must still not fail. */
+function uriForm(token: string): ReadonlyArray<string> {
+  try {
+    return [encodeURIComponent(token)];
+  } catch {
+    return [];
+  }
 }
 
 export interface RedactorShape {
