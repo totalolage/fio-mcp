@@ -57,6 +57,14 @@ interface TokenState {
   readonly background: ReadonlyArray<Waiter>;
 }
 
+interface DispatchStep {
+  /** Interactive waiters that can no longer start within budget, with their projected wait. */
+  readonly rejected: ReadonlyArray<readonly [Waiter, number]>;
+  readonly grant: Waiter | undefined;
+  /** Milliseconds until the next slot opens, when no grant was possible yet. */
+  readonly waitMs: number | undefined;
+}
+
 interface TokenLimiter {
   readonly state: Ref.Ref<TokenState>;
   /** Wakes the dispatcher after arrivals, cancellations, and 409 blocks. */
@@ -103,41 +111,49 @@ export const makeRateLimiter = Effect.fn("RateLimiter.make")(function* (options:
         `FIO allows one request per ${Math.round(intervalMs / 1000)} s per token and the next free slot is ${Math.ceil(waitMs / 1000)} s away.`,
     });
 
+  /**
+   * One dispatcher step, decided atomically on the current state: drop the
+   * interactive waiters a 409 pushed past their budget, then either grant the
+   * next slot or report how long until it opens. Arrivals that happen while
+   * the dispatcher runs are never lost, because nothing is decided on a
+   * stale snapshot.
+   */
+  const step = (now: number) =>
+    (s: TokenState): [DispatchStep, TokenState] => {
+      if (s.interactive.length === 0 && s.background.length === 0) {
+        return [{ rejected: [], grant: undefined, waitMs: undefined }, s];
+      }
+      const ready = readyAt(s);
+      const start = Math.max(now, ready);
+      const rejected: Array<readonly [Waiter, number]> = [];
+      const survivors: Array<Waiter> = [];
+      for (const waiter of s.interactive) {
+        const projected = start + survivors.length * intervalMs;
+        if (projected > waiter.deadline) rejected.push([waiter, projected - now]);
+        else survivors.push(waiter);
+      }
+      const pruned: TokenState = { ...s, interactive: survivors };
+      if (ready > now) return [{ rejected, grant: undefined, waitMs: ready - now }, pruned];
+      const [head, ...rest] = survivors.length > 0 ? survivors : s.background;
+      if (head === undefined) return [{ rejected, grant: undefined, waitMs: undefined }, pruned];
+      const queues = survivors.length > 0 ? { interactive: rest } : { background: rest };
+      return [{ rejected, grant: head, waitMs: undefined }, { ...pruned, ...queues, lastStart: now }];
+    };
+
   /** Hands out slots; fails interactive waiters a 409 pushed past their budget. */
   const dispatch = (limiter: TokenLimiter): Effect.Effect<never> =>
     Effect.gen(function* () {
       const now = yield* Clock.currentTimeMillis;
-      const s = yield* Ref.get(limiter.state);
-      if (s.interactive.length === 0 && s.background.length === 0) {
-        yield* Queue.take(limiter.wake);
+      const { rejected, grant, waitMs } = yield* Ref.modify(limiter.state, step(now));
+      for (const [waiter, waitFor] of rejected) yield* Deferred.fail(waiter.grant, tooLate(waitFor));
+      if (grant !== undefined) {
+        yield* Deferred.succeed(grant.grant, undefined);
         return;
       }
-      const ready = readyAt(s);
-      const start = Math.max(now, ready);
-      const survivors: Array<Waiter> = [];
-      for (const waiter of s.interactive) {
-        const projected = start + survivors.length * intervalMs;
-        if (projected > waiter.deadline) yield* Deferred.fail(waiter.grant, tooLate(projected - now));
-        else survivors.push(waiter);
-      }
-      if (survivors.length !== s.interactive.length) {
-        yield* Ref.update(limiter.state, (current) => ({
-          ...current,
-          interactive: current.interactive.filter((w) => survivors.includes(w)),
-        }));
-      }
-      if (ready > now) {
-        yield* Queue.take(limiter.wake).pipe(Effect.timeoutOrElse({ duration: ready - now, orElse: () => Effect.void }));
-        return;
-      }
-      const next = yield* Ref.modify(limiter.state, (current): [Waiter | undefined, TokenState] => {
-        const [head, ...rest] = current.interactive.length > 0 ? current.interactive : current.background;
-        if (head === undefined) return [undefined, current];
-        const queues =
-          current.interactive.length > 0 ? { interactive: rest } : { background: rest };
-        return [head, { ...current, ...queues, lastStart: now }];
-      });
-      if (next !== undefined) yield* Deferred.succeed(next.grant, undefined);
+      // Sleep until the slot opens or something changes (arrival, cancellation, 409).
+      yield* waitMs === undefined
+        ? Queue.take(limiter.wake)
+        : Queue.take(limiter.wake).pipe(Effect.timeoutOrElse({ duration: waitMs, orElse: () => Effect.void }));
     }).pipe(Effect.forever);
 
   const limiterFor = (key: string) =>

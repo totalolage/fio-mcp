@@ -255,4 +255,33 @@ describe("RateLimiter", () => {
       assert.instanceOf(yield* Effect.flip(rl.run("a", "interactive", Effect.succeed(3))), RateLimited);
     }).pipe(Effect.scoped),
   );
+
+  it.effect("settles every caller when arrivals race a 409 that pushes queued calls past their budget", () =>
+    Effect.gen(function* () {
+      const rl = yield* limiter({ intervalMs: 30_000, maxWaitMs: 40_000 });
+      // A holds the first slot and gets a 409 after 1 s, blocking the token until 31 s.
+      const { request } = yield* flaky(5, 1_000);
+      const a = yield* Effect.forkChild(Effect.exit(rl.run(KEY, "interactive", request)));
+      yield* settle;
+      // Waves of callers arrive before, at, and after the 409; each either runs or fails fast.
+      const callers: Array<Fiber.Fiber<Exit.Exit<number, RateLimited>>> = [];
+      for (const at of [0, 500, 1_000, 1_000, 1_500, 2_000]) {
+        yield* TestClock.setTime(at);
+        for (let i = 0; i < 3; i++) {
+          callers.push(yield* Effect.forkChild(Effect.exit(rl.run(KEY, "interactive", Effect.succeed(i)))));
+          callers.push(yield* Effect.forkChild(Effect.exit(rl.run(KEY, "background", Effect.succeed(i)))));
+        }
+        yield* Effect.yieldNow;
+      }
+      yield* settle;
+      yield* TestClock.adjust(30 * 60_000);
+      yield* settle;
+      // A caller left waiting forever would hang here and fail the test by timeout.
+      yield* Fiber.join(a);
+      const exits = yield* Effect.forEach(callers, Fiber.join);
+      assert.strictEqual(exits.length, callers.length);
+      const state = yield* rl.state(KEY);
+      assert.strictEqual(state.queued + state.queuedBackground, 0);
+    }).pipe(Effect.scoped),
+  );
 });
