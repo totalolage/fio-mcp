@@ -13,6 +13,7 @@ import { RateLimiter } from "../rate-limiter.js";
 import { Redactor } from "../redaction.js";
 import { parseLastStatement, type StatementInfo } from "../statement.js";
 import { annotateTool, DateParam, JsonObject, ToolFailure, withAccount } from "./common.js";
+import { PAYMENTS, permittedAccount, READ, requireScopes, visibleAccounts } from "./permissions.js";
 
 export const SERVER_INSTRUCTIONS =
   "Tools for FIO Bank accounts (Czech Republic). Every tool is listed regardless of what the configured API tokens may do; if a token lacks the permission, the tool answers \"You don't have permissions to do that.\" FIO allows one request per token every 30 seconds, so batch questions into as few calls as possible. Call get_server_status to see accounts and rate-limit state.";
@@ -234,7 +235,7 @@ export const makeFioHandlers = Effect.fn("FioTools.handlers")(function* (toolkit
     get_transactions: ({ account, dateFrom, dateTo, source = "auto" }) =>
       out(
         Effect.gen(function* () {
-          const acc = yield* accounts.resolve(account);
+          const acc = yield* permittedAccount(accounts, account);
           yield* checkRange(dateFrom, dateTo);
           const range: DayRange = { from: dateFrom, to: dateTo };
           if (source === "cache") {
@@ -254,7 +255,7 @@ export const makeFioHandlers = Effect.fn("FioTools.handlers")(function* (toolkit
     get_statement: ({ account, year, number }) =>
       out(
         Effect.gen(function* () {
-          const acc = yield* accounts.resolve(account);
+          const acc = yield* permittedAccount(accounts, account);
           const statement = yield* fio.statement(acc, year, number);
           if (cache !== undefined) yield* cache.record(acc, statement);
           return { account: acc.name, ...statement };
@@ -264,7 +265,7 @@ export const makeFioHandlers = Effect.fn("FioTools.handlers")(function* (toolkit
     get_new_transactions: ({ account }) =>
       out(
         Effect.gen(function* () {
-          const acc = yield* accounts.resolve(account);
+          const acc = yield* permittedAccount(accounts, account);
           const statement = yield* fio.last(acc);
           if (cache !== undefined) yield* cache.record(acc, statement);
           return { account: acc.name, markerAdvanced: statement.transactionCount > 0, ...statement };
@@ -274,7 +275,7 @@ export const makeFioHandlers = Effect.fn("FioTools.handlers")(function* (toolkit
     set_download_marker: ({ account, movementId, date }) =>
       out(
         Effect.gen(function* () {
-          const acc = yield* accounts.resolve(account);
+          const acc = yield* permittedAccount(accounts, account);
           if (movementId !== undefined && date === undefined) {
             yield* fio.setLastId(acc, movementId);
             return { account: acc.name, ok: true, marker: { movementId } };
@@ -290,7 +291,7 @@ export const makeFioHandlers = Effect.fn("FioTools.handlers")(function* (toolkit
     get_last_statement: ({ account }) =>
       out(
         Effect.gen(function* () {
-          const acc = yield* accounts.resolve(account);
+          const acc = yield* permittedAccount(accounts, account);
           return { account: acc.name, ...parseLastStatement(yield* fio.lastStatement(acc)) };
         }),
       ),
@@ -298,7 +299,7 @@ export const makeFioHandlers = Effect.fn("FioTools.handlers")(function* (toolkit
     export_transactions: (args) =>
       out(
         Effect.gen(function* () {
-          const acc = yield* accounts.resolve(args.account);
+          const acc = yield* permittedAccount(accounts, args.account);
           const { source, format, dateFrom, dateTo, year, number } = args;
           if (source === "statement") {
             if (year === undefined || number === undefined) {
@@ -331,7 +332,7 @@ export const makeFioHandlers = Effect.fn("FioTools.handlers")(function* (toolkit
     preview_payment_orders: ({ account, orders }) =>
       out(
         Effect.gen(function* () {
-          const acc = yield* accounts.resolve(account);
+          const acc = yield* permittedAccount(accounts, account);
           const payer = yield* accounts.payer(acc);
           const xml = yield* buildImportXml(orders, payer);
           return {
@@ -347,7 +348,7 @@ export const makeFioHandlers = Effect.fn("FioTools.handlers")(function* (toolkit
     submit_payment_orders: ({ account, orders }) =>
       out(
         Effect.gen(function* () {
-          const acc = yield* accounts.resolve(account);
+          const acc = yield* permittedAccount(accounts, account, PAYMENTS);
           const payer = yield* accounts.payer(acc);
           const xml = yield* buildImportXml(orders, payer);
           const body = yield* fio.importXml(acc, xml).pipe(
@@ -381,7 +382,8 @@ export const makeFioHandlers = Effect.fn("FioTools.handlers")(function* (toolkit
     get_server_status: () =>
       out(
         Effect.gen(function* () {
-          const listed = yield* Effect.forEach(accounts.list, accountStatus);
+          yield* requireScopes(READ);
+          const listed = yield* Effect.forEach(yield* visibleAccounts(accounts.list), accountStatus);
           return {
             accounts: listed,
             rateLimit: {

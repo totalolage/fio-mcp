@@ -10,7 +10,6 @@ import type { NormalizedStatement } from "../../src/statement.js";
 /** A FIO-shaped read token (64 URL-safe characters). */
 export const FIO_TOKEN = "fioT0ken-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRS";
 const SAVINGS_TOKEN = "savingsT0ken-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMN";
-export const AUTH_TOKEN = "bearer-0123456789abcdefghijklmnopqrstuvwxyzABCDEF";
 
 export const STATEMENT: NormalizedStatement = {
   info: {
@@ -45,11 +44,7 @@ export function testConfig(transport: TransportConfig = { kind: "stdio" }): AppC
       { name: "main", token, accountNumber: "2900000000", currency: "CZK" },
       { name: "savings", token: savings, accountNumber: "2900000001", currency: "CZK" },
     ],
-    secrets: [
-      token,
-      savings,
-      ...(transport.kind === "http" && transport.authToken !== undefined ? [transport.authToken] : []),
-    ],
+    secrets: [token, savings],
     baseUrl: "http://fio.invalid",
     rateLimitIntervalMs: 30_000,
     // Far below the interval: a call that would queue behind a held slot

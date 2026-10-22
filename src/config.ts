@@ -1,11 +1,14 @@
 import { Config, Context, Effect, FileSystem, Layer, Option, Predicate, Redacted, Schema } from "effect";
 import { ConfigError } from "./errors.js";
+import { type PasswordHash, PasswordHashError, parsePasswordHash } from "./oauth/crypto.js";
+import { parsePublicUrl } from "./oauth/urls.js";
 
 /**
  * Configuration from the environment, through Effect's ConfigProvider.
  *
- * Secrets (FIO tokens, the HTTP bearer token) come from a variable or from a
- * file named by its `_FILE` twin, never both, and are held as `Redacted`.
+ * Secrets (FIO tokens) come from a variable or from a file named by its
+ * `_FILE` twin, never both, and are held as `Redacted`; the admin password
+ * hash comes from a file only.
  * Diagnostics name the variable, field, or path, never a value: a misplaced
  * token must not reach stderr.
  */
@@ -26,12 +29,26 @@ export type TransportConfig =
       readonly kind: "http";
       readonly host: string;
       readonly port: number;
-      readonly authToken: Redacted.Redacted<string> | undefined;
+      readonly auth: HttpAuthConfig;
       /** Exact Origin values accepted on /mcp. Requests without Origin are accepted. */
       readonly allowedOrigins: ReadonlyArray<string>;
       /** Accepted Host header values (host or host:port). Empty accepts any. */
       readonly allowedHosts: ReadonlyArray<string>;
     };
+
+/**
+ * How /mcp is protected. `oauth`: the embedded authorization server
+ * (FIO_MCP_PUBLIC_URL + FIO_MCP_ADMIN_PASSWORD_HASH_FILE). `unauthenticated`:
+ * FIO_MCP_ALLOW_UNAUTHENTICATED=true, every caller has full access.
+ */
+export type HttpAuthConfig =
+  | {
+      readonly kind: "oauth";
+      /** The public origin: OAuth issuer; the resource is this plus /mcp. */
+      readonly publicUrl: string;
+      readonly passwordHash: Redacted.Redacted<PasswordHash>;
+    }
+  | { readonly kind: "unauthenticated" };
 
 export interface CacheConfig {
   readonly enabled: boolean;
@@ -49,7 +66,7 @@ export interface CacheConfig {
 
 export interface AppConfigShape {
   readonly accounts: ReadonlyArray<AccountConfig>;
-  /** Every secret that must never leave the process: tokens and the HTTP bearer token. */
+  /** Every configured secret that must never leave the process: the FIO tokens. */
   readonly secrets: ReadonlyArray<Redacted.Redacted<string>>;
   readonly baseUrl: string;
   /** Minimum spacing between requests with the same token. */
@@ -70,7 +87,6 @@ export const DEFAULT_MAX_WAIT_MS = 25_000;
 export const DEFAULT_REQUEST_TIMEOUT_MS = 20_000;
 export const DEFAULT_ACCOUNT_NAME = "default";
 export const MIN_TOKEN_LENGTH = 32;
-export const MIN_AUTH_TOKEN_LENGTH = 16;
 export const DEFAULT_HTTP_HOST = "0.0.0.0";
 export const DEFAULT_HTTP_PORT = 3000;
 /** Earliest day the initial backfill asks for; FIO serves what the account has. */
@@ -83,7 +99,6 @@ const ACCOUNT_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/;
 // URL-safe characters only: tokens go into URL paths, and protocol-level
 // redaction can then never cut through JSON or SSE framing.
 const TOKEN = new RegExp(`^[A-Za-z0-9._~-]{${MIN_TOKEN_LENGTH},}$`);
-const AUTH_TOKEN = new RegExp(`^[\\x21-\\x7e]{${MIN_AUTH_TOKEN_LENGTH},}$`);
 const ACCOUNT_NUMBER = /^\d{1,10}$/;
 const CURRENCY = /^[A-Z]{3}$/;
 const DATE = /^(?!0000)\d{4}-\d{2}-\d{2}$/;
@@ -256,6 +271,36 @@ const loadAccounts = Effect.fn("config.loadAccounts")(function* () {
   return [account];
 });
 
+const HTTP_AUTH_REQUIRED =
+  "HTTP mode requires FIO_MCP_PUBLIC_URL and FIO_MCP_ADMIN_PASSWORD_HASH_FILE (create the hash with `fio-mcp hash-password`). To run without authentication on a trusted network, set FIO_MCP_ALLOW_UNAUTHENTICATED=true";
+
+const loadHttpAuth = Effect.fn("config.loadHttpAuth")(function* () {
+  const publicUrl = yield* optionalVar("FIO_MCP_PUBLIC_URL");
+  const hashFile = yield* optionalVar("FIO_MCP_ADMIN_PASSWORD_HASH_FILE");
+  const allowUnauthenticated = yield* boolVar("FIO_MCP_ALLOW_UNAUTHENTICATED", false);
+  if (Option.isNone(publicUrl) && Option.isNone(hashFile)) {
+    if (allowUnauthenticated) return { kind: "unauthenticated" } satisfies HttpAuthConfig;
+    return yield* fail(HTTP_AUTH_REQUIRED);
+  }
+  if (Option.isNone(publicUrl)) return yield* fail(`FIO_MCP_ADMIN_PASSWORD_HASH_FILE is set but FIO_MCP_PUBLIC_URL is not. ${HTTP_AUTH_REQUIRED}`);
+  if (Option.isNone(hashFile)) return yield* fail(`FIO_MCP_PUBLIC_URL is set but FIO_MCP_ADMIN_PASSWORD_HASH_FILE is not. ${HTTP_AUTH_REQUIRED}`);
+  const parsedUrl = parsePublicUrl(publicUrl.value);
+  if ("problem" in parsedUrl) return yield* fail(`FIO_MCP_PUBLIC_URL ${parsedUrl.problem}`);
+  const fs = yield* FileSystem.FileSystem;
+  const content = yield* fs
+    .readFileString(hashFile.value)
+    .pipe(Effect.mapError(() => new ConfigError({ detail: `FIO_MCP_ADMIN_PASSWORD_HASH_FILE: cannot read ${hashFile.value}` })));
+  const lines = content.split(/\r?\n/).filter((line) => line.trim() !== "");
+  if (lines.length !== 1) {
+    return yield* fail(`FIO_MCP_ADMIN_PASSWORD_HASH_FILE: ${hashFile.value} must contain exactly one hash line`);
+  }
+  const hash = parsePasswordHash(lines[0] ?? "");
+  if (hash instanceof PasswordHashError) {
+    return yield* fail(`FIO_MCP_ADMIN_PASSWORD_HASH_FILE: ${hashFile.value} ${hash.detail}`);
+  }
+  return { kind: "oauth", publicUrl: parsedUrl.origin, passwordHash: Redacted.make(hash) } satisfies HttpAuthConfig;
+});
+
 const loadTransport = Effect.fn("config.loadTransport")(function* () {
   const kind = Option.getOrElse(yield* optionalVar("FIO_MCP_TRANSPORT"), () => "stdio").toLowerCase();
   if (kind === "stdio") return { kind: "stdio" } satisfies TransportConfig;
@@ -263,17 +308,11 @@ const loadTransport = Effect.fn("config.loadTransport")(function* () {
   const host = Option.getOrElse(yield* optionalVar("FIO_MCP_HOST"), () => DEFAULT_HTTP_HOST);
   const port = yield* intVar("FIO_MCP_PORT", DEFAULT_HTTP_PORT, 1);
   if (port > 65_535) return yield* fail("FIO_MCP_PORT must be an integer from 1 to 65535");
-  const authToken = yield* secretVar("FIO_MCP_AUTH_TOKEN");
-  if (Option.isSome(authToken) && !AUTH_TOKEN.test(Redacted.value(authToken.value))) {
-    return yield* fail(
-      `FIO_MCP_AUTH_TOKEN must be at least ${MIN_AUTH_TOKEN_LENGTH} printable characters without spaces`,
-    );
-  }
   return {
     kind: "http",
     host,
     port,
-    authToken: Option.getOrUndefined(authToken),
+    auth: yield* loadHttpAuth(),
     allowedOrigins: yield* listVar("FIO_MCP_ALLOWED_ORIGINS"),
     allowedHosts: (yield* listVar("FIO_MCP_ALLOWED_HOSTS")).map((h) => h.toLowerCase()),
   } satisfies TransportConfig;
@@ -313,12 +352,15 @@ export const loadConfig = Effect.fn("config.load")(function* () {
   const accounts = yield* loadAccounts();
   const transport = yield* loadTransport();
   const baseUrl = Option.getOrElse(yield* optionalVar("FIO_API_BASE_URL"), () => DEFAULT_BASE_URL).replace(/\/+$/, "");
+  const cache = yield* loadCache();
+  if (transport.kind === "http" && transport.auth.kind === "oauth" && cache.dbPath === "") {
+    return yield* fail(
+      "FIO_DB_PATH is not set and neither XDG_DATA_HOME nor HOME is, so the OAuth clients and tokens have no location",
+    );
+  }
   const config: AppConfigShape = {
     accounts,
-    secrets: [
-      ...accounts.map((a) => a.token),
-      ...(transport.kind === "http" && transport.authToken !== undefined ? [transport.authToken] : []),
-    ],
+    secrets: accounts.map((a) => a.token),
     baseUrl,
     rateLimitIntervalMs: yield* intVar(
       "FIO_RATE_LIMIT_INTERVAL_MS",
@@ -329,7 +371,7 @@ export const loadConfig = Effect.fn("config.load")(function* () {
     maxWaitMs: yield* intVar("FIO_MAX_WAIT_MS", DEFAULT_MAX_WAIT_MS, 0),
     requestTimeoutMs: yield* intVar("FIO_REQUEST_TIMEOUT_MS", DEFAULT_REQUEST_TIMEOUT_MS, 1),
     transport,
-    cache: yield* loadCache(),
+    cache,
   };
   return config;
 });

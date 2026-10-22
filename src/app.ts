@@ -1,19 +1,24 @@
 import { NodeFileSystem, NodeStdio } from "@effect/platform-node";
-import { Effect, Layer, Schema } from "effect";
+import { Effect, Layer } from "effect";
 import { McpProtocol } from "effect/ai";
 import { Accounts } from "./accounts.js";
 import { backupDatabase, DatabaseLive } from "./cache/db.js";
 import { CacheLive, CacheSyncLive } from "./cache/service.js";
-import { AppConfig } from "./config.js";
+import { AppConfig, type HttpAuthConfig } from "./config.js";
 import { FioApiLive } from "./fio-api-live.js";
 import { CACHE_INSTRUCTIONS, CacheToolsLive } from "./mcp/cache-tools.js";
 import { FioToolsLive, SERVER_INSTRUCTIONS } from "./mcp/fio-tools.js";
+import { listClientsCommand, revokeAllTokensCommand, revokeClientCommand } from "./oauth/cli.js";
+import { OAuthLive } from "./oauth/server.js";
 import { RateLimiter } from "./rate-limiter.js";
 import { LoggerLive, Redactor } from "./redaction.js";
 import { Auth } from "./transport/auth.js";
 import { type HttpTransportConfig, serveHttp } from "./transport/http.js";
+import { LocalPrincipalLive } from "./transport/principal.js";
 import type { ServerInfo } from "./transport/server-info.js";
 import { layerStdio } from "./transport/stdio.js";
+
+export { CommandFailed, hashPasswordCommand } from "./oauth/cli.js";
 
 export const SERVER_NAME = "fio-mcp";
 export const SERVER_VERSION = "0.2.0";
@@ -60,12 +65,29 @@ export const BackgroundLive = CacheSyncLive;
 const withServices = <A, E, R>(transport: Layer.Layer<A, E, R>) =>
   Layer.mergeAll(transport, BackgroundLive).pipe(Layer.provide(ServicesLive));
 
+// stdio has one trusted local client: full access, captured when the tools register.
 export const StdioAppLive = withServices(
-  ToolsLive.pipe(Layer.provide(layerStdio(SERVER_INFO)), Layer.provide(NodeStdio.layer)),
+  ToolsLive.pipe(
+    Layer.provide(LocalPrincipalLive),
+    Layer.provide(layerStdio(SERVER_INFO)),
+    Layer.provide(NodeStdio.layer),
+  ),
 );
 
+const UNAUTHENTICATED_WARNING =
+  "SECURITY WARNING: FIO_MCP_ALLOW_UNAUTHENTICATED=true. /mcp accepts every request without authentication and gives it full access to every account, including payment orders. Anyone who can reach this port can use your bank tools. Set FIO_MCP_PUBLIC_URL and FIO_MCP_ADMIN_PASSWORD_HASH_FILE to require OAuth.";
+
+/** /mcp authentication: the embedded OAuth server, or (escape hatch) none. */
+export const httpAuthLive = (auth: HttpAuthConfig) =>
+  auth.kind === "oauth"
+    ? OAuthLive({ publicUrl: auth.publicUrl, passwordHash: auth.passwordHash }).pipe(
+        Layer.provide(DatabaseLive),
+        Layer.provide(NodeFileSystem.layer),
+      )
+    : Layer.merge(Auth.layerOpen, Layer.effectDiscard(Effect.logWarning(UNAUTHENTICATED_WARNING)));
+
 export const HttpAppLive = (config: HttpTransportConfig) =>
-  withServices(serveHttp(ToolsLive, Auth.layerFrom(config.authToken), SERVER_INFO, config));
+  withServices(serveHttp(ToolsLive, httpAuthLive(config.auth), SERVER_INFO, config));
 
 /** The transport selected by FIO_MCP_TRANSPORT. */
 export const AppLive = Layer.unwrap(
@@ -74,10 +96,6 @@ export const AppLive = Layer.unwrap(
     return transport.kind === "http" ? HttpAppLive(transport) : StdioAppLive;
   }),
 ).pipe(Layer.provide(AppConfig.layer), Layer.provide(NodeFileSystem.layer));
-
-export class CommandFailed extends Schema.TaggedError<CommandFailed>()("CommandFailed", {
-  message: Schema.String,
-}) {}
 
 /**
  * `fio-mcp backup <dest>`: writes a consistent copy of the live cache
@@ -89,6 +107,21 @@ export const backup = (dest: string) =>
       DatabaseLive.pipe(Layer.provideMerge(AppConfig.layer), Layer.provideMerge(NodeFileSystem.layer)),
     ),
   );
+
+const withDatabase = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+  effect.pipe(
+    Effect.provide(
+      Layer.mergeAll(
+        DatabaseLive.pipe(Layer.provideMerge(AppConfig.layer), Layer.provideMerge(NodeFileSystem.layer)),
+        NodeStdio.layer,
+      ),
+    ),
+  );
+
+/** `fio-mcp clients list` / `clients revoke <id>` / `tokens revoke-all` on the server's database. */
+export const listClients = withDatabase(listClientsCommand());
+export const revokeClient = (clientId: string) => withDatabase(revokeClientCommand(clientId));
+export const revokeAllTokens = withDatabase(revokeAllTokensCommand());
 
 /** The redacting stderr logger, for everything the app layers fork. */
 export const AppLoggerLive = LoggerLive.pipe(

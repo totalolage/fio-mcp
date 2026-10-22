@@ -4,12 +4,13 @@ import { TestClock } from "effect/testing";
 import { Accounts, makeAccounts } from "../src/accounts.js";
 import { CACHE_DISABLED, NOT_VERIFIED } from "../src/cache/service.js";
 import { AppConfig } from "../src/config.js";
-import { type CacheError, InvalidInput } from "../src/errors.js";
+import { type CacheError, InvalidInput, type PermissionDenied } from "../src/errors.js";
 import { FioApi } from "../src/fio-api.js";
 import { makeCacheHandlers, makeCacheToolkit } from "../src/mcp/cache-tools.js";
 import { makeFioHandlers, makeFioToolkit } from "../src/mcp/fio-tools.js";
 import { RateLimiter } from "../src/rate-limiter.js";
 import { Redactor } from "../src/redaction.js";
+import { LocalPrincipalLive } from "../src/transport/principal.js";
 import {
   account,
   cacheLayer,
@@ -84,7 +85,7 @@ describe("cache query tools", () => {
         assert.instanceOf(invalid, InvalidInput);
         assert.instanceOf(yield* Effect.flip(search({ dateFrom: "2026-02-02", dateTo: "2026-02-01" })), InvalidInput);
         assert.instanceOf(yield* Effect.flip(search({ dateFrom: "2026-11-01" })), InvalidInput);
-      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+      }).pipe(Effect.provide(Layer.mergeAll(cacheLayer(config(), fio.api), LocalPrincipalLive)));
     }),
   );
 
@@ -119,7 +120,7 @@ describe("cache query tools", () => {
         assert.deepStrictEqual(byType.groups, [
           { key: "Příjem", currency: "CZK", count: 1, income: 2500, expense: 0, net: 2500 },
         ]);
-      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+      }).pipe(Effect.provide(Layer.mergeAll(cacheLayer(config(), fio.api), LocalPrincipalLive)));
     }),
   );
 
@@ -140,7 +141,7 @@ describe("cache query tools", () => {
           historyLimited: false,
           complete: false,
         });
-      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+      }).pipe(Effect.provide(Layer.mergeAll(cacheLayer(config(), fio.api), LocalPrincipalLive)));
     }),
   );
 
@@ -172,7 +173,7 @@ describe("cache query tools", () => {
         assert.strictEqual((status?.sync as { lastSuccessAt: string } | undefined)?.lastSuccessAt, "2026-10-22T10:00:00.000Z");
 
         assert.instanceOf(yield* Effect.flip(tools.sync_transactions({ from: "2026-01-01" })), InvalidInput);
-      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+      }).pipe(Effect.provide(Layer.mergeAll(cacheLayer(config(), fio.api), LocalPrincipalLive)));
     }),
   );
 });
@@ -211,7 +212,7 @@ describe("get_transactions with the cache", () => {
         const calls = (yield* Ref.get(fio.calls)).length;
         assert.strictEqual((yield* tools.get_transactions({ ...old, source: "fio" })).source, "fio");
         assert.strictEqual((yield* Ref.get(fio.calls)).length, calls + 1);
-      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+      }).pipe(Effect.provide(Layer.mergeAll(cacheLayer(config(), fio.api), LocalPrincipalLive)));
     }),
   );
 
@@ -232,7 +233,7 @@ describe("get_transactions with the cache", () => {
         assert.deepStrictEqual(ids(partial.transactions), [1, 2]);
         assert.isFalse((partial.freshness as { complete: boolean }).complete);
         assert.strictEqual((yield* Ref.get(fio.calls)).length, 0);
-      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+      }).pipe(Effect.provide(Layer.mergeAll(cacheLayer(config(), fio.api), LocalPrincipalLive)));
     }),
   );
 
@@ -257,7 +258,7 @@ describe("get_transactions with the cache", () => {
         const found = yield* (yield* cacheTools).search_transactions({});
         assert.deepStrictEqual(ids(found.transactions), [42, 2, 1]);
         assert.isFalse((found.freshness as { complete: boolean }).complete);
-      }).pipe(Effect.provide(cacheLayer(config(), api)));
+      }).pipe(Effect.provide(Layer.mergeAll(cacheLayer(config(), api), LocalPrincipalLive)));
     }),
   );
 
@@ -283,7 +284,7 @@ describe("get_transactions with the cache", () => {
           historyLimited: false,
           complete: true,
         });
-      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+      }).pipe(Effect.provide(Layer.mergeAll(cacheLayer(config(), fio.api), LocalPrincipalLive)));
     }),
   );
 });
@@ -295,7 +296,7 @@ describe("cache disabled", () => {
       const fio = yield* fakeFio(serveFrom(fixture));
       yield* Effect.gen(function* () {
         const cache = yield* cacheTools;
-        const runs: ReadonlyArray<Effect.Effect<object, InvalidInput | CacheError>> = [
+        const runs: ReadonlyArray<Effect.Effect<object, InvalidInput | CacheError | PermissionDenied>> = [
           cache.search_transactions({}),
           cache.summarize_transactions({ groupBy: "month" }),
           cache.get_cache_status(),
@@ -313,7 +314,7 @@ describe("cache disabled", () => {
         assert.strictEqual((yield* Ref.get(fio.calls)).length, 2);
         const error = yield* Effect.flip(tools.get_transactions({ ...args, source: "cache" }));
         assert.strictEqual(error.message, CACHE_DISABLED);
-      }).pipe(Effect.provide(disabledCacheLayer(config(), fio.api)));
+      }).pipe(Effect.provide(Layer.mergeAll(disabledCacheLayer(config(), fio.api), LocalPrincipalLive)));
     }),
   );
 
@@ -332,7 +333,7 @@ describe("cache disabled", () => {
         const result = yield* tools.get_transactions({ dateFrom: "2026-01-01", dateTo: TODAY });
         assert.strictEqual(result.source, "fio");
         assert.strictEqual(result.transactionCount, 6);
-      }).pipe(Effect.provide(layer));
+      }).pipe(Effect.provide(Layer.mergeAll(layer, LocalPrincipalLive)));
     }),
   );
 });
