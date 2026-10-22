@@ -120,7 +120,6 @@ describe("loadConfig", () => {
   });
 
   it("rejects rate-limit intervals below FIO's 30 s limit", () => {
-    expect(MIN_RATE_LIMIT_INTERVAL_MS).toBe(30_000);
     for (const value of ["0", "1", "29999"]) {
       expect(configError({ FIO_TOKEN: READ_TOKEN, FIO_RATE_LIMIT_INTERVAL_MS: value }).message).toBe(
         "FIO_RATE_LIMIT_INTERVAL_MS must be an integer >= 30000 (FIO allows one request per token every 30 s)",
@@ -128,6 +127,7 @@ describe("loadConfig", () => {
     }
     expect(loadConfig({ FIO_TOKEN: READ_TOKEN, FIO_RATE_LIMIT_INTERVAL_MS: "30000" }).rateLimitIntervalMs).toBe(30_000);
     expect(loadConfig({ FIO_TOKEN: READ_TOKEN, FIO_RATE_LIMIT_INTERVAL_MS: "45000" }).rateLimitIntervalMs).toBe(45_000);
+    expect(MIN_RATE_LIMIT_INTERVAL_MS).toBe(30_000);
   });
 });
 
@@ -157,9 +157,25 @@ describe("token redaction", () => {
     expect(tagged).not.toContain(READ_TOKEN.slice(0, 5));
   });
 
-  it("redacts JSON-escaped tokens", () => {
+  it("redacts JSON- and XML-escaped tokens", () => {
     registerSecret('ab"cd\\ef');
     expect(redact(JSON.stringify({ token: 'ab"cd\\ef' }))).toBe('{"token":"***"}');
+    registerSecret("gh&ij<kl");
+    expect(redact("<msg>gh&amp;ij&lt;kl</msg>")).toBe("<msg>***</msg>");
+    expect(excerpt("<msg>gh&amp;ij&lt;kl</msg>")).toBe("***");
+  });
+
+  it("does not throw on a malformed registered token", () => {
+    registerSecret("\ud800");
+    expect(redact("plain text")).toBe("plain text");
+    const error = (() => {
+      try {
+        loadConfig({ FIO_ACCOUNTS: JSON.stringify([{ name: "a", token: "\ud800", currency: "x" }]) });
+      } catch (e) {
+        return e as Error;
+      }
+    })();
+    expect(redact(error?.message ?? "")).toContain("FIO_ACCOUNTS[0].currency");
   });
 
   it("keeps tokens out of client errors", async () => {

@@ -22,16 +22,35 @@ export function clearSecrets(): void {
   knownTokens.clear();
 }
 
+/**
+ * Forms a token takes in output: raw, URL-encoded (read URLs), JSON-escaped
+ * (tool results are stringified before redaction), and XML-escaped (response
+ * bodies and payment XML).
+ */
+function tokenForms(token: string): string[] {
+  const forms = new Set([token, JSON.stringify(token).slice(1, -1), escapeXmlText(token)]);
+  try {
+    forms.add(encodeURIComponent(token));
+  } catch {
+    // A lone surrogate has no URI form; redaction must still not throw.
+  }
+  return [...forms];
+}
+
+function escapeXmlText(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
 export function redact(text: string): string {
   let out = text;
   // Longest first so a token that contains another is fully replaced.
   for (const token of [...knownTokens].sort((a, b) => b.length - a.length)) {
-    out = out.split(token).join(REDACTED);
-    const encoded = encodeURIComponent(token);
-    if (encoded !== token) out = out.split(encoded).join(REDACTED);
-    // Tool results are JSON.stringify'd before redaction.
-    const jsonEscaped = JSON.stringify(token).slice(1, -1);
-    if (jsonEscaped !== token) out = out.split(jsonEscaped).join(REDACTED);
+    for (const form of tokenForms(token)) out = out.split(form).join(REDACTED);
   }
   return out.replace(TOKEN_PATH, (_match, segment: string) => `/${segment}/${REDACTED}`);
 }

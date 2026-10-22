@@ -48,9 +48,10 @@ const digits = (max: number, what: string) =>
     .regex(new RegExp(`^\\d{1,${max}}$`), `must be 1-${max} digits`)
     .describe(what);
 
+// xs:date (XML Schema 1.0) has no year 0000, though JavaScript's Date does.
 const isoDate = z
   .string()
-  .regex(/^\d{4}-\d{2}-\d{2}$/, "must be YYYY-MM-DD")
+  .regex(/^(?!0000)\d{4}-\d{2}-\d{2}$/, "must be YYYY-MM-DD with a year from 0001")
   .refine((v) => {
     const d = new Date(`${v}T00:00:00Z`);
     return !Number.isNaN(d.getTime()) && d.toISOString().startsWith(v);

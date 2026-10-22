@@ -181,6 +181,7 @@ describe("payment validation", () => {
     rejects({ ...domestic, amount: 100000000000000.01 });
     rejects({ ...domestic, amount: 1e12 });
     rejects({ ...domestic, date: "2025-02-30" });
+    rejects({ ...domestic, date: "0000-01-01" });
     rejects({ ...domestic, paymentType: "431001" });
     rejects({ ...domestic, paymentReason: "111" });
     rejects({ ...domestic, messageForRecipient: "line\nbreak" });
