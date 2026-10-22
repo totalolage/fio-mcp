@@ -1,0 +1,745 @@
+openapi: 3.1.0
+info:
+  title: FIO API Bankovnictví
+  version: "1.9"
+  summary: FIO Bank's REST API for account movements, statements, download markers, and payment import.
+  description: |
+    Hand-written from FIO's "API Bankovnictví" PDF, version 1.9 (16 October 2025),
+    https://www.fio.cz/docs/cz/API_Bankovnictvi.pdf, as summarised in docs/fio-api.md.
+    FIO publishes no OpenAPI document; section and page references below point into that PDF.
+
+    Authentication is a per-account token (64 characters, created in Internetbanking under
+    Nastavení → API). Read calls carry it as the first path segment after the operation name;
+    the payment import carries it as a multipart field. The token is a secret: never log a
+    request URL or an import body.
+
+    Rate limit: one request (read or write, any format) per token every 30 seconds; a request
+    sooner is answered with HTTP 409 (PDF §8, p. 54).
+
+    Non-2xx responses carry an HTML page, not a structured error. Their meanings are documented
+    per status in components.responses.
+servers:
+  - url: https://fioapi.fio.cz/v1/rest
+tags:
+  - name: movements
+    description: Account movements (PDF §5).
+  - name: statements
+    description: Official account statements (PDF §5).
+  - name: marker
+    description: The token's server-side last-download marker ("zarážka", PDF §5, p. 8).
+  - name: merchant
+    description: Card transactions from FIO POS terminals and the payment gateway (PDF §5.3.2).
+  - name: import
+    description: Payment order import (PDF §6).
+paths:
+  /periods/{token}/{from}/{to}/transactions.json:
+    get:
+      tags: [movements]
+      operationId: getPeriodsJson
+      summary: Movements in a date range, as a JSON account statement.
+      description: Never moves the download marker. Date-range inclusivity and time zone are not documented.
+      parameters:
+        - $ref: "#/components/parameters/Token"
+        - $ref: "#/components/parameters/From"
+        - $ref: "#/components/parameters/To"
+      responses:
+        "200":
+          $ref: "#/components/responses/AccountStatement"
+        "404":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/TokenBusy"
+        "413":
+          $ref: "#/components/responses/TooManyItems"
+        "422":
+          $ref: "#/components/responses/HistoryAuthorizationRequired"
+        "500":
+          $ref: "#/components/responses/TokenRejected"
+  /periods/{token}/{from}/{to}/transactions.{format}:
+    get:
+      tags: [movements]
+      operationId: getPeriods
+      summary: Movements in a date range, in any movement format, as raw text.
+      description: Never moves the download marker. `json` returns the same document as getPeriodsJson, undecoded.
+      parameters:
+        - $ref: "#/components/parameters/Token"
+        - $ref: "#/components/parameters/From"
+        - $ref: "#/components/parameters/To"
+        - $ref: "#/components/parameters/MovementFormat"
+      responses:
+        "200":
+          $ref: "#/components/responses/MovementExport"
+        "404":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/TokenBusy"
+        "413":
+          $ref: "#/components/responses/TooManyItems"
+        "422":
+          $ref: "#/components/responses/HistoryAuthorizationRequired"
+        "500":
+          $ref: "#/components/responses/TokenRejected"
+  /by-id/{token}/{year}/{id}/transactions.json:
+    get:
+      tags: [statements]
+      operationId: getStatementJson
+      summary: An official statement by year and number, as a JSON account statement.
+      parameters:
+        - $ref: "#/components/parameters/Token"
+        - $ref: "#/components/parameters/Year"
+        - $ref: "#/components/parameters/StatementId"
+      responses:
+        "200":
+          $ref: "#/components/responses/AccountStatement"
+        "404":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/TokenBusy"
+        "422":
+          $ref: "#/components/responses/HistoryAuthorizationRequired"
+        "500":
+          $ref: "#/components/responses/TokenRejected"
+  /by-id/{token}/{year}/{id}/transactions.pdf:
+    get:
+      tags: [statements]
+      operationId: getStatementPdf
+      summary: An official statement by year and number, as PDF.
+      parameters:
+        - $ref: "#/components/parameters/Token"
+        - $ref: "#/components/parameters/Year"
+        - $ref: "#/components/parameters/StatementId"
+      responses:
+        "200":
+          description: The statement as a PDF document.
+          content:
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+        "404":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/TokenBusy"
+        "422":
+          $ref: "#/components/responses/HistoryAuthorizationRequired"
+        "500":
+          $ref: "#/components/responses/TokenRejected"
+  /by-id/{token}/{year}/{id}/transactions.{format}:
+    get:
+      tags: [statements]
+      operationId: getStatement
+      summary: An official statement by year and number, in any text statement format, as raw text.
+      description: PDF is binary and has its own operation, getStatementPdf.
+      parameters:
+        - $ref: "#/components/parameters/Token"
+        - $ref: "#/components/parameters/Year"
+        - $ref: "#/components/parameters/StatementId"
+        - $ref: "#/components/parameters/StatementFormat"
+      responses:
+        "200":
+          $ref: "#/components/responses/StatementExport"
+        "404":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/TokenBusy"
+        "422":
+          $ref: "#/components/responses/HistoryAuthorizationRequired"
+        "500":
+          $ref: "#/components/responses/TokenRejected"
+  /last/{token}/transactions.json:
+    get:
+      tags: [movements, marker]
+      operationId: getLastJson
+      summary: Movements since the download marker, as a JSON account statement.
+      description: |
+        Reads from the token's download marker and, only when the result contains movements,
+        moves the marker to the last returned movement. An empty result carries only the
+        statement header and leaves the marker unchanged (PDF §5, p. 8).
+      parameters:
+        - $ref: "#/components/parameters/Token"
+      responses:
+        "200":
+          $ref: "#/components/responses/AccountStatement"
+        "404":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/TokenBusy"
+        "413":
+          $ref: "#/components/responses/TooManyItems"
+        "422":
+          $ref: "#/components/responses/HistoryAuthorizationRequired"
+        "500":
+          $ref: "#/components/responses/TokenRejected"
+  /last/{token}/transactions.{format}:
+    get:
+      tags: [movements, marker]
+      operationId: getLast
+      summary: Movements since the download marker, in any movement format, as raw text.
+      description: Moves the marker like getLastJson.
+      parameters:
+        - $ref: "#/components/parameters/Token"
+        - $ref: "#/components/parameters/MovementFormat"
+      responses:
+        "200":
+          $ref: "#/components/responses/MovementExport"
+        "404":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/TokenBusy"
+        "413":
+          $ref: "#/components/responses/TooManyItems"
+        "422":
+          $ref: "#/components/responses/HistoryAuthorizationRequired"
+        "500":
+          $ref: "#/components/responses/TokenRejected"
+  /set-last-id/{token}/{id}/:
+    get:
+      tags: [marker]
+      operationId: setLastId
+      summary: Sets the download marker to the last successfully downloaded movement ID.
+      description: Changes server state despite being a GET. The PDF documents no response body.
+      parameters:
+        - $ref: "#/components/parameters/Token"
+        - name: id
+          in: path
+          required: true
+          description: Movement ID (column22 / `ID pohybu`).
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        "2XX":
+          description: |
+            Marker set. The PDF documents neither the success status nor a body, so any 2xx
+            counts as success and the body is ignored.
+        "404":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/TokenBusy"
+        "500":
+          $ref: "#/components/responses/TokenRejected"
+  /set-last-date/{token}/{date}/:
+    get:
+      tags: [marker]
+      operationId: setLastDate
+      summary: Sets the download marker to the last day whose movements were not successfully downloaded.
+      description: Changes server state despite being a GET. The PDF documents no response body.
+      parameters:
+        - $ref: "#/components/parameters/Token"
+        - name: date
+          in: path
+          required: true
+          description: Calendar day, `YYYY-MM-DD`.
+          schema:
+            type: string
+            format: date
+      responses:
+        "2XX":
+          description: |
+            Marker set. The PDF documents neither the success status nor a body, so any 2xx
+            counts as success and the body is ignored.
+        "404":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/TokenBusy"
+        "500":
+          $ref: "#/components/responses/TokenRejected"
+  /merchant/{token}/{from}/{to}/transactions.{format}:
+    get:
+      tags: [merchant]
+      operationId: getMerchantTransactions
+      summary: Card transactions from POS terminals and the payment gateway in a date range, as raw text.
+      description: |
+        Available to business accounts using FIO POS terminals or the payment gateway. The XML
+        document is `<MerchantStatement>` with `<Info>` and `<TransactionList><Transaction>`; CSV is
+        UTF-8, semicolon-separated (PDF §5.3.2, pp. 35–39).
+      parameters:
+        - $ref: "#/components/parameters/Token"
+        - $ref: "#/components/parameters/From"
+        - $ref: "#/components/parameters/To"
+        - name: format
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [xml, csv]
+      responses:
+        "200":
+          description: The merchant statement in the requested format.
+          content:
+            application/xml:
+              schema:
+                type: string
+            text/csv:
+              schema:
+                type: string
+        "404":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/TokenBusy"
+        "413":
+          $ref: "#/components/responses/TooManyItems"
+        "422":
+          $ref: "#/components/responses/HistoryAuthorizationRequired"
+        "500":
+          $ref: "#/components/responses/TokenRejected"
+  /lastStatement/{token}/statement:
+    get:
+      tags: [statements]
+      operationId: getLastStatement
+      summary: Year and number of the latest official statement.
+      description: |
+        The PDF names this lookup (§5, pp. 8–9) but does not document the response body or how
+        the year and number are represented. Treat it as opaque text.
+      parameters:
+        - $ref: "#/components/parameters/Token"
+      responses:
+        "200":
+          description: The latest statement's year and number, format undocumented.
+          content:
+            text/plain:
+              schema:
+                type: string
+        "404":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/TokenBusy"
+        "500":
+          $ref: "#/components/responses/TokenRejected"
+  /import/:
+    post:
+      tags: [import]
+      operationId: importPayments
+      summary: Uploads a file of payment or direct-debit orders as one batch.
+      description: |
+        Creates a batch that must still be authorized by an account holder in Internetbanking
+        before FIO executes it. The token needs the permission "Sledování účtu a zadávání platebních
+        a inkasních příkazů". FIO documents no distinct status for a read-only token; HTTP 500
+        ("token does not exist or is inactive") is the likely answer. A body sent as a plain POST
+        rather than a multipart file upload fails with "The server encoutered an internal error"
+        (PDF §8). Files over 2 MB are rejected with import errorCode 13, not HTTP 413 (PDF §6, p. 40).
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: "#/components/schemas/ImportRequest"
+            encoding:
+              file:
+                contentType: application/xml, text/plain, application/octet-stream
+      responses:
+        "200":
+          description: |
+            The import result as XML, `<responseImport>` per
+            https://www.fio.cz/schema/responseImportIB.xsd: a required `<result>` with
+            `errorCode` (0 OK, 1 validation errors, 2 validation warnings, 11 syntax error,
+            12 empty import, 13 file over 2 MB, 14 empty file), `status` (ok | error | warning |
+            fatal), optional repeated `idInstruction` and `message`, optional `<sums>`, and optional
+            per-order `<ordersDetails>` (PDF §6, pp. 40–41). Labels follow `lng`.
+          content:
+            application/xml:
+              schema:
+                type: string
+        "404":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/TokenBusy"
+        "500":
+          $ref: "#/components/responses/TokenRejected"
+components:
+  parameters:
+    Token:
+      name: token
+      in: path
+      required: true
+      description: |
+        Secret API token (64 characters per FIO), created in Internetbanking under Nastavení → API.
+        One token per account. Treat every URL that contains it as a secret.
+      schema:
+        type: string
+        format: password
+    From:
+      name: from
+      in: path
+      required: true
+      description: First day of the range, `YYYY-MM-DD`.
+      schema:
+        type: string
+        format: date
+    To:
+      name: to
+      in: path
+      required: true
+      description: Last day of the range, `YYYY-MM-DD`.
+      schema:
+        type: string
+        format: date
+    Year:
+      name: year
+      in: path
+      required: true
+      description: Statement year, four digits.
+      schema:
+        type: integer
+        minimum: 1000
+        maximum: 9999
+    StatementId:
+      name: id
+      in: path
+      required: true
+      description: Statement number within the year.
+      schema:
+        type: integer
+        minimum: 0
+    MovementFormat:
+      name: format
+      in: path
+      required: true
+      description: |
+        Movement export format: csv, gpc (ABO/GPC), html, json, ofx, or xml (Fio XML). All are
+        UTF-8 text (PDF §5, p. 6).
+      schema:
+        type: string
+        enum: [csv, gpc, html, json, ofx, xml]
+    StatementFormat:
+      name: format
+      in: path
+      required: true
+      description: |
+        Statement export format: the movement formats plus sta (MT940; the suffix is inferred
+        from the `.STA` file extension, the PDF shows no URL), cba_xml (ČBA XML), and sba_xml
+        (SBA XML).
+      schema:
+        type: string
+        enum: [csv, gpc, html, json, ofx, xml, sta, cba_xml, sba_xml]
+  responses:
+    AccountStatement:
+      description: The JSON account statement (PDF §5.3.1.6, pp. 26–29).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AccountStatementResponse"
+    MovementExport:
+      description: The export in the requested format, UTF-8 text. `json` is returned as raw text too.
+      content:
+        application/json:
+          schema:
+            type: string
+        text/csv:
+          schema:
+            type: string
+        text/plain:
+          schema:
+            type: string
+        text/html:
+          schema:
+            type: string
+        application/xml:
+          schema:
+            type: string
+        application/x-ofx:
+          schema:
+            type: string
+    StatementExport:
+      description: The statement in the requested format, UTF-8 text. `json` is returned as raw text too.
+      content:
+        application/json:
+          schema:
+            type: string
+        text/csv:
+          schema:
+            type: string
+        text/plain:
+          schema:
+            type: string
+        text/html:
+          schema:
+            type: string
+        application/xml:
+          schema:
+            type: string
+        application/x-ofx:
+          schema:
+            type: string
+    BadRequest:
+      description: |
+        "Not Found": bad request parameters in the URL, query, or import, so the server cannot
+        answer correctly (PDF §8, p. 54).
+      content:
+        text/html:
+          schema:
+            type: string
+    TokenBusy:
+      description: |
+        "Conflict": the token was used less than 30 seconds ago. FIO allows one read or write per
+        token per 30 seconds regardless of format (PDF §8, p. 54).
+      content:
+        text/html:
+          schema:
+            type: string
+    TooManyItems:
+      description: |
+        "Příliš mnoho položek": the download would return more than 50,000 movements. Narrow the
+        date range or move the download marker forward (PDF §8, p. 55).
+      content:
+        text/html:
+          schema:
+            type: string
+    HistoryAuthorizationRequired:
+      description: |
+        The request covers data older than 90 days, which needs the account owner to unlock full
+        history for this token in Internetbanking (strong authorization, valid 10 minutes)
+        (PDF §8, p. 55).
+      content:
+        text/html:
+          schema:
+            type: string
+    TokenRejected:
+      description: |
+        "Internal Server Error": the token does not exist or is inactive; check it in
+        Internetbanking (PDF §8, p. 54). FIO documents no separate permission error.
+      content:
+        text/html:
+          schema:
+            type: string
+  schemas:
+    ImportRequest:
+      type: object
+      required: [token, type, file]
+      additionalProperties: false
+      properties:
+        token:
+          type: string
+          format: password
+          description: Secret API token with payment permission (64 characters per FIO).
+        type:
+          type: string
+          enum: [abo, xml, pain001_xml, pain008_xml]
+          description: |
+            File format: abo (ABO), xml (Fio XML per https://www.fio.cz/schema/importIB.xsd),
+            pain001_xml (SEPA credit transfer, pain.001.001.03 or .09, EUR only), or pain008_xml
+            (SEPA direct debit, pain.008.001.02).
+        lng:
+          type: string
+          enum: [cs, sk, en]
+          description: Language of the response labels.
+        file:
+          type: string
+          format: binary
+          description: |
+            The order file. The part must be named `file` and its Content-Disposition must carry
+            the original `filename` (for example orders.xml); FIO rejects a body without it.
+    AccountStatementResponse:
+      type: object
+      required: [accountStatement]
+      properties:
+        accountStatement:
+          $ref: "#/components/schemas/AccountStatement"
+    AccountStatement:
+      type: object
+      required: [info]
+      properties:
+        info:
+          $ref: "#/components/schemas/StatementInfo"
+        transactionList:
+          description: |
+            The movements, documented as an object with a `transaction` array. Null and absence
+            are tolerated as an empty selection (defensive; the PDF shows neither).
+          anyOf:
+            - $ref: "#/components/schemas/TransactionList"
+            - type: "null"
+    StatementInfo:
+      type: object
+      description: Statement header (PDF §5.3.1.6, p. 26; formats from the Fio XML table, pp. 9–10).
+      properties:
+        accountId:
+          type: [string, "null"]
+          description: Account number (16n).
+        bankId:
+          type: [string, "null"]
+          description: Bank code (4!n).
+        currency:
+          type: [string, "null"]
+          description: Account currency, ISO 4217.
+        iban:
+          type: [string, "null"]
+        bic:
+          type: [string, "null"]
+        openingBalance:
+          type: [number, "null"]
+          description: Balance at the start of the period.
+        closingBalance:
+          type: [number, "null"]
+          description: Balance at the end of the period.
+        dateStart:
+          $ref: "#/components/schemas/FioDate"
+        dateEnd:
+          $ref: "#/components/schemas/FioDate"
+        yearList:
+          type: [integer, "null"]
+          description: Selected statement year.
+        idList:
+          type: [integer, "null"]
+          description: Selected statement number.
+        idFrom:
+          type: [integer, "null"]
+          description: First movement ID in the selection.
+        idTo:
+          type: [integer, "null"]
+          description: Last movement ID in the selection.
+        idLastDownload:
+          type: [integer, "null"]
+          description: ID of the last successfully downloaded movement.
+    FioDate:
+      description: |
+        Epoch milliseconds in the PDF's JSON examples; `YYYY-MM-DD+GMT` (for example
+        2012-07-27+0200) in the Fio XML format and in practice.
+      anyOf:
+        - type: string
+        - type: number
+        - type: "null"
+    TransactionList:
+      type: object
+      required: [transaction]
+      properties:
+        transaction:
+          type: array
+          items:
+            $ref: "#/components/schemas/Transaction"
+    Transaction:
+      type: object
+      description: |
+        One movement. Each column is `{ value, name, id }` or null when absent (PDF §5.3.1.6, p. 26).
+        Required/optional per the Fio XML table (pp. 9–10); all are nullable here because the
+        JSON examples null absent columns.
+      properties:
+        column22:
+          description: ID pohybu, unique movement ID (M).
+          anyOf:
+            - $ref: "#/components/schemas/NumberColumn"
+            - type: "null"
+        column0:
+          description: Datum, movement date (M).
+          anyOf:
+            - $ref: "#/components/schemas/DateColumn"
+            - type: "null"
+        column1:
+          description: Objem, signed amount (M).
+          anyOf:
+            - $ref: "#/components/schemas/NumberColumn"
+            - type: "null"
+        column14:
+          description: Měna, ISO 4217 currency (M).
+          anyOf:
+            - $ref: "#/components/schemas/StringColumn"
+            - type: "null"
+        column2:
+          description: Protiúčet, counterparty account.
+          anyOf:
+            - $ref: "#/components/schemas/StringColumn"
+            - type: "null"
+        column10:
+          description: Název protiúčtu, counterparty name.
+          anyOf:
+            - $ref: "#/components/schemas/StringColumn"
+            - type: "null"
+        column3:
+          description: Kód banky, counterparty bank code.
+          anyOf:
+            - $ref: "#/components/schemas/StringColumn"
+            - type: "null"
+        column12:
+          description: Název banky, counterparty bank name.
+          anyOf:
+            - $ref: "#/components/schemas/StringColumn"
+            - type: "null"
+        column4:
+          description: KS, constant symbol (keep leading zeroes).
+          anyOf:
+            - $ref: "#/components/schemas/StringColumn"
+            - type: "null"
+        column5:
+          description: VS, variable symbol (keep leading zeroes).
+          anyOf:
+            - $ref: "#/components/schemas/StringColumn"
+            - type: "null"
+        column6:
+          description: SS, specific symbol (keep leading zeroes).
+          anyOf:
+            - $ref: "#/components/schemas/StringColumn"
+            - type: "null"
+        column7:
+          description: Uživatelská identifikace, user identification.
+          anyOf:
+            - $ref: "#/components/schemas/StringColumn"
+            - type: "null"
+        column16:
+          description: Zpráva pro příjemce, message for the recipient.
+          anyOf:
+            - $ref: "#/components/schemas/StringColumn"
+            - type: "null"
+        column8:
+          description: Typ, operation type (M).
+          anyOf:
+            - $ref: "#/components/schemas/StringColumn"
+            - type: "null"
+        column9:
+          description: Provedl, authorized person who entered the order.
+          anyOf:
+            - $ref: "#/components/schemas/StringColumn"
+            - type: "null"
+        column18:
+          description: Upřesnění, additional information (usually amount and currency).
+          anyOf:
+            - $ref: "#/components/schemas/StringColumn"
+            - type: "null"
+        column25:
+          description: Komentář, comment.
+          anyOf:
+            - $ref: "#/components/schemas/StringColumn"
+            - type: "null"
+        column26:
+          description: BIC of the counterparty bank.
+          anyOf:
+            - $ref: "#/components/schemas/StringColumn"
+            - type: "null"
+        column17:
+          description: ID pokynu, instruction ID; can repeat across movements.
+          anyOf:
+            - $ref: "#/components/schemas/NumberColumn"
+            - type: "null"
+        column27:
+          description: Reference plátce, payer reference.
+          anyOf:
+            - $ref: "#/components/schemas/StringColumn"
+            - type: "null"
+    StringColumn:
+      type: object
+      required: [value, name, id]
+      properties:
+        value:
+          type: [string, "null"]
+        name:
+          type: string
+        id:
+          type: integer
+    NumberColumn:
+      type: object
+      required: [value, name, id]
+      properties:
+        value:
+          type: [number, "null"]
+        name:
+          type: string
+        id:
+          type: integer
+    DateColumn:
+      type: object
+      required: [value, name, id]
+      properties:
+        value:
+          $ref: "#/components/schemas/FioDate"
+        name:
+          type: string
+        id:
+          type: integer
