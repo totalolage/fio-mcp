@@ -726,7 +726,7 @@ describe("FioApiLive over fetch", () => {
         return yield* failure(api.periodsRaw(yield* account, "2024-01-01", "2024-01-31", "csv"));
       }).pipe(Effect.provide(layer));
       assert.strictEqual(error._tag, "FioResponseError");
-      yield* Effect.sleep(200);
+      for (let waited = 0; waited < 2_000 && !closed; waited += 10) yield* Effect.sleep(10);
       assert.isTrue(closed);
     }).pipe(Effect.scoped),
   );
