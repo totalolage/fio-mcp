@@ -2,15 +2,15 @@
  * Regenerates src/generated/effect.gen.ts from openapi/fio-api.yaml with
  * @effect/openapi-generator (`npm run generate`).
  *
- * The spec documents FIO's text exports as `type: string` bodies under their
- * real media types (text/csv, application/xml, raw JSON, ...). The generator
- * only decodes JSON-schema and binary success bodies; a text body falls
- * through to its "unexpected status" error (and a string under
- * application/json would be JSON-decoded). So the generator gets a temporary
- * copy in which every 2xx `type: string` body without a format is
- * `format: binary`: those operations return the raw bytes, which FioApi
- * decodes as UTF-8. Error responses keep their text/html bodies and surface
- * as StatusCodeError.
+ * The generator only decodes JSON-schema and binary success bodies; a text
+ * body (text/csv, application/xml, ...) falls through to its "unexpected
+ * status" error. Operations marked `x-raw-body: true` in the spec are the
+ * ones FioApi reads as raw text, so the generator gets a temporary copy in
+ * which their 2xx body schemas are `format: binary`: those operations return
+ * the bytes, which FioApi decodes as UTF-8. Any other operation with a
+ * non-JSON 2xx body is an error here, so it cannot silently become an
+ * "unexpected status". Error responses keep their text/html bodies and
+ * surface as StatusCodeError.
  */
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -31,9 +31,6 @@ type JsonObject = Record<string, unknown>;
 const isObject = (value: unknown): value is JsonObject =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
-/** A plain text body: `type: string` with no format (binary, date, ...). */
-const isTextSchema = (schema: unknown) => isObject(schema) && schema.type === "string" && schema.format === undefined;
-
 /** Resolves a local `#/components/...` reference. */
 const resolve = (document: JsonObject, value: JsonObject): JsonObject => {
   const ref = value.$ref;
@@ -45,23 +42,28 @@ const resolve = (document: JsonObject, value: JsonObject): JsonObject => {
   return resolve(document, target);
 };
 
-const resolveSchema = (document: JsonObject, schema: unknown): unknown =>
-  isObject(schema) ? resolve(document, schema) : schema;
+const isJsonMediaType = (mediaType: string) => /^application\/(?:[\w.-]+\+)?json\b/i.test(mediaType);
 
-/** Rewrites every 2xx text response body schema to binary, in place. */
-const binaryTextResponses = (document: JsonObject): void => {
+const isBinarySchema = (document: JsonObject, schema: unknown) =>
+  isObject(schema) && resolve(document, schema).format === "binary";
+
+/** Makes the 2xx bodies of `x-raw-body` operations binary, in place. */
+const binaryRawBodies = (document: JsonObject): void => {
   const paths = isObject(document.paths) ? document.paths : {};
-  for (const pathItem of Object.values(paths)) {
+  for (const [path, pathItem] of Object.entries(paths)) {
     if (!isObject(pathItem)) continue;
-    for (const operation of Object.values(pathItem)) {
+    for (const [method, operation] of Object.entries(pathItem)) {
       if (!isObject(operation) || !isObject(operation.responses)) continue;
+      const raw = operation["x-raw-body"] === true;
       for (const [status, response] of Object.entries(operation.responses)) {
         if (!/^2(?:\d\d|XX)$/i.test(status) || !isObject(response)) continue;
         const content = resolve(document, response).content;
         if (!isObject(content)) continue;
-        for (const media of Object.values(content)) {
-          if (isObject(media) && isTextSchema(resolveSchema(document, media.schema))) {
-            media.schema = { type: "string", format: "binary" };
+        for (const [mediaType, media] of Object.entries(content)) {
+          if (!isObject(media)) continue;
+          if (raw) media.schema = { type: "string", format: "binary" };
+          else if (!isJsonMediaType(mediaType) && !isBinarySchema(document, media.schema)) {
+            throw new Error(`${method.toUpperCase()} ${path} ${status} ${mediaType}: mark the operation x-raw-body: true`);
           }
         }
       }
@@ -72,7 +74,7 @@ const binaryTextResponses = (document: JsonObject): void => {
 // @effect-diagnostics-next-line unstableApiUsage:off
 const document = Yaml.parse(readFileSync(SPEC, "utf8"));
 if (!isObject(document)) throw new Error(`${SPEC} is not an OpenAPI document`);
-binaryTextResponses(document);
+binaryRawBodies(document);
 
 const workDirectory = mkdtempSync(join(tmpdir(), "fio-openapi-"));
 try {

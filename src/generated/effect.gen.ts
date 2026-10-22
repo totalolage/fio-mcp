@@ -11,7 +11,7 @@ import * as HttpClientRequest from "effect/http/HttpClientRequest"
 import * as HttpClientResponse from "effect/http/HttpClientResponse"
 // non-recursive definitions
 export type FioDate = string | number | null
-export const FioDate = Schema.Union([Schema.String, Schema.Finite, Schema.Null]).annotate({ "description": "Epoch milliseconds in the PDF's JSON examples; `YYYY-MM-DD+GMT` (for example\n2012-07-27+0200) in the Fio XML format and in practice.\n", "identifier": "FioDate" })
+export const FioDate = Schema.Union([Schema.String, Schema.Finite.check(Schema.isGreaterThanOrEqualTo(-8640000000000000).annotate({ "expected": "a value greater than or equal to -8640000000000000" })).check(Schema.isLessThanOrEqualTo(8640000000000000).annotate({ "expected": "a value less than or equal to 8640000000000000" })), Schema.Null]).annotate({ "description": "Epoch milliseconds in the PDF's JSON examples (bounded to the JavaScript Date range);\n`YYYY-MM-DD+GMT` (for example 2012-07-27+0200) in the Fio XML format and in practice.\n", "identifier": "FioDate" })
 export type NumberColumn = { readonly "value": number | null, readonly "name": string, readonly "id": number } & { readonly [x: string]: Schema.Json }
 export const NumberColumn = Schema.StructWithRest(Schema.Struct({ "value": Schema.Union([Schema.Finite, Schema.Null]), "name": Schema.String, "id": Schema.Int }), [Schema.Record(Schema.String, Schema.Json.annotate({ "expected": "JSON value" }))]).annotate({ "identifier": "NumberColumn" })
 export type StringColumn = { readonly "value": string | null, readonly "name": string, readonly "id": number } & { readonly [x: string]: Schema.Json }

@@ -16,6 +16,10 @@ info:
     Rate limit: one request (read or write, any format) per token every 30 seconds; a request
     sooner is answered with HTTP 409 (PDF §8, p. 54).
 
+    Operations marked `x-raw-body: true` are consumed as raw bytes whatever their media type
+    (scripts/generate-fio-client.ts turns their 2xx bodies into `format: binary` before
+    generating the client); their documented schemas describe the wire format.
+
     Non-2xx responses carry an HTML page, not a structured error. Their meanings are documented
     per status in components.responses.
 servers:
@@ -59,6 +63,7 @@ paths:
     get:
       tags: [movements]
       operationId: getPeriods
+      x-raw-body: true
       summary: Movements in a date range, in any movement format, as raw text.
       description: Never moves the download marker. `json` returns the same document as getPeriodsJson, undecoded.
       parameters:
@@ -128,6 +133,7 @@ paths:
     get:
       tags: [statements]
       operationId: getStatement
+      x-raw-body: true
       summary: An official statement by year and number, in any text statement format, as raw text.
       description: PDF is binary and has its own operation, getStatementPdf.
       parameters:
@@ -174,6 +180,7 @@ paths:
     get:
       tags: [movements, marker]
       operationId: getLast
+      x-raw-body: true
       summary: Movements since the download marker, in any movement format, as raw text.
       description: Moves the marker like getLastJson.
       parameters:
@@ -248,6 +255,7 @@ paths:
     get:
       tags: [merchant]
       operationId: getMerchantTransactions
+      x-raw-body: true
       summary: Card transactions from POS terminals and the payment gateway in a date range, as raw text.
       description: |
         Available to business accounts using FIO POS terminals or the payment gateway. The XML
@@ -287,6 +295,7 @@ paths:
     get:
       tags: [statements]
       operationId: getLastStatement
+      x-raw-body: true
       summary: Year and number of the latest official statement.
       description: |
         The PDF names this lookup (§5, pp. 8–9) but does not document the response body or how
@@ -310,6 +319,7 @@ paths:
     post:
       tags: [import]
       operationId: importPayments
+      x-raw-body: true
       summary: Uploads a file of payment or direct-debit orders as one batch.
       description: |
         Creates a batch that must still be authorized by an account holder in Internetbanking
@@ -424,7 +434,7 @@ components:
       content:
         application/json:
           schema:
-            type: string
+            $ref: "#/components/schemas/AccountStatementResponse"
         text/csv:
           schema:
             type: string
@@ -445,7 +455,7 @@ components:
       content:
         application/json:
           schema:
-            type: string
+            $ref: "#/components/schemas/AccountStatementResponse"
         text/csv:
           schema:
             type: string
@@ -592,11 +602,13 @@ components:
           description: ID of the last successfully downloaded movement.
     FioDate:
       description: |
-        Epoch milliseconds in the PDF's JSON examples; `YYYY-MM-DD+GMT` (for example
-        2012-07-27+0200) in the Fio XML format and in practice.
+        Epoch milliseconds in the PDF's JSON examples (bounded to the JavaScript Date range);
+        `YYYY-MM-DD+GMT` (for example 2012-07-27+0200) in the Fio XML format and in practice.
       anyOf:
         - type: string
         - type: number
+          minimum: -8640000000000000
+          maximum: 8640000000000000
         - type: "null"
     TransactionList:
       type: object
