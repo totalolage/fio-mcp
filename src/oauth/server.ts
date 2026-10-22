@@ -425,6 +425,10 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
     );
 
   const authorize = Effect.fnUntraced(function* (request: HttpServerRequest.HttpServerRequest) {
+    // The router also routes absolute-form targets that are not URLs (`GET http://[/authorize`).
+    if (!URL.canParse(request.url, issuer)) {
+      return yield* new PageError({ status: 400, title: "Invalid authorization request", detail: "The request URL is malformed." });
+    }
     const params = new URL(request.url, issuer).searchParams;
     const target = yield* authorizationTarget(params);
     const state = Result.getOrUndefined(single(params, "state"));
