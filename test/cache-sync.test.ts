@@ -518,6 +518,25 @@ describe("cache sync", () => {
     }),
   );
 
+  it.effect("while an interrupted refresh keeps failing, other jobs stop before touching its ranges", () =>
+    Effect.gen(function* () {
+      yield* setNow();
+      const fio = yield* fakeFio(serveFrom(movements));
+      yield* Effect.gen(function* () {
+        yield* runToEnd({ kind: "backfill" });
+        yield* fio.setScript(() => Effect.fail(new FioServerError({ status: 503, excerpt: "" })));
+        yield* runToEnd({ kind: "refresh", range: { from: "2025-03-01", to: "2025-03-31" } });
+        yield* Ref.set(fio.calls, []);
+        const job = yield* runToEnd({ kind: "incremental" });
+        assert.strictEqual(job.status, "failed");
+        assert.deepStrictEqual(ranges(yield* Ref.get(fio.calls)), ["2025-03-01..2025-03-31"]);
+        const state = yield* (yield* enabledCache).store.syncState(TOKEN_FP);
+        assert.strictEqual(state.mode, "refresh");
+        assert.deepStrictEqual(state.pending, [{ from: "2025-03-01", to: "2025-03-31" }]);
+      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+    }),
+  );
+
   it.effect("an interrupted refresh resumes as a refresh after a restart", () =>
     Effect.gen(function* () {
       yield* setNow();
