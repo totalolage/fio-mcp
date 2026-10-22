@@ -186,18 +186,20 @@ export const makeRateLimiter = Effect.fn("RateLimiter.make")(function* (options:
     if (projected > deadline) return yield* tooLate(projected - now, reason);
     const waiter: Waiter = { deadline, grant: yield* Deferred.make<void, RateLimited>() };
     const queue = priority === "interactive" ? "interactive" : "background";
-    yield* Ref.update(limiter.state, (current) => ({
+    const leave = Ref.update(limiter.state, (current) => ({
       ...current,
-      [queue]: front ? [waiter, ...current[queue]] : [...current[queue], waiter],
-    }));
-    yield* signal(limiter);
-    yield* Deferred.await(waiter.grant).pipe(
-      Effect.onInterrupt(() =>
-        Ref.update(limiter.state, (current) => ({
-          ...current,
-          interactive: current.interactive.filter((w) => w !== waiter),
-          background: current.background.filter((w) => w !== waiter),
-        })).pipe(Effect.andThen(signal(limiter))),
+      interactive: current.interactive.filter((w) => w !== waiter),
+      background: current.background.filter((w) => w !== waiter),
+    })).pipe(Effect.andThen(signal(limiter)));
+    // Enqueue without interruption, then wait interruptibly: an interrupted
+    // caller always leaves the queue, so no orphan waiter takes a slot.
+    yield* Effect.uninterruptibleMask((restore) =>
+      Ref.update(limiter.state, (current) => ({
+        ...current,
+        [queue]: front ? [waiter, ...current[queue]] : [...current[queue], waiter],
+      })).pipe(
+        Effect.andThen(signal(limiter)),
+        Effect.andThen(restore(Deferred.await(waiter.grant)).pipe(Effect.onInterrupt(() => leave))),
       ),
     );
   });
