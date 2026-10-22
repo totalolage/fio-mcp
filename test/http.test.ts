@@ -166,6 +166,19 @@ describe("HTTP transport", () => {
       // Only /mcp is authenticated; other routes belong to whoever adds them.
       assert.strictEqual((yield* raw(`${base}/other`)).status, 404);
 
+      // The router maps all of these to McpServer's routes (each answers 200
+      // with the token); none may skip authentication.
+      for (const path of ["/MCP", "/mcp/", "//mcp", "/%6dcp", "/mcp;x"]) {
+        const variant = yield* raw(`${base}${path}`, {
+          method: "POST",
+          headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+          body: INITIALIZE,
+        });
+        assert.strictEqual(variant.status, 401, `POST ${path}`);
+      }
+      assert.strictEqual((yield* raw(`${base}/mcp`, { method: "DELETE" })).status, 401);
+      assert.strictEqual((yield* raw(`${base}/mcp`)).status, 401);
+
       const denied = yield* Effect.exit(connect(base));
       assert.isTrue(Exit.isFailure(denied));
 
@@ -230,10 +243,12 @@ describe("HTTP transport", () => {
       // Stands in for an OAuth server: its own route, and a principal per token.
       const auth = Layer.mergeAll(
         Layer.succeed(Auth, {
-          authenticate: (request) =>
-            request.headers.authorization === "Bearer alice"
-              ? Effect.succeed({ subject: "alice", scopes: ["fio:read"], accounts: ["main"] })
-              : Effect.fail(new Unauthorized({ challenge: 'Bearer resource_metadata="/.well-known/test"' })),
+          authenticate: (request) => {
+            const subject = /^Bearer (alice|bob)$/.exec(request.headers.authorization ?? "")?.[1];
+            return subject === undefined
+              ? Effect.fail(new Unauthorized({ challenge: 'Bearer resource_metadata="/.well-known/test"' }))
+              : Effect.succeed({ subject, scopes: ["fio:read"], accounts: [subject === "alice" ? "main" : "savings"] });
+          },
         }),
         HttpRouter.add("GET", "/.well-known/test", HttpServerResponse.text("metadata")),
       );
@@ -243,9 +258,24 @@ describe("HTTP transport", () => {
       assert.strictEqual(denied.status, 401);
       assert.strictEqual(denied.headers["www-authenticate"], 'Bearer resource_metadata="/.well-known/test"');
 
-      const alice = yield* connect(base, { authorization: "Bearer alice" });
-      const result = yield* Effect.promise(() => alice.callTool({ name: "whoami", arguments: {} }));
-      assert.deepStrictEqual(JSON.parse(textOf(result)), { subject: "alice", accounts: ["main"] });
+      // Concurrent sessions each see their own principal.
+      const [alice, bob] = yield* Effect.all([
+        connect(base, { authorization: "Bearer alice" }),
+        connect(base, { authorization: "Bearer bob" }),
+      ]);
+      const whoami = (client: Client) =>
+        Effect.promise(() => client.callTool({ name: "whoami", arguments: {} })).pipe(
+          Effect.map((result) => JSON.parse(textOf(result))),
+        );
+      const results = yield* Effect.all([whoami(alice), whoami(bob), whoami(alice), whoami(bob)], {
+        concurrency: "unbounded",
+      });
+      assert.deepStrictEqual(results, [
+        { subject: "alice", accounts: ["main"] },
+        { subject: "bob", accounts: ["savings"] },
+        { subject: "alice", accounts: ["main"] },
+        { subject: "bob", accounts: ["savings"] },
+      ]);
     }).pipe(Effect.scoped),
   );
 

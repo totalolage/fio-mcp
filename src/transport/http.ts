@@ -15,8 +15,9 @@ import type { ServerInfo } from "./server-info.js";
  * reverse proxy in front of it.
  *
  * Every path except /healthz passes the Host allowlist (DNS-rebinding
- * defence); /mcp then passes `Auth`, and McpServer itself rejects foreign
- * Origin headers there. Every response body is redacted on the way out.
+ * defence); McpServer's routes then pass `Auth`, and McpServer itself
+ * rejects foreign Origin headers. Every response body is redacted on the
+ * way out.
  * /healthz bypasses the guard so container and proxy probes work with any
  * Host header and without credentials; it touches neither FIO nor the
  * network.
@@ -84,36 +85,51 @@ const unauthorized = (challenge: string) =>
 const forbidden = HttpServerResponse.empty({ status: 403 });
 
 /**
- * For every route: response redaction. Except /healthz: the Host allowlist.
- * On /mcp: authentication, whose principal the tool handlers see as
- * `CurrentPrincipal`.
+ * Every route: response redaction, and (except /healthz) the Host allowlist.
+ * Paths are compared literally; any other spelling of /healthz is checked.
  */
 const guard = (allowedHosts: ReadonlyArray<string>) =>
   HttpRouter.middleware(
     Effect.gen(function* () {
-      const auth = yield* Auth;
       const frames = makeFrameRedactor(yield* Redactor);
       return Effect.fnUntraced(function* (
         httpEffect: Effect.Effect<HttpServerResponse.HttpServerResponse, Types.unhandled>,
       ) {
         const request = yield* HttpServerRequest.HttpServerRequest;
-        const path = pathOf(request.url);
-        if (path === HEALTH_PATH) return redactResponse(frames, yield* httpEffect);
-        if (!isAllowedHost(allowedHosts, request.headers.host)) return forbidden;
-        if (path !== MCP_PATH) return redactResponse(frames, yield* httpEffect);
-        const principal = yield* Effect.result(auth.authenticate(request));
-        if (Result.isFailure(principal)) return unauthorized(principal.failure.challenge);
-        return redactResponse(frames, yield* Effect.provideService(httpEffect, CurrentPrincipal, principal.success));
+        if (pathOf(request.url) !== HEALTH_PATH && !isAllowedHost(allowedHosts, request.headers.host)) {
+          return forbidden;
+        }
+        return redactResponse(frames, yield* httpEffect);
       });
     }),
     { global: true },
   );
 
 /**
+ * Authentication for every route McpServer registers. Route middleware, not
+ * a path comparison: the router also matches /MCP, /mcp/, //mcp and
+ * percent-encoded spellings. The principal reaches tool handlers as
+ * `CurrentPrincipal`.
+ */
+const mcpAuth = HttpRouter.middleware(
+  Effect.gen(function* () {
+    const auth = yield* Auth;
+    return Effect.fnUntraced(function* (
+      httpEffect: Effect.Effect<HttpServerResponse.HttpServerResponse, Types.unhandled>,
+    ) {
+      const principal = yield* Effect.result(auth.authenticate(yield* HttpServerRequest.HttpServerRequest));
+      if (Result.isFailure(principal)) return unauthorized(principal.failure.challenge);
+      return yield* Effect.provideService(httpEffect, CurrentPrincipal, principal.success);
+    });
+  }),
+);
+
+/**
  * Serves `app` (tool registrations and anything else that needs `McpServer`)
- * at /mcp, with /healthz and the guard, on a Node HTTP server. `auth` is
- * built inside the router app, so it may add routes of its own. All sessions
- * share the services `app` is built from.
+ * at /mcp, with /healthz and the guards, on a Node HTTP server. `auth` is
+ * built inside the router app, so it may add routes of its own (those pass
+ * the Host allowlist but not `Auth`). All sessions share the services `app`
+ * is built from.
  */
 export const serveHttp = <A, E, R, EA, RA>(
   app: Layer.Layer<A, E, R>,
@@ -123,14 +139,14 @@ export const serveHttp = <A, E, R, EA, RA>(
 ) =>
   HttpRouter.serve(
     Layer.mergeAll(app, HealthRoute, guard(config.allowedHosts)).pipe(
-      Layer.provide(auth),
       Layer.provideMerge(
         McpServer.layerHttp({
           ...info,
           path: MCP_PATH,
           allowedOrigins: config.allowedOrigins,
           allowSessionTermination: true,
-        }),
+        }).pipe(Layer.provide(mcpAuth.layer)),
       ),
+      Layer.provide(auth),
     ),
   ).pipe(Layer.provideMerge(NodeHttpServer.layer(createServer, { host: config.host, port: config.port })));
