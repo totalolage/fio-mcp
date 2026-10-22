@@ -15,6 +15,8 @@ import {
 } from "../src/oauth/crypto.js";
 import { DEFAULT_THROTTLE, delayAfter, makeLoginGuard } from "../src/oauth/login.js";
 import { escapeHtml } from "../src/oauth/pages.js";
+import { makeWindowLimiter } from "../src/oauth/rate-limit.js";
+import { MAX_SESSIONS, makeSessions, type PendingAuthorization } from "../src/oauth/sessions.js";
 import { makeOAuthStore } from "../src/oauth/store.js";
 import { isResource, parsePublicUrl, redirectUriMatches, redirectUriProblem } from "../src/oauth/urls.js";
 
@@ -96,6 +98,75 @@ describe("secrets", () => {
 
   it("stores tokens as SHA-256 hex", () => {
     assert.strictEqual(hashSecret("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+  });
+});
+
+describe("authorization sessions", () => {
+  const request: PendingAuthorization = {
+    clientId: "c",
+    clientName: null,
+    redirectUri: "http://127.0.0.1/cb",
+    state: undefined,
+    codeChallenge: "x",
+    requestedScopes: ["fio:read"],
+    resource: "https://fio.example.test/mcp",
+  };
+
+  it.effect("caps sign-ins in progress apart from signed-in sessions", () =>
+    Effect.gen(function* () {
+      const sessions = yield* makeSessions();
+      const first = yield* sessions.start(request);
+      const signedIn = yield* sessions.login((yield* sessions.start(request)).session);
+      for (let i = 0; i < MAX_SESSIONS.pending + 50; i++) yield* sessions.start(request);
+      assert.isTrue(Option.isSome(yield* sessions.find(Redacted.value(signedIn.cookie))));
+      assert.isTrue(Option.isNone(yield* sessions.find(Redacted.value(first.cookie))));
+      // Signed-in sessions make room among themselves.
+      const more = [];
+      for (let i = 0; i < MAX_SESSIONS.signedIn; i++) more.push(yield* sessions.login((yield* sessions.start(request)).session));
+      assert.isTrue(Option.isNone(yield* sessions.find(Redacted.value(signedIn.cookie))));
+      assert.isTrue(Option.isSome(yield* sessions.find(Redacted.value(more[0]?.cookie ?? Redacted.make("")))));
+    }),
+  );
+
+  it.effect("makes room among the sign-ins of the client with the most in progress", () =>
+    Effect.gen(function* () {
+      const sessions = yield* makeSessions();
+      const other = yield* sessions.start({ ...request, clientId: "other" });
+      const flooded = yield* sessions.start(request);
+      for (let i = 0; i < MAX_SESSIONS.pending * 2; i++) yield* sessions.start(request);
+      assert.isTrue(Option.isSome(yield* sessions.find(Redacted.value(other.cookie))));
+      assert.isTrue(Option.isNone(yield* sessions.find(Redacted.value(flooded.cookie))));
+    }),
+  );
+
+  it.effect("breaks ties against the client adding a sign-in", () =>
+    Effect.gen(function* () {
+      const sessions = yield* makeSessions();
+      // A full pool, one sign-in per client; the admin's is the oldest.
+      const admin = yield* sessions.start({ ...request, clientId: "admin" });
+      for (let i = 1; i < MAX_SESSIONS.pending; i++) yield* sessions.start({ ...request, clientId: `client-${i}` });
+      const own = yield* sessions.start({ ...request, clientId: "client-1" });
+      assert.isTrue(Option.isSome(yield* sessions.find(Redacted.value(admin.cookie))));
+      assert.isTrue(Option.isSome(yield* sessions.find(Redacted.value(own.cookie))));
+    }),
+  );
+});
+
+describe("window limiter", () => {
+  it("allows `limit` events per window per key and forgets the stalest keys", () => {
+    const limiter = makeWindowLimiter({ limit: 2, windowMs: 10_000, maxKeys: 2 });
+    limiter.record("a", 0);
+    limiter.record("a", 4_000);
+    assert.strictEqual(limiter.retryAfter("a", 5_000), 5);
+    assert.strictEqual(limiter.retryAfter("b", 5_000), 0);
+    // The first event leaves the window.
+    assert.strictEqual(limiter.retryAfter("a", 10_000), 0);
+    limiter.record("a", 10_000);
+    assert.strictEqual(limiter.retryAfter("a", 10_000), 4);
+    limiter.record("b", 11_000);
+    limiter.record("c", 11_000);
+    // Three keys: "a", the stalest, is forgotten.
+    assert.strictEqual(limiter.retryAfter("a", 11_000), 0);
   });
 });
 

@@ -292,6 +292,17 @@ describe("loadConfig", () => {
     }),
   );
 
+  it.effect("reads trusted proxies and rejects invalid entries without echoing them", () =>
+    Effect.gen(function* () {
+      const env = { FIO_TOKEN: READ_TOKEN, FIO_MCP_TRANSPORT: "http", FIO_MCP_ALLOW_UNAUTHENTICATED: "true" };
+      const config = yield* loadConfigFrom({ ...env, FIO_MCP_TRUSTED_PROXIES: "172.18.0.0/16, 10.0.0.2,fd00::/8" });
+      assert.strictEqual(config.transport.kind === "http" ? config.transport.trustedProxies.length : 0, 3);
+      const message = yield* configError({ ...env, FIO_MCP_TRUSTED_PROXIES: "172.18.0.0/16,secret-proxy-name" });
+      assert.include(message, "FIO_MCP_TRUSTED_PROXIES entry 2");
+      assert.notInclude(message, "secret-proxy-name");
+    }),
+  );
+
   it.effect("reads HTTP transport and cache settings", () =>
     Effect.gen(function* () {
       const config = yield* loadConfigFrom({
@@ -313,6 +324,7 @@ describe("loadConfig", () => {
         auth: { kind: "unauthenticated" },
         allowedOrigins: ["https://a.example", "https://b.example"],
         allowedHosts: ["fio.example:443", "localhost"],
+        trustedProxies: [],
       });
       assert.deepInclude(config.cache, {
         enabled: true,

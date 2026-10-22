@@ -1,10 +1,12 @@
 import { ByteSize, Clock, Effect, Layer, Option, Redacted, Result, Schedule, Schema } from "effect";
 import { Cookies, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
+import type { IpNetwork } from "effect/net";
 import type { SqlClient } from "effect/sql";
 import { Accounts } from "../accounts.js";
 import type { HttpAuthConfig } from "../config.js";
 import { SCOPE_PAYMENTS, SCOPE_READ, SCOPES } from "../mcp/permissions.js";
 import { Auth, AuthUnavailable, Unauthorized } from "../transport/auth.js";
+import { clientAddress } from "../transport/client-address.js";
 import type { Principal } from "../transport/principal.js";
 import { CODE_CHALLENGE, hashSecret, pkceMatches, randomId, randomSecret, safeEqual } from "./crypto.js";
 import {
@@ -26,6 +28,7 @@ import {
 } from "./errors.js";
 import { DEFAULT_THROTTLE, makeLoginGuard, type ThrottlePolicy } from "./login.js";
 import { consentPage, errorPage, loginPage, pageHeaders, redirectFormTarget } from "./pages.js";
+import { makeWindowLimiter } from "./rate-limit.js";
 import { type AuthSession, makeSessions, type PendingAuthorization, SESSION_COOKIE, SESSION_TTL_MS } from "./sessions.js";
 import { type Client, type Grant, makeOAuthStore, type OAuthStore } from "./store.js";
 import { isResource, MCP_RESOURCE_PATH, redirectUriMatches, redirectUriProblem, withParams } from "./urls.js";
@@ -62,6 +65,9 @@ export const LIMITS = {
   maxClientName: 100,
   maxState: 1024,
   maxBodyBytes: 16 * 1024,
+  /** Sign-ins (/authorize requests that start a session) per client address per window. */
+  authorizationsPerAddress: 20,
+  authorizationWindowMs: 10 * 60_000,
 } as const;
 
 export const PROTECTED_RESOURCE_PATH = "/.well-known/oauth-protected-resource";
@@ -81,6 +87,8 @@ export interface OAuthSettings {
   readonly publicUrl: string;
   readonly passwordHash: Extract<HttpAuthConfig, { kind: "oauth" }>["passwordHash"];
   readonly throttle?: ThrottlePolicy | undefined;
+  /** Proxies whose X-Forwarded-For names the client address (see clientAddress). */
+  readonly trustedProxies?: ReadonlyArray<IpNetwork.IpNetwork> | undefined;
 }
 
 const ACCESS_PREFIX = "fio_at_";
@@ -112,7 +120,13 @@ const html = (body: string, status = 200, formTargets: ReadonlyArray<string> = [
     headers: { ...pageHeaders(formTargets), ...extra },
   });
 
-const pageError = (error: PageError) => html(errorPage(error.title, error.detail), error.status);
+const pageError = (error: PageError) =>
+  html(
+    errorPage(error.title, error.detail),
+    error.status,
+    [],
+    error.retryAfterSeconds === undefined ? {} : { "retry-after": String(error.retryAfterSeconds) },
+  );
 
 const sessionCookie = (value: string, maxAgeMs: number) =>
   Cookies.setUnsafe(Cookies.empty, SESSION_COOKIE, value, {
@@ -204,6 +218,13 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
   const resourceMetadataUrl = `${issuer}${PROTECTED_RESOURCE_PATH}${MCP_RESOURCE_PATH}`;
   const accountNames = accounts.list.map((account) => account.name);
   const registrations: Array<number> = [];
+  const authorizationsByAddress = makeWindowLimiter({
+    limit: LIMITS.authorizationsPerAddress,
+    windowMs: LIMITS.authorizationWindowMs,
+    maxKeys: 10_000,
+  });
+  const trustedProxies = settings.trustedProxies ?? [];
+  const addressOf = (request: HttpServerRequest.HttpServerRequest) => clientAddress(request, trustedProxies);
 
   const challenge = (error?: string) =>
     `Bearer resource_metadata="${resourceMetadataUrl}", scope="${SCOPE_READ}"${error === undefined ? "" : `, error="${error}"`}`;
@@ -412,6 +433,22 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
     }
     const pending = yield* Effect.result(authorizationRequest(params, target.client, target.redirectUri));
     if (Result.isFailure(pending)) return errorRedirect(target.redirectUri, state, pending.failure);
+    // Anyone can start sign-ins; each holds memory for SESSION_TTL_MS. Not
+    // limited per client: client ids are public, so anyone could block the
+    // admin's client (sessions.ts makes room per client instead).
+    const now = yield* Clock.currentTimeMillis;
+    const address = addressOf(request);
+    const wait = authorizationsByAddress.retryAfter(address, now);
+    if (wait > 0) {
+      yield* Effect.logDebug("oauth: refused a sign-in: too many started from one address");
+      return yield* new PageError({
+        status: 429,
+        title: "Too many sign-in attempts",
+        detail: `Too many sign-ins were started recently. Try again in ${wait} s.`,
+        retryAfterSeconds: wait,
+      });
+    }
+    authorizationsByAddress.record(address, now);
     const issued = yield* sessions.start(pending.success);
     return redirect("/login", sessionCookie(Redacted.value(issued.cookie), SESSION_TTL_MS));
   });
@@ -485,8 +522,7 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
     yield* checkForm(request, session, form);
     if (session.loggedIn) return redirect("/consent");
     const password = Result.getOrUndefined(single(form, "password")) ?? "";
-    const address = Option.getOrElse(request.remoteAddress, () => "unknown");
-    const result = yield* guard.attempt(address, Redacted.make(password));
+    const result = yield* guard.attempt(addressOf(request), Redacted.make(password));
     switch (result._tag) {
       case "Accepted": {
         const next = yield* sessions.login(session);
@@ -653,7 +689,7 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
 
   const refresh = Effect.fnUntraced(function* (client: Client, form: URLSearchParams) {
     const token = yield* required(form, "refresh_token");
-    yield* checkResource(form, false);
+    yield* checkResource(form, true);
     const scope = yield* param(form, "scope");
     const requested = scope === undefined ? undefined : parseScopes(scope);
     if (requested !== undefined && Result.isFailure(requested)) return yield* requested.failure;

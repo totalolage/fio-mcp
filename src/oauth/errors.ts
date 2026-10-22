@@ -82,5 +82,7 @@ export class PageError extends Schema.TaggedError<PageError>()("PageError", {
   status: Schema.Int,
   title: Schema.String,
   detail: Schema.String,
+  /** Sent as Retry-After (rate limits). */
+  retryAfterSeconds: Schema.optional(Schema.Int),
 }) {}
 

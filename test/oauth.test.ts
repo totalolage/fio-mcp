@@ -4,8 +4,9 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { Clock, Effect, Redacted } from "effect";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { hashSecret, randomSecret } from "../src/oauth/crypto.js";
+import { DEFAULT_THROTTLE } from "../src/oauth/login.js";
 import { LIMITS } from "../src/oauth/server.js";
-import { MAX_SESSIONS_PER_SUBJECT, SESSION_IDLE_MS } from "../src/transport/http.js";
+import { MAX_BODY_BYTES, MAX_CONCURRENT_REQUESTS, SESSION_LIMITS } from "../src/transport/http.js";
 import {
   authorizationUrl,
   authorizeInBrowser,
@@ -15,6 +16,7 @@ import {
   LOOPBACK_REDIRECT,
   type OAuthHarness,
   PASSWORD,
+  PEER_HEADER,
   PUBLIC_URL,
   pkcePair,
   postMcp,
@@ -25,6 +27,8 @@ import {
   tokenRequest,
   tokensFor,
 } from "./support/oauth.js";
+
+const MAX_SESSIONS_PER_SUBJECT = SESSION_LIMITS.maxPerSubject;
 
 const CHALLENGE = `Bearer resource_metadata="${PUBLIC_URL}/.well-known/oauth-protected-resource/mcp", scope="fio:read"`;
 
@@ -233,11 +237,87 @@ describe("metadata and the /mcp challenge", () => {
 
   it("never admits more sessions per grant than the limit, even concurrently", async () => {
     const { access } = await tokensFor(harness);
+    const before = MAX_SESSIONS_PER_SUBJECT + 8 - MAX_CONCURRENT_REQUESTS;
+    for (let i = 0; i < before; i++) {
+      expect((await postMcp(harness, { authorization: `Bearer ${access}` })).status).toBe(200);
+    }
+    // The last requests race for the remaining slots.
     const statuses = await Promise.all(
-      Array.from({ length: MAX_SESSIONS_PER_SUBJECT + 8 }, () => postMcp(harness, { authorization: `Bearer ${access}` })),
+      Array.from({ length: MAX_CONCURRENT_REQUESTS }, () => postMcp(harness, { authorization: `Bearer ${access}` })),
     ).then((responses) => responses.map((r) => r.status));
-    expect(statuses.filter((s) => s === 200)).toHaveLength(MAX_SESSIONS_PER_SUBJECT);
+    expect(statuses.filter((s) => s === 200)).toHaveLength(MAX_SESSIONS_PER_SUBJECT - before);
     expect(statuses.filter((s) => s === 429)).toHaveLength(8);
+  });
+
+  it("limits the requests a grant has in flight", async () => {
+    const { access } = await tokensFor(harness);
+    // Bodies that never end keep their requests in flight.
+    const streams: Array<ReadableStreamDefaultController<Uint8Array>> = [];
+    const pending = Array.from({ length: MAX_CONCURRENT_REQUESTS }, () =>
+      harness.fetch(
+        new Request(`${PUBLIC_URL}/mcp`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            accept: "application/json, text/event-stream",
+            authorization: `Bearer ${access}`,
+          },
+          body: new ReadableStream<Uint8Array>({ start: (controller) => void streams.push(controller) }),
+          duplex: "half",
+        } as RequestInit),
+      ),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const refused = await postMcp(harness, { authorization: `Bearer ${access}` });
+    expect(refused.status).toBe(429);
+    expect(refused.headers.get("retry-after")).toBe("1");
+    // Other grants are not affected.
+    const other = await tokensFor(harness);
+    expect((await postMcp(harness, { authorization: `Bearer ${other.access}` })).status).toBe(200);
+    for (const stream of streams) stream.close();
+    await Promise.all(pending);
+    expect((await postMcp(harness, { authorization: `Bearer ${access}` })).status).toBe(200);
+  });
+
+  it("refuses request bodies over the limit with 413 and keeps serving", async () => {
+    const { access } = await tokensFor(harness);
+    const big = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: { pad: "x".repeat(MAX_BODY_BYTES) } });
+    const refused = await postMcp(harness, { authorization: `Bearer ${access}` }, "/mcp", big);
+    expect(refused.status).toBe(413);
+    // An initialize request may not carry more than 64 KiB of client data.
+    const bigInit = JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "x".repeat(70_000), version: "0" } },
+    });
+    expect((await postMcp(harness, { authorization: `Bearer ${access}` }, "/mcp", bigInit)).status).toBe(413);
+    expect((await postMcp(harness, { authorization: `Bearer ${access}` })).status).toBe(200);
+  });
+
+  it("ends an idle session in McpServer when its slot is needed", async () => {
+    const { access, refresh, clientId } = await tokensFor(harness);
+    const list = JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
+    const first = (await postMcp(harness, { authorization: `Bearer ${access}` })).headers.get("mcp-session-id") ?? "";
+    for (let i = 1; i < MAX_SESSIONS_PER_SUBJECT; i++) {
+      expect((await postMcp(harness, { authorization: `Bearer ${access}` })).status).toBe(200);
+    }
+    expect((await postMcp(harness, { authorization: `Bearer ${access}` })).status).toBe(429);
+    harness.clock.advance(SESSION_LIMITS.idleMs + 1000);
+    const refreshed = await tokenRequest(harness, {
+      grant_type: "refresh_token",
+      client_id: clientId,
+      refresh_token: refresh,
+      resource: RESOURCE,
+    });
+    const token = String(refreshed.body.access_token);
+    const fresh = await postMcp(harness, { authorization: `Bearer ${token}` });
+    expect(fresh.status).toBe(200);
+    // McpServer answered the internal DELETE with 204: it held the session and ended it.
+    expect(harness.logs.filter((line) => line.includes("ended an idle session"))).toHaveLength(1);
+    const headers = { "mcp-session-id": first, "mcp-protocol-version": "2025-11-25", authorization: `Bearer ${token}` };
+    expect((await postMcp(harness, headers, "/mcp", list)).status).toBe(404);
+    expect(harness.logs.join("\n")).not.toContain(first);
   });
 
   it("rejects an expired access token and accepts it before expiry", async () => {
@@ -282,7 +362,7 @@ describe("metadata and the /mcp challenge", () => {
     );
     expect(bobStill.status).toBe(200);
     // After an hour without use, an old session gives up its slot (with a refreshed token).
-    harness.clock.advance(SESSION_IDLE_MS + 1000);
+    harness.clock.advance(SESSION_LIMITS.idleMs + 1000);
     const refreshed = await tokenRequest(harness, {
       grant_type: "refresh_token",
       client_id: alice.clientId,
@@ -422,9 +502,9 @@ describe("authorization endpoint", () => {
 });
 
 describe("login and consent pages", () => {
-  const begin = async () => {
+  const begin = async (headers: Record<string, string> = {}) => {
     const { body } = await register(harness, [LOOPBACK_REDIRECT], "<script>alert(1)</script>");
-    const browser = new Browser(harness);
+    const browser = new Browser(harness, headers);
     const start = await browser.get(
       authorizationUrl({
         response_type: "code",
@@ -502,6 +582,63 @@ describe("login and consent pages", () => {
     const logged = harness.logs.join("\n");
     expect(logged).toContain("admin login failed");
     expect(logged).not.toContain("wrong password!");
+  });
+
+  it("rate-limits sign-ins per address; a flood ends neither a signed-in session nor another client's sign-in", async () => {
+    const flooder = String((await register(harness, [LOOPBACK_REDIRECT])).body.client_id);
+    const start = (peer: string) =>
+      new Browser(harness, { [PEER_HEADER]: peer }).get(
+        authorizationUrl({
+          response_type: "code",
+          client_id: flooder,
+          redirect_uri: LOOPBACK_REDIRECT,
+          code_challenge: pkcePair().challenge,
+          code_challenge_method: "S256",
+          resource: RESOURCE,
+        }),
+      );
+    // The admin signs in, and a second sign-in (another client) waits at the password page.
+    const { browser: admin } = await begin({ [PEER_HEADER]: "192.0.2.10" });
+    const csrf = await csrfOf(await admin.get("/login"));
+    expect((await admin.post("/login", { csrf, password: PASSWORD })).status).toBe(303);
+    const { browser: waiting } = await begin({ [PEER_HEADER]: "192.0.2.11" });
+    // 150 sign-ins from 150 addresses: more than the 100 sign-ins held.
+    for (let i = 0; i < 150; i++) expect((await start(`198.51.100.${i}`)).status, `sign-in ${i}`).toBe(303);
+    expect((await admin.get("/consent")).status).toBe(200);
+    expect((await waiting.get("/login")).status).toBe(200);
+    // One address may start 20 sign-ins per 10 minutes.
+    for (let i = 0; i < LIMITS.authorizationsPerAddress; i++) expect((await start("203.0.113.2")).status).toBe(303);
+    const refused = await start("203.0.113.2");
+    expect(refused.status).toBe(429);
+    expect(Number(refused.headers.get("retry-after"))).toBeGreaterThan(0);
+    expect((await start("203.0.113.3")).status).toBe(303);
+    harness.clock.advance(LIMITS.authorizationWindowMs);
+    expect((await start("203.0.113.2")).status).toBe(303);
+  });
+
+  it("throttles logins per client behind a trusted proxy, and per peer otherwise", async () => {
+    await harness.close();
+    const throttle = { ...DEFAULT_THROTTLE, freeFailures: 1, lockoutFailures: 2 };
+    harness = await startOAuth({ throttle, trustedProxies: ["172.18.0.0/16"] });
+    const via = (peer: string, forwardedFor: string) => ({ [PEER_HEADER]: peer, "x-forwarded-for": forwardedFor });
+    const login = async (headers: Record<string, string>, password: string) => {
+      const { browser } = await begin(headers);
+      const csrf = await csrfOf(await browser.get("/login"));
+      return (await browser.post("/login", { csrf, password })).status;
+    };
+    // Two failures lock the client at 203.0.113.9 out...
+    expect(await login(via("172.18.0.2", "203.0.113.9"), "wrong password!")).toBe(401);
+    expect(await login(via("172.18.0.2", "203.0.113.9"), "wrong password!")).toBe(401);
+    expect(await login(via("172.18.0.2", "203.0.113.9"), PASSWORD)).toBe(429);
+    // ...including when it prepends another address; Traefik appends the real one.
+    expect(await login(via("172.18.0.3", "198.51.100.7, 203.0.113.9"), PASSWORD)).toBe(429);
+    // The admin behind the same proxy is not affected.
+    expect(await login(via("172.18.0.2", "198.51.100.7"), PASSWORD)).toBe(303);
+    // An untrusted peer's X-Forwarded-For is ignored: the peer is the client.
+    expect(await login(via("10.9.9.9", "192.0.2.1"), "wrong password!")).toBe(401);
+    expect(await login(via("10.9.9.9", "192.0.2.2"), "wrong password!")).toBe(401);
+    expect(await login(via("10.9.9.9", "192.0.2.3"), PASSWORD)).toBe(429);
+    expect(harness.logs.join("\n")).not.toMatch(/203\.0\.113\.9|10\.9\.9\.9|172\.18\./);
   });
 });
 
@@ -599,6 +736,7 @@ describe("token endpoint", () => {
       grant_type: "refresh_token",
       client_id: first.clientId,
       refresh_token: first.refresh,
+      resource: RESOURCE,
     });
     expect(replay.body.error).toBe("invalid_grant");
     // Family revoked: the current access and refresh tokens die too.
@@ -607,6 +745,7 @@ describe("token endpoint", () => {
       grant_type: "refresh_token",
       client_id: first.clientId,
       refresh_token: second.refresh,
+      resource: RESOURCE,
     });
     expect(afterReplay.body.error).toBe("invalid_grant");
   });
@@ -618,12 +757,14 @@ describe("token endpoint", () => {
       grant_type: "refresh_token",
       client_id: String(body.client_id),
       refresh_token: owner.refresh,
+      resource: RESOURCE,
     });
     expect(stolen.body.error).toBe("invalid_grant");
     const wider = await tokenRequest(harness, {
       grant_type: "refresh_token",
       client_id: owner.clientId,
       refresh_token: owner.refresh,
+      resource: RESOURCE,
       scope: "fio:read fio:payments",
     });
     expect(wider.body.error).toBe("invalid_scope");
@@ -632,9 +773,22 @@ describe("token endpoint", () => {
       grant_type: "refresh_token",
       client_id: owner.clientId,
       refresh_token: owner.refresh,
+      resource: RESOURCE,
       scope: "fio:read",
     });
     expect(still.response.status).toBe(200);
+  });
+
+  it("requires this server's resource on refresh without consuming the token", async () => {
+    const owner = await tokensFor(harness);
+    const refresh = { grant_type: "refresh_token", client_id: owner.clientId, refresh_token: owner.refresh };
+    const missing = await tokenRequest(harness, refresh);
+    expect(missing.response.status).toBe(400);
+    expect(missing.body.error).toBe("invalid_request");
+    const foreign = await tokenRequest(harness, { ...refresh, resource: "https://other.example.test/mcp" });
+    expect(foreign.body.error).toBe("invalid_target");
+    const ok = await tokenRequest(harness, { ...refresh, resource: RESOURCE });
+    expect(ok.response.status).toBe(200);
   });
 
   it("revocation of another client's token is refused; unknown tokens are accepted", async () => {

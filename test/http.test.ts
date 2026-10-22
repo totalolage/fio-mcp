@@ -11,7 +11,13 @@ import { makeFioToolkit } from "../src/mcp/fio-tools.js";
 import { makeRedactor } from "../src/redaction.js";
 import { Auth, Unauthorized } from "../src/transport/auth.js";
 import { makeFrameRedactor } from "../src/transport/frame-redaction.js";
-import { type HttpTransportConfig, isAllowedHost, serveHttp } from "../src/transport/http.js";
+import {
+  type HttpTransportConfig,
+  isAllowedHost,
+  MAX_BODY_BYTES,
+  makeSessionOwners,
+  serveHttp,
+} from "../src/transport/http.js";
 import { CurrentPrincipal } from "../src/transport/principal.js";
 import { ACCOUNT_NAMES, FIO_TOKEN, testConfig, testServices } from "./support/transport.js";
 
@@ -22,6 +28,7 @@ const transport = (overrides: Partial<HttpTransportConfig> = {}): HttpTransportC
   auth: { kind: "unauthenticated" },
   allowedOrigins: [],
   allowedHosts: [],
+  trustedProxies: [],
   ...overrides,
 });
 
@@ -81,6 +88,36 @@ const raw = (url: string, options: { method?: string; headers?: Record<string, s
       }),
   );
 
+/** POSTs `total` bytes in chunks without a Content-Length; resolves with the status even if the server stops reading. */
+const postChunked = (url: string, total: number) =>
+  Effect.promise(
+    () =>
+      new Promise<number>((resolve, reject) => {
+        const req = nodeRequest(
+          url,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+          },
+          (res) => {
+            res.resume();
+            resolve(res.statusCode ?? 0);
+          },
+        );
+        req.on("error", (error) => (req.writableEnded ? undefined : reject(error)));
+        const chunk = Buffer.alloc(64 * 1024, "x");
+        let sent = 0;
+        const pump = () => {
+          while (sent < total) {
+            sent += chunk.length;
+            if (!req.write(chunk)) return void req.once("drain", pump);
+          }
+          req.end();
+        };
+        pump();
+      }),
+  );
+
 const INITIALIZE = JSON.stringify({
   jsonrpc: "2.0",
   id: 1,
@@ -136,6 +173,7 @@ describe("HTTP transport", () => {
       const { base } = yield* startServer(
         transport({
           allowedHosts: ["fio.example.test"],
+          trustedProxies: [],
           allowedOrigins: ["https://fio.example.test"],
         }),
         Layer.succeed(
@@ -172,6 +210,20 @@ describe("HTTP transport", () => {
       assert.strictEqual((yield* postInitialize(base, { host: "127.0.0.1" })).status, 403);
       assert.strictEqual((yield* postInitialize(base, { host: "fio.example.test" })).status, 200);
       assert.strictEqual((yield* postInitialize(base, { host: "FIO.example.test:443" })).status, 200);
+    }).pipe(Effect.scoped),
+  );
+
+  it.live("answers 413 to /mcp bodies over the limit, declared or streamed, and keeps serving", () =>
+    Effect.gen(function* () {
+      const { base } = yield* startServer(transport());
+      const big = yield* raw(`${base}/mcp`, {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+        body: "x".repeat(MAX_BODY_BYTES + 1),
+      });
+      assert.strictEqual(big.status, 413);
+      assert.strictEqual(yield* postChunked(`${base}/mcp`, 4 * MAX_BODY_BYTES), 413);
+      assert.strictEqual((yield* postInitialize(base)).status, 200);
     }).pipe(Effect.scoped),
   );
 
@@ -331,5 +383,48 @@ describe("isAllowedHost", () => {
     assert.isTrue(isAllowedHost(["[::1]"], "[::1]:3000"));
     assert.isFalse(isAllowedHost(["fio.example.test"], "fio.example.test.evil.example"));
     assert.isFalse(isAllowedHost(["fio.example.test"], undefined));
+  });
+});
+
+describe("session owners", () => {
+  const limits = { maxTracked: 3, maxPerSubject: 2, idleMs: 1000 };
+
+  it("counts sessions being ended against the server limit until McpServer has ended them", () => {
+    const owners = makeSessionOwners(limits);
+    for (const [subject, session] of [["a", "a1"], ["b", "b1"], ["c", "c1"]] as const) {
+      const admission = owners.admit(subject, 0);
+      assert.strictEqual(admission._tag, "Admitted");
+      if (admission._tag === "Admitted") owners.settle(admission.reservation, subject, session, "2025-11-25", 0);
+    }
+    assert.strictEqual(owners.admit("d", 500)._tag, "ServerFull");
+    const admission = owners.admit("d", 2000);
+    if (admission._tag !== "Admitted" || admission.evicted === undefined) return assert.fail("expected an eviction");
+    assert.strictEqual(admission.evicted.session, "a1");
+    assert.strictEqual(admission.evicted.slot.protocolVersion, "2025-11-25");
+    // a1 (being ended) and d's reservation both count.
+    assert.strictEqual(owners.size(), 4);
+    assert.strictEqual(owners.use("a1", "a", 2000), undefined);
+    owners.ended(admission.evicted, true);
+    owners.settle(admission.reservation, "d", "d1", undefined, 2000);
+    assert.strictEqual(owners.size(), 3);
+  });
+
+  it("keeps a session that could not be ended, and never ends a busy one", () => {
+    const owners = makeSessionOwners(limits);
+    const first = owners.admit("a", 0);
+    if (first._tag === "Admitted") owners.settle(first.reservation, "a", "a1", undefined, 0);
+    const second = owners.admit("a", 0);
+    if (second._tag === "Admitted") owners.settle(second.reservation, "a", "a2", undefined, 0);
+    const busy = owners.use("a2", "a", 0);
+    assert.isDefined(busy);
+    const admission = owners.admit("a", 5000);
+    assert.strictEqual(admission._tag, "Admitted");
+    if (admission._tag !== "Admitted" || admission.evicted === undefined) return assert.fail("expected an eviction");
+    assert.strictEqual(admission.evicted.session, "a1");
+    owners.ended(admission.evicted, false);
+    owners.settle(admission.reservation, "a", undefined, undefined, 5000);
+    assert.isDefined(owners.use("a1", "a", 5000));
+    // Both sessions are now busy: nothing can be ended.
+    assert.strictEqual(owners.admit("a", 10_000)._tag, "SubjectFull");
   });
 });

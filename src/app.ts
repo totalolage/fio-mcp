@@ -78,16 +78,16 @@ const UNAUTHENTICATED_WARNING =
   "SECURITY WARNING: FIO_MCP_ALLOW_UNAUTHENTICATED=true. /mcp accepts every request without authentication and gives it full access to every account, including payment orders. Anyone who can reach this port can use your bank tools. Set FIO_MCP_PUBLIC_URL and FIO_MCP_ADMIN_PASSWORD_HASH_FILE to require OAuth.";
 
 /** /mcp authentication: the embedded OAuth server, or (escape hatch) none. */
-export const httpAuthLive = (auth: HttpAuthConfig) =>
+export const httpAuthLive = (auth: HttpAuthConfig, trustedProxies: HttpTransportConfig["trustedProxies"]) =>
   auth.kind === "oauth"
-    ? OAuthLive({ publicUrl: auth.publicUrl, passwordHash: auth.passwordHash }).pipe(
+    ? OAuthLive({ publicUrl: auth.publicUrl, passwordHash: auth.passwordHash, trustedProxies }).pipe(
         Layer.provide(DatabaseLive),
         Layer.provide(NodeFileSystem.layer),
       )
     : Layer.merge(Auth.layerOpen, Layer.effectDiscard(Effect.logWarning(UNAUTHENTICATED_WARNING)));
 
 export const HttpAppLive = (config: HttpTransportConfig) =>
-  withServices(serveHttp(ToolsLive, httpAuthLive(config.auth), SERVER_INFO, config));
+  withServices(serveHttp(ToolsLive, httpAuthLive(config.auth, config.trustedProxies), SERVER_INFO, config));
 
 /** The transport selected by FIO_MCP_TRANSPORT. */
 export const AppLive = Layer.unwrap(

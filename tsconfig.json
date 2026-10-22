@@ -36,6 +36,7 @@
           "effect/FileSystem",
           "effect/ai",
           "effect/http",
+          "effect/net",
           "effect/sql",
           "effect/schema",
           "@effect/sql-sqlite-node",
