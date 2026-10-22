@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { assert, describe, it } from "@effect/vitest";
@@ -98,7 +98,49 @@ describe("loadConfig", () => {
         "Set either FIO_ACCOUNTS or FIO_ACCOUNTS_FILE, not both",
       );
       const missing = yield* configError({ FIO_TOKEN_FILE: "/nonexistent/fio-token" });
-      assert.strictEqual(missing, "FIO_TOKEN_FILE: cannot read /nonexistent/fio-token");
+      assert.strictEqual(missing, "FIO_TOKEN_FILE: file not readable");
+    }),
+  );
+
+  it.effect("never echoes the value or path of a *_FILE variable", () =>
+    Effect.gen(function* () {
+      // A token pasted into a _FILE variable is read as a path; it must not be printed.
+      const pasted = "Xq7LmR2vT9bWc4NzK8pJd3HsF6gYa1UeQ5oVi0nZrM2tB7xLw4kCj9hPy3sDf8Ga";
+      const pastedDir = join(mkdtempSync(join(tmpdir(), "fio-mcp-config-")), pasted);
+      mkdirSync(pastedDir);
+      const fileIn = (content: string) => {
+        const path = join(pastedDir, `secret-${content.length}`);
+        writeFileSync(path, content, { mode: 0o440 });
+        return path;
+      };
+      const http = {
+        FIO_TOKEN: READ_TOKEN,
+        FIO_MCP_TRANSPORT: "http",
+        FIO_MCP_PUBLIC_URL: "https://fio.example.test",
+      };
+      const attempts: Array<[Record<string, string>, string]> = [
+        [{ FIO_TOKEN_FILE: pasted }, "FIO_TOKEN_FILE: file not readable"],
+        [{ FIO_TOKEN_FILE: fileIn("\n") }, "FIO_TOKEN_FILE: file is empty"],
+        [{ FIO_ACCOUNTS_FILE: pasted }, "FIO_ACCOUNTS_FILE: file not readable"],
+        [{ FIO_ACCOUNTS_FILE: fileIn("  \n") }, "FIO_ACCOUNTS_FILE: file is empty"],
+        [{ ...http, FIO_MCP_ADMIN_PASSWORD_HASH_FILE: pasted }, "FIO_MCP_ADMIN_PASSWORD_HASH_FILE: file not readable"],
+        [
+          { ...http, FIO_MCP_ADMIN_PASSWORD_HASH_FILE: fileIn("") },
+          "FIO_MCP_ADMIN_PASSWORD_HASH_FILE: file must contain exactly one hash line",
+        ],
+        [
+          { ...http, FIO_MCP_ADMIN_PASSWORD_HASH_FILE: fileIn("not-a-hash") },
+          "FIO_MCP_ADMIN_PASSWORD_HASH_FILE: file is not a fio-mcp password hash ($scrypt$ln=…,r=…,p=…$salt$hash); create one with `fio-mcp hash-password`",
+        ],
+      ];
+      for (const [env, expected] of attempts) {
+        const error = yield* Effect.flip(loadConfigFrom(env));
+        assert.instanceOf(error, ConfigError);
+        assert.strictEqual(error.message, expected);
+        for (const output of [error.message, error.detail, String(error), JSON.stringify(error)]) {
+          assert.notInclude(output, pasted.slice(0, 20), JSON.stringify(Object.keys(env)));
+        }
+      }
     }),
   );
 
