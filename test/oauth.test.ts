@@ -474,11 +474,12 @@ describe("authorization endpoint", () => {
 
   it("shows an error page (no redirect) for malformed redirect URIs", async () => {
     const params = await validParams();
-    for (const uri of MALFORMED_REDIRECTS) {
-      const response = await harness.fetch(authorizationUrl({ ...params, redirect_uri: uri }));
-      expect(response.status, uri).toBe(400);
-      expect(response.headers.get("location"), uri).toBeNull();
-      expect(response.headers.get("content-type"), uri).toContain("text/html");
+    // A protocol error (plain PKCE) would otherwise be redirected to the presented URI.
+    for (const [uri, method] of MALFORMED_REDIRECTS.flatMap((uri) => [[uri, "plain"], [uri, "S256"]] as const)) {
+      const response = await harness.fetch(authorizationUrl({ ...params, redirect_uri: uri, code_challenge_method: method }));
+      expect(response.status, `${uri} ${method}`).toBe(400);
+      expect(response.headers.get("location"), `${uri} ${method}`).toBeNull();
+      expect(response.headers.get("content-type"), `${uri} ${method}`).toContain("text/html");
     }
   });
 
