@@ -9,6 +9,7 @@ import { AppConfig } from "../config.js";
 import { InvalidInput } from "../errors.js";
 import { Redactor } from "../redaction.js";
 import { annotateTool, DateParam, JsonObject, ToolFailure, withAccount } from "./common.js";
+import { permittedAccount, READ, requireScopes, visibleAccounts } from "./permissions.js";
 
 /**
  * Tools answered from the local cache only. They never call FIO, so they
@@ -166,8 +167,8 @@ export const makeCacheHandlers = Effect.fn("CacheTools.handlers")(function* (too
 
   /** The account, its verified bank account key, and the range the filters span. */
   const scope = Effect.fnUntraced(function* (name: string | undefined, args: FilterArgs) {
+    const account = yield* permittedAccount(accounts, name);
     const cache = yield* enabled;
-    const account = yield* accounts.resolve(name);
     yield* checkFilters(args);
     const accountKey = yield* cache.boundAccount(account);
     const today = yield* pragueToday;
@@ -264,6 +265,7 @@ export const makeCacheHandlers = Effect.fn("CacheTools.handlers")(function* (too
     get_cache_status: () =>
       out(
         Effect.gen(function* () {
+          yield* requireScopes(READ);
           const cache = yield* enabled;
           return {
             dbPath: config.cache.dbPath,
@@ -274,7 +276,7 @@ export const makeCacheHandlers = Effect.fn("CacheTools.handlers")(function* (too
               overlapDays: config.cache.overlapDays,
               maxAgeMinutes: config.cache.maxAgeMinutes,
             },
-            accounts: yield* Effect.forEach(accounts.list, (account) => accountStatus(cache, account)),
+            accounts: yield* Effect.forEach(yield* visibleAccounts(accounts.list), (account) => accountStatus(cache, account)),
           };
         }),
       ),
@@ -282,8 +284,8 @@ export const makeCacheHandlers = Effect.fn("CacheTools.handlers")(function* (too
     sync_transactions: ({ account: name, mode, from }) =>
       out(
         Effect.gen(function* () {
+          const account = yield* permittedAccount(accounts, name);
           const cache = yield* enabled;
-          const account = yield* accounts.resolve(name);
           if (from !== undefined && mode !== "backfill") {
             return yield* new InvalidInput({ detail: "`from` applies to mode=backfill only." });
           }
