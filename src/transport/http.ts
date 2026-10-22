@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 import { createServer } from "node:http";
 import { NodeHttpServer } from "@effect/platform-node";
-import { ByteSize, Clock, Context, Effect, Exit, Layer, Predicate, Result, Schema, type Scope, Stream, type Types } from "effect";
+import { ByteSize, Clock, Context, Effect, Exit, Fiber, Layer, Predicate, Result, Schema, type Scope, Stream, type Types } from "effect";
 import { McpServer } from "effect/ai";
 import { Headers, HttpBody, HttpEffect, HttpMiddleware, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 import type { TransportConfig } from "../config.js";
@@ -121,7 +121,7 @@ export const SESSION_LIMITS: SessionLimits = {
 export const MAX_BODY_BYTES = 1024 * 1024;
 /** Largest initialize request: McpServer keeps its client info for the session's lifetime. */
 export const MAX_INITIALIZE_BODY_BYTES = 64 * 1024;
-/** Requests one subject may have in flight at once; each may hold a body of MAX_BODY_BYTES. */
+/** Requests (until their response is written) one subject may have at once; each may hold a body of MAX_BODY_BYTES. */
 export const MAX_CONCURRENT_REQUESTS = 16;
 
 /** A session slot: the subject (OAuth grant) holding it and its use. */
@@ -407,10 +407,12 @@ const mcpAuth = HttpRouter.middleware(
           yield* Effect.logInfo(`mcp: ended an idle session to make room (${sessions.size()} sessions tracked)`);
         }
       }
-      // McpServer sets a new session's id in a pre-response handler; ours is
-      // appended after it and runs even when the response fails or the
-      // client went away.
-      return yield* handle.pipe(Effect.ensuring(settleOnResponse(reservation, subject)));
+      // McpServer creates the session and sets its id in a pre-response
+      // handler. Run in a fiber of its own and joined uninterruptibly, a
+      // client that goes away cannot interrupt it in between; ours is then
+      // appended after McpServer's and runs even when the client is gone.
+      const fiber = yield* Effect.forkChild(handle);
+      return yield* Fiber.join(fiber).pipe(Effect.ensuring(settleOnResponse(reservation, subject)));
     });
 
     const serve = Effect.fnUntraced(function* (
@@ -431,11 +433,13 @@ const mcpAuth = HttpRouter.middleware(
         }
       }
       if (session !== undefined) {
-        const slot = sessions.use(session, subject, yield* Clock.currentTimeMillis);
-        if (slot === undefined) return unknownSession;
-        const response = yield* handle.pipe(
-          Effect.ensuring(Effect.map(Clock.currentTimeMillis, (now) => sessions.done(slot, now))),
+        // In use until the request scope closes, after a streamed response is written.
+        const slot = yield* Effect.acquireRelease(
+          Effect.map(Clock.currentTimeMillis, (now) => sessions.use(session, subject, now)),
+          (slot) => (slot === undefined ? Effect.void : Effect.map(Clock.currentTimeMillis, (now) => sessions.done(slot, now))),
         );
+        if (slot === undefined) return unknownSession;
+        const response = yield* handle;
         if (request.method === "DELETE" && response.status < 300) sessions.forget(session);
         return response;
       }
@@ -457,18 +461,25 @@ const mcpAuth = HttpRouter.middleware(
         return failure._tag === "AuthUnavailable" ? unavailable : unauthorized(failure.challenge);
       }
       const subject = principal.success.subject;
-      const running = inFlight.get(subject) ?? 0;
-      if (running >= MAX_CONCURRENT_REQUESTS) return tooManyRequests;
-      inFlight.set(subject, running + 1);
-      return yield* serve(request, principal.success, httpEffect).pipe(
-        Effect.ensuring(
-          Effect.sync(() => {
-            const left = (inFlight.get(subject) ?? 1) - 1;
-            if (left === 0) inFlight.delete(subject);
-            else inFlight.set(subject, left);
-          }),
-        ),
+      // Held until the request scope closes, after a streamed response is written.
+      const admitted = yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          const running = inFlight.get(subject) ?? 0;
+          if (running >= MAX_CONCURRENT_REQUESTS) return false;
+          inFlight.set(subject, running + 1);
+          return true;
+        }),
+        (admitted) =>
+          admitted
+            ? Effect.sync(() => {
+                const left = (inFlight.get(subject) ?? 1) - 1;
+                if (left === 0) inFlight.delete(subject);
+                else inFlight.set(subject, left);
+              })
+            : Effect.void,
       );
+      if (!admitted) return tooManyRequests;
+      return yield* serve(request, principal.success, httpEffect);
     });
   }),
 );
