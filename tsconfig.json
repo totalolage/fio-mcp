@@ -3,8 +3,12 @@
     "target": "ES2022",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "lib": ["ES2023"],
-    "types": ["node"],
+    "lib": [
+      "ES2023"
+    ],
+    "types": [
+      "node"
+    ],
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "noImplicitOverride": true,
@@ -23,7 +27,17 @@
         "name": "@effect/language-service",
         "ignoreEffectWarningsInTscExitCode": false,
         "ignoreEffectErrorsInTscExitCode": false,
-        "allowedUnstableApis": ["@effect/vitest", "effect/testing", "effect/FileSystem", "effect/ai", "effect/http", "effect/sql", "effect/schema", "@effect/sql-sqlite-node", "@effect/platform-node"],
+        "allowedUnstableApis": [
+          "@effect/vitest",
+          "effect/testing",
+          "effect/FileSystem",
+          "effect/ai",
+          "effect/http",
+          "effect/sql",
+          "effect/schema",
+          "@effect/sql-sqlite-node",
+          "@effect/platform-node"
+        ],
         "diagnosticSeverity": {
           "schemaClassMissingBrand": "off",
           "floatingEffect": "error",
@@ -53,10 +67,30 @@
           "extendsNativeError": "error",
           "layerMergeAllWithDependencies": "error",
           "leakingRequirements": "warning"
-        }
+        },
+        "overrides": [
+          {
+            "include": [
+              "test/**/*.ts"
+            ],
+            "options": {
+              "diagnosticSeverity": {
+                "asyncFunction": "off"
+              }
+            }
+          }
+        ]
       }
     ]
   },
-  "include": ["src", "test", "scripts", "vitest.config.ts"],
-  "exclude": ["node_modules", "dist"]
+  "include": [
+    "src",
+    "test",
+    "scripts",
+    "vitest.config.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist"
+  ]
 }

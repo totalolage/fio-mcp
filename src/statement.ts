@@ -111,8 +111,11 @@ const PRAGUE_DATE = new Intl.DateTimeFormat("en-CA", {
   day: "2-digit",
 });
 
-function pragueDate(ms: number): string {
-  return PRAGUE_DATE.format(new Date(ms));
+// Date accepts at most ±8.64e15 ms; anything beyond has no calendar date.
+const MAX_EPOCH_MS = 8.64e15;
+
+function pragueDate(ms: number): string | null {
+  return Math.abs(ms) > MAX_EPOCH_MS ? null : PRAGUE_DATE.format(new Date(ms));
 }
 
 function toNumber(value: unknown): number | null {

@@ -79,6 +79,8 @@ describe("statement normalisation", () => {
     expect(toDate(1340661600000)).toBe("2012-06-26");
     expect(toDate("2024-01-05+0100")).toBe("2024-01-05");
     expect(toDate(null)).toBeNull();
+    // Outside the JavaScript date range: no date rather than a RangeError.
+    expect(toDate(1e20)).toBeNull();
   });
 });
 
