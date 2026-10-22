@@ -12,7 +12,7 @@ import { cacheFailure } from "./db.js";
  * a FIO response verified. Every SqlError becomes a CacheError (cause logged).
  */
 
-export type SyncMode = "backfill" | "incremental";
+export type SyncMode = "backfill" | "incremental" | "refresh";
 
 export interface SyncState {
   readonly accountKey: string | null;
@@ -111,6 +111,12 @@ export interface CommitInput {
    */
   readonly coverage?: DayRange | undefined;
   readonly fetchedAt: number;
+  /**
+   * Also delete cached movements on the covered days that the response no
+   * longer lists. A /periods response is FIO's whole list for its period, so a
+   * movement missing from it was cancelled or moved to another day.
+   */
+  readonly replace?: boolean | undefined;
   /** Sync state to persist in the same transaction. */
   readonly syncState?: SyncState | undefined;
 }
@@ -118,6 +124,8 @@ export interface CommitInput {
 export interface CommitResult {
   readonly accountKey: string;
   readonly rowsWritten: number;
+  /** Movements deleted because a `replace` response no longer lists them. */
+  readonly rowsDeleted: number;
   /** The days recorded as covered. */
   readonly coverage: DayRange | undefined;
 }
@@ -351,7 +359,7 @@ export const makeCacheStore = Effect.fn("CacheStore.make")(function* () {
       if (row === undefined) return emptySyncState;
       return {
         accountKey: row.account_key,
-        mode: row.mode === "backfill" || row.mode === "incremental" ? row.mode : null,
+        mode: row.mode === "backfill" || row.mode === "incremental" || row.mode === "refresh" ? row.mode : null,
         pending: yield* decodeRanges(row.pending_json),
         blocked: yield* decodeRanges(row.blocked_json),
         failedDays: yield* decodeDays(row.failed_days_json),
@@ -471,6 +479,16 @@ export const makeCacheStore = Effect.fn("CacheStore.make")(function* () {
             `;
           }
           const coverage = coveredBy(input.coverage, info);
+          let rowsDeleted = 0;
+          if (input.replace === true && coverage !== undefined) {
+            const deleted = yield* sql<{ movement_id: number }>`
+              DELETE FROM transactions
+              WHERE account_key = ${accountKey} AND date >= ${coverage.from} AND date <= ${coverage.to}
+                AND movement_id NOT IN (SELECT value FROM json_each(${JSON.stringify(rows.map((tx) => tx.id))}))
+              RETURNING movement_id
+            `;
+            rowsDeleted = deleted.length;
+          }
           if (coverage !== undefined) {
             const days = eachDay(coverage).map((day) => ({ account_key: accountKey, day, fetched_at: now }));
             for (const batch of chunks(days, DAY_BATCH)) {
@@ -483,7 +501,7 @@ export const makeCacheStore = Effect.fn("CacheStore.make")(function* () {
           if (input.syncState !== undefined) {
             yield* writeSyncState(input.tokenFingerprint, { ...input.syncState, accountKey });
           }
-          return { accountKey, rowsWritten: rows.length, coverage } satisfies CommitResult;
+          return { accountKey, rowsWritten: rows.length, rowsDeleted, coverage } satisfies CommitResult;
         }),
       );
     },

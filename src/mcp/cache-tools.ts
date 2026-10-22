@@ -4,7 +4,7 @@ import { type Account, Accounts } from "../accounts.js";
 import { type DayRange, minDate, pragueToday } from "../cache/dates.js";
 import { CACHE_DISABLED, type EnabledCache, TransactionCache } from "../cache/service.js";
 import type { GroupBy, TransactionFilters } from "../cache/store.js";
-import { historyUnlockMessage, type JobProgress } from "../cache/sync.js";
+import { historyUnlockMessage, type JobProgress, type SyncRequest } from "../cache/sync.js";
 import { AppConfig } from "../config.js";
 import { InvalidInput } from "../errors.js";
 import { Redactor } from "../redaction.js";
@@ -100,10 +100,16 @@ export function makeCacheToolkit(accountNames: ReadonlyArray<string>) {
   const SyncTransactions = annotateTool(
     tool(
       "sync_transactions",
-      "Fetch movements from FIO into the cache in the background (date-range downloads only; the download marker is never moved). mode=incremental (default) re-fetches the recent days; mode=backfill fetches all missing history from `from` (default: the configured backfill start) and retries history FIO refused earlier. FIO allows one request per 30 s, so a long backfill takes minutes; this call waits briefly and returns the job status. Joins the job already running for this account.",
+      "Fetch movements from FIO into the cache in the background (date-range downloads only; the download marker is never moved). mode=incremental (default) re-fetches the recent days; mode=backfill fetches all missing history from `from` (default: the configured backfill start) and retries history FIO refused earlier, skipping days already cached. `refresh` (instead of mode/from) re-downloads the given days even if cached, updates changed movements and deletes the ones FIO no longer lists; days older than 90 days need a history unlock first. FIO allows one request per 30 s, so a long backfill takes minutes; this call waits briefly and returns the job status. Joins the job already running for this account.",
       params({
         mode: Schema.optionalKey(Schema.Literals(["incremental", "backfill"])),
         from: Schema.optionalKey(DateParam("For mode=backfill: first day to fetch (YYYY-MM-DD).")),
+        refresh: Schema.optionalKey(
+          Schema.Struct({
+            from: DateParam("First day to re-download (YYYY-MM-DD)."),
+            to: DateParam("Last day to re-download (YYYY-MM-DD); days after today are ignored."),
+          }).annotate({ description: "Re-download these days even if they are cached. Not combinable with mode or from." }),
+        ),
       }),
     ),
     { title: "Sync transactions into the cache", readOnly: false, idempotent: true, openWorld: true },
@@ -281,7 +287,7 @@ export const makeCacheHandlers = Effect.fn("CacheTools.handlers")(function* (too
         }),
       ),
 
-    sync_transactions: ({ account: name, mode, from }) =>
+    sync_transactions: ({ account: name, mode, from, refresh }) =>
       out(
         Effect.gen(function* () {
           const account = yield* permittedAccount(accounts, name);
@@ -291,10 +297,18 @@ export const makeCacheHandlers = Effect.fn("CacheTools.handlers")(function* (too
           }
           const today = yield* pragueToday;
           if (from !== undefined && from > today) return yield* new InvalidInput({ detail: "`from` is in the future." });
-          const started = yield* cache.sync.start(
-            account,
-            mode === "backfill" ? { kind: "backfill", from, retryFailed: true } : { kind: "incremental" },
-          );
+          let request: SyncRequest = mode === "backfill" ? { kind: "backfill", from, retryFailed: true } : { kind: "incremental" };
+          if (refresh !== undefined) {
+            if (mode !== undefined || from !== undefined) {
+              return yield* new InvalidInput({ detail: "`refresh` cannot be combined with `mode` or `from`." });
+            }
+            if (refresh.from > refresh.to) {
+              return yield* new InvalidInput({ detail: "`refresh.from` must not be after `refresh.to`." });
+            }
+            if (refresh.from > today) return yield* new InvalidInput({ detail: "`refresh.from` is in the future." });
+            request = { kind: "refresh", range: { from: refresh.from, to: refresh.to } };
+          }
+          const started = yield* cache.sync.start(account, request);
           const job = Option.getOrElse(yield* cache.sync.awaitJob(account, config.maxWaitMs), () => started.progress);
           const note =
             job.status === "running"
@@ -303,8 +317,10 @@ export const makeCacheHandlers = Effect.fn("CacheTools.handlers")(function* (too
           return {
             account: account.name,
             joinedRunningJob: started.joined,
-            ...(started.joined && mode !== undefined && started.progress.kind !== mode
-              ? { warning: `A ${started.progress.kind} job was already running; it was joined instead of starting ${mode}.` }
+            ...(started.joined && (mode !== undefined || refresh !== undefined) && started.progress.kind !== request.kind
+              ? {
+                  warning: `A ${started.progress.kind} job was already running; it was joined instead of starting ${request.kind}.`,
+                }
               : {}),
             job: formatJob(job),
             note,

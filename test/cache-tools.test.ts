@@ -177,6 +177,43 @@ describe("cache query tools", () => {
       }).pipe(Effect.provide(Layer.mergeAll(cacheLayer(config(), fio.api), LocalPrincipalLive)));
     }),
   );
+  it.effect("sync_transactions refresh re-downloads cached days and validates its range", () =>
+    Effect.gen(function* () {
+      yield* setNow();
+      const fio = yield* fakeFio(serveFrom(fixture));
+      yield* Effect.gen(function* () {
+        yield* seed;
+        const tools = yield* cacheTools;
+        yield* fio.setScript(serveFrom(fixture.map((t) => (t.id === 7 ? { ...t, amount: -1200 } : t))));
+
+        const invalid = [
+          { refresh: { from: "2026-03-01", to: TODAY }, mode: "backfill" as const },
+          { refresh: { from: "2026-03-01", to: TODAY }, from: "2026-03-01" },
+          { refresh: { from: TODAY, to: "2026-03-01" } },
+          { refresh: { from: "2026-10-23", to: "2026-10-30" } },
+        ];
+        for (const args of invalid) assert.instanceOf(yield* Effect.flip(tools.sync_transactions(args)), InvalidInput);
+        assert.deepStrictEqual(yield* Ref.get(fio.calls), []);
+
+        // A backfill skips the cached days, so the old amount stays.
+        yield* tools.sync_transactions({ mode: "backfill", from: "2026-03-01" });
+        assert.deepStrictEqual(yield* Ref.get(fio.calls), []);
+        const before = yield* tools.search_transactions({ text: "Rent March" });
+        assert.deepStrictEqual((before.transactions as ReadonlyArray<{ amount: number }>).map((t) => t.amount), [-1000]);
+
+        const synced = yield* tools.sync_transactions({ refresh: { from: "2026-03-01", to: TODAY } });
+        const job = synced.job as { status: string; kind: string };
+        assert.strictEqual(job.status, "completed");
+        assert.strictEqual(job.kind, "refresh");
+        assert.deepStrictEqual(
+          (yield* Ref.get(fio.calls)).map((c) => [c.from, c.to, c.priority]),
+          [["2026-03-01", TODAY, "background"]],
+        );
+        const after = yield* tools.search_transactions({ text: "Rent March" });
+        assert.deepStrictEqual((after.transactions as ReadonlyArray<{ amount: number }>).map((t) => t.amount), [-1200]);
+      }).pipe(Effect.provide(Layer.mergeAll(cacheLayer(config(), fio.api), LocalPrincipalLive)));
+    }),
+  );
 });
 
 describe("get_transactions with the cache", () => {
