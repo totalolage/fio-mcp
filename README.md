@@ -283,10 +283,10 @@ HTTP mode is protected by OAuth, with fio-mcp as its own authorization server (M
 
 ### Setup
 
-1. Create the admin password hash. On a terminal it asks twice and does not echo; a piped password is read once. Minimum 12 characters. Only the hash goes to standard output; prompts and errors go to standard error. With Docker, pipe the password in with `-i` and leave out `-t`: a TTY merges both streams, so the prompts would land in the file and fio-mcp would reject it.
+1. Create the admin password hash. On a terminal it asks twice and does not echo; a piped password is read once. Minimum 12 characters. Only the hash goes to standard output; prompts and errors go to standard error. With Docker, pipe the password in with `-i` and leave out `-t`: a TTY merges both streams, so the prompts would land in the file and fio-mcp would reject it. In Bash:
 
-   ```sh
-   read -rs -p 'Admin password: ' pw && echo
+   ```bash
+   IFS= read -rs -p 'Admin password: ' pw && echo
    printf '%s\n' "$pw" | docker run --rm -i <image> hash-password > admin.hash; unset pw
    # or, outside Docker: fio-mcp hash-password > admin.hash
    ```
@@ -313,7 +313,7 @@ Every tool stays listed. A call outside the grant answers "You don't have permis
 | `/login`, `/consent` | Sign-in and consent pages |
 | `/token` | Code exchange and refresh |
 | `/revoke` | Token revocation (RFC 7009) |
-| `/mcp` | MCP; `Authorization: Bearer <access token>`. Without a valid token: 401 with `WWW-Authenticate: Bearer resource_metadata="<public url>/.well-known/oauth-protected-resource/mcp", scope="fio:read"`, followed by `, error="invalid_request"` for a malformed `Authorization` header or `, error="invalid_token"` for an unknown, expired or revoked token |
+| `/mcp` | MCP; `Authorization: Bearer <access token>`. Without a valid token: 401 with `WWW-Authenticate: Bearer resource_metadata="<public url>/.well-known/oauth-protected-resource/mcp", scope="fio:read"`, with no `error` when `Authorization` is missing or empty, `, error="invalid_request"` when it is not a Bearer token, and `, error="invalid_token"` for a token that is unknown, expired, revoked or issued for another resource |
 
 - **Clients** register without a secret. Redirect URIs must be https, or http on a loopback address (`127.0.0.1`, `[::1]`, `localhost`) on any port; they must match exactly except for the loopback port. Client ID metadata documents are not supported, because the server never fetches URLs. At most 100 clients and 20 registrations per hour; a client that never completes a sign-in is removed after an hour, and one without a live grant 24 hours after its last use.
 - **Tokens** are random and stored only as SHA-256 hashes. Authorization codes are single-use and live 60 s; access tokens 1 hour; refresh tokens 30 days, rotated on every use. Reusing an old refresh token or an authorization code revokes the whole grant. Tokens are bound to the audience `<public url>/mcp`, and every token request, refresh included, must name it as `resource`.
@@ -336,7 +336,7 @@ Forward the whole host, or at least `/mcp`, `/.well-known/oauth-protected-resour
 
 Set `FIO_MCP_TRUSTED_PROXIES` to the proxy's address as fio-mcp sees it:
 
-- **Traefik connects through a published port** (Docker NAT, as on TrueNAS): connections arrive from the gateway of fio-mcp's Docker network, not from Traefik's container (`docker network inspect <network> --format '{{(index .IPAM.Config 0).Gateway}}'`). `172.16.0.0/12` covers the 172.17.0.0/16 to 172.31.0.0/16 networks that Docker hands out first from its default address pools, so it keeps working when the network is recreated with another subnet (later networks come from 192.168.0.0/16; check the gateway). Trade-off: any container on those networks can choose its own throttling key.
+- **Traefik connects through a published port** (Docker NAT): on the TrueNAS setup above, connections arrive from the gateway of fio-mcp's Docker network, not from Traefik's container (`docker network inspect <network> --format '{{(index .IPAM.Config 0).Gateway}}'`). `172.16.0.0/12` covers the 172.17.0.0/16 to 172.31.0.0/16 networks that Docker hands out first from its default address pools, so it keeps working when the network is recreated with another subnet (later networks come from 192.168.0.0/16). Whether the source address is rewritten depends on Docker's proxy and masquerading settings, so check the gateway and your setup. Trade-off: any container on those networks can choose its own throttling key.
 - **Traefik shares a Docker network with fio-mcp** and connects to the container directly: use Traefik's container address on that network (`docker inspect <traefik> --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}'`). Give it a static address, or trust the network's subnet (`docker network inspect <network> --format '{{(index .IPAM.Config 0).Subnet}}'`); then any container on that network can choose its own throttling key, so prefer a network shared only by Traefik and fio-mcp.
 
 Traefik appends the client's address to `X-Forwarded-For`; addresses a client adds itself sit further left and are ignored.

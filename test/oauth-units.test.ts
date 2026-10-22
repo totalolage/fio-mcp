@@ -434,10 +434,9 @@ describe("sign-in scrypt bound", () => {
       const guard = yield* makeLoginGuard(Redacted.make(parsed), DEFAULT_THROTTLE, verify);
       const wrong = Redacted.make("the wrong password");
       const fibers = yield* Effect.forEach(Array.from({ length: 10 }, (_, i) => `10.0.0.${i}`), (address) =>
-        Effect.forkChild(guard.attempt(address, wrong)),
+        Effect.forkChild(guard.attempt(address, wrong), { startImmediately: true }),
       );
       yield* Deferred.await(entered);
-      for (let i = 0; i < 20; i++) yield* Effect.yieldNow;
       // Released before any assertion: the admitted check is uninterruptible.
       yield* Deferred.succeed(release, undefined);
       const results = yield* Effect.forEach(fibers, Fiber.join);
