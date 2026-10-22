@@ -5,8 +5,6 @@ export class RateLimitedError extends Error {
   constructor(
     readonly retryAfterSeconds: number,
     reason: string,
-    /** HTTP status FIO returned, when the limit came from the server (409) rather than the local queue. */
-    readonly observedStatus?: number,
   ) {
     super(`Rate limited: ${reason} Retry after ${retryAfterSeconds} s.`);
   }
@@ -35,9 +33,14 @@ export class FioApiError extends Error {
   }
 }
 
-/** Raised when an account no longer has (or never had) a capability. */
-export class CapabilityError extends Error {
-  override name = "CapabilityError";
+export const PERMISSION_DENIED = "You don't have permissions to do that.";
+
+/** FIO refused the call because the token may not do it. The message leads with PERMISSION_DENIED. */
+export class PermissionDeniedError extends Error {
+  override name = "PermissionDeniedError";
+  constructor(detail: string) {
+    super(`${PERMISSION_DENIED}\n${detail}`);
+  }
 }
 
 /** Maps a non-2xx HTTP status to the meaning documented in PDF §8. */

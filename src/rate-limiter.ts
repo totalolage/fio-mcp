@@ -55,7 +55,7 @@ export class TokenRateLimiter {
     } catch (error) {
       if (!isConflict(error)) throw error;
       this.block();
-      await this.acquire(deadline, signal, true, "FIO returned HTTP 409 (the token was used elsewhere within the last 30 s).", 409);
+      await this.acquire(deadline, signal, true, "FIO returned HTTP 409 (the token was used elsewhere within the last 30 s).");
       try {
         return await fn();
       } catch (retryError) {
@@ -64,7 +64,6 @@ export class TokenRateLimiter {
         throw new RateLimitedError(
           Math.ceil(this.options.intervalMs / 1000),
           "FIO returned HTTP 409 twice; another client is probably using this token.",
-          409,
         );
       }
     }
@@ -96,17 +95,11 @@ export class TokenRateLimiter {
     this.reschedule();
   }
 
-  private acquire(
-    deadline: number,
-    signal: AbortSignal | undefined,
-    front: boolean,
-    reason?: string,
-    observedStatus?: number,
-  ): Promise<void> {
+  private acquire(deadline: number, signal: AbortSignal | undefined, front: boolean, reason?: string): Promise<void> {
     const now = Date.now();
     const start = front ? Math.max(now, this.readyAt()) : this.projectedStart(now);
     if (start > deadline) {
-      return Promise.reject(this.tooLate(start - now, reason, observedStatus));
+      return Promise.reject(this.tooLate(start - now, reason));
     }
     if (signal?.aborted) return Promise.reject(signal.reason ?? new Error("Aborted"));
     return new Promise<void>((resolve, reject) => {
@@ -126,12 +119,11 @@ export class TokenRateLimiter {
     });
   }
 
-  private tooLate(waitMs: number, reason?: string, observedStatus?: number): RateLimitedError {
+  private tooLate(waitMs: number, reason?: string): RateLimitedError {
     return new RateLimitedError(
       Math.max(1, Math.ceil(waitMs / 1000)),
       reason ??
         `FIO allows one request per ${Math.round(this.options.intervalMs / 1000)} s per token and the next free slot is ${Math.ceil(waitMs / 1000)} s away.`,
-      observedStatus,
     );
   }
 

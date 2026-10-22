@@ -137,13 +137,11 @@ export function baseConfig(accounts: ServerConfig["accounts"]): ServerConfig {
 export const readAccount = (name = "personal", token = READ_TOKEN) => ({
   name,
   token,
-  permissions: new Set(["read"] as const),
 });
 
 export const payAccount = (name = "business", token = PAY_TOKEN, accountNumber: string | null = "2400222222") => ({
   name,
   token,
-  permissions: new Set(["read", "payments"] as const),
   ...(accountNumber ? { accountNumber } : {}),
   currency: "CZK",
 });

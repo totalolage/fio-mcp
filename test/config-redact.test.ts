@@ -7,11 +7,9 @@ import { clearSecrets, redact, registerSecret } from "../src/redact.js";
 import { PAY_TOKEN, READ_TOKEN } from "./fixtures.js";
 
 describe("loadConfig", () => {
-  it("defaults a single token to read-only", () => {
+  it("reads a single token with defaults", () => {
     const config = loadConfig({ FIO_TOKEN: READ_TOKEN });
-    expect(config.accounts).toHaveLength(1);
-    expect(config.accounts[0]).toMatchObject({ name: "default", token: READ_TOKEN });
-    expect([...config.accounts[0]!.permissions]).toEqual(["read"]);
+    expect(config.accounts).toEqual([{ name: "default", token: READ_TOKEN, accountNumber: undefined, currency: undefined }]);
     expect(config).toMatchObject({
       baseUrl: "https://fioapi.fio.cz/v1/rest",
       rateLimitIntervalMs: 30_000,
@@ -19,17 +17,15 @@ describe("loadConfig", () => {
     });
   });
 
-  it("reads single-token permissions and account details", () => {
+  it("reads single-token account details", () => {
     const config = loadConfig({
       FIO_TOKEN: PAY_TOKEN,
-      FIO_TOKEN_PERMISSIONS: "read,payments",
       FIO_ACCOUNT_NAME: "main",
       FIO_ACCOUNT_NUMBER: "2400222222",
       FIO_ACCOUNT_CURRENCY: "czk",
       FIO_MAX_WAIT_MS: "10000",
     });
     expect(config.accounts[0]).toMatchObject({ name: "main", accountNumber: "2400222222", currency: "CZK" });
-    expect([...config.accounts[0]!.permissions].sort()).toEqual(["payments", "read"]);
     expect(config.maxWaitMs).toBe(10_000);
   });
 
@@ -37,12 +33,12 @@ describe("loadConfig", () => {
     const config = loadConfig({
       FIO_ACCOUNTS: JSON.stringify([
         { name: "personal", token: READ_TOKEN },
-        { name: "business", token: PAY_TOKEN, permissions: ["read", "payments"] },
+        { name: "business", token: PAY_TOKEN, accountNumber: "2400222222" },
       ]),
     });
-    expect(config.accounts.map((a) => [a.name, [...a.permissions].sort()])).toEqual([
-      ["personal", ["read"]],
-      ["business", ["payments", "read"]],
+    expect(config.accounts.map((a) => [a.name, a.accountNumber])).toEqual([
+      ["personal", undefined],
+      ["business", "2400222222"],
     ]);
   });
 
@@ -51,7 +47,7 @@ describe("loadConfig", () => {
       {},
       { FIO_TOKEN: READ_TOKEN, FIO_ACCOUNTS: "[]" },
       { FIO_ACCOUNTS: `[{"name":"a","token":"${READ_TOKEN}"` },
-      { FIO_ACCOUNTS: JSON.stringify([{ name: "a", token: READ_TOKEN, permissions: "write" }]) },
+      { FIO_ACCOUNTS: JSON.stringify([{ name: "a", token: READ_TOKEN, unknownKey: true }]) },
       { FIO_ACCOUNTS: JSON.stringify([{ name: "a", token: READ_TOKEN }, { name: "a", token: PAY_TOKEN }]) },
       { FIO_ACCOUNTS: JSON.stringify([{ name: "bad name", token: READ_TOKEN }]) },
       { FIO_TOKEN: READ_TOKEN, FIO_RATE_LIMIT_INTERVAL_MS: "soon" },

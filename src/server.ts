@@ -1,19 +1,11 @@
-import { McpServer, type RegisteredTool } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult, ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import {
-  Account,
-  AccountRegistry,
-  classifyFailure,
-  classifyImportResult,
-  recordSuccess,
-  type FailureOutcome,
-  type Operation,
-} from "./accounts.js";
-import type { Capability, ServerConfig } from "./config.js";
-import { CapabilityError, FioApiError, RateLimitedError, ToolInputError } from "./errors.js";
+import { Account, AccountRegistry } from "./accounts.js";
+import type { ServerConfig } from "./config.js";
+import { FioApiError, PermissionDeniedError, RateLimitedError, ToolInputError } from "./errors.js";
 import { MERCHANT_FORMATS, MOVEMENT_FORMATS, STATEMENT_FORMATS, type FetchFn } from "./fio-client.js";
-import { parseImportResponse } from "./import-response.js";
+import { looksLikeMissingPaymentPermission, parseImportResponse } from "./import-response.js";
 import { buildImportXml, paymentOrdersSchema, summarizeOrders, type PaymentOrder } from "./payments.js";
 import { log, redact } from "./redact.js";
 import { parseLastStatement, parseStatementJson } from "./statement.js";
@@ -24,9 +16,9 @@ export const SERVER_VERSION = "0.1.0";
 type Shape = Record<string, z.ZodType>;
 type Args = Record<string, unknown>;
 type Extra = { signal: AbortSignal };
+type Operation = "read" | "import";
 
 interface ToolContext {
-  /** The account the call targets; undefined only for tools without a capability. */
   account: Account;
   args: Args;
   signal: AbortSignal;
@@ -36,9 +28,7 @@ interface ToolDefinition {
   name: string;
   title: string;
   description: string;
-  /** null = always available. */
-  capability: Capability | null;
-  /** Network operation type for permission-loss classification. */
+  /** Network operation type, for error messages. Absent for local-only tools. */
   operation?: Operation;
   annotations: ToolAnnotations;
   shape: Shape;
@@ -54,22 +44,55 @@ const dateParam = (what: string) =>
 const PAYMENT_WARNING =
   "Orders are NOT executed by this call: FIO only queues them as a batch, which an authorized person must then sign in FIO Internetbanking (SMS or Fio signature) before anything is paid. Even so, it creates a real batch in the bank. Only call it after the user has reviewed the exact orders (use preview_payment_orders) and explicitly asked to submit them.";
 
+/** What to tell the user when a payment upload is refused for lack of permission. */
+const PAYMENT_TOKEN_HINT =
+  'Payment orders need a token created with the "Sledování účtu a zadávání platebních a inkasních příkazů" permission (Internetbanking → Nastavení → API).';
+
+const UPLOAD_UNCERTAIN =
+  "The upload may or may not have created a batch. Check the pending batches in FIO Internetbanking before submitting again, or the orders could be duplicated.";
+
+/** Upload failures after which FIO may still have created the batch. */
+const UNCERTAIN_UPLOAD_ERRORS = new Set<FioApiError["kind"]>(["timeout", "network", "bad_response", "http_error"]);
+
 function json(value: unknown): CallToolResult {
   // Redacted too: a bank response echoing a token must not reach the model.
   return { content: [{ type: "text", text: redact(JSON.stringify(value, null, 2)) }] };
 }
 
-const UPLOAD_UNCERTAIN =
-  "The upload may or may not have created a batch. Check the pending batches in FIO Internetbanking before submitting again, or the orders could be duplicated.";
-
 function errorResult(message: string): CallToolResult {
   return { isError: true, content: [{ type: "text", text: redact(message) }] };
+}
+
+/**
+ * Turns FIO's refusals into the permission-denied message. FIO documents no
+ * permission error, so this covers the signals that can only mean the token
+ * may not do this:
+ * - HTTP 401/403 on any call (undocumented, but unambiguous);
+ * - HTTP 500 on a payment upload: FIO's code for a missing or inactive token,
+ *   and the most likely answer to a read-only token trying to upload;
+ * - an upload response refusing the batch on the token's behalf (handled in
+ *   submit_payment_orders via looksLikeMissingPaymentPermission).
+ * HTTP 500 on reads keeps FIO's documented meaning (token missing or inactive).
+ */
+function asPermissionDenied(operation: Operation | undefined, error: unknown): PermissionDeniedError | undefined {
+  if (!(error instanceof FioApiError)) return undefined;
+  if (error.kind === "unauthorized") {
+    return new PermissionDeniedError(
+      `FIO refused this token (HTTP ${error.status}). Check the token and its permission in Internetbanking (Nastavení → API).` +
+        (operation === "import" ? ` ${PAYMENT_TOKEN_HINT}` : ""),
+    );
+  }
+  if (operation === "import" && error.kind === "token_rejected") {
+    return new PermissionDeniedError(
+      `FIO rejected this token for payment orders (HTTP 500): it is read-only, or inactive or expired. ${PAYMENT_TOKEN_HINT}`,
+    );
+  }
+  return undefined;
 }
 
 export interface FioServer {
   server: McpServer;
   registry: AccountRegistry;
-  /** Names of currently registered tools. */
   toolNames(): string[];
 }
 
@@ -78,13 +101,10 @@ export function createFioServer(config: ServerConfig, options: { fetch?: FetchFn
   const server = new McpServer(
     { name: SERVER_NAME, version: SERVER_VERSION },
     {
-      capabilities: { tools: { listChanged: true } },
       instructions:
-        "Tools for FIO Bank accounts (Czech Republic). The tool list reflects the permissions of the configured API tokens and shrinks if FIO rejects a token. FIO allows one request per token every 30 seconds, so batch questions into as few calls as possible. Call get_server_capabilities to see accounts, permissions, and rate-limit state.",
+        "Tools for FIO Bank accounts (Czech Republic). Every tool is listed regardless of what the configured API tokens may do; if a token lacks the permission, the tool answers \"You don't have permissions to do that.\" FIO allows one request per token every 30 seconds, so batch questions into as few calls as possible. Call get_server_status to see accounts and rate-limit state.",
     },
   );
-
-  const registered = new Map<string, { tool: RegisteredTool; accountsKey: string }>();
 
   const definitions: ToolDefinition[] = [
     {
@@ -92,7 +112,6 @@ export function createFioServer(config: ServerConfig, options: { fetch?: FetchFn
       title: "Transactions for a date range",
       description:
         "List account movements between two dates (inclusive, YYYY-MM-DD) with the account header (balances, IBAN). Does not move the download marker. Data older than 90 days requires the owner to unlock history in Internetbanking first.",
-      capability: "read",
       operation: "read",
       annotations: { readOnlyHint: true, openWorldHint: true },
       shape: {
@@ -111,7 +130,6 @@ export function createFioServer(config: ServerConfig, options: { fetch?: FetchFn
       name: "get_statement",
       title: "Official statement",
       description: "Fetch an official account statement by year and statement number, with all its movements.",
-      capability: "read",
       operation: "read",
       annotations: { readOnlyHint: true, openWorldHint: true },
       shape: {
@@ -130,7 +148,6 @@ export function createFioServer(config: ServerConfig, options: { fetch?: FetchFn
       title: "New transactions since last download",
       description:
         "Fetch movements that arrived since the last download. SIDE EFFECT: when the result is non-empty, FIO moves this token's server-side download marker past them, so the same movements will not be returned again (also to other programs using the same token). If a call times out, the marker may have moved anyway; use set_download_marker to rewind. For read-only browsing, prefer get_transactions.",
-      capability: "read",
       operation: "read",
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
       shape: {},
@@ -149,7 +166,6 @@ export function createFioServer(config: ServerConfig, options: { fetch?: FetchFn
       title: "Set the download marker",
       description:
         "Move the server-side marker used by get_new_transactions. Give exactly one of: movementId (the last movement that was downloaded successfully; later ones count as new) or date (the last day whose movements were NOT downloaded successfully; movements from that day onward count as new). Changes state in the bank but moves no money.",
-      capability: "read",
       operation: "read",
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
       shape: {
@@ -171,7 +187,6 @@ export function createFioServer(config: ServerConfig, options: { fetch?: FetchFn
       title: "Latest statement number",
       description:
         "Look up the year and number of the most recent official statement (use with get_statement). FIO does not document the response format; the raw text is included.",
-      capability: "read",
       operation: "read",
       annotations: { readOnlyHint: true, openWorldHint: true },
       shape: {},
@@ -184,7 +199,6 @@ export function createFioServer(config: ServerConfig, options: { fetch?: FetchFn
       name: "export_transactions",
       title: "Raw export",
       description: `Download movements as raw text in one of FIO's export formats. source=period needs dateFrom/dateTo and supports ${MOVEMENT_FORMATS.join(", ")}. source=statement needs year/number and also supports sta (MT940), cba_xml, sba_xml. source=merchant (card/POS transactions for merchants) needs dateFrom/dateTo and supports ${MERCHANT_FORMATS.join(", ")}. FIO recommends one format per token, so prefer the JSON tools unless a specific format is needed.`,
-      capability: "read",
       operation: "read",
       annotations: { readOnlyHint: true, openWorldHint: true },
       shape: {
@@ -231,7 +245,6 @@ export function createFioServer(config: ServerConfig, options: { fetch?: FetchFn
       title: "Preview payment orders (dry run)",
       description:
         "Validate payment orders locally and return the exact Fio XML that submit_payment_orders would upload, with totals. Sends nothing to the bank; FIO validates again on upload. Show the result to the user before submitting.",
-      capability: "payments",
       annotations: { readOnlyHint: true, openWorldHint: false },
       shape: { orders: paymentOrdersSchema },
       run: async ({ account, args }) => {
@@ -250,7 +263,6 @@ export function createFioServer(config: ServerConfig, options: { fetch?: FetchFn
       name: "submit_payment_orders",
       title: "Submit payment orders",
       description: `Upload domestic, euro (SEPA/T2), and foreign payment orders to FIO as one batch. WARNING: ${PAYMENT_WARNING} The response lists FIO's verdict per batch and order.`,
-      capability: "payments",
       operation: "import",
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
       shape: {
@@ -264,9 +276,8 @@ export function createFioServer(config: ServerConfig, options: { fetch?: FetchFn
         const payer = payerFor(account);
         const xml = buildImportXml(orders, payer);
         const result = parseImportResponse(await account.client.importXml(xml, signal));
-        const outcome = classifyImportResult(account, result);
-        if (outcome.revoked.length > 0) {
-          throw new PermissionLost(outcome, `FIO refused the import: ${result.messages.join(" ") || result.errorMeaning}`);
+        if (looksLikeMissingPaymentPermission(result)) {
+          throw new PermissionDeniedError(`FIO refused the upload: "${result.messages.join(" ")}". ${PAYMENT_TOKEN_HINT}`);
         }
         return {
           account: account.name,
@@ -287,117 +298,74 @@ export function createFioServer(config: ServerConfig, options: { fetch?: FetchFn
   function payerFor(account: Account) {
     const accountNumber = account.accountNumber;
     if (!accountNumber) {
-      throw new CapabilityError(
+      throw new ToolInputError(
         `The FIO account number for "${account.name}" is unknown. Configure it (FIO_ACCOUNT_NUMBER or accounts[].accountNumber), or call get_transactions for this account once so the server can read it from the statement header.`,
       );
     }
     return { accountNumber, ...(account.currency ? { currency: account.currency } : {}) };
   }
 
-  function resolveAccount(def: ToolDefinition & { capability: Capability }, requested: unknown): Account {
-    const qualifying = registry.qualifying(def.capability);
+  function resolveAccount(requested: unknown): Account {
     if (typeof requested === "string") {
       const account = registry.find(requested);
-      if (!account) throw new CapabilityError(`Unknown account "${requested}".`);
-      if (!account.has(def.capability)) {
-        throw new CapabilityError(`Account "${requested}" does not have the ${def.capability} permission (any more).`);
-      }
+      if (!account) throw new ToolInputError(`Unknown account "${requested}".`);
       return account;
     }
-    if (qualifying.length === 1 && qualifying[0]) return qualifying[0];
-    if (qualifying.length === 0) throw new CapabilityError(`No configured account has the ${def.capability} permission any more.`);
-    throw new CapabilityError(`Specify account: one of ${qualifying.map((a) => a.name).join(", ")}.`);
+    const [only, ...rest] = registry.accounts;
+    if (only && rest.length === 0) return only;
+    throw new ToolInputError(`Specify account: one of ${registry.accounts.map((a) => a.name).join(", ")}.`);
   }
 
-  function handlerFor(def: ToolDefinition & { capability: Capability }) {
+  function handlerFor(def: ToolDefinition) {
     return async (args: Args, extra: Extra): Promise<CallToolResult> => {
-      let account: Account | undefined;
       try {
-        account = resolveAccount(def, args.account);
-        const value = await def.run({ account, args, signal: extra.signal });
-        if (def.operation) recordSuccess(account, def.operation);
-        return json(value);
+        const account = resolveAccount(args.account);
+        return json(await def.run({ account, args, signal: extra.signal }));
       } catch (error) {
-        return failure(def, account, error);
+        return failure(def, error);
       }
     };
   }
 
-  function failure(def: ToolDefinition, account: Account | undefined, error: unknown): CallToolResult {
-    let outcome: FailureOutcome = { revoked: [] };
-    let message: string;
-    if (error instanceof PermissionLost) {
-      outcome = error.outcome;
-      message = error.message;
-    } else {
-      message = error instanceof Error ? error.message : String(error);
-      if (account && def.operation) outcome = classifyFailure(account, def.operation, error);
-    }
-    if (error instanceof RateLimitedError ||
-      error instanceof CapabilityError ||
-      error instanceof ToolInputError ||
-      error instanceof FioApiError) {
-      // expected; already user-facing
-    } else if (!(error instanceof PermissionLost)) {
-      log.error(`tool ${def.name} failed:`, error);
-    }
-    const before = new Set(toolNames());
-    if (account) registry.apply(account, outcome);
-    const removed = [...before].filter((name) => !registered.has(name));
-    const parts = [message];
-    if (outcome.note) parts.push(outcome.note);
+  function failure(def: ToolDefinition, error: unknown): CallToolResult {
+    const denied = error instanceof PermissionDeniedError ? error : asPermissionDenied(def.operation, error);
+    if (denied) return errorResult(denied.message);
+    const expected =
+      error instanceof RateLimitedError || error instanceof ToolInputError || error instanceof FioApiError;
+    if (!expected) log.error(`tool ${def.name} failed:`, error);
+    const parts = [error instanceof Error ? error.message : String(error)];
     if (def.operation === "import" && error instanceof FioApiError && UNCERTAIN_UPLOAD_ERRORS.has(error.kind)) {
       parts.push(UPLOAD_UNCERTAIN);
-    }
-    if (account && outcome.revoked.length > 0) {
-      parts.push(
-        `Account "${account.name}" has lost: ${outcome.revoked.join(", ")}.` +
-          (removed.length > 0 ? ` Tools no longer available: ${removed.join(", ")}.` : ""),
-      );
     }
     return errorResult(parts.join("\n"));
   }
 
-  function toolNames(): string[] {
-    return ["get_server_capabilities", ...registered.keys()];
-  }
-
-  /** Registers, re-registers (account enum changed), or removes tools to match current capabilities. */
-  function sync(): void {
-    for (const def of definitions) {
-      if (def.capability === null) continue;
-      const capability = def.capability;
-      const names = registry.qualifying(capability).map((a) => a.name);
-      const accountsKey = names.join(",");
-      const current = registered.get(def.name);
-      if (current && current.accountsKey === accountsKey) continue;
-      if (current) {
-        current.tool.remove();
-        registered.delete(def.name);
-      }
-      if (names.length === 0) continue;
-      const accountShape: Shape =
-        names.length > 1
-          ? { account: z.enum(names as [string, ...string[]]).describe(`Account to use: ${names.join(", ")}.`) }
-          : {};
-      // strictObject: a stale client sending an account that was dropped from the enum gets an error,
-      // instead of the argument being silently stripped and the call going to the remaining account.
-      const inputSchema = z.strictObject({ ...accountShape, ...def.shape });
-      const tool = server.registerTool(
-        def.name,
-        { title: def.title, description: def.description, inputSchema, annotations: def.annotations },
-        handlerFor({ ...def, capability }) as never,
-      );
-      registered.set(def.name, { tool, accountsKey });
-    }
+  const names = registry.accounts.map((a) => a.name);
+  // Only multi-account setups get an account parameter. strictObject rejects unknown
+  // arguments (typos, or an account parameter sent to a single-account server).
+  const accountShape: Shape =
+    names.length > 1
+      ? { account: z.enum(names as [string, ...string[]]).describe(`Account to use: ${names.join(", ")}.`) }
+      : {};
+  for (const def of definitions) {
+    server.registerTool(
+      def.name,
+      {
+        title: def.title,
+        description: def.description,
+        inputSchema: z.strictObject({ ...accountShape, ...def.shape }),
+        annotations: def.annotations,
+      },
+      handlerFor(def) as never,
+    );
   }
 
   server.registerTool(
-    "get_server_capabilities",
+    "get_server_status",
     {
-      title: "Server capabilities",
+      title: "Server status",
       description:
-        "Show configured accounts (names only), their declared and effective permissions, permissions lost at runtime, the tools currently available, and each token's rate-limit state.",
+        "Show configured accounts (names only, never tokens), their FIO account numbers and currencies where known, and each token's rate-limit state. No network call.",
       inputSchema: z.strictObject({}),
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
@@ -405,14 +373,10 @@ export function createFioServer(config: ServerConfig, options: { fetch?: FetchFn
       json({
         accounts: registry.accounts.map((account) => ({
           name: account.name,
-          declaredPermissions: account.declared,
-          effectivePermissions: account.effective(),
-          lostPermissions: account.lostCapabilities(),
           accountNumber: account.accountNumber ?? null,
           currency: account.currency ?? null,
           rateLimit: account.limiter.state(),
         })),
-        tools: toolNames(),
         rateLimit: {
           requestsPerToken: `1 per ${config.rateLimitIntervalMs / 1000} s`,
           maxWaitSeconds: config.maxWaitMs / 1000,
@@ -420,21 +384,6 @@ export function createFioServer(config: ServerConfig, options: { fetch?: FetchFn
       }),
   );
 
-  sync();
-  registry.onChange(sync);
-
+  const toolNames = () => [...definitions.map((d) => d.name), "get_server_status"];
   return { server, registry, toolNames };
-}
-
-/** Upload failures after which FIO may still have created the batch. */
-const UNCERTAIN_UPLOAD_ERRORS = new Set<FioApiError["kind"]>(["timeout", "network", "bad_response", "http_error", "token_rejected"]);
-
-/** Thrown inside a tool when a parsed response shows a permission loss. */
-class PermissionLost extends Error {
-  constructor(
-    readonly outcome: FailureOutcome,
-    message: string,
-  ) {
-    super(message);
-  }
 }

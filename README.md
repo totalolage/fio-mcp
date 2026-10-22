@@ -2,7 +2,7 @@
 
 # fio-mcp
 
-An [MCP](https://modelcontextprotocol.io) server for [FIO Bank](https://www.fio.cz)'s REST API ("API Bankovnictví"). It only exposes the tools your FIO tokens are allowed to use. With a read-only token the model can read transactions and statements but never sees a payment tool. With a payment-capable token it can also prepare and upload payment orders, which still have to be signed in Internetbanking.
+An [MCP](https://modelcontextprotocol.io) server for [FIO Bank](https://www.fio.cz)'s REST API ("API Bankovnictví"). It exposes every tool: reading transactions and statements, and preparing and uploading payment orders, which still have to be signed in Internetbanking. If a token isn't allowed to do something, the tool answers "You don't have permissions to do that."
 
 The API reference this server is built against is in [docs/fio-api.md](docs/fio-api.md) (summarised from FIO's PDF, version 1.9 of 16 October 2025).
 
@@ -31,7 +31,6 @@ Everything is set through environment variables.
 | Variable | Required | Meaning |
 |---|---|---|
 | `FIO_TOKEN` | yes | The 64-character API token. |
-| `FIO_TOKEN_PERMISSIONS` | no | `read` (default) or `read,payments`. Must match what the token was created with. |
 | `FIO_ACCOUNT_NAME` | no | Name shown to the model. Default `default`. |
 | `FIO_ACCOUNT_NUMBER` | no | Your FIO account number without bank code (e.g. `2400222222`). Used as the payer for payment orders. If unset, the server reads it from the first statement it downloads. |
 | `FIO_ACCOUNT_CURRENCY` | no | Account currency (e.g. `CZK`). Default currency for payment orders. Also learned from statements. |
@@ -42,12 +41,12 @@ FIO issues one token per account. To use several, set `FIO_ACCOUNTS` to a JSON a
 
 ```json
 [
-  { "name": "personal", "token": "…", "permissions": "read" },
-  { "name": "business", "token": "…", "permissions": ["read", "payments"], "accountNumber": "2400222222", "currency": "CZK" }
+  { "name": "personal", "token": "…" },
+  { "name": "business", "token": "…", "accountNumber": "2400222222", "currency": "CZK" }
 ]
 ```
 
-`name` must be 1–32 letters, digits, `_` or `-`, and unique. `permissions` accepts `"read"`, `"read,payments"`, or an array, and defaults to read-only. Setting both `FIO_TOKEN` and `FIO_ACCOUNTS` is an error.
+`name` must be 1–32 letters, digits, `_` or `-`, and unique. Setting both `FIO_TOKEN` and `FIO_ACCOUNTS` is an error.
 
 ### Tuning
 
@@ -69,8 +68,7 @@ Claude Desktop (`claude_desktop_config.json`) or any client that uses the same f
       "command": "node",
       "args": ["/path/to/fio-mcp/dist/index.js"],
       "env": {
-        "FIO_TOKEN": "your-64-character-token",
-        "FIO_TOKEN_PERMISSIONS": "read"
+        "FIO_TOKEN": "your-64-character-token"
       }
     }
   }
@@ -86,48 +84,41 @@ Several accounts:
       "command": "npx",
       "args": ["-y", "fio-mcp"],
       "env": {
-        "FIO_ACCOUNTS": "[{\"name\":\"personal\",\"token\":\"…\"},{\"name\":\"business\",\"token\":\"…\",\"permissions\":\"read,payments\",\"accountNumber\":\"2400222222\"}]"
+        "FIO_ACCOUNTS": "[{\"name\":\"personal\",\"token\":\"…\"},{\"name\":\"business\",\"token\":\"…\",\"accountNumber\":\"2400222222\"}]"
       }
     }
   }
 }
 ```
 
-## Permission model
+## Permissions
 
 FIO tokens have one of two levels, chosen when the token is created:
 
 - **Sledování účtu**: read-only account monitoring.
 - **Sledování účtu a zadávání platebních a inkasních příkazů**: monitoring plus entering payment and collection orders.
 
-The API has no endpoint that reports a token's level. The only way to test for write access is to upload a payment batch, and a successful upload creates a real batch in the bank. This server therefore never probes. You declare each token's level in the configuration, and the server trusts it:
+The API has no endpoint that reports a token's level, so the server doesn't try to find out. Every tool is always listed. When FIO refuses a call because the token may not do it, the tool returns an error that starts with:
 
-1. **Startup.** The tool set is the union of what the configured tokens can do. Payment tools exist only if at least one token declares `payments`.
-2. **Account selection.** Tools that act on an account take an `account` argument whose allowed values are only the accounts that hold the needed permission. When exactly one account qualifies, the argument is omitted. Tool inputs are strict: an unknown or no-longer-valid account name is rejected, never silently redirected to another account.
-3. **Runtime downgrade.** If FIO rejects a token in a way that means the permission is gone, the server marks the capability as lost and removes tools that no remaining token supports. It also shrinks account enums and sends `notifications/tools/list_changed`, and the failing call returns an error that explains what was removed. Lost capabilities stay lost until the server restarts.
-4. **Visibility.** `get_server_capabilities` reports each account's name, its declared and effective permissions, any lost permissions with their reasons, the tools currently registered, and the rate-limit state. It never reports tokens.
+> You don't have permissions to do that.
 
-### When is a permission considered lost?
+It is followed by one line saying what FIO answered and, for payments, which token level is needed. That message is used for:
 
-FIO does not document what a read-only token gets back when it tries an upload, so the classification is deliberately conservative. Transient-looking failures never remove tools: network errors, timeouts, 404, 409, 413, 422, and 5xx other than 500.
+| FIO's answer | Call |
+|---|---|
+| HTTP 401 or 403 | any |
+| HTTP 500 (FIO's code for a missing or inactive token, and the likely answer to a read-only token trying to upload) | payment upload |
+| Upload rejected with a batch-level message that mentions the token or API **and** denies a right (e.g. "Token does not have permission…", "Token nemá oprávnění…") | payment upload |
 
-| Signal | On a read call | On a payment upload |
-|---|---|---|
-| HTTP 401 or 403 (undocumented, but unambiguous) | Token is dead: `read` and `payments` are lost | `payments` is lost |
-| HTTP 500, documented as "token does not exist or is inactive" | Lost only after **2 consecutive** 500s on reads. A success or any other HTTP status resets the count. | `payments` is lost after 2 consecutive 500s on uploads |
-| Upload response with status `error`/`fatal` and a batch-level message that mentions the token or API **and** denies a right (e.g. "Token does not have permission…", "Token nemá oprávnění…") | n/a | `payments` is lost |
-
-An upload rejected for ordinary validation errors or content restrictions does not revoke anything. That includes messages that don't mention the token, such as "payments to this country are not permitted", and all per-order messages. If a downgrade turns out to be wrong, restart the server.
+FIO does not document what a read-only token gets back on upload, so this is a best guess. Other errors keep their own messages. On reads, HTTP 500 is reported as "token does not exist or is inactive". Ordinary validation failures and content restrictions (e.g. "payments to this country are not permitted") come back as a normal rejected result. With several accounts, every tool takes an `account` argument listing all configured account names. Tool inputs are strict: unknown arguments are rejected.
 
 ## Tools
 
-### Always available
-
 | Tool | What it does |
 |---|---|
-| `get_server_capabilities` | Accounts, permissions, lost permissions, current tools, and rate-limit state. No network call. |
+| `get_server_status` | Account names (never tokens), account numbers and currencies where known, and each token's rate-limit state. No network call. |
 
-### With `read` (every token)
+### Reading (works with any token)
 
 | Tool | Endpoint | Notes |
 |---|---|---|
@@ -140,7 +131,7 @@ An upload rejected for ordinary validation errors or content restrictions does n
 
 Data older than 90 days is only served after the account owner unlocks full history for the token in Internetbanking (HTTP 422 otherwise). A download of more than 50,000 movements fails with HTTP 413.
 
-### With `payments`
+### Payments (need a token with the payment-order level)
 
 | Tool | What it does |
 |---|---|
@@ -158,7 +149,7 @@ Orders are sent in the order FIO requires (domestic, euro, foreign), and all tex
 ## Payment safety
 
 - **Uploading does not pay anything by itself.** Per FIO's documentation, an imported batch must be signed by an authorized person in Internetbanking (SMS or Fio signature) before FIO processes it. Treat an upload as real anyway: it creates a pending batch in the bank.
-- Payment tools exist only if you declare `payments` for a token. Give the server a read-only token unless you need payments.
+- Payment tools are always listed, but FIO refuses uploads from a read-only token. Give the server a read-only token unless you need payments.
 - `submit_payment_orders` requires `confirm: true` and is annotated destructive, so MCP clients that ask before destructive actions will ask. Have the model show you `preview_payment_orders` output first.
 - Validation covers formats, lengths, and enums from the PDF and `importIB.xsd`: account and bank-code patterns, symbols, dates, 2-decimal amounts, BIC, IBAN checksum, ISO country, payment-reason codes, and fee codes. FIO's character-set classes (for example "no diacritics" in euro beneficiary names) are described in the tool schema but not enforced locally. FIO rejects such a batch with a validation error instead of creating it.
 - If the outcome is uncertain, the server says so instead of reporting a rejection. That covers a timeout or network failure during upload, an unexpected HTTP status, an unparseable response, or a response with a missing status or an error status alongside a batch ID. Check pending batches in Internetbanking before submitting again, or the orders may be duplicated.
@@ -172,7 +163,7 @@ FIO allows **one request per token every 30 seconds**, for any operation, and an
 - Each token has one serialized queue. Calls run in arrival order, at least `FIO_RATE_LIMIT_INTERVAL_MS` apart. Accounts that share a token share the queue.
 - A call that would wait longer than `FIO_MAX_WAIT_MS` (default 25 s) for its slot fails immediately with `Rate limited: … Retry after N s.` This keeps calls below typical MCP client timeouts (about 60 s).
 - On HTTP 409 (another program used the token), the token is treated as busy for a full interval. Calls already queued are pushed back too, and any whose budget that exceeds fail fast. The call that got the 409 is retried once **if the extra wait still fits in `FIO_MAX_WAIT_MS`**. With the defaults (30 s interval, 25 s budget) the retry does not fit, so the call fails fast with a retry-after hint. Raise `FIO_MAX_WAIT_MS` above 30000 if your client tolerates longer calls and you want the automatic retry. A second 409 always fails.
-- `get_server_capabilities` shows each account's next free slot.
+- `get_server_status` shows each account's next free slot.
 
 ## Security
 
@@ -186,8 +177,8 @@ FIO allows **one request per token every 30 seconds**, for any operation, and an
 src/
   index.ts            stdio entry point (bin)
   config.ts           environment parsing
-  server.ts           tool definitions, permission-driven registration, capabilities tool
-  accounts.ts         per-account capability state and the permission-loss heuristic
+  server.ts           tool definitions and registration, permission-denied messages, status tool
+  accounts.ts         configured accounts, their clients and rate limiters
   fio-client.ts       HTTP client for one token
   rate-limiter.ts     per-token serialized queue
   statement.ts        JSON statement normalisation
@@ -204,4 +195,3 @@ Tests mock `fetch` and make no network calls.
 
 - The response body of `lastStatement` and the read-only upload response are undocumented. The parsing and classification above are best effort.
 - Only the Fio XML import format is used. ABO and SEPA `pain.001`/`pain.008` uploads are not exposed.
-- Lost permissions are not re-checked. Restart the server after fixing a token.

@@ -1,9 +1,10 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { ToolListChangedNotificationSchema, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ServerConfig } from "../src/config.js";
 import type { FetchFn } from "../src/fio-client.js";
+import { PERMISSION_DENIED } from "../src/errors.js";
 import { clearSecrets } from "../src/redact.js";
 import { createFioServer } from "../src/server.js";
 import {
@@ -17,16 +18,17 @@ import {
   readAccount,
 } from "./fixtures.js";
 
-const READ_TOOLS = [
+const ALL_TOOLS = [
   "export_transactions",
   "get_last_statement",
   "get_new_transactions",
-  "get_server_capabilities",
+  "get_server_status",
   "get_statement",
   "get_transactions",
+  "preview_payment_orders",
   "set_download_marker",
+  "submit_payment_orders",
 ];
-const PAYMENT_TOOLS = ["preview_payment_orders", "submit_payment_orders"];
 
 interface Call {
   url: string;
@@ -55,14 +57,12 @@ async function connect(config: ServerConfig, route: Route = () => ok(STATEMENT_J
   const fio = createFioServer(config, { fetch: mock.fetch });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "test-client", version: "1.0.0" });
-  const listChanged = vi.fn();
-  client.setNotificationHandler(ToolListChangedNotificationSchema, listChanged);
   await Promise.all([fio.server.connect(serverTransport), client.connect(clientTransport)]);
   const tools = async () => (await client.listTools()).tools;
   const names = async () => (await tools()).map((t) => t.name).sort();
   const call = async (name: string, args: Record<string, unknown> = {}) =>
     (await client.callTool({ name, arguments: args })) as CallToolResult;
-  return { client, fio, listChanged, tools, names, call, ...mock };
+  return { client, fio, tools, names, call, ...mock };
 }
 
 function text(result: CallToolResult): string {
@@ -73,9 +73,6 @@ function data(result: CallToolResult): any {
   expect(result.isError, text(result)).toBeFalsy();
   return JSON.parse(text(result));
 }
-
-/** Waits for in-flight notifications to reach the client. */
-const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 const domesticOrder = {
   type: "domestic",
@@ -88,63 +85,56 @@ const domesticOrder = {
 
 afterEach(() => clearSecrets());
 
-describe("tool set per permission configuration", () => {
-  it("read-only token exposes read tools and no payment tools", async () => {
+describe("tool set", () => {
+  it("exposes every tool, including payments, with one account", async () => {
     const { names, tools } = await connect(baseConfig([readAccount()]));
-    expect(await names()).toEqual(READ_TOOLS);
-    const getTransactions = (await tools()).find((t) => t.name === "get_transactions");
-    expect(getTransactions?.inputSchema.properties).not.toHaveProperty("account");
-    expect(getTransactions?.annotations).toMatchObject({ readOnlyHint: true });
-    const newTx = (await tools()).find((t) => t.name === "get_new_transactions");
-    expect(newTx?.annotations?.readOnlyHint).toBe(false);
-    expect(newTx?.description).toMatch(/marker/);
-  });
-
-  it("payments token adds payment tools with safety annotations", async () => {
-    const { names, tools } = await connect(baseConfig([payAccount()]));
-    expect(await names()).toEqual([...READ_TOOLS, ...PAYMENT_TOOLS].sort());
-    const submit = (await tools()).find((t) => t.name === "submit_payment_orders");
-    expect(submit?.annotations).toMatchObject({ destructiveHint: true, openWorldHint: true, readOnlyHint: false });
-    expect(submit?.description).toMatch(/NOT executed/);
-    expect(submit?.inputSchema.required).toContain("confirm");
-    const preview = (await tools()).find((t) => t.name === "preview_payment_orders");
-    expect(preview?.annotations).toMatchObject({ readOnlyHint: true });
-  });
-
-  it("restricts the account enum to accounts holding the capability", async () => {
-    const { tools } = await connect(baseConfig([readAccount("personal"), payAccount("business")]));
+    expect(await names()).toEqual(ALL_TOOLS);
     const byName = Object.fromEntries((await tools()).map((t) => [t.name, t]));
-    expect(byName.get_transactions?.inputSchema.properties?.account).toMatchObject({ enum: ["personal", "business"] });
-    expect(byName.get_transactions?.inputSchema.required).toContain("account");
-    // Only "business" can pay, so the payment tools need no account parameter.
-    expect(byName.submit_payment_orders?.inputSchema.properties).not.toHaveProperty("account");
-    expect(byName.preview_payment_orders?.inputSchema.properties).not.toHaveProperty("account");
+    expect(byName.get_transactions?.inputSchema.properties).not.toHaveProperty("account");
+    expect(byName.get_transactions?.annotations).toMatchObject({ readOnlyHint: true });
+    expect(byName.get_new_transactions?.annotations?.readOnlyHint).toBe(false);
+    expect(byName.get_new_transactions?.description).toMatch(/marker/);
+    expect(byName.submit_payment_orders?.annotations).toMatchObject({
+      destructiveHint: true,
+      openWorldHint: true,
+      readOnlyHint: false,
+    });
+    expect(byName.submit_payment_orders?.description).toMatch(/NOT executed/);
+    expect(byName.submit_payment_orders?.inputSchema.required).toContain("confirm");
+    expect(byName.preview_payment_orders?.annotations).toMatchObject({ readOnlyHint: true });
   });
 
-  it("offers an account enum on payment tools when several accounts can pay", async () => {
-    const { tools } = await connect(
-      baseConfig([readAccount("personal"), payAccount("business"), payAccount("shop", `${PAY_TOKEN}x`)]),
-    );
-    const submit = (await tools()).find((t) => t.name === "submit_payment_orders");
-    expect(submit?.inputSchema.properties?.account).toMatchObject({ enum: ["business", "shop"] });
+  it("offers every account on every tool when several are configured", async () => {
+    const { names, tools } = await connect(baseConfig([readAccount("personal"), payAccount("business")]));
+    expect(await names()).toEqual(ALL_TOOLS);
+    for (const tool of await tools()) {
+      if (tool.name === "get_server_status") continue;
+      expect(tool.inputSchema.properties?.account, tool.name).toMatchObject({ enum: ["personal", "business"] });
+      expect(tool.inputSchema.required, tool.name).toContain("account");
+    }
   });
 
-  it("reports capabilities without exposing tokens", async () => {
+  it("rejects an account argument on a single-account server", async () => {
+    const { call, fetch } = await connect(baseConfig([readAccount()]));
+    const result = await call("get_last_statement", { account: "other" });
+    expect(result.isError).toBe(true);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("reports status without exposing tokens", async () => {
     const { call } = await connect(baseConfig([readAccount("personal"), payAccount("business")]));
-    const result = await call("get_server_capabilities");
+    const result = await call("get_server_status");
     expect(text(result)).not.toContain(READ_TOKEN);
     expect(text(result)).not.toContain(PAY_TOKEN);
-    const caps = data(result);
-    expect(caps.accounts).toEqual([
-      expect.objectContaining({ name: "personal", declaredPermissions: ["read"], effectivePermissions: ["read"] }),
+    expect(data(result).accounts).toEqual([
+      expect.objectContaining({ name: "personal", accountNumber: null }),
       expect.objectContaining({
         name: "business",
-        effectivePermissions: ["read", "payments"],
         accountNumber: "2400222222",
+        currency: "CZK",
         rateLimit: expect.objectContaining({ intervalSeconds: 0 }),
       }),
     ]);
-    expect(caps.tools).toContain("submit_payment_orders");
   });
 });
 
@@ -211,102 +201,63 @@ describe("read tools", () => {
     expect(text(result)).toContain("1;***");
   });
 
-  it("explains documented HTTP errors without revoking anything", async () => {
-    const { call, names } = await connect(baseConfig([readAccount()]), () => status(422));
+  it("explains documented HTTP errors", async () => {
+    const { call } = await connect(baseConfig([readAccount()]), () => status(422));
     const result = await call("get_transactions", { dateFrom: "2020-01-01", dateTo: "2020-01-31" });
     expect(result.isError).toBe(true);
     expect(text(result)).toMatch(/older than 90 days/);
-    expect(await names()).toEqual(READ_TOOLS);
+    expect(text(result)).not.toContain(PERMISSION_DENIED);
+  });
+
+  it("keeps FIO's meaning for HTTP 500 on reads", async () => {
+    const { call } = await connect(baseConfig([readAccount()]), () => status(500));
+    const result = await call("get_transactions", { dateFrom: "2024-01-01", dateTo: "2024-01-31" });
+    expect(text(result)).toMatch(/token does not exist or is inactive/);
+    expect(text(result)).not.toContain(PERMISSION_DENIED);
   });
 });
 
-describe("runtime downgrade", () => {
-  it("removes every tool of a token FIO rejects with 401/403 and notifies the client", async () => {
-    const { call, names, listChanged } = await connect(baseConfig([readAccount()]), () =>
-      status(403, `denied ${READ_TOKEN}`),
-    );
-    await flush();
-    listChanged.mockClear();
-    const result = await call("get_transactions", { dateFrom: "2024-01-01", dateTo: "2024-01-31" });
-    expect(result.isError).toBe(true);
-    expect(text(result)).toMatch(/lost: read/);
-    expect(text(result)).toMatch(/no longer available: .*get_transactions/);
-    expect(text(result)).not.toContain(READ_TOKEN);
-    await flush();
-    expect(listChanged).toHaveBeenCalled();
-    expect(await names()).toEqual(["get_server_capabilities"]);
-  });
+describe("permission denied", () => {
+  const args = { dateFrom: "2024-01-01", dateTo: "2024-01-31" };
 
-  it("needs two consecutive HTTP 500s before treating a token as dead", async () => {
-    let responses = [status(500), ok(STATEMENT_JSON), status(500), status(500)];
-    const { call, names } = await connect(baseConfig([readAccount()]), () => responses.shift() ?? ok(""));
-    const args = { dateFrom: "2024-01-01", dateTo: "2024-01-31" };
-
-    const first = await call("get_transactions", args);
-    expect(first.isError).toBe(true);
-    expect(text(first)).toMatch(/If the next request fails the same way/);
-    expect(await names()).toEqual(READ_TOOLS);
-
-    data(await call("get_transactions", args)); // success resets the count
-    expect((await call("get_transactions", args)).isError).toBe(true);
-    expect(await names()).toEqual(READ_TOOLS);
-
-    const fourth = await call("get_transactions", args);
-    expect(text(fourth)).toMatch(/lost: read, payments|lost: read/);
-    expect(await names()).toEqual(["get_server_capabilities"]);
-    responses = [];
-  });
-
-  it("does not count 500s separated by another HTTP answer as consecutive", async () => {
-    // 404, and a 409 that fails fast because its retry would exceed the wait budget.
-    for (const middle of [404, 409]) {
-      const responses = [status(500), status(middle), status(500)];
-      const config = { ...baseConfig([readAccount()]), rateLimitIntervalMs: 50, maxWaitMs: 20 };
-      const { call, names } = await connect(config, () => responses.shift() ?? ok(STATEMENT_JSON));
-      const args = { dateFrom: "2024-01-01", dateTo: "2024-01-31" };
-      for (let i = 0; i < 3; i++) {
-        const result = await call("get_transactions", args);
-        expect(result.isError).toBe(true);
-        if (i === 1 && middle === 409) expect(text(result)).toMatch(/409/);
-        await new Promise((resolve) => setTimeout(resolve, 60));
-      }
-      expect(await names(), `500, ${middle}, 500`).toEqual(READ_TOOLS);
+  it("answers 401/403 with the permission message, without leaking the token", async () => {
+    for (const code of [401, 403]) {
+      const { call, names } = await connect(baseConfig([readAccount()]), () => status(code, `denied ${READ_TOKEN}`));
+      const result = await call("get_transactions", args);
+      expect(result.isError).toBe(true);
+      expect(text(result).split("\n")[0]).toBe("You don't have permissions to do that.");
+      expect(text(result)).toContain(`HTTP ${code}`);
+      expect(text(result)).not.toContain(READ_TOKEN);
+      // Nothing is removed: the tools stay listed.
+      expect(await names()).toEqual(ALL_TOOLS);
     }
   });
 
-  it("shrinks the account enum when one of several accounts is lost", async () => {
-    const config = baseConfig([readAccount("personal"), readAccount("savings", `${READ_TOKEN}2`)]);
-    const { call, tools, listChanged } = await connect(config, ({ url }) =>
-      url.includes(`${READ_TOKEN}2/`) ? ok(STATEMENT_JSON) : status(401),
-    );
-    await flush();
-    listChanged.mockClear();
-    const args = { dateFrom: "2024-01-01", dateTo: "2024-01-31" };
-    expect((await call("get_transactions", { ...args, account: "personal" })).isError).toBe(true);
-    await flush();
-    expect(listChanged).toHaveBeenCalled();
-    const getTransactions = (await tools()).find((t) => t.name === "get_transactions");
-    expect(getTransactions?.inputSchema.properties).not.toHaveProperty("account");
-    // A stale client naming the lost account is refused rather than silently redirected.
-    expect((await call("get_transactions", { ...args, account: "personal" })).isError).toBe(true);
-    expect(data(await call("get_transactions", args)).account).toBe("savings");
-  });
-
-  it("removes payment tools when FIO refuses an import for lack of permission", async () => {
-    const { call, names, listChanged } = await connect(baseConfig([readAccount("personal"), payAccount("business")]), ({ url }) =>
-      url.endsWith("/import/") ? ok(IMPORT_PERMISSION_XML) : ok(STATEMENT_JSON),
-    );
-    await flush();
-    listChanged.mockClear();
+  it("answers a payment upload refused for the token with the permission message", async () => {
+    const { call, names } = await connect(baseConfig([payAccount()]), () => ok(IMPORT_PERMISSION_XML));
     const result = await call("submit_payment_orders", { orders: [domesticOrder], confirm: true });
     expect(result.isError).toBe(true);
-    expect(text(result)).toMatch(/permission/);
-    expect(text(result)).toMatch(/no longer available: .*submit_payment_orders/);
-    await flush();
-    expect(listChanged).toHaveBeenCalled();
-    expect(await names()).toEqual(READ_TOOLS);
-    const caps = data(await call("get_server_capabilities"));
-    expect(caps.accounts[1]).toMatchObject({ effectivePermissions: ["read"], lostPermissions: [expect.objectContaining({ capability: "payments" })] });
+    expect(text(result).split("\n")[0]).toBe(PERMISSION_DENIED);
+    expect(text(result)).toMatch(/Token does not have permission/);
+    expect(text(result)).toMatch(/Sledování účtu a zadávání/);
+    expect(await names()).toEqual(ALL_TOOLS);
+  });
+
+  it("answers HTTP 401/403/500 on a payment upload with the permission message", async () => {
+    for (const code of [401, 403, 500]) {
+      const { call } = await connect(baseConfig([payAccount()]), () => status(code));
+      const result = await call("submit_payment_orders", { orders: [domesticOrder], confirm: true });
+      expect(result.isError).toBe(true);
+      expect(text(result).split("\n")[0], `HTTP ${code}`).toBe(PERMISSION_DENIED);
+      expect(text(result)).toMatch(/Sledování účtu a zadávání/);
+      expect(text(result)).not.toMatch(/may or may not have created a batch/);
+    }
+  });
+
+  it("does not treat an ordinary rejection as a permission problem", async () => {
+    const { call } = await connect(baseConfig([payAccount()]), () => ok(IMPORT_PERMISSION_XML.replace("Token does not have permission to enter payment orders", "Payments to this country are not permitted")));
+    const submitted = data(await call("submit_payment_orders", { orders: [domesticOrder], confirm: true }));
+    expect(submitted.result.outcome).toBe("rejected");
   });
 });
 
@@ -361,22 +312,20 @@ describe("payment tools", () => {
     expect(submitted.nextStep).toMatch(/105545555.*Check the pending batches/s);
 
     for (const route of [() => status(502), () => ok("<html>oops</html>"), (): Response => { throw new TypeError("socket hang up"); }]) {
-      const { call: callOther, names } = await connect(baseConfig([payAccount()]), route);
+      const { call: callOther } = await connect(baseConfig([payAccount()]), route);
       const result = await callOther("submit_payment_orders", { orders: [domesticOrder], confirm: true });
       expect(result.isError).toBe(true);
       expect(text(result)).toMatch(/may or may not have created a batch/);
-      expect(await names()).toContain("submit_payment_orders");
     }
   });
 
-  it("does not revoke payments on an ordinary rejected batch", async () => {
+  it("reports an ordinary rejected batch as a result, not an error", async () => {
     const rejected = IMPORT_OK_XML.replace("<status>ok</status>", "<status>error</status>").replace(
       "<errorCode>0</errorCode>",
       "<errorCode>1</errorCode>",
     );
-    const { call, names } = await connect(baseConfig([payAccount()]), () => ok(rejected));
+    const { call } = await connect(baseConfig([payAccount()]), () => ok(rejected));
     const submitted = data(await call("submit_payment_orders", { orders: [domesticOrder], confirm: true }));
     expect(submitted.result.accepted).toBe(false);
-    expect(await names()).toContain("submit_payment_orders");
   });
 });

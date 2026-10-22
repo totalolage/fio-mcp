@@ -8,7 +8,7 @@ async function main(): Promise<void> {
   const config = loadConfig();
   const { server, toolNames } = createFioServer(config);
   await server.connect(new StdioServerTransport());
-  const summary = config.accounts.map((a) => `${a.name} [${[...a.permissions].join(",")}]`).join("; ");
+  const summary = config.accounts.map((a) => a.name).join(", ");
   log.info(`ready; accounts: ${summary}; tools: ${toolNames().join(", ")}`);
 }
 
