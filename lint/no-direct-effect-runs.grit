@@ -1,0 +1,20 @@
+engine biome(1.0)
+language js(typescript)
+
+// Effects run only at the process entry point; everything else composes Effects.
+file($name, $body) where {
+  $name <: r".*/src/.*\.ts$",
+  not $name <: r".*/src/main\.ts$",
+  not $name <: r".*/src/generated/.*",
+  $body <: r"(?s).*run[A-Z].*",
+  $body <: contains bubble {
+    `Effect.$method($...)` as $call where {
+      $method <: r"run[A-Z].*",
+      register_diagnostic(
+        span = $call,
+        message = "Run Effects only in src/main.ts; compose them everywhere else so failures stay in the error channel.",
+        severity = "error"
+      )
+    }
+  }
+}

@@ -1,0 +1,20 @@
+engine biome(1.0)
+language js(typescript)
+
+file($name, $body) where {
+  $name <: r".*/src/.*\.ts$",
+  not $name <: r".*/src/generated/.*",
+  $body <: r"(?s).*(?:\bPromise\b|\bawait\b).*",
+  $body <: contains bubble {
+    or {
+      `new Promise($_)` as $promise,
+      `await $_` as $promise
+    } where {
+      register_diagnostic(
+        span = $promise,
+        message = "Use Effect values instead of Promises so failures are typed (wrap foreign Promise APIs with Effect.tryPromise).",
+        severity = "error"
+      )
+    }
+  }
+}

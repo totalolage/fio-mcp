@@ -1,0 +1,18 @@
+engine biome(1.0)
+language js(typescript)
+
+file($name, $body) where {
+  $name <: r".*/src/.*\.ts$",
+  not $name <: r".*/src/generated/.*",
+  $body <: r"(?s).*Effect\.gen\(.*",
+  $body <: contains bubble {
+    `$parameters => $generator` as $arrow where {
+      $generator <: r"(?s)^\s*Effect\.gen\(function\*.*",
+      register_diagnostic(
+        span = $arrow,
+        message = "Define Effect generator functions with Effect.fn instead of wrapping Effect.gen in an arrow function.",
+        severity = "error"
+      )
+    }
+  }
+}

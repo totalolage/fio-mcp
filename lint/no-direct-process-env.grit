@@ -1,0 +1,20 @@
+engine biome(1.0)
+language js(typescript)
+
+file($name, $body) where {
+  $name <: r".*/src/.*\.ts$",
+  $body <: r"(?s).*\bprocess\b.*",
+  $body <: contains bubble {
+    or {
+      `process.env.$property` as $access,
+      `process.env[$_]` as $access,
+      `process.env` as $access
+    } where {
+      register_diagnostic(
+        span = $access,
+        message = "Read configuration through Effect Config (src/config.ts) so values stay typed and secrets stay Redacted.",
+        severity = "error"
+      )
+    }
+  }
+}

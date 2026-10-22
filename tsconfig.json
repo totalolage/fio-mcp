@@ -8,6 +8,7 @@
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
     "exactOptionalPropertyTypes": false,
     "esModuleInterop": true,
     "skipLibCheck": true,
@@ -16,7 +17,46 @@
     "isolatedModules": true,
     "verbatimModuleSyntax": true,
     "rootDir": ".",
-    "outDir": "dist"
+    "outDir": "dist",
+    "plugins": [
+      {
+        "name": "@effect/language-service",
+        "ignoreEffectWarningsInTscExitCode": false,
+        "ignoreEffectErrorsInTscExitCode": false,
+        "allowedUnstableApis": ["effect/FileSystem", "effect/ai", "effect/http", "effect/sql", "effect/schema", "@effect/sql-sqlite-node", "@effect/platform-node"],
+        "diagnosticSeverity": {
+          "schemaClassMissingBrand": "off",
+          "floatingEffect": "error",
+          "floatingEffectInVitest": "error",
+          "missingEffectError": "error",
+          "missingEffectContext": "error",
+          "missingLayerContext": "error",
+          "anyUnknownInErrorContext": "error",
+          "unsafeEffectTypeAssertion": "error",
+          "missingStarInYieldEffectGen": "error",
+          "missingReturnYieldStar": "error",
+          "returnEffectInGen": "error",
+          "effectInVoidSuccess": "error",
+          "effectInFailure": "error",
+          "globalErrorInEffectFailure": "error",
+          "globalErrorInEffectCatch": "error",
+          "unknownInEffectCatch": "error",
+          "tryCatchInEffectGen": "error",
+          "runEffectInsideEffect": "error",
+          "promiseInEffectSuccess": "error",
+          "catchUnfailableEffect": "warning",
+          "globalFetch": "error",
+          "globalFetchInEffect": "error",
+          "globalDateInEffect": "warning",
+          "globalConsoleInEffect": "error",
+          "asyncFunction": "warning",
+          "extendsNativeError": "error",
+          "layerMergeAllWithDependencies": "error",
+          "leakingRequirements": "warning"
+        }
+      }
+    ]
   },
-  "include": ["src", "test", "vitest.config.ts"]
+  "include": ["src", "test", "scripts", "vitest.config.ts"],
+  "exclude": ["node_modules", "dist"]
 }
