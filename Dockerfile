@@ -31,7 +31,7 @@ VOLUME /data
 EXPOSE 3000
 # Probes the configured bind address (loopback for the wildcard ones).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-  CMD ["node", "-e", "const h = process.env.FIO_MCP_HOST || '0.0.0.0'; const host = h === '0.0.0.0' ? '127.0.0.1' : h === '::' ? '[::1]' : h.includes(':') ? `[${h}]` : h; fetch(`http://${host}:${process.env.FIO_MCP_PORT || 3000}/healthz`, { signal: AbortSignal.timeout(4000) }).then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+  CMD ["node", "-e", "const h = (process.env.FIO_MCP_HOST || '').trim() || '0.0.0.0'; const host = h === '0.0.0.0' ? '127.0.0.1' : h === '::' ? '[::1]' : h.includes(':') ? `[${h}]` : h; fetch(`http://${host}:${(process.env.FIO_MCP_PORT || '').trim() || 3000}/healthz`, { signal: AbortSignal.timeout(4000) }).then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
 # `docker run <image>` serves; `docker run <image> backup /data/backup.sqlite`
 # (or `docker exec <container> node dist/main.js backup ...`) runs a backup.
 ENTRYPOINT ["node", "/app/dist/main.js"]
