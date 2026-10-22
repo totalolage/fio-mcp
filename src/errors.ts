@@ -151,7 +151,7 @@ export class CacheError extends Schema.TaggedError<CacheError>()("CacheError", {
   }
 }
 
-/** Invalid configuration. Names the variable or path, never its value. */
+/** Invalid configuration. Names the variable, never its value or a path. */
 export class ConfigError extends Schema.TaggedError<ConfigError>()("ConfigError", {
   detail: Schema.String,
 }) {
