@@ -1,4 +1,3 @@
-// @effect-diagnostics unstableApiUsage:off
 import { assert, describe, it } from "@effect/vitest";
 import { Deferred, Effect, Fiber, Layer, Queue, Sink, Stdio, Stream } from "effect";
 import { SERVER_INFO, ToolsLive } from "../src/app.js";

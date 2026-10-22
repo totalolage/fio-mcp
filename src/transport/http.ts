@@ -125,11 +125,32 @@ const mcpAuth = HttpRouter.middleware(
 );
 
 /**
- * Serves `app` (tool registrations and anything else that needs `McpServer`)
- * at /mcp, with /healthz and the guards, on a Node HTTP server. `auth` is
- * built inside the router app, so it may add routes of its own (those pass
- * the Host allowlist but not `Auth`). All sessions share the services `app`
- * is built from.
+ * The router app: `app` (tool registrations and anything else that needs
+ * `McpServer`) at /mcp, with /healthz and the guards. `auth` is built inside
+ * it, so it may add routes of its own (those pass the Host allowlist but not
+ * `Auth`). Usable with `HttpRouter.serve` or `HttpRouter.toWebHandler`.
+ */
+export const httpRouterApp = <A, E, R, EA, RA>(
+  app: Layer.Layer<A, E, R>,
+  auth: Layer.Layer<Auth, EA, RA>,
+  info: ServerInfo,
+  config: HttpTransportConfig,
+) =>
+  Layer.mergeAll(app, HealthRoute, guard(config.allowedHosts)).pipe(
+    Layer.provideMerge(
+      McpServer.layerHttp({
+        ...info,
+        path: MCP_PATH,
+        allowedOrigins: config.allowedOrigins,
+        allowSessionTermination: true,
+      }).pipe(Layer.provide(mcpAuth.layer)),
+    ),
+    Layer.provide(auth),
+  );
+
+/**
+ * Serves the router app on a Node HTTP server. All sessions share the
+ * services `app` is built from.
  */
 export const serveHttp = <A, E, R, EA, RA>(
   app: Layer.Layer<A, E, R>,
@@ -137,16 +158,6 @@ export const serveHttp = <A, E, R, EA, RA>(
   info: ServerInfo,
   config: HttpTransportConfig,
 ) =>
-  HttpRouter.serve(
-    Layer.mergeAll(app, HealthRoute, guard(config.allowedHosts)).pipe(
-      Layer.provideMerge(
-        McpServer.layerHttp({
-          ...info,
-          path: MCP_PATH,
-          allowedOrigins: config.allowedOrigins,
-          allowSessionTermination: true,
-        }).pipe(Layer.provide(mcpAuth.layer)),
-      ),
-      Layer.provide(auth),
-    ),
-  ).pipe(Layer.provideMerge(NodeHttpServer.layer(createServer, { host: config.host, port: config.port })));
+  HttpRouter.serve(httpRouterApp(app, auth, info, config)).pipe(
+    Layer.provideMerge(NodeHttpServer.layer(createServer, { host: config.host, port: config.port })),
+  );

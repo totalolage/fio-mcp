@@ -1,5 +1,4 @@
 // McpServer.layerStdio is built on the Stdio service, which effect marks unstable.
-// @effect-diagnostics unstableApiUsage:off
 import { Effect, Layer, Sink, Stdio } from "effect";
 import { McpServer } from "effect/ai";
 import { Redactor } from "../redaction.js";
