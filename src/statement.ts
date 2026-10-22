@@ -1,4 +1,5 @@
-import { FioApiError } from "./errors.js";
+import { Effect, Option, Predicate, Schema } from "effect";
+import { FioResponseError } from "./errors.js";
 
 /**
  * Normalises FIO's JSON account statement (PDF §5.3.1.6) into named fields.
@@ -82,9 +83,8 @@ const EMPTY_TRANSACTION: Transaction = Object.fromEntries(
   Object.values(COLUMNS).map(([field]) => [field, null]),
 ) as unknown as Transaction;
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  Predicate.isObject(value) && !Array.isArray(value);
 
 /**
  * FIO dates arrive as epoch milliseconds in the PDF examples and as
@@ -136,25 +136,32 @@ function columnValue(column: unknown): unknown {
   return isRecord(column) ? column.value : column;
 }
 
+const CONVERTERS: Record<ColumnKind, (value: unknown) => unknown> = {
+  number: toNumber,
+  date: toDate,
+  string: toText,
+};
+
 export function normalizeTransaction(raw: Record<string, unknown>): Transaction {
   const tx: Transaction = { ...EMPTY_TRANSACTION };
   for (const [key, [field, kind]] of Object.entries(COLUMNS)) {
     const value = columnValue(raw[key]);
-    const converted = kind === "number" ? toNumber(value) : kind === "date" ? toDate(value) : toText(value);
-    (tx as unknown as Record<string, unknown>)[field] = converted;
+    (tx as unknown as Record<string, unknown>)[field] = CONVERTERS[kind](value);
   }
   return tx;
 }
 
-export function normalizeStatement(json: unknown): NormalizedStatement {
+export const normalizeStatement = Effect.fnUntraced(function* (json: unknown) {
   const statement = isRecord(json) ? json.accountStatement : undefined;
   if (!isRecord(statement)) {
-    throw new FioApiError("bad_response", "FIO response is not a JSON account statement (missing accountStatement).");
+    return yield* new FioResponseError({
+      detail: "FIO response is not a JSON account statement (missing accountStatement).",
+    });
   }
   const info = isRecord(statement.info) ? statement.info : {};
   const list = isRecord(statement.transactionList) ? statement.transactionList.transaction : undefined;
   // Defensive: some serializers collapse one-element arrays to an object.
-  const rawTransactions = Array.isArray(list) ? list : isRecord(list) ? [list] : [];
+  const rawTransactions: ReadonlyArray<unknown> = Array.isArray(list) ? list : [list].filter(isRecord);
   const transactions = rawTransactions.filter(isRecord).map(normalizeTransaction);
   return {
     info: {
@@ -175,18 +182,14 @@ export function normalizeStatement(json: unknown): NormalizedStatement {
     },
     transactionCount: transactions.length,
     transactions,
-  };
-}
+  } satisfies NormalizedStatement;
+});
 
-export function parseStatementJson(body: string): NormalizedStatement {
-  let json: unknown;
-  try {
-    json = JSON.parse(body);
-  } catch {
-    throw new FioApiError("bad_response", "FIO returned a response that is not valid JSON.");
-  }
-  return normalizeStatement(json);
-}
+export const parseStatementJson = (body: string): Effect.Effect<NormalizedStatement, FioResponseError> =>
+  Option.match(parseJson(body), {
+    onNone: () => Effect.fail(new FioResponseError({ detail: "FIO returned a response that is not valid JSON." })),
+    onSome: normalizeStatement,
+  });
 
 /**
  * `/lastStatement/{token}/statement` has no documented response body. Accept
@@ -194,17 +197,19 @@ export function parseStatementJson(body: string): NormalizedStatement {
  */
 export function parseLastStatement(body: string): { year: number | null; number: number | null; raw: string } {
   const raw = body.trim();
-  try {
-    const json: unknown = JSON.parse(raw);
-    if (isRecord(json)) {
-      const year = toNumber(json.year ?? json.yearList);
-      const number = toNumber(json.id ?? json.number ?? json.idList);
-      if (year !== null || number !== null) return { year, number, raw };
-    }
-  } catch {
-    // not JSON
+  const json = parseJsonOrUndefined(raw);
+  if (isRecord(json)) {
+    const year = toNumber(json.year ?? json.yearList);
+    const number = toNumber(json.id ?? json.number ?? json.idList);
+    if (year !== null || number !== null) return { year, number, raw };
   }
   const match = /^\D*(\d{4})\D+(\d{1,4})\D*$/.exec(raw);
   if (match) return { year: Number(match[1]), number: Number(match[2]), raw };
   return { year: null, number: null, raw };
+}
+
+const parseJson = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown));
+
+function parseJsonOrUndefined(text: string): unknown {
+  return Option.getOrUndefined(parseJson(text));
 }

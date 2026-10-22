@@ -1,6 +1,6 @@
+import { Effect, Predicate } from "effect";
 import { XMLParser, XMLValidator } from "fast-xml-parser";
-import { FioApiError } from "./errors.js";
-import { excerpt } from "./fio-client.js";
+import { XmlParseError } from "./errors.js";
 
 /** Import response (PDF §6, responseImportIB.xsd). */
 
@@ -57,9 +57,7 @@ const parser = new XMLParser({
 
 type Node = Record<string, unknown>;
 
-function isNode(value: unknown): value is Node {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
+const isNode = (value: unknown): value is Node => Predicate.isObject(value) && !Array.isArray(value);
 
 function asArray(value: unknown): unknown[] {
   if (value === undefined || value === null) return [];
@@ -86,22 +84,21 @@ function decimalOrNull(value: unknown): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
-export function parseImportResponse(body: string): ImportResult {
+/**
+ * Parses FIO's import response. `excerpt` turns the body into a redacted,
+ * truncated snippet for the error message.
+ */
+export const parseImportResponse = Effect.fnUntraced(function* (body: string, excerpt: (body: string) => string) {
+  const invalid = () =>
+    new XmlParseError({ detail: `FIO returned an import response that is not valid XML: ${excerpt(body)}` });
   // Validate first: the parser alone accepts truncated XML, which could turn a
   // cut-off "accepted" response into an apparent rejection.
-  if (XMLValidator.validate(body) !== true) {
-    throw new FioApiError("bad_response", `FIO returned an import response that is not valid XML: ${excerpt(body)}`);
-  }
-  let doc: unknown;
-  try {
-    doc = parser.parse(body);
-  } catch {
-    throw new FioApiError("bad_response", `FIO returned an import response that is not valid XML: ${excerpt(body)}`);
-  }
+  if (XMLValidator.validate(body) !== true) return yield* invalid();
+  const doc = yield* Effect.try({ try: (): unknown => parser.parse(body), catch: invalid });
   const root = isNode(doc) ? doc.responseImport : undefined;
   const result = isNode(root) ? root.result : undefined;
   if (!isNode(root) || !isNode(result)) {
-    throw new FioApiError("bad_response", `FIO returned an unexpected import response: ${excerpt(body)}`);
+    return yield* new XmlParseError({ detail: `FIO returned an unexpected import response: ${excerpt(body)}` });
   }
 
   const status = textOf(result.status).trim().toLowerCase();
@@ -118,14 +115,9 @@ export function parseImportResponse(body: string): ImportResult {
   const details = isNode(root.ordersDetails) ? asArray(root.ordersDetails.detail).filter(isNode) : [];
 
   const batchIds = asArray(result.idInstruction).map(textOf).filter((s) => s !== "");
-  const outcome: ImportOutcome =
-    status === "ok" || status === "warning"
-      ? "accepted"
-      : (status === "error" || status === "fatal") && batchIds.length === 0
-        ? "rejected"
-        : "unknown";
+  const outcome = classifyOutcome(status, batchIds);
 
-  return {
+  const parsed: ImportResult = {
     outcome,
     accepted: outcome === "accepted",
     status,
@@ -143,6 +135,13 @@ export function parseImportResponse(body: string): ImportResult {
       })),
     })),
   };
+  return parsed;
+});
+
+function classifyOutcome(status: string, batchIds: ReadonlyArray<string>): ImportOutcome {
+  if (status === "ok" || status === "warning") return "accepted";
+  if ((status === "error" || status === "fatal") && batchIds.length === 0) return "rejected";
+  return "unknown";
 }
 
 /** The refusal must name the token/API... */

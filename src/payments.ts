@@ -1,4 +1,5 @@
-import { z } from "zod";
+import { Effect, Schema, SchemaTransformation } from "effect";
+import { InvalidInput } from "./errors.js";
 import { FIO_COUNTRY_CODES } from "./fio-countries.js";
 
 /**
@@ -30,68 +31,78 @@ export const CHARGES = { OUR: "470501", BEN: "470502", SHA: "470503" } as const;
 
 export const MAX_ORDERS_PER_BATCH = 100;
 
-// eslint-disable-next-line no-control-regex
+// biome-ignore lint/suspicious/noControlCharactersInRegex: matching control characters is the point
 const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
 
 const text = (max: number, what: string) =>
-  z
-    .string()
-    .trim()
-    .min(1)
-    .max(max)
-    .refine((v) => !CONTROL_CHARS.test(v), "must not contain control characters or line breaks")
-    .describe(what);
+  Schema.Trim.check(
+    Schema.isMinLength(1, { message: "must not be empty" }),
+    Schema.isMaxLength(max, { message: `must be at most ${max} characters` }),
+    Schema.makeFilter((v: string) => !CONTROL_CHARS.test(v), {
+      message: "must not contain control characters or line breaks",
+    }),
+  ).annotate({ description: what });
 
 const digits = (max: number, what: string) =>
-  z
-    .string()
-    .regex(new RegExp(`^\\d{1,${max}}$`), `must be 1-${max} digits`)
-    .describe(what);
+  Schema.String.check(Schema.isPattern(new RegExp(`^\\d{1,${max}}$`), { message: `must be 1-${max} digits` })).annotate({
+    description: what,
+  });
+
+const isCalendarDate = (v: string): boolean => {
+  const d = new Date(`${v}T00:00:00Z`);
+  return !Number.isNaN(d.getTime()) && d.toISOString().startsWith(v);
+};
 
 // xs:date (XML Schema 1.0) has no year 0000, though JavaScript's Date does.
-const isoDate = z
-  .string()
-  .regex(/^(?!0000)\d{4}-\d{2}-\d{2}$/, "must be YYYY-MM-DD with a year from 0001")
-  .refine((v) => {
-    const d = new Date(`${v}T00:00:00Z`);
-    return !Number.isNaN(d.getTime()) && d.toISOString().startsWith(v);
-  }, "is not a valid calendar date");
+const isoDate = (what: string) =>
+  Schema.String.check(
+    Schema.isPattern(/^(?!0000)\d{4}-\d{2}-\d{2}$/, { message: "must be YYYY-MM-DD with a year from 0001" }),
+    Schema.makeFilter(isCalendarDate, { message: "is not a valid calendar date" }),
+  ).annotate({ description: what });
 
 export const MAX_AMOUNT = 999_999_999_999.99;
 
 // Exact to the cent: the value must be the nearest double to its own 2-decimal
 // rendering, so toFixed(2) never rounds. The cap keeps cents representable.
-const amount = z
-  .number()
-  .min(0.01)
-  .max(MAX_AMOUNT)
-  .refine((v) => Number(v.toFixed(2)) === v, "must have at most two decimal places")
-  .describe("Amount in the payer account's currency, at most 2 decimal places (e.g. 1250.5).");
+const amount = Schema.Finite.check(
+  Schema.isGreaterThanOrEqualTo(0.01, { message: "must be at least 0.01" }),
+  Schema.isLessThanOrEqualTo(MAX_AMOUNT, { message: `must be at most ${MAX_AMOUNT}` }),
+  Schema.makeFilter((v: number) => Number(v.toFixed(2)) === v, { message: "must have at most two decimal places" }),
+).annotate({ description: "Amount in the payer account's currency, at most 2 decimal places (e.g. 1250.5)." });
 
-const currency = z
-  .string()
-  .regex(/^[A-Z]{3}$/, "must be an ISO 4217 code such as CZK or EUR")
-  .optional()
-  .describe("Payer-account currency (ISO 4217). Defaults to the configured or last-seen account currency.");
+const currency = Schema.optionalKey(
+  Schema.String.check(Schema.isPattern(/^[A-Z]{3}$/, { message: "must be an ISO 4217 code such as CZK or EUR" })).annotate({
+    description: "Payer-account currency (ISO 4217). Defaults to the configured or last-seen account currency.",
+  }),
+);
 
-const bic = z
-  .string()
-  .regex(/^[A-Z]{6}[A-Z0-9]{2}([A-Z0-9]{3})?$/, "must be an 8 or 11 character BIC (ISO 9362)");
+const bic = (what: string) =>
+  Schema.String.check(
+    Schema.isPattern(/^[A-Z]{6}[A-Z0-9]{2}([A-Z0-9]{3})?$/, { message: "must be an 8 or 11 character BIC (ISO 9362)" }),
+  ).annotate({ description: what });
 
 const FIO_COUNTRIES: ReadonlySet<string> = new Set(FIO_COUNTRY_CODES);
 
 // The XSD's country_type is a closed enumeration; checked by lookup rather than
-// z.enum so the tool schema does not carry all 253 codes.
-const country = z
-  .string()
-  .regex(/^[A-Z]{2}$/, "must be an ISO 3166 alpha-2 country code such as DE")
-  .refine((v) => FIO_COUNTRIES.has(v), "is not a country code FIO accepts (fio_xml_type.xsd country_type)");
+// a literal union so the tool schema does not carry all 253 codes.
+const country = (what: string) =>
+  Schema.String.check(
+    Schema.isPattern(/^[A-Z]{2}$/, { message: "must be an ISO 3166 alpha-2 country code such as DE" }),
+    Schema.makeFilter((v: string) => FIO_COUNTRIES.has(v), {
+      message: "is not a country code FIO accepts (fio_xml_type.xsd country_type)",
+    }),
+  ).annotate({ description: what });
 
-const paymentReason = z.enum(PAYMENT_REASONS);
+const paymentReason = (what: string) => Schema.Literals(PAYMENT_REASONS).annotate({ description: what });
 
 function compact(value: string): string {
   return value.replace(/\s+/g, "").toUpperCase();
 }
+
+/** Decodes by removing whitespace and upper-casing; encodes as is. */
+const Compacted = Schema.String.pipe(
+  Schema.decodeTo(Schema.String, SchemaTransformation.transform({ decode: compact, encode: (v: string) => v })),
+);
 
 /** ISO 13616 mod-97 check. */
 export function isValidIban(value: string): boolean {
@@ -106,104 +117,105 @@ export function isValidIban(value: string): boolean {
   return remainder === 1;
 }
 
-const iban = z
-  .string()
-  .transform(compact)
-  .refine(isValidIban, "must be a valid IBAN");
+const iban = (what: string) =>
+  Compacted.check(Schema.makeFilter(isValidIban, { message: "must be a valid IBAN" })).annotate({ description: what });
 
-export const domesticOrderSchema = z
-  .strictObject({
-    type: z.literal("domestic"),
-    amount,
-    currency,
-    accountTo: z
-      .string()
-      .regex(/^(\d{1,6}-)?\d{1,10}$/, "must be a Czech account number: optional 1-6 digit prefix, '-', 1-10 digits")
-      .describe("Payee account number without bank code, e.g. 2212-2000000699."),
-    bankCode: z.string().regex(/^\d{4}$/, "must be 4 digits").describe("Payee bank code, e.g. 0300."),
-    date: isoDate.describe("Due date (YYYY-MM-DD)."),
-    ks: digits(4, "Constant symbol (up to 4 digits).").optional(),
-    vs: digits(10, "Variable symbol (up to 10 digits).").optional(),
-    ss: digits(10, "Specific symbol (up to 10 digits).").optional(),
-    messageForRecipient: text(140, "Message shown to the recipient (max 140 characters).").optional(),
-    comment: text(140, "Your own label for the order (max 140 characters).").optional(),
-    paymentReason: paymentReason.optional().describe("Payment reason code (platební titul), optional."),
-    paymentType: z
-      .enum(["standard", "priority", "collection"])
-      .optional()
-      .describe("standard (431001, default), priority (431005), or collection (431022): a direct-debit collection that PULLS money from accountTo into your account."),
-  })
-  .describe("Domestic (Czech) payment, also usable for foreign-currency transfers between FIO accounts.");
+const opt = Schema.optionalKey;
 
-export const euroOrderSchema = z
-  .strictObject({
-    type: z.literal("euro"),
-    amount,
-    currency,
-    accountTo: iban.describe("Payee IBAN."),
-    bic: bic.optional().describe("Payee bank BIC, optional."),
-    date: isoDate.describe("Due date (YYYY-MM-DD)."),
-    ks: digits(4, "Constant symbol (up to 4 digits).").optional(),
-    vs: digits(10, "Variable symbol (up to 10 digits).").optional(),
-    ss: digits(10, "Specific symbol (up to 10 digits).").optional(),
-    comment: text(140, "Your own label (max 140; letters without diacritics, digits, space , . / -).").optional(),
-    benefName: text(35, "Beneficiary name (max 35; letters without diacritics, digits, space , . / -)."),
-    benefStreet: text(35, "Beneficiary street (max 35).").optional(),
-    benefCity: text(35, "Beneficiary city (max 35).").optional(),
-    benefCountry: country.optional().describe("Beneficiary country, ISO alpha-2."),
-    remittanceInfo1: text(35, "Remittance information line 1 (max 35).").optional(),
-    remittanceInfo2: text(35, "Remittance information line 2 (max 35).").optional(),
-    remittanceInfo3: text(35, "Remittance information line 3 (max 35).").optional(),
-    paymentReason: paymentReason
-      .optional()
-      .describe("Payment reason code; required only for accounts at FIO's Slovak branch above EUR 50,000."),
-    paymentType: z
-      .enum(["standard", "priority", "instant"])
-      .optional()
-      .describe("standard (431008, default), priority (431009), or instant (431018)."),
-  })
-  .describe("Euro payment (T2/SEPA) to an IBAN.");
+export const DomesticOrder = Schema.Struct({
+  type: Schema.Literal("domestic"),
+  amount,
+  currency,
+  accountTo: Schema.String.check(
+    Schema.isPattern(/^(\d{1,6}-)?\d{1,10}$/, {
+      message: "must be a Czech account number: optional 1-6 digit prefix, '-', 1-10 digits",
+    }),
+  ).annotate({ description: "Payee account number without bank code, e.g. 2212-2000000699." }),
+  bankCode: Schema.String.check(Schema.isPattern(/^\d{4}$/, { message: "must be 4 digits" })).annotate({
+    description: "Payee bank code, e.g. 0300.",
+  }),
+  date: isoDate("Due date (YYYY-MM-DD)."),
+  ks: opt(digits(4, "Constant symbol (up to 4 digits).")),
+  vs: opt(digits(10, "Variable symbol (up to 10 digits).")),
+  ss: opt(digits(10, "Specific symbol (up to 10 digits).")),
+  messageForRecipient: opt(text(140, "Message shown to the recipient (max 140 characters).")),
+  comment: opt(text(140, "Your own label for the order (max 140 characters).")),
+  paymentReason: opt(paymentReason("Payment reason code (platební titul), optional.")),
+  paymentType: opt(
+    Schema.Literals(["standard", "priority", "collection"]).annotate({
+      description:
+        "standard (431001, default), priority (431005), or collection (431022): a direct-debit collection that PULLS money from accountTo into your account.",
+    }),
+  ),
+}).annotate({ description: "Domestic (Czech) payment, also usable for foreign-currency transfers between FIO accounts." });
 
-export const foreignOrderSchema = z
-  .strictObject({
-    type: z.literal("foreign"),
-    amount,
-    currency,
-    accountTo: z
-      .string()
-      .transform(compact)
-      .refine((v) => /^[A-Z0-9]{1,34}$/.test(v), "must be an account number or IBAN of up to 34 letters/digits")
-      .describe("Payee account number or IBAN."),
-    bic: bic.describe("Payee bank BIC (required)."),
-    date: isoDate.describe("Due date (YYYY-MM-DD)."),
-    comment: text(140, "Additional information (max 140).").optional(),
-    benefName: text(35, "Beneficiary name (max 35)."),
-    benefStreet: text(35, "Beneficiary street (max 35)."),
-    benefCity: text(35, "Beneficiary city (max 35)."),
-    benefCountry: country.describe("Beneficiary country, ISO alpha-2."),
-    remittanceInfo1: text(35, "Remittance information line 1 (max 35, required)."),
-    remittanceInfo2: text(35, "Remittance information line 2 (max 35).").optional(),
-    remittanceInfo3: text(35, "Remittance information line 3 (max 35).").optional(),
-    remittanceInfo4: text(35, "Remittance information line 4 (max 35).").optional(),
-    detailsOfCharges: z
-      .enum(["OUR", "BEN", "SHA"])
-      .describe("Who pays fees: OUR (sender, 470501), BEN (recipient, 470502), SHA (shared, 470503)."),
-    paymentReason: paymentReason.describe("Payment reason code (platební titul), required."),
-  })
-  .describe("Foreign (non-SEPA) payment.");
+export const EuroOrder = Schema.Struct({
+  type: Schema.Literal("euro"),
+  amount,
+  currency,
+  accountTo: iban("Payee IBAN."),
+  bic: opt(bic("Payee bank BIC, optional.")),
+  date: isoDate("Due date (YYYY-MM-DD)."),
+  ks: opt(digits(4, "Constant symbol (up to 4 digits).")),
+  vs: opt(digits(10, "Variable symbol (up to 10 digits).")),
+  ss: opt(digits(10, "Specific symbol (up to 10 digits).")),
+  comment: opt(text(140, "Your own label (max 140; letters without diacritics, digits, space , . / -).")),
+  benefName: text(35, "Beneficiary name (max 35; letters without diacritics, digits, space , . / -)."),
+  benefStreet: opt(text(35, "Beneficiary street (max 35).")),
+  benefCity: opt(text(35, "Beneficiary city (max 35).")),
+  benefCountry: opt(country("Beneficiary country, ISO alpha-2.")),
+  remittanceInfo1: opt(text(35, "Remittance information line 1 (max 35).")),
+  remittanceInfo2: opt(text(35, "Remittance information line 2 (max 35).")),
+  remittanceInfo3: opt(text(35, "Remittance information line 3 (max 35).")),
+  paymentReason: opt(
+    paymentReason("Payment reason code; required only for accounts at FIO's Slovak branch above EUR 50,000."),
+  ),
+  paymentType: opt(
+    Schema.Literals(["standard", "priority", "instant"]).annotate({
+      description: "standard (431008, default), priority (431009), or instant (431018).",
+    }),
+  ),
+}).annotate({ description: "Euro payment (T2/SEPA) to an IBAN." });
 
-export const paymentOrderSchema = z.discriminatedUnion("type", [domesticOrderSchema, euroOrderSchema, foreignOrderSchema]);
+export const ForeignOrder = Schema.Struct({
+  type: Schema.Literal("foreign"),
+  amount,
+  currency,
+  accountTo: Compacted.check(
+    Schema.isPattern(/^[A-Z0-9]{1,34}$/, { message: "must be an account number or IBAN of up to 34 letters/digits" }),
+  ).annotate({ description: "Payee account number or IBAN." }),
+  bic: bic("Payee bank BIC (required)."),
+  date: isoDate("Due date (YYYY-MM-DD)."),
+  comment: opt(text(140, "Additional information (max 140).")),
+  benefName: text(35, "Beneficiary name (max 35)."),
+  benefStreet: text(35, "Beneficiary street (max 35)."),
+  benefCity: text(35, "Beneficiary city (max 35)."),
+  benefCountry: country("Beneficiary country, ISO alpha-2."),
+  remittanceInfo1: text(35, "Remittance information line 1 (max 35, required)."),
+  remittanceInfo2: opt(text(35, "Remittance information line 2 (max 35).")),
+  remittanceInfo3: opt(text(35, "Remittance information line 3 (max 35).")),
+  remittanceInfo4: opt(text(35, "Remittance information line 4 (max 35).")),
+  detailsOfCharges: Schema.Literals(["OUR", "BEN", "SHA"]).annotate({
+    description: "Who pays fees: OUR (sender, 470501), BEN (recipient, 470502), SHA (shared, 470503).",
+  }),
+  paymentReason: paymentReason("Payment reason code (platební titul), required."),
+}).annotate({ description: "Foreign (non-SEPA) payment." });
 
-export const paymentOrdersSchema = z
-  .array(paymentOrderSchema)
-  .min(1)
-  .max(MAX_ORDERS_PER_BATCH)
-  .describe(`1-${MAX_ORDERS_PER_BATCH} orders. They are sent as one batch in the order FIO requires: domestic, euro, foreign.`);
+export const PaymentOrder = Schema.Union([DomesticOrder, EuroOrder, ForeignOrder]);
 
-export type PaymentOrder = z.infer<typeof paymentOrderSchema>;
-export type DomesticOrder = z.infer<typeof domesticOrderSchema>;
-export type EuroOrder = z.infer<typeof euroOrderSchema>;
-export type ForeignOrder = z.infer<typeof foreignOrderSchema>;
+export const PaymentOrders = Schema.Array(PaymentOrder)
+  .check(
+    Schema.isMinLength(1, { message: "must contain at least one order" }),
+    Schema.isMaxLength(MAX_ORDERS_PER_BATCH, { message: `must contain at most ${MAX_ORDERS_PER_BATCH} orders` }),
+  )
+  .annotate({
+    description: `1-${MAX_ORDERS_PER_BATCH} orders. They are sent as one batch in the order FIO requires: domestic, euro, foreign.`,
+  });
+
+export type PaymentOrder = typeof PaymentOrder.Type;
+export type DomesticOrder = typeof DomesticOrder.Type;
+export type EuroOrder = typeof EuroOrder.Type;
+export type ForeignOrder = typeof ForeignOrder.Type;
 
 export interface Payer {
   accountNumber: string;
@@ -240,21 +252,11 @@ function block(tag: string, elements: Element[]): string {
   return `    <${tag}>\n${elements.map(element).join("")}    </${tag}>\n`;
 }
 
-function resolveCurrency(order: PaymentOrder, payer: Payer): string {
-  const value = order.currency ?? payer.currency;
-  if (!value) {
-    throw new Error(
-      "Order currency is unknown: pass `currency` on each order, or configure the account currency (FIO_ACCOUNT_CURRENCY / accounts[].currency).",
-    );
-  }
-  return value;
-}
-
 /** Element order follows the xs:sequence in importIB.xsd exactly. */
-function orderXml(order: PaymentOrder, payer: Payer): string {
+function orderXml(order: PaymentOrder, payer: Payer, currency: string): string {
   const common: Element[] = [
     ["accountFrom", payer.accountNumber],
-    ["currency", resolveCurrency(order, payer)],
+    ["currency", currency],
     ["amount", order.amount.toFixed(2)],
   ];
   switch (order.type) {
@@ -314,13 +316,24 @@ function orderXml(order: PaymentOrder, payer: Payer): string {
 }
 
 /** Builds a Fio XML import document (UTF-8) for the given orders. */
-export function buildImportXml(orders: readonly PaymentOrder[], payer: Payer): string {
+export const buildImportXml = Effect.fnUntraced(function* (orders: readonly PaymentOrder[], payer: Payer) {
   if (!/^\d{1,10}$/.test(payer.accountNumber)) {
-    throw new Error("Payer account number must be 1-10 digits (FIO account number without bank code).");
+    return yield* new InvalidInput({
+      detail: "Payer account number must be 1-10 digits (FIO account number without bank code).",
+    });
   }
-  const body = sortOrders(orders)
-    .map((order) => orderXml(order, payer))
-    .join("");
+  const parts: Array<string> = [];
+  for (const order of sortOrders(orders)) {
+    const currency = order.currency ?? payer.currency;
+    if (currency === undefined) {
+      return yield* new InvalidInput({
+        detail:
+          "Order currency is unknown: pass `currency` on each order, or configure the account currency (FIO_ACCOUNT_CURRENCY / accounts[].currency).",
+      });
+    }
+    parts.push(orderXml(order, payer, currency));
+  }
+  const body = parts.join("");
   return (
     '<?xml version="1.0" encoding="UTF-8"?>\n' +
     '<Import xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.fio.cz/schema/importIB.xsd">\n' +
@@ -329,7 +342,7 @@ export function buildImportXml(orders: readonly PaymentOrder[], payer: Payer): s
     "  </Orders>\n" +
     "</Import>\n"
   );
-}
+});
 
 /** Totals per currency, for the confirmation summary. */
 export function summarizeOrders(orders: readonly PaymentOrder[], payer: Payer) {

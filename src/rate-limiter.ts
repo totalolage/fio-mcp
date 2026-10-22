@@ -1,172 +1,249 @@
-import { FioApiError, RateLimitedError } from "./errors.js";
+import { Clock, Context, DateTime, Deferred, Effect, Layer, Predicate, Queue, Ref, Result, SynchronizedRef } from "effect";
+import { AppConfig } from "./config.js";
+import { RateLimited, type TokenBusy } from "./errors.js";
+
+/**
+ * Per-token request pacing. FIO allows one request per token every 30 s for
+ * any operation and answers HTTP 409 otherwise.
+ *
+ * Each token has one dispatcher and two FIFO queues. Interactive calls (tool
+ * calls) always go before background calls (cache sync), so a long backfill
+ * never sits ahead of a user's question. Starts are at least `intervalMs`
+ * apart.
+ *
+ * Interactive calls have a wait budget (`maxWaitMs` from arrival). A call that
+ * cannot start within it fails with a retry-after hint instead of hanging past
+ * the MCP client's timeout: at arrival when the projected start is already too
+ * late, or later when a 409 pushes the queue back. Background calls wait as
+ * long as it takes.
+ *
+ * On HTTP 409 (token used elsewhere within the window) the token is blocked
+ * for a full interval, which delays everyone queued, and the call retries
+ * once at the front of its queue if that still fits its budget.
+ */
+
+export type Priority = "interactive" | "background";
 
 export interface RateLimiterOptions {
-  /** Minimum spacing between request starts. FIO allows one request per 30 s per token. */
-  intervalMs: number;
-  /** Longest a call may spend waiting (queue plus 409 back-off) before failing fast. */
-  maxWaitMs: number;
+  /** Minimum spacing between request starts. */
+  readonly intervalMs: number;
+  /** Longest an interactive call may spend waiting before failing fast. */
+  readonly maxWaitMs: number;
 }
 
 export interface RateLimitState {
-  intervalSeconds: number;
-  /** Seconds until a newly arriving call could start (0 = now). */
-  nextSlotInSeconds: number;
-  /** Calls waiting for a slot. */
-  queued: number;
-  last409At?: string;
+  readonly intervalSeconds: number;
+  /** Seconds until a newly arriving interactive call could start (0 = now). */
+  readonly nextSlotInSeconds: number;
+  /** Interactive calls waiting for a slot. */
+  readonly queued: number;
+  /** Background (sync) calls waiting for a slot. */
+  readonly queuedBackground: number;
+  readonly last409At: string | undefined;
 }
 
 interface Waiter {
-  /** Latest acceptable start time; past it the call fails fast instead of waiting. */
-  deadline: number;
-  resolve: () => void;
-  reject: (error: unknown) => void;
-  signal?: AbortSignal;
-  onAbort?: () => void;
+  /** Latest acceptable start (epoch ms); past it an interactive call fails fast. */
+  readonly deadline: number;
+  readonly grant: Deferred.Deferred<void, RateLimited>;
 }
 
-/**
- * Serialized request queue for one FIO token.
- *
- * Calls start in arrival order, at least `intervalMs` apart. Each call has a
- * wait budget (`maxWaitMs` from when it arrived). A call that cannot start
- * within its budget is rejected with a retry-after hint instead of hanging past
- * the MCP client's timeout: at arrival when the projected start is already too
- * late, or at dispatch when a later 409 pushed the queue back.
- *
- * On HTTP 409 (token used elsewhere within the window) the token is blocked for
- * a full interval, which delays everyone queued, and the call retries once at
- * the head of the queue if that still fits its budget.
- */
-export class TokenRateLimiter {
-  private lastStart = Number.NEGATIVE_INFINITY;
-  private blockedUntil = 0;
-  private last409At: number | undefined;
-  private readonly queue: Waiter[] = [];
-  private timer: ReturnType<typeof setTimeout> | undefined;
+interface TokenState {
+  readonly lastStart: number;
+  readonly blockedUntil: number;
+  readonly last409At: number | undefined;
+  readonly interactive: ReadonlyArray<Waiter>;
+  readonly background: ReadonlyArray<Waiter>;
+}
 
-  constructor(private readonly options: RateLimiterOptions) {}
+interface TokenLimiter {
+  readonly state: Ref.Ref<TokenState>;
+  /** Wakes the dispatcher after arrivals, cancellations, and 409 blocks. */
+  readonly wake: Queue.Queue<void>;
+}
 
-  async run<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
-    const deadline = Date.now() + this.options.maxWaitMs;
-    await this.acquire(deadline, signal, false);
-    try {
-      return await fn();
-    } catch (error) {
-      if (!isConflict(error)) throw error;
-      this.block();
-      await this.acquire(deadline, signal, true, "FIO returned HTTP 409 (the token was used elsewhere within the last 30 s).");
-      try {
-        return await fn();
-      } catch (retryError) {
-        if (!isConflict(retryError)) throw retryError;
-        this.block();
-        throw new RateLimitedError(
-          Math.ceil(this.options.intervalMs / 1000),
-          "FIO returned HTTP 409 twice; another client is probably using this token.",
-        );
-      }
-    }
-  }
+const CONFLICT_REASON = "FIO returned HTTP 409 (the token was used elsewhere within the last 30 s).";
+const SECOND_CONFLICT_REASON = "FIO returned HTTP 409 twice; another client is probably using this token.";
 
-  state(): RateLimitState {
-    const now = Date.now();
-    return {
-      intervalSeconds: this.options.intervalMs / 1000,
-      nextSlotInSeconds: Math.ceil(Math.max(0, this.projectedStart(now) - now) / 1000),
-      queued: this.queue.length,
-      ...(this.last409At === undefined ? {} : { last409At: new Date(this.last409At).toISOString() }),
-    };
-  }
+export interface RateLimiterShape {
+  /**
+   * Runs `request` in the token's next slot. A `TokenBusy` failure (HTTP 409)
+   * is consumed: the token is blocked for an interval and the request retried
+   * once, or the call fails with `RateLimited`.
+   */
+  readonly run: <A, E, R>(
+    key: string,
+    priority: Priority,
+    request: Effect.Effect<A, E | TokenBusy, R>,
+  ) => Effect.Effect<A, Exclude<E, TokenBusy> | RateLimited, R>;
+  readonly state: (key: string) => Effect.Effect<RateLimitState>;
+}
 
-  /** Earliest time the head of the queue may start. */
-  private readyAt(): number {
-    return Math.max(this.lastStart + this.options.intervalMs, this.blockedUntil);
-  }
+const initialState: TokenState = {
+  lastStart: Number.NEGATIVE_INFINITY,
+  blockedUntil: 0,
+  last409At: undefined,
+  interactive: [],
+  background: [],
+};
 
-  /** Estimated start for a call joining the back of the queue now. */
-  private projectedStart(now: number): number {
-    return Math.max(now, this.readyAt()) + this.queue.length * this.options.intervalMs;
-  }
+export const makeRateLimiter = Effect.fn("RateLimiter.make")(function* (options: RateLimiterOptions) {
+  const scope = yield* Effect.scope;
+  const limiters = yield* SynchronizedRef.make(new Map<string, TokenLimiter>());
+  const { intervalMs, maxWaitMs } = options;
 
-  private block(): void {
-    this.last409At = Date.now();
-    this.blockedUntil = Math.max(this.blockedUntil, Date.now() + this.options.intervalMs);
-    this.reschedule();
-  }
+  const readyAt = (s: TokenState) => Math.max(s.lastStart + intervalMs, s.blockedUntil);
 
-  private acquire(deadline: number, signal: AbortSignal | undefined, front: boolean, reason?: string): Promise<void> {
-    const now = Date.now();
-    const start = front ? Math.max(now, this.readyAt()) : this.projectedStart(now);
-    if (start > deadline) {
-      return Promise.reject(this.tooLate(start - now, reason));
-    }
-    if (signal?.aborted) return Promise.reject(signal.reason ?? new Error("Aborted"));
-    return new Promise<void>((resolve, reject) => {
-      const waiter: Waiter = { deadline, resolve, reject };
-      if (signal) {
-        waiter.signal = signal;
-        waiter.onAbort = () => {
-          this.remove(waiter);
-          reject(signal.reason ?? new Error("Aborted"));
-          this.reschedule();
-        };
-        signal.addEventListener("abort", waiter.onAbort, { once: true });
-      }
-      if (front) this.queue.unshift(waiter);
-      else this.queue.push(waiter);
-      this.reschedule();
+  const tooLate = (waitMs: number, reason?: string) =>
+    new RateLimited({
+      retryAfterSeconds: Math.max(1, Math.ceil(waitMs / 1000)),
+      reason:
+        reason ??
+        `FIO allows one request per ${Math.round(intervalMs / 1000)} s per token and the next free slot is ${Math.ceil(waitMs / 1000)} s away.`,
     });
-  }
 
-  private tooLate(waitMs: number, reason?: string): RateLimitedError {
-    return new RateLimitedError(
-      Math.max(1, Math.ceil(waitMs / 1000)),
-      reason ??
-        `FIO allows one request per ${Math.round(this.options.intervalMs / 1000)} s per token and the next free slot is ${Math.ceil(waitMs / 1000)} s away.`,
-    );
-  }
-
-  private remove(waiter: Waiter): void {
-    const index = this.queue.indexOf(waiter);
-    if (index >= 0) this.queue.splice(index, 1);
-    if (waiter.signal && waiter.onAbort) waiter.signal.removeEventListener("abort", waiter.onAbort);
-  }
-
-  private reschedule(): void {
-    if (this.timer !== undefined) {
-      clearTimeout(this.timer);
-      this.timer = undefined;
-    }
-    this.pump();
-  }
-
-  /** Dispatches the head of the queue when its slot arrives. */
-  private pump(): void {
-    const now = Date.now();
-    while (this.queue.length > 0) {
-      const head = this.queue[0] as Waiter;
-      const readyAt = Math.max(now, this.readyAt());
-      if (readyAt > head.deadline) {
-        // A 409 pushed the queue past this call's budget: fail fast.
-        this.remove(head);
-        head.reject(this.tooLate(readyAt - now));
-        continue;
-      }
-      if (readyAt > now) {
-        this.timer = setTimeout(() => {
-          this.timer = undefined;
-          this.pump();
-        }, readyAt - now);
+  /** Hands out slots; fails interactive waiters a 409 pushed past their budget. */
+  const dispatch = (limiter: TokenLimiter): Effect.Effect<never> =>
+    Effect.gen(function* () {
+      const now = yield* Clock.currentTimeMillis;
+      const s = yield* Ref.get(limiter.state);
+      if (s.interactive.length === 0 && s.background.length === 0) {
+        yield* Queue.take(limiter.wake);
         return;
       }
-      this.remove(head);
-      this.lastStart = now;
-      head.resolve();
+      const ready = readyAt(s);
+      const start = Math.max(now, ready);
+      const survivors: Array<Waiter> = [];
+      for (const waiter of s.interactive) {
+        const projected = start + survivors.length * intervalMs;
+        if (projected > waiter.deadline) yield* Deferred.fail(waiter.grant, tooLate(projected - now));
+        else survivors.push(waiter);
+      }
+      if (survivors.length !== s.interactive.length) {
+        yield* Ref.update(limiter.state, (current) => ({
+          ...current,
+          interactive: current.interactive.filter((w) => survivors.includes(w)),
+        }));
+      }
+      if (ready > now) {
+        yield* Queue.take(limiter.wake).pipe(Effect.timeoutOrElse({ duration: ready - now, orElse: () => Effect.void }));
+        return;
+      }
+      const next = yield* Ref.modify(limiter.state, (current): [Waiter | undefined, TokenState] => {
+        const [head, ...rest] = current.interactive.length > 0 ? current.interactive : current.background;
+        if (head === undefined) return [undefined, current];
+        const queues =
+          current.interactive.length > 0 ? { interactive: rest } : { background: rest };
+        return [head, { ...current, ...queues, lastStart: now }];
+      });
+      if (next !== undefined) yield* Deferred.succeed(next.grant, undefined);
+    }).pipe(Effect.forever);
+
+  const limiterFor = (key: string) =>
+    SynchronizedRef.modifyEffect(limiters, (map) => {
+      const existing = map.get(key);
+      if (existing !== undefined) return Effect.succeed([existing, map] as const);
+      return Effect.gen(function* () {
+        const limiter: TokenLimiter = {
+          state: yield* Ref.make(initialState),
+          wake: yield* Queue.sliding<void>(1),
+        };
+        yield* Effect.forkIn(dispatch(limiter), scope);
+        return [limiter, new Map(map).set(key, limiter)] as const;
+      });
+    });
+
+  const signal = (limiter: TokenLimiter) => Queue.offer(limiter.wake, undefined).pipe(Effect.asVoid);
+
+  const acquire = Effect.fnUntraced(function* (
+    limiter: TokenLimiter,
+    priority: Priority,
+    deadline: number,
+    front: boolean,
+    reason?: string,
+  ) {
+    const now = yield* Clock.currentTimeMillis;
+    const s = yield* Ref.get(limiter.state);
+    const ahead = priority === "interactive" && !front ? s.interactive.length : 0;
+    const projected = Math.max(now, readyAt(s)) + ahead * intervalMs;
+    if (projected > deadline) return yield* tooLate(projected - now, reason);
+    const waiter: Waiter = { deadline, grant: yield* Deferred.make<void, RateLimited>() };
+    const queue = priority === "interactive" ? "interactive" : "background";
+    yield* Ref.update(limiter.state, (current) => ({
+      ...current,
+      [queue]: front ? [waiter, ...current[queue]] : [...current[queue], waiter],
+    }));
+    yield* signal(limiter);
+    yield* Deferred.await(waiter.grant).pipe(
+      Effect.onInterrupt(() =>
+        Ref.update(limiter.state, (current) => ({
+          ...current,
+          interactive: current.interactive.filter((w) => w !== waiter),
+          background: current.background.filter((w) => w !== waiter),
+        })).pipe(Effect.andThen(signal(limiter))),
+      ),
+    );
+  });
+
+  const block = Effect.fnUntraced(function* (limiter: TokenLimiter) {
+    const now = yield* Clock.currentTimeMillis;
+    yield* Ref.update(limiter.state, (current) => ({
+      ...current,
+      last409At: now,
+      blockedUntil: Math.max(current.blockedUntil, now + intervalMs),
+    }));
+    yield* signal(limiter);
+  });
+
+  const run = Effect.fnUntraced(function* <A, E, R>(
+    key: string,
+    priority: Priority,
+    request: Effect.Effect<A, E | TokenBusy, R>,
+  ): Effect.fn.Return<A, Exclude<E, TokenBusy> | RateLimited, R> {
+    const limiter = yield* limiterFor(key);
+    const arrival = yield* Clock.currentTimeMillis;
+    const deadline = priority === "interactive" ? arrival + maxWaitMs : Number.POSITIVE_INFINITY;
+    yield* acquire(limiter, priority, deadline, false);
+    for (const attempt of [1, 2]) {
+      const outcome = yield* Effect.result(request);
+      if (Result.isSuccess(outcome)) return outcome.success;
+      const failure = outcome.failure;
+      if (!Predicate.isTagged(failure, "TokenBusy")) return yield* Effect.fail(failure as Exclude<E, TokenBusy>);
+      yield* block(limiter);
+      if (attempt === 1) yield* acquire(limiter, priority, deadline, true, CONFLICT_REASON);
     }
-  }
+    return yield* new RateLimited({ retryAfterSeconds: Math.ceil(intervalMs / 1000), reason: SECOND_CONFLICT_REASON });
+  });
+
+  const state = Effect.fnUntraced(function* (key: string) {
+      const limiter = yield* limiterFor(key);
+      const now = yield* Clock.currentTimeMillis;
+      const s = yield* Ref.get(limiter.state);
+      const projected = Math.max(now, readyAt(s)) + s.interactive.length * intervalMs;
+      return {
+        intervalSeconds: intervalMs / 1000,
+        nextSlotInSeconds: Math.ceil(Math.max(0, projected - now) / 1000),
+        queued: s.interactive.length,
+        queuedBackground: s.background.length,
+        last409At: s.last409At === undefined ? undefined : DateTime.formatIso(DateTime.makeUnsafe(s.last409At)),
+      } satisfies RateLimitState;
+  });
+
+  return { run, state } satisfies RateLimiterShape;
+});
+
+export class RateLimiter extends Context.Service<RateLimiter, RateLimiterShape>()("fio-mcp/RateLimiter") {
+  static readonly layer = Layer.effect(
+    RateLimiter,
+    Effect.gen(function* () {
+      const config = yield* AppConfig;
+      return RateLimiter.of(
+        yield* makeRateLimiter({ intervalMs: config.rateLimitIntervalMs, maxWaitMs: config.maxWaitMs }),
+      );
+    }),
+  );
+
+  static readonly layerFrom = (options: RateLimiterOptions) =>
+    Layer.effect(RateLimiter, Effect.map(makeRateLimiter(options), RateLimiter.of));
 }
 
-function isConflict(error: unknown): boolean {
-  return error instanceof FioApiError && error.kind === "rate_limited";
-}

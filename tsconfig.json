@@ -23,7 +23,7 @@
         "name": "@effect/language-service",
         "ignoreEffectWarningsInTscExitCode": false,
         "ignoreEffectErrorsInTscExitCode": false,
-        "allowedUnstableApis": ["effect/FileSystem", "effect/ai", "effect/http", "effect/sql", "effect/schema", "@effect/sql-sqlite-node", "@effect/platform-node"],
+        "allowedUnstableApis": ["@effect/vitest", "effect/testing", "effect/FileSystem", "effect/ai", "effect/http", "effect/sql", "effect/schema", "@effect/sql-sqlite-node", "@effect/platform-node"],
         "diagnosticSeverity": {
           "schemaClassMissingBrand": "off",
           "floatingEffect": "error",

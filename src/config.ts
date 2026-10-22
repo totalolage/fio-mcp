@@ -1,25 +1,65 @@
-import { z } from "zod";
-import { registerSecret } from "./redact.js";
+import { Config, Context, Effect, FileSystem, Layer, Option, Predicate, Redacted, Schema } from "effect";
+import { ConfigError } from "./errors.js";
+
+/**
+ * Configuration from the environment, through Effect's ConfigProvider.
+ *
+ * Secrets (FIO tokens, the HTTP bearer token) come from a variable or from a
+ * file named by its `_FILE` twin, never both, and are held as `Redacted`.
+ * Diagnostics name the variable, field, or path, never a value: a misplaced
+ * token must not reach stderr.
+ */
 
 export interface AccountConfig {
   /** Name the model uses to pick an account; never the token. */
-  name: string;
-  token: string;
+  readonly name: string;
+  readonly token: Redacted.Redacted<string>;
   /** FIO account number (payer `accountFrom` for payment orders). */
-  accountNumber?: string;
-  /** Account currency (ISO 4217), used as the default order currency. */
-  currency?: string;
+  readonly accountNumber: string | undefined;
+  /** Account currency (ISO 4217), the default order currency. */
+  readonly currency: string | undefined;
 }
 
-export interface ServerConfig {
-  accounts: AccountConfig[];
-  baseUrl: string;
+export type TransportConfig =
+  | { readonly kind: "stdio" }
+  | {
+      readonly kind: "http";
+      readonly host: string;
+      readonly port: number;
+      readonly authToken: Redacted.Redacted<string> | undefined;
+      /** Exact Origin values accepted on /mcp. Requests without Origin are accepted. */
+      readonly allowedOrigins: ReadonlyArray<string>;
+      /** Accepted Host header values (host or host:port). Empty accepts any. */
+      readonly allowedHosts: ReadonlyArray<string>;
+    };
+
+export interface CacheConfig {
+  readonly enabled: boolean;
+  readonly dbPath: string;
+  readonly syncOnStartup: boolean;
+  /** 0 disables periodic sync. */
+  readonly syncIntervalMinutes: number;
+  /** First day the initial backfill asks for (YYYY-MM-DD). */
+  readonly backfillFrom: string;
+  /** Incremental sync re-fetches this many days before the newest covered day. */
+  readonly overlapDays: number;
+  /** A cached day fetched less than this long ago counts as fresh. */
+  readonly maxAgeMinutes: number;
+}
+
+export interface AppConfigShape {
+  readonly accounts: ReadonlyArray<AccountConfig>;
+  /** Every secret that must never leave the process: tokens and the HTTP bearer token. */
+  readonly secrets: ReadonlyArray<Redacted.Redacted<string>>;
+  readonly baseUrl: string;
   /** Minimum spacing between requests with the same token. */
-  rateLimitIntervalMs: number;
-  /** Longest a tool call may wait for a rate-limit slot before failing fast. */
-  maxWaitMs: number;
+  readonly rateLimitIntervalMs: number;
+  /** Longest an interactive call may wait for a rate-limit slot before failing fast. */
+  readonly maxWaitMs: number;
   /** Per-request HTTP timeout. */
-  requestTimeoutMs: number;
+  readonly requestTimeoutMs: number;
+  readonly transport: TransportConfig;
+  readonly cache: CacheConfig;
 }
 
 export const DEFAULT_BASE_URL = "https://fioapi.fio.cz/v1/rest";
@@ -29,39 +69,33 @@ export const MIN_RATE_LIMIT_INTERVAL_MS = 30_000;
 export const DEFAULT_MAX_WAIT_MS = 25_000;
 export const DEFAULT_REQUEST_TIMEOUT_MS = 20_000;
 export const DEFAULT_ACCOUNT_NAME = "default";
-
-export class ConfigError extends Error {
-  override name = "ConfigError";
-}
+export const MIN_TOKEN_LENGTH = 32;
+export const MIN_AUTH_TOKEN_LENGTH = 16;
+export const DEFAULT_HTTP_HOST = "0.0.0.0";
+export const DEFAULT_HTTP_PORT = 3000;
+/** Earliest day the initial backfill asks for; FIO serves what the account has. */
+export const DEFAULT_BACKFILL_FROM = "2000-01-01";
+export const DEFAULT_OVERLAP_DAYS = 10;
+export const DEFAULT_CACHE_MAX_AGE_MINUTES = 60;
+export const MIN_SYNC_INTERVAL_MINUTES = 5;
 
 const ACCOUNT_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/;
+// URL-safe characters only: tokens go into URL paths, and protocol-level
+// redaction can then never cut through JSON or SSE framing.
+const TOKEN = new RegExp(`^[A-Za-z0-9._~-]{${MIN_TOKEN_LENGTH},}$`);
+const AUTH_TOKEN = new RegExp(`^[\\x21-\\x7e]{${MIN_AUTH_TOKEN_LENGTH},}$`);
+const ACCOUNT_NUMBER = /^\d{1,10}$/;
+const CURRENCY = /^[A-Z]{3}$/;
+const DATE = /^(?!0000)\d{4}-\d{2}-\d{2}$/;
 
-const accountSchema = z
-  .object({
-    name: z.string().regex(ACCOUNT_NAME),
-    token: z
-      .string()
-      .min(1)
-      .refine((t) => !/[\s/?#]/.test(t)),
-    accountNumber: z
-      .string()
-      .regex(/^\d{1,10}$/)
-      .optional(),
-    currency: z
-      .string()
-      .regex(/^[A-Z]{3}$/)
-      .optional(),
-  })
-  .strict();
-
-type AccountField = keyof z.infer<typeof accountSchema>;
-
-const FIELD_RULES: Record<AccountField, string> = {
+const FIELD_RULES = {
   name: "must be 1-32 characters of letters, digits, _ or -, starting with a letter or digit",
-  token: "must be a non-empty string without whitespace, '/', '?' or '#'",
+  token: `must be at least ${MIN_TOKEN_LENGTH} characters of letters, digits, '.', '_', '~' or '-' (FIO tokens are 64 characters)`,
   accountNumber: "must be the FIO account number without bank code (1-10 digits)",
   currency: "must be an ISO 4217 code such as CZK",
-};
+} as const;
+
+type AccountField = keyof typeof FIELD_RULES;
 
 const SINGLE_ACCOUNT_VARS: Record<AccountField, string> = {
   name: "FIO_ACCOUNT_NAME",
@@ -72,121 +106,237 @@ const SINGLE_ACCOUNT_VARS: Record<AccountField, string> = {
 
 const ACCOUNT_FIELDS = Object.keys(FIELD_RULES).join(", ");
 
-/**
- * Describes schema failures by field name and rule only. Zod's own messages
- * and unknown keys can quote the input, which may be a token.
- */
-function describeIssues(error: z.ZodError, index: number | undefined): string {
-  const where = index === undefined ? undefined : `FIO_ACCOUNTS[${index}]`;
-  const problems = new Set<string>();
-  for (const issue of error.issues) {
-    const field = issue.path[0];
-    if (issue.path.length === 1 && typeof field === "string" && field in FIELD_RULES) {
-      const label = where ? `${where}.${field}` : SINGLE_ACCOUNT_VARS[field as AccountField];
-      problems.add(`${label} ${FIELD_RULES[field as AccountField]}`);
-    } else if (issue.code === "unrecognized_keys") {
-      problems.add(`${where ?? "account"} has unknown fields; allowed fields are ${ACCOUNT_FIELDS}`);
-    } else {
-      problems.add(`${where ?? "account"} must be an object with fields ${ACCOUNT_FIELDS}`);
-    }
-  }
-  return [...problems].join("; ");
-}
+const fail = (detail: string) => Effect.fail(new ConfigError({ detail }));
 
-/** Never echoes the raw value: a misplaced token must not reach stderr. */
-function intSetting(env: NodeJS.ProcessEnv, key: string, fallback: number, min: number, why = ""): number {
-  const raw = env[key];
-  if (raw === undefined || raw.trim() === "") return fallback;
-  const value = Number(raw);
+/** A trimmed, non-empty variable, or None. Never echoes the value on failure. */
+const optionalVar = Effect.fn("config.optionalVar")(function* (key: string) {
+  const value = yield* Config.option(Config.String(key)).pipe(
+    Effect.mapError(() => new ConfigError({ detail: `Could not read ${key}` })),
+  );
+  return Option.filter(
+    Option.map(value, (s) => s.trim()),
+    (s) => s !== "",
+  );
+});
+
+/**
+ * A secret from `key` or from the file named by `${key}_FILE`. Exactly one
+ * may be set. A trailing newline in the file is dropped.
+ */
+const secretVar = Effect.fn("config.secretVar")(function* (key: string) {
+  const direct = yield* optionalVar(key);
+  const file = yield* optionalVar(`${key}_FILE`);
+  if (Option.isSome(direct) && Option.isSome(file)) {
+    return yield* fail(`Set either ${key} or ${key}_FILE, not both`);
+  }
+  if (Option.isSome(file)) {
+    const fs = yield* FileSystem.FileSystem;
+    const content = yield* fs
+      .readFileString(file.value)
+      .pipe(Effect.mapError(() => new ConfigError({ detail: `${key}_FILE: cannot read ${file.value}` })));
+    const trimmed = content.replace(/\r?\n$/, "").trim();
+    if (trimmed === "") return yield* fail(`${key}_FILE: ${file.value} is empty`);
+    return Option.some(Redacted.make(trimmed));
+  }
+  return Option.map(direct, (value) => Redacted.make(value));
+});
+
+const intVar = Effect.fn("config.intVar")(function* (key: string, fallback: number, min: number, why = "") {
+  const raw = yield* optionalVar(key);
+  if (Option.isNone(raw)) return fallback;
+  const value = Number(raw.value);
   if (!Number.isInteger(value) || value < min) {
-    throw new ConfigError(`${key} must be an integer >= ${min}${why}`);
+    return yield* fail(`${key} must be an integer >= ${min}${why}`);
   }
   return value;
-}
+});
 
-/** Registers every token-like value before validation, so no later message or log line can carry one. */
-function registerCandidateTokens(single: string | undefined, accounts: unknown): void {
-  if (single) registerSecret(single);
-  if (!Array.isArray(accounts)) return;
-  for (const account of accounts) {
-    const token: unknown = (account as { token?: unknown } | null)?.token;
-    if (typeof token === "string") registerSecret(token);
-  }
-}
+const boolVar = Effect.fn("config.boolVar")(function* (key: string, fallback: boolean) {
+  const raw = yield* optionalVar(key);
+  if (Option.isNone(raw)) return fallback;
+  const value = raw.value.toLowerCase();
+  if (["1", "true", "yes", "on"].includes(value)) return true;
+  if (["0", "false", "no", "off"].includes(value)) return false;
+  return yield* fail(`${key} must be true or false`);
+});
 
-/**
- * Reads configuration from the environment.
- *
- * Single account: FIO_TOKEN, optional FIO_ACCOUNT_NAME, FIO_ACCOUNT_NUMBER,
- * FIO_ACCOUNT_CURRENCY. Several accounts: FIO_ACCOUNTS, a JSON array of
- * {name, token, accountNumber?, currency?}.
- */
-export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
-  const single = env.FIO_TOKEN?.trim();
-  const multi = env.FIO_ACCOUNTS?.trim();
-  registerCandidateTokens(single, undefined);
-  if (single && multi) {
-    throw new ConfigError("Set either FIO_TOKEN or FIO_ACCOUNTS, not both");
-  }
-  if (!single && !multi) {
-    throw new ConfigError("No FIO token configured: set FIO_TOKEN, or FIO_ACCOUNTS for several accounts");
-  }
+const listVar = (key: string) =>
+  optionalVar(key).pipe(
+    Effect.map((raw) =>
+      Option.match(raw, {
+        onNone: () => [],
+        onSome: (value) =>
+          value
+            .split(",")
+            .map((s) => s.trim())
+            .filter((s) => s !== ""),
+      }),
+    ),
+  );
 
-  let rawAccounts: unknown[];
-  if (multi) {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(multi);
-    } catch {
+const isCalendarDate = (value: string): boolean => {
+  if (!DATE.test(value)) return false;
+  const date = new Date(`${value}T00:00:00Z`);
+  return !Number.isNaN(date.getTime()) && date.toISOString().startsWith(value);
+};
+
+const RawAccount = Schema.Record(Schema.String, Schema.Unknown);
+
+/** Validates one account object, describing failures by field name and rule only. */
+const parseAccount = Effect.fn("config.parseAccount")(function* (raw: unknown, index: number | undefined) {
+  const where = index === undefined ? undefined : `FIO_ACCOUNTS[${index}]`;
+  const label = (field: AccountField) => (where ? `${where}.${field}` : SINGLE_ACCOUNT_VARS[field]);
+  if (!Schema.is(RawAccount)(raw)) {
+    return yield* fail(`Invalid account configuration: ${where ?? "account"} must be an object with fields ${ACCOUNT_FIELDS}`);
+  }
+  const problems: Array<string> = [];
+  if (Object.keys(raw).some((key) => !(key in FIELD_RULES))) {
+    problems.push(`${where ?? "account"} has unknown fields; allowed fields are ${ACCOUNT_FIELDS}`);
+  }
+  const text = (field: AccountField, pattern: RegExp, required: boolean): string | undefined => {
+    const value = raw[field];
+    if (value === undefined && !required) return undefined;
+    if (Predicate.isString(value) && pattern.test(value)) return value;
+    problems.push(`${label(field)} ${FIELD_RULES[field]}`);
+    return undefined;
+  };
+  const name = text("name", ACCOUNT_NAME, true);
+  const token = text("token", TOKEN, true);
+  const accountNumber = text("accountNumber", ACCOUNT_NUMBER, false);
+  const currency = text("currency", CURRENCY, false);
+  if (problems.length > 0 || name === undefined || token === undefined) {
+    return yield* fail(`Invalid account configuration: ${problems.join("; ")}`);
+  }
+  return { name, token: Redacted.make(token), accountNumber, currency } satisfies AccountConfig;
+});
+
+const loadAccounts = Effect.fn("config.loadAccounts")(function* () {
+  const single = yield* secretVar("FIO_TOKEN");
+  const multi = yield* secretVar("FIO_ACCOUNTS");
+  if (Option.isSome(single) && Option.isSome(multi)) {
+    return yield* fail("Set either FIO_TOKEN or FIO_ACCOUNTS (or their _FILE variants), not both");
+  }
+  if (Option.isSome(multi)) {
+    const parsed = yield* Effect.try({
+      try: (): unknown => JSON.parse(Redacted.value(multi.value)),
       // Do not echo the value: it contains tokens.
-      throw new ConfigError("FIO_ACCOUNTS is not valid JSON");
-    }
-    registerCandidateTokens(undefined, parsed);
+      catch: () => new ConfigError({ detail: "FIO_ACCOUNTS is not valid JSON" }),
+    });
     if (!Array.isArray(parsed) || parsed.length === 0) {
-      throw new ConfigError("FIO_ACCOUNTS must be a non-empty JSON array of {name, token}");
+      return yield* fail("FIO_ACCOUNTS must be a non-empty JSON array of {name, token}");
     }
-    rawAccounts = parsed;
-  } else {
-    rawAccounts = [
-      {
-        name: env.FIO_ACCOUNT_NAME?.trim() || DEFAULT_ACCOUNT_NAME,
-        token: single,
-        accountNumber: env.FIO_ACCOUNT_NUMBER?.trim() || undefined,
-        currency: env.FIO_ACCOUNT_CURRENCY?.trim().toUpperCase() || undefined,
-      },
-    ];
+    const accounts = yield* Effect.forEach(parsed, (raw: unknown, index) => parseAccount(raw, index));
+    const firstIndex = new Map<string, number>();
+    for (const [index, account] of accounts.entries()) {
+      const earlier = firstIndex.get(account.name);
+      if (earlier !== undefined) {
+        return yield* fail(`FIO_ACCOUNTS[${index}].name repeats the name of FIO_ACCOUNTS[${earlier}]; names must be unique`);
+      }
+      firstIndex.set(account.name, index);
+    }
+    return accounts;
   }
+  if (Option.isNone(single)) {
+    return yield* fail(
+      "No FIO token configured: set FIO_TOKEN (or FIO_TOKEN_FILE), or FIO_ACCOUNTS (or FIO_ACCOUNTS_FILE) for several accounts",
+    );
+  }
+  const name = yield* optionalVar("FIO_ACCOUNT_NAME");
+  const accountNumber = yield* optionalVar("FIO_ACCOUNT_NUMBER");
+  const currency = yield* optionalVar("FIO_ACCOUNT_CURRENCY");
+  const account = yield* parseAccount(
+    {
+      name: Option.getOrElse(name, () => DEFAULT_ACCOUNT_NAME),
+      token: Redacted.value(single.value),
+      ...(Option.isSome(accountNumber) ? { accountNumber: accountNumber.value } : {}),
+      ...(Option.isSome(currency) ? { currency: currency.value.toUpperCase() } : {}),
+    },
+    undefined,
+  );
+  return [account];
+});
 
-  const accounts: AccountConfig[] = [];
-  rawAccounts.forEach((raw, index) => {
-    const result = accountSchema.safeParse(raw);
-    if (!result.success) {
-      throw new ConfigError(`Invalid account configuration: ${describeIssues(result.error, multi ? index : undefined)}`);
-    }
-    const { name, token, accountNumber, currency } = result.data;
-    accounts.push({ name, token, accountNumber, currency });
-  });
-
-  const firstIndex = new Map<string, number>();
-  accounts.forEach((account, index) => {
-    const earlier = firstIndex.get(account.name);
-    if (earlier !== undefined) {
-      throw new ConfigError(`FIO_ACCOUNTS[${index}].name repeats the name of FIO_ACCOUNTS[${earlier}]; names must be unique`);
-    }
-    firstIndex.set(account.name, index);
-  });
-
+const loadTransport = Effect.fn("config.loadTransport")(function* () {
+  const kind = Option.getOrElse(yield* optionalVar("FIO_MCP_TRANSPORT"), () => "stdio").toLowerCase();
+  if (kind === "stdio") return { kind: "stdio" } satisfies TransportConfig;
+  if (kind !== "http") return yield* fail("FIO_MCP_TRANSPORT must be stdio or http");
+  const host = Option.getOrElse(yield* optionalVar("FIO_MCP_HOST"), () => DEFAULT_HTTP_HOST);
+  const port = yield* intVar("FIO_MCP_PORT", DEFAULT_HTTP_PORT, 1);
+  if (port > 65_535) return yield* fail("FIO_MCP_PORT must be an integer from 1 to 65535");
+  const authToken = yield* secretVar("FIO_MCP_AUTH_TOKEN");
+  if (Option.isSome(authToken) && !AUTH_TOKEN.test(Redacted.value(authToken.value))) {
+    return yield* fail(
+      `FIO_MCP_AUTH_TOKEN must be at least ${MIN_AUTH_TOKEN_LENGTH} printable characters without spaces`,
+    );
+  }
   return {
+    kind: "http",
+    host,
+    port,
+    authToken: Option.getOrUndefined(authToken),
+    allowedOrigins: yield* listVar("FIO_MCP_ALLOWED_ORIGINS"),
+    allowedHosts: (yield* listVar("FIO_MCP_ALLOWED_HOSTS")).map((h) => h.toLowerCase()),
+  } satisfies TransportConfig;
+});
+
+const loadCache = Effect.fn("config.loadCache")(function* () {
+  const enabled = yield* boolVar("FIO_CACHE_ENABLED", true);
+  const explicitPath = yield* optionalVar("FIO_DB_PATH");
+  const xdg = yield* optionalVar("XDG_DATA_HOME");
+  const home = yield* optionalVar("HOME");
+  const dataHome = Option.isSome(xdg) ? Option.some(xdg.value) : Option.map(home, (h) => `${h}/.local/share`);
+  const dbPath = Option.isSome(explicitPath)
+    ? explicitPath
+    : Option.map(dataHome, (dir) => `${dir}/fio-mcp/fio.sqlite`);
+  if (enabled && Option.isNone(dbPath)) {
+    return yield* fail("FIO_DB_PATH is not set and neither XDG_DATA_HOME nor HOME is, so the cache has no location");
+  }
+  const backfillFrom = Option.getOrElse(yield* optionalVar("FIO_BACKFILL_FROM"), () => DEFAULT_BACKFILL_FROM);
+  if (!isCalendarDate(backfillFrom)) return yield* fail("FIO_BACKFILL_FROM must be a date YYYY-MM-DD");
+  const syncIntervalMinutes = yield* intVar("FIO_SYNC_INTERVAL_MINUTES", 0, 0);
+  if (syncIntervalMinutes !== 0 && syncIntervalMinutes < MIN_SYNC_INTERVAL_MINUTES) {
+    return yield* fail(`FIO_SYNC_INTERVAL_MINUTES must be 0 (off) or at least ${MIN_SYNC_INTERVAL_MINUTES}`);
+  }
+  return {
+    enabled,
+    dbPath: Option.getOrElse(dbPath, () => ""),
+    syncOnStartup: yield* boolVar("FIO_SYNC_ON_STARTUP", true),
+    syncIntervalMinutes,
+    backfillFrom,
+    overlapDays: yield* intVar("FIO_SYNC_OVERLAP_DAYS", DEFAULT_OVERLAP_DAYS, 1),
+    maxAgeMinutes: yield* intVar("FIO_CACHE_MAX_AGE_MINUTES", DEFAULT_CACHE_MAX_AGE_MINUTES, 0),
+  } satisfies CacheConfig;
+});
+
+/** Reads and validates the whole configuration. */
+export const loadConfig = Effect.fn("config.load")(function* () {
+  const accounts = yield* loadAccounts();
+  const transport = yield* loadTransport();
+  const baseUrl = Option.getOrElse(yield* optionalVar("FIO_API_BASE_URL"), () => DEFAULT_BASE_URL).replace(/\/+$/, "");
+  const config: AppConfigShape = {
     accounts,
-    baseUrl: (env.FIO_API_BASE_URL?.trim() || DEFAULT_BASE_URL).replace(/\/+$/, ""),
-    rateLimitIntervalMs: intSetting(
-      env,
+    secrets: [
+      ...accounts.map((a) => a.token),
+      ...(transport.kind === "http" && transport.authToken !== undefined ? [transport.authToken] : []),
+    ],
+    baseUrl,
+    rateLimitIntervalMs: yield* intVar(
       "FIO_RATE_LIMIT_INTERVAL_MS",
       DEFAULT_RATE_LIMIT_INTERVAL_MS,
       MIN_RATE_LIMIT_INTERVAL_MS,
       " (FIO allows one request per token every 30 s)",
     ),
-    maxWaitMs: intSetting(env, "FIO_MAX_WAIT_MS", DEFAULT_MAX_WAIT_MS, 0),
-    requestTimeoutMs: intSetting(env, "FIO_REQUEST_TIMEOUT_MS", DEFAULT_REQUEST_TIMEOUT_MS, 1),
+    maxWaitMs: yield* intVar("FIO_MAX_WAIT_MS", DEFAULT_MAX_WAIT_MS, 0),
+    requestTimeoutMs: yield* intVar("FIO_REQUEST_TIMEOUT_MS", DEFAULT_REQUEST_TIMEOUT_MS, 1),
+    transport,
+    cache: yield* loadCache(),
   };
+  return config;
+});
+
+export class AppConfig extends Context.Service<AppConfig, AppConfigShape>()("fio-mcp/AppConfig") {
+  /** Reads the environment (and `_FILE` secrets) through the current ConfigProvider. */
+  static readonly layer = Layer.effect(AppConfig, loadConfig());
+
+  static readonly layerFrom = (config: AppConfigShape) => Layer.succeed(AppConfig, config);
 }
