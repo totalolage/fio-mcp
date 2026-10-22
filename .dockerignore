@@ -1,0 +1,8 @@
+# Allowlist: only what the image build reads. Keeps .env files, local
+# databases, worktrees and node_modules out of the build context.
+*
+!package.json
+!package-lock.json
+!tsconfig.json
+!tsconfig.build.json
+!src/
