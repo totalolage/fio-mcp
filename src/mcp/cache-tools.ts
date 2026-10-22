@@ -317,9 +317,10 @@ export const makeCacheHandlers = Effect.fn("CacheTools.handlers")(function* (too
           return {
             account: account.name,
             joinedRunningJob: started.joined,
-            ...(started.joined && (mode !== undefined || refresh !== undefined) && started.progress.kind !== request.kind
+            // A joined job never takes on a refresh range, even when it is a refresh itself.
+            ...(started.joined && (refresh !== undefined || (mode !== undefined && started.progress.kind !== mode))
               ? {
-                  warning: `A ${started.progress.kind} job was already running; it was joined instead of starting ${request.kind}.`,
+                  warning: `A ${started.progress.kind} job was already running; it was joined instead of starting ${refresh === undefined ? mode : `a refresh of ${refresh.from}..${refresh.to}`}. Call sync_transactions again when it has finished.`,
                 }
               : {}),
             job: formatJob(job),

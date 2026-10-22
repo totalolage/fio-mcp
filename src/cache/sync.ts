@@ -205,7 +205,8 @@ export const makeCacheSync = Effect.fn("CacheSync.make")(function* (
         if (Result.isSuccess(outcome)) {
           const statement = outcome.success;
           // A success shows the range needs no unlock, so all of it leaves `blocked`. Days the
-          // header does not cover stay uncovered, and the next backfill plan asks for them again.
+          // header does not cover keep their state: uncovered ones are planned again by the next
+          // backfill, and a refresh leaves covered ones as they were.
           const covered = coveredBy(range, statement.info);
           if (covered === undefined || covered.from !== range.from || covered.to !== range.to) {
             yield* Effect.logWarning(
@@ -336,24 +337,25 @@ export const makeCacheSync = Effect.fn("CacheSync.make")(function* (
       return drain(fetchOrder([...state.pending, ...withoutPending(wanted, state.pending)], recentStart), "refresh");
     };
 
-    let ok: boolean;
-    switch (request.kind) {
-      case "backfill":
-        ok = yield* backfill(request.from, request.retryFailed);
-        break;
-      case "incremental":
-        ok = yield* incremental(undefined);
-        break;
-      case "refresh":
-        ok = yield* refresh(request.range);
-        break;
-      case "startup":
-        // An interrupted refresh finishes as a refresh, so its ranges still drop what FIO no longer lists.
-        ok =
-          (state.mode !== "refresh" || (yield* refresh(undefined))) &&
-          (yield* backfill(undefined)) &&
-          (yield* incremental(startedAt));
-        break;
+    // Ranges an interrupted refresh left pending finish as a refresh before any other job, so they
+    // still drop what FIO no longer lists.
+    const interruptedRefresh = request.kind !== "refresh" && state.mode === "refresh" && state.pending.length > 0;
+    let ok = !interruptedRefresh || (yield* refresh(undefined));
+    if (ok) {
+      switch (request.kind) {
+        case "backfill":
+          ok = yield* backfill(request.from, request.retryFailed);
+          break;
+        case "incremental":
+          ok = yield* incremental(undefined);
+          break;
+        case "refresh":
+          ok = yield* refresh(request.range);
+          break;
+        case "startup":
+          ok = (yield* backfill(undefined)) && (yield* incremental(startedAt));
+          break;
+      }
     }
     const finishedAt = yield* Clock.currentTimeMillis;
     yield* report({ status: ok ? "completed" : "failed", finishedAt, current: null });

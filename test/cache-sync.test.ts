@@ -494,6 +494,30 @@ describe("cache sync", () => {
     }),
   );
 
+  it.effect("an incremental sync finishes an interrupted refresh as a refresh first", () =>
+    Effect.gen(function* () {
+      yield* setNow();
+      const fio = yield* fakeFio(serveFrom(movements));
+      yield* Effect.gen(function* () {
+        yield* runToEnd({ kind: "backfill" });
+        yield* fio.setScript(() => Effect.fail(new FioServerError({ status: 503, excerpt: "" })));
+        assert.strictEqual((yield* runToEnd({ kind: "refresh", range: { from: "2025-03-01", to: "2025-03-31" } })).status, "failed");
+        // Movement 2 was cancelled meanwhile.
+        yield* fio.setScript(serveFrom(movements.filter((m) => m.id !== 2)));
+        yield* Ref.set(fio.calls, []);
+        const job = yield* runToEnd({ kind: "incremental" });
+        assert.strictEqual(job.status, "completed");
+        assert.deepStrictEqual(ranges(yield* Ref.get(fio.calls)), ["2025-03-01..2025-03-31", `2026-10-12..${TODAY}`]);
+        const cache = yield* enabledCache;
+        const key = yield* cache.boundAccount(yield* account());
+        assert.deepStrictEqual(yield* cache.store.transactionsIn(key, { from: "2025-03-01", to: "2025-03-31" }), []);
+        const state = yield* cache.store.syncState(TOKEN_FP);
+        assert.deepStrictEqual(state.pending, []);
+        assert.strictEqual(state.mode, null);
+      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+    }),
+  );
+
   it.effect("an interrupted refresh resumes as a refresh after a restart", () =>
     Effect.gen(function* () {
       yield* setNow();
