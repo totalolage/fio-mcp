@@ -55,6 +55,7 @@ export function redirectUriProblem(raw: string): string | undefined {
   if (raw.includes("#")) return "redirect URIs must not contain a fragment";
   // The parsed URL drops an empty userinfo (`http://@host/`) and an empty port (`http://host:/`).
   const authority = /^[^:]*:\/\/([^/?#]*)/.exec(raw)?.[1] ?? "";
+  if (authority === "") return "redirect URIs must be absolute URLs"; // e.g. `http:////@host/`, `http:host/`
   if (url.username !== "" || url.password !== "" || authority.includes("@")) {
     return "redirect URIs must not contain credentials";
   }

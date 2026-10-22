@@ -49,7 +49,7 @@ describe("URL rules", () => {
     for (const ok of ["https://app.example/cb", "http://127.0.0.1:1234/cb", "http://[::1]/cb", "http://localhost:8080/cb?x=1"]) {
       assert.isUndefined(redirectUriProblem(ok), ok);
     }
-    for (const bad of ["http://app.example/cb", "http://127.0.0.2/cb", "myapp://cb", "https://app.example/cb#f", "https://u@app.example/cb", "https://", "https://app.example/\u001b]52;c;x\u0007", "https://app.example/a b", "http://127.0.0.1:0/cb", "http://127.0.0.1:99999/cb", "http://127.0.0.1:/cb", "http://@127.0.0.1/cb"]) {
+    for (const bad of ["http://app.example/cb", "http://127.0.0.2/cb", "myapp://cb", "https://app.example/cb#f", "https://u@app.example/cb", "https://", "https://app.example/\u001b]52;c;x\u0007", "https://app.example/a b", "http://127.0.0.1:0/cb", "http://127.0.0.1:99999/cb", "http://127.0.0.1:/cb", "http://@127.0.0.1/cb", "http:////@127.0.0.1/cb", "http:127.0.0.1/cb"]) {
       assert.isDefined(redirectUriProblem(bad), bad);
     }
   });
