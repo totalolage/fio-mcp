@@ -214,6 +214,53 @@ describe("payment validation", () => {
     rejects({ ...foreign, bic: undefined });
   });
 
+  const textFields = [
+    ...(["messageForRecipient", "comment"] as const).map((field) => [domestic, field] as const),
+    ...(
+      ["comment", "benefName", "benefStreet", "benefCity", "remittanceInfo1", "remittanceInfo2", "remittanceInfo3"] as const
+    ).map((field) => [euro, field] as const),
+    ...(
+      [
+        "comment",
+        "benefName",
+        "benefStreet",
+        "benefCity",
+        "remittanceInfo1",
+        "remittanceInfo2",
+        "remittanceInfo3",
+        "remittanceInfo4",
+      ] as const
+    ).map((field) => [foreign, field] as const),
+  ];
+
+  it("rejects characters outside XML 1.0's Char production in every text field", () => {
+    const invalid = {
+      "U+FFFF": "\uffff",
+      "U+FFFE": "\ufffe",
+      "high surrogate": "\ud800",
+      "last high surrogate": "\udbff",
+      "low surrogate": "\udc00",
+      "last low surrogate": "\udfff",
+    };
+    for (const [order, field] of textFields) {
+      for (const [what, ch] of Object.entries({ ...invalid, "U+0001": "\u0001", "reversed pair": "\ude00\ud83d" })) {
+        expect(paymentOrderSchema.safeParse({ ...order, [field]: `a${ch}b` }).success, `${order.type}.${field} ${what}`).toBe(
+          false,
+        );
+      }
+    }
+    const error = Schema.decodeUnknownResult(PaymentOrderSchema)({ ...domestic, comment: "a\ud800b" }, strict);
+    expect(Result.isFailure(error) && String(error.failure)).toMatch(/unpaired surrogates/);
+  });
+
+  it("accepts astral characters as surrogate pairs and keeps them in the XML", () => {
+    for (const [order, field] of textFields) {
+      const value = "Kůň 😀 € \u{10000}\u{10ffff}";
+      const [parsed] = parseAll([{ ...order, [field]: value }]);
+      expect(buildImportXml([parsed!], payer), `${order.type}.${field}`).toContain(`<${field}>${value}</${field}>`);
+    }
+  });
+
   it("accepts only countries in the XSD's country_type enumeration", () => {
     // ZZ, EU and UK are alpha-2 shaped but absent from fio_xml_type.xsd, which rejects them.
     for (const code of ["ZZ", "EU", "UK", "de"]) {
