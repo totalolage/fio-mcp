@@ -46,7 +46,7 @@ function uriForm(token: string): ReadonlyArray<string> {
 export interface RedactorShape {
   /** Replaces every configured secret and every token-shaped URL segment. */
   readonly redact: (text: string) => string;
-  /** Redacts every string (and object key) in a JSON-like value. */
+  /** Redacts every string (and object key) in a JSON-like value and drops undefined fields. */
   readonly redactDeep: <T>(value: T) => T;
   /** Short, single-line, token-free excerpt of a response body for error messages. */
   readonly excerpt: (body: string) => string;
@@ -81,7 +81,13 @@ function deep(value: unknown, redact: (text: string) => string): unknown {
   if (typeof value === "string") return redact(value);
   if (Array.isArray(value)) return value.map((item) => deep(item, redact));
   if (value !== null && typeof value === "object" && Object.getPrototypeOf(value) === Object.prototype) {
-    return Object.fromEntries(Object.entries(value).map(([key, item]) => [redact(key), deep(item, redact)]));
+    // Undefined fields are dropped, as JSON would: MCP structured content
+    // must be a JSON value.
+    return Object.fromEntries(
+      Object.entries(value)
+        .filter(([, item]) => item !== undefined)
+        .map(([key, item]) => [redact(key), deep(item, redact)]),
+    );
   }
   return value;
 }

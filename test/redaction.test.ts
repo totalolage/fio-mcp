@@ -49,6 +49,8 @@ describe("token redaction", () => {
       [READ_TOKEN]: [`a ${PAY_TOKEN}`, 1, null, { nested: READ_TOKEN, ok: true }],
     };
     assert.deepStrictEqual<unknown>(redactDeep(value), { "***": ["a ***", 1, null, { nested: "***", ok: true }] });
+    // Undefined fields are dropped so the result is a JSON value.
+    assert.deepStrictEqual<unknown>(redactDeep({ a: undefined, b: [{ c: undefined, d: 1 }] }), { b: [{ d: 1 }] });
   });
 
   it.effect("the stderr logger writes redacted logfmt lines to stderr only", () =>

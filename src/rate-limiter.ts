@@ -39,7 +39,8 @@ export interface RateLimitState {
   readonly queued: number;
   /** Background (sync) calls waiting for a slot. */
   readonly queuedBackground: number;
-  readonly last409At: string | undefined;
+  /** ISO time of the last HTTP 409, or null if none. */
+  readonly last409At: string | null;
 }
 
 interface Waiter {
@@ -225,7 +226,7 @@ export const makeRateLimiter = Effect.fn("RateLimiter.make")(function* (options:
         nextSlotInSeconds: Math.ceil(Math.max(0, projected - now) / 1000),
         queued: s.interactive.length,
         queuedBackground: s.background.length,
-        last409At: s.last409At === undefined ? undefined : DateTime.formatIso(DateTime.makeUnsafe(s.last409At)),
+        last409At: s.last409At === undefined ? null : DateTime.formatIso(DateTime.makeUnsafe(s.last409At)),
       } satisfies RateLimitState;
   });
 

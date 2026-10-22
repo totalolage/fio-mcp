@@ -108,7 +108,7 @@ describe("RateLimiter", () => {
       assert.strictEqual(yield* Fiber.join(fiber), "ok");
       assert.strictEqual(yield* Ref.get(calls), 2);
       assert.strictEqual((yield* Clock.currentTimeMillis) - t0, 30_000);
-      assert.isDefined((yield* rl.state(KEY)).last409At);
+      assert.isString((yield* rl.state(KEY)).last409At);
     }).pipe(Effect.scoped),
   );
 
