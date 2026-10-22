@@ -4,11 +4,12 @@ import { Effect, FileSystem, Layer } from "effect";
 import { SqlClient, type SqlError } from "effect/sql";
 import { AppConfig } from "../config.js";
 import { CacheError, InvalidInput } from "../errors.js";
+import { OAUTH_MIGRATIONS } from "../oauth/store.js";
 
 /**
  * The server's SQLite file (FIO_DB_PATH). It holds the transaction cache and
- * is meant to hold other server state through further migrations, so the
- * layer does not depend on cache.enabled. One connection per process (the
+ * the OAuth state (clients, grants, token hashes), so the layer does not
+ * depend on cache.enabled. One connection per process (the
  * HTTP transport serves several MCP sessions from it). The file is
  * private to the user: the directory is created 0700 and the file 0600
  * before SQLite opens it, and SQLite gives its WAL and SHM files the
@@ -178,8 +179,14 @@ export const makeDatabaseLive = (
     }),
   );
 
-/** The database with the cache migrations. Share one instance between every user of the file. */
-export const DatabaseLive = makeDatabaseLive();
+/** Every module's migrations, in one id sequence. */
+export const SERVER_MIGRATIONS: Migrations = { ...CACHE_MIGRATIONS, ...OAUTH_MIGRATIONS };
+
+/**
+ * The database with all migrations. Every user provides this same value, so
+ * one build (one connection) is shared: layers are memoized by reference.
+ */
+export const DatabaseLive = makeDatabaseLive(SERVER_MIGRATIONS);
 
 /**
  * Writes a consistent copy of the live database to `destination` with
