@@ -15,7 +15,7 @@ import {
 } from "../src/oauth/crypto.js";
 import { DEFAULT_THROTTLE, delayAfter, makeLoginGuard } from "../src/oauth/login.js";
 import { escapeHtml } from "../src/oauth/pages.js";
-import { makeOAuthStore, ROTATED_KEPT } from "../src/oauth/store.js";
+import { makeOAuthStore } from "../src/oauth/store.js";
 import { isResource, parsePublicUrl, redirectUriMatches, redirectUriProblem } from "../src/oauth/urls.js";
 
 const FAST = { ln: 14, r: 8, p: 1 } as const;
@@ -249,26 +249,36 @@ describe("hash-password", () => {
 describe("admin commands", () => {
   const db = databaseLayer(":memory:", SERVER_MIGRATIONS).pipe(Layer.provide(NodeFileSystem.layer));
 
-  it.effect("keeps only the newest rotated refresh tokens per grant, and still detects recent reuse", () =>
+  it.effect("detects reuse of any earlier refresh token and ends a grant at the rotation limit", () =>
     Effect.gen(function* () {
-      const store = yield* makeOAuthStore();
+      const store = yield* makeOAuthStore(30);
       const sql = yield* SqlClient.SqlClient;
       const now = yield* Clock.currentTimeMillis;
-      const clientId = "fio_client_r";
-      yield* store.insertClient({ clientId, clientName: null, redirectUris: ["https://a.example/cb"], createdAt: now, lastUsedAt: null }, 10);
-      const grant = { grantId: "grant_r", clientId, scopes: ["fio:read"], accounts: ["main"], resource: "https://fio.example.test/mcp" };
-      yield* store.createGrant(grant, { codeHash: "c", clientId, redirectUri: "https://a.example/cb", codeChallenge: "x", expiresAt: now + 60_000 }, now);
-      const pair = (n: number) => ({ accessHash: `a${n}`, accessExpiresAt: now + 3_600_000, refreshHash: `r${n}`, refreshExpiresAt: now + 3_600_000 });
-      yield* store.insertTokens(grant.grantId, pair(0));
-      for (let n = 1; n <= ROTATED_KEPT + 10; n++) {
-        const rotated = yield* store.rotateRefresh(`r${n - 1}`, clientId, now + n, () => pair(n));
-        assert.strictEqual(rotated._tag, "Rotated");
-      }
-      const [count] = yield* sql<{ total: number }>`SELECT COUNT(*) AS total FROM oauth_tokens WHERE grant_id = 'grant_r'`;
-      // The kept rotated tokens, the live refresh token, and its access token.
-      assert.strictEqual(count?.total, ROTATED_KEPT + 2);
-      const reused = yield* store.rotateRefresh(`r${ROTATED_KEPT + 5}`, clientId, now + 100, () => pair(99));
-      assert.strictEqual(reused._tag, "Reused");
+      const setup = Effect.fnUntraced(function* (clientId: string) {
+        yield* store.insertClient({ clientId, clientName: null, redirectUris: ["https://a.example/cb"], createdAt: now, lastUsedAt: null }, 10);
+        const grant = { grantId: `grant_${clientId}`, clientId, scopes: ["fio:read"], accounts: ["main"], resource: "https://fio.example.test/mcp" };
+        yield* store.createGrant(grant, { codeHash: `c_${clientId}`, clientId, redirectUri: "https://a.example/cb", codeChallenge: "x", expiresAt: now + 60_000 }, now);
+        yield* store.insertTokens(grant.grantId, pair(clientId, 0));
+        return grant;
+      });
+      const pair = (clientId: string, n: number) => ({
+        accessHash: `${clientId}_a${n}`,
+        accessExpiresAt: now + 3_600_000,
+        refreshHash: `${clientId}_r${n}`,
+        refreshExpiresAt: now + 3_600_000,
+      });
+      // The oldest token of a long chain still revokes the family.
+      yield* setup("x");
+      for (let n = 1; n <= 25; n++) assert.strictEqual((yield* store.rotateRefresh(`x_r${n - 1}`, "x", now + n, () => pair("x", n)))._tag, "Rotated");
+      assert.strictEqual((yield* store.rotateRefresh("x_r0", "x", now + 100, () => pair("x", 99)))._tag, "Reused");
+      assert.isTrue(Option.isNone(yield* store.accessGrant("x_a25", now + 100)));
+      // At the limit the grant ends; its rows stay bounded.
+      yield* setup("y");
+      for (let n = 1; n <= 30; n++) assert.strictEqual((yield* store.rotateRefresh(`y_r${n - 1}`, "y", now + n, () => pair("y", n)))._tag, "Rotated");
+      assert.strictEqual((yield* store.rotateRefresh("y_r30", "y", now + 100, () => pair("y", 31)))._tag, "Exhausted");
+      assert.isTrue(Option.isNone(yield* store.accessGrant("y_a30", now + 100)));
+      const [rows] = yield* sql<{ total: number }>`SELECT COUNT(*) AS total FROM oauth_tokens WHERE grant_id = 'grant_y'`;
+      assert.strictEqual(rows?.total, 0);
     }).pipe(Effect.provide(db)),
   );
 

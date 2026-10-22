@@ -5,6 +5,7 @@ import { Clock, Effect, Redacted } from "effect";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { hashSecret, randomSecret } from "../src/oauth/crypto.js";
 import { LIMITS } from "../src/oauth/server.js";
+import { MAX_SESSIONS_PER_SUBJECT, SESSION_IDLE_MS } from "../src/transport/http.js";
 import {
   authorizationUrl,
   authorizeInBrowser,
@@ -254,12 +255,16 @@ describe("metadata and the /mcp challenge", () => {
     const made = await postMcp(harness, { "mcp-session-id": "made-up", authorization: `Bearer ${alice.access}` }, "/mcp", list);
     expect(made.status).toBe(404);
 
-    // A grant that keeps initializing loses its own oldest sessions, not other grants'.
+    // A grant at its session limit is refused new sessions; its live ones and other grants' keep working.
     const bobInit = await postMcp(harness, { authorization: `Bearer ${bob.access}` });
     const bobSession = bobInit.headers.get("mcp-session-id") ?? "";
-    for (let i = 0; i < 32; i++) await postMcp(harness, { authorization: `Bearer ${alice.access}` });
-    const evicted = await postMcp(harness, { ...headers, authorization: `Bearer ${alice.access}` }, "/mcp", list);
-    expect(evicted.status).toBe(404);
+    const statuses: Array<number> = [];
+    for (let i = 0; i < MAX_SESSIONS_PER_SUBJECT; i++) {
+      statuses.push((await postMcp(harness, { authorization: `Bearer ${alice.access}` })).status);
+    }
+    expect(statuses.filter((s) => s === 200)).toHaveLength(MAX_SESSIONS_PER_SUBJECT - 1);
+    expect(statuses.at(-1)).toBe(429);
+    expect((await postMcp(harness, { ...headers, authorization: `Bearer ${alice.access}` }, "/mcp", list)).status).toBe(200);
     const bobStill = await postMcp(
       harness,
       { "mcp-session-id": bobSession, "mcp-protocol-version": "2025-11-25", authorization: `Bearer ${bob.access}` },
@@ -267,6 +272,16 @@ describe("metadata and the /mcp challenge", () => {
       list,
     );
     expect(bobStill.status).toBe(200);
+    // After an hour without use, an old session gives up its slot (with a refreshed token).
+    harness.clock.advance(SESSION_IDLE_MS + 1000);
+    const refreshed = await tokenRequest(harness, {
+      grant_type: "refresh_token",
+      client_id: alice.clientId,
+      refresh_token: alice.refresh,
+      resource: RESOURCE,
+    });
+    const fresh = String(refreshed.body.access_token);
+    expect((await postMcp(harness, { authorization: `Bearer ${fresh}` })).status).toBe(200);
   });
 });
 

@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { NodeHttpServer } from "@effect/platform-node";
-import { Effect, Layer, Result, Stream, type Types } from "effect";
+import { Clock, Effect, Layer, Result, Stream, type Types } from "effect";
 import { McpServer } from "effect/ai";
 import { HttpBody, HttpEffect, HttpMiddleware, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 import type { TransportConfig } from "../config.js";
@@ -90,10 +90,12 @@ const unavailable = HttpServerResponse.empty({ status: 503, headers: { "retry-af
 const unknownSession = HttpServerResponse.empty({ status: 404 });
 
 const MCP_SESSION_HEADER = "mcp-session-id";
-/** Tracked MCP sessions; beyond this the oldest are forgotten (their clients re-initialize). */
+/** Tracked MCP sessions across all subjects. */
 const MAX_TRACKED_SESSIONS = 10_000;
-/** Sessions per subject; a client that keeps initializing loses its own oldest, not others'. */
-const MAX_SESSIONS_PER_SUBJECT = 32;
+/** Sessions one subject (OAuth grant) may hold. */
+export const MAX_SESSIONS_PER_SUBJECT = 32;
+/** A session unused this long gives up its slot when its subject or the server is at capacity. */
+export const SESSION_IDLE_MS = 60 * 60_000;
 
 /**
  * Every route: response redaction, and (except /healthz) the Host allowlist.
@@ -116,6 +118,81 @@ const guard = (allowedHosts: ReadonlyArray<string>) =>
     { global: true },
   );
 
+/** A tracked MCP session: the subject (OAuth grant) that opened it and when it was last used. */
+interface SessionOwner {
+  readonly subject: string;
+  lastSeen: number;
+}
+
+/**
+ * Which subject owns which MCP session, with admission limits. McpServer
+ * keeps HTTP sessions until a DELETE and offers no other way to end them, so
+ * new sessions are refused at capacity instead of forgetting live ones; a
+ * session idle for SESSION_IDLE_MS gives up its slot (it then answers 404).
+ */
+const makeSessionOwners = () => {
+  const owners = new Map<string, SessionOwner>();
+  const pending = new Map<string, number>();
+  let pendingTotal = 0;
+
+  const countOf = (subject: string) => {
+    let count = pending.get(subject) ?? 0;
+    for (const owner of owners.values()) if (owner.subject === subject) count++;
+    return count;
+  };
+
+  /** The longest-idle session (of `subject`, or of anyone) idle beyond SESSION_IDLE_MS. */
+  const idlest = (now: number, subject?: string) => {
+    let found: [string, SessionOwner] | undefined;
+    for (const entry of owners) {
+      const [, owner] = entry;
+      if (subject !== undefined && owner.subject !== subject) continue;
+      if (owner.lastSeen > now - SESSION_IDLE_MS) continue;
+      if (found === undefined || owner.lastSeen < found[1].lastSeen) found = entry;
+    }
+    return found?.[0];
+  };
+
+  /** Reserves room for one new session; "subject" or "global" when full. */
+  const admit = (subject: string, now: number): "ok" | "subject" | "global" => {
+    if (countOf(subject) >= MAX_SESSIONS_PER_SUBJECT) {
+      const idle = idlest(now, subject);
+      if (idle === undefined) return "subject";
+      owners.delete(idle);
+    }
+    if (owners.size + pendingTotal >= MAX_TRACKED_SESSIONS) {
+      const idle = idlest(now);
+      if (idle === undefined) return "global";
+      owners.delete(idle);
+    }
+    pending.set(subject, (pending.get(subject) ?? 0) + 1);
+    pendingTotal++;
+    return "ok";
+  };
+
+  const release = (subject: string) => {
+    const left = (pending.get(subject) ?? 1) - 1;
+    if (left <= 0) pending.delete(subject);
+    else pending.set(subject, left);
+    pendingTotal = Math.max(0, pendingTotal - 1);
+  };
+
+  /** Whether `session` belongs to `subject`; marks it used. */
+  const owns = (session: string, subject: string, now: number) => {
+    const owner = owners.get(session);
+    if (owner === undefined || owner.subject !== subject) return false;
+    owner.lastSeen = now;
+    return true;
+  };
+
+  const bind = (session: string, subject: string, now: number) => owners.set(session, { subject, lastSeen: now });
+  const forget = (session: string) => owners.delete(session);
+
+  return { admit, release, owns, bind, forget };
+};
+
+const tooManySessions = HttpServerResponse.empty({ status: 429, headers: { "retry-after": "60" } });
+
 /**
  * Authentication for every route McpServer registers. Route middleware, not
  * a path comparison: the router also matches /MCP, /mcp/, //mcp and
@@ -126,22 +203,14 @@ const guard = (allowedHosts: ReadonlyArray<string>) =>
  * initialized them. McpServer finds sessions by id alone, so a session id
  * presented by another grant, or one no longer tracked, is answered 404 like
  * an unknown session and the client starts a new one. Refreshing tokens
- * keeps the grant, so sessions survive refresh.
+ * keeps the grant, so sessions survive refresh. A grant may hold
+ * MAX_SESSIONS_PER_SUBJECT sessions; beyond that, initialization is refused
+ * (429) unless one of its sessions has been idle for SESSION_IDLE_MS.
  */
 const mcpAuth = HttpRouter.middleware(
   Effect.gen(function* () {
     const auth = yield* Auth;
-    const owners = new Map<string, string>();
-    const bind = (session: string, subject: string) => {
-      owners.set(session, subject);
-      const own = [...owners].filter(([, owner]) => owner === subject);
-      for (const [oldest] of own.slice(0, Math.max(0, own.length - MAX_SESSIONS_PER_SUBJECT))) owners.delete(oldest);
-      while (owners.size > MAX_TRACKED_SESSIONS) {
-        const oldest = owners.keys().next();
-        if (oldest.done === true) break;
-        owners.delete(oldest.value);
-      }
-    };
+    const sessions = makeSessionOwners();
     return Effect.fnUntraced(function* (
       httpEffect: Effect.Effect<HttpServerResponse.HttpServerResponse, Types.unhandled>,
     ) {
@@ -153,22 +222,38 @@ const mcpAuth = HttpRouter.middleware(
       }
       const subject = principal.success.subject;
       const session = request.headers[MCP_SESSION_HEADER];
-      if (session !== undefined && owners.get(session) !== subject) return unknownSession;
-      const response = yield* Effect.provideService(httpEffect, CurrentPrincipal, principal.success);
-      if (session === undefined) {
-        // McpServer sets a new session's id in a pre-response handler; this
-        // one is appended after it, and runs before the client sees the id.
-        yield* HttpEffect.appendPreResponseHandler((_request, final) =>
-          Effect.sync(() => {
-            const created = final.headers[MCP_SESSION_HEADER];
-            if (created !== undefined) bind(created, subject);
-            return final;
-          }),
-        );
-      } else if (request.method === "DELETE" && response.status < 300) {
-        owners.delete(session);
+      const now = yield* Clock.currentTimeMillis;
+      const handle = Effect.provideService(httpEffect, CurrentPrincipal, principal.success);
+      if (session !== undefined) {
+        if (!sessions.owns(session, subject, now)) return unknownSession;
+        const response = yield* handle;
+        if (request.method === "DELETE" && response.status < 300) sessions.forget(session);
+        return response;
       }
-      return response;
+      if (request.method !== "POST") return yield* handle;
+      // A POST without a session id may initialize one: reserve its slot first.
+      const admission = sessions.admit(subject, now);
+      if (admission !== "ok") return admission === "subject" ? tooManySessions : unavailable;
+      let released = false;
+      const release = () => {
+        if (!released) sessions.release(subject);
+        released = true;
+      };
+      // McpServer sets a new session's id in a pre-response handler; this
+      // one is appended after it, and runs before the client sees the id.
+      return yield* handle.pipe(
+        Effect.tap(() =>
+          HttpEffect.appendPreResponseHandler((_request, final) =>
+            Effect.sync(() => {
+              const created = final.headers[MCP_SESSION_HEADER];
+              if (created !== undefined) sessions.bind(created, subject, now);
+              release();
+              return final;
+            }),
+          ),
+        ),
+        Effect.ensuring(Effect.sync(release)),
+      );
     });
   }),
 );

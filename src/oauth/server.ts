@@ -673,6 +673,9 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
         return yield* new InvalidGrant({ description: "the refresh token was already used; the authorization is revoked" });
       case "Declined":
         return yield* new InvalidScope({ description: "the requested scope exceeds the grant" });
+      case "Exhausted":
+        yield* Effect.logWarning(`oauth: a grant of client ${client.clientId} reached the refresh limit and ended`);
+        return yield* new InvalidGrant({ description: "the authorization reached its refresh limit; authorize again" });
       case "Rotated":
         return tokenResponse(rotation.grant, issued);
     }

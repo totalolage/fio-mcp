@@ -111,6 +111,8 @@ export type Rotation =
   | { readonly _tag: "Reused"; readonly clientId: string }
   /** `next` declined the grant (e.g. scope beyond it); nothing changed. */
   | { readonly _tag: "Declined" }
+  /** The grant reached MAX_ROTATIONS and was revoked. */
+  | { readonly _tag: "Exhausted" }
   | { readonly _tag: "Rotated"; readonly grant: Grant };
 
 export interface TokenPair {
@@ -120,8 +122,13 @@ export interface TokenPair {
   readonly refreshExpiresAt: number;
 }
 
-/** Rotated refresh tokens remembered per grant for reuse detection. */
-export const ROTATED_KEPT = 20;
+/**
+ * Refresh rotations per grant. Every rotated token is kept while the grant
+ * lives (reuse of any of them revokes the grant), so the count bounds the
+ * rows a grant can accumulate; reaching it ends the grant and the client
+ * authorizes again. Hourly refreshes take over 200 days to get there.
+ */
+export const MAX_ROTATIONS = 5000;
 
 const StringList = Schema.fromJsonString(Schema.Array(Schema.String));
 const decodeList = Schema.decodeUnknownSync(StringList);
@@ -168,7 +175,7 @@ const toGrant = (row: GrantRow): Grant => ({
   resource: row.resource,
 });
 
-export const makeOAuthStore = Effect.fn("OAuthStore.make")(function* () {
+export const makeOAuthStore = Effect.fn("OAuthStore.make")(function* (maxRotations: number = MAX_ROTATIONS) {
   const sql = yield* SqlClient.SqlClient;
 
   const liveGrant = (now: number) => sql`
@@ -349,6 +356,14 @@ export const makeOAuthStore = Effect.fn("OAuthStore.make")(function* () {
           const grant = toGrant(row);
           const pair = next(grant);
           if (pair === undefined) return { _tag: "Declined" } satisfies Rotation as Rotation;
+          const [rotations] = yield* sql<{ total: number }>`
+            SELECT COUNT(*) AS total FROM oauth_tokens
+            WHERE grant_id = ${grant.grantId} AND kind = 'refresh' AND rotated_at IS NOT NULL
+          `;
+          if ((rotations?.total ?? 0) >= maxRotations) {
+            yield* revokeGrantNow(grant.grantId, now);
+            return { _tag: "Exhausted" } satisfies Rotation as Rotation;
+          }
           yield* sql`UPDATE oauth_tokens SET rotated_at = ${now} WHERE token_hash = ${refreshHash}`;
           // The superseded access tokens of this grant end with the rotation.
           yield* sql`DELETE FROM oauth_tokens WHERE grant_id = ${grant.grantId} AND kind = 'access'`;
@@ -357,17 +372,6 @@ export const makeOAuthStore = Effect.fn("OAuthStore.make")(function* () {
               { token_hash: pair.accessHash, grant_id: grant.grantId, kind: "access", expires_at: pair.accessExpiresAt, rotated_at: null },
               { token_hash: pair.refreshHash, grant_id: grant.grantId, kind: "refresh", expires_at: pair.refreshExpiresAt, rotated_at: null },
             ])}
-          `;
-          // Reuse detection keeps the newest rotated tokens only, so a client
-          // that refreshes in a loop cannot grow the database without bound.
-          yield* sql`
-            DELETE FROM oauth_tokens
-            WHERE grant_id = ${grant.grantId} AND kind = 'refresh' AND rotated_at IS NOT NULL
-              AND token_hash NOT IN (
-                SELECT token_hash FROM oauth_tokens
-                WHERE grant_id = ${grant.grantId} AND kind = 'refresh' AND rotated_at IS NOT NULL
-                ORDER BY rotated_at DESC LIMIT ${ROTATED_KEPT}
-              )
           `;
           yield* sql`UPDATE oauth_clients SET last_used_at = ${now} WHERE client_id = ${grant.clientId}`;
           return { _tag: "Rotated", grant } satisfies Rotation as Rotation;
