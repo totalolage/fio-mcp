@@ -389,7 +389,13 @@ Images are built locally and pushed by hand; there is no CI.
    npm run publish:image -- ghcr.io/<owner>/fio-mcp     # or FIO_MCP_IMAGE=ghcr.io/<owner>/fio-mcp npm run publish:image
    ```
 
-   [scripts/publish-image.sh](scripts/publish-image.sh) builds linux/amd64 with `docker buildx`, pushes `:<package version>` and `:<short git sha>`, and prints `ghcr.io/<owner>/fio-mcp@sha256:…`. Pin that digest in Compose. It refuses to run on a dirty tree.
+   [scripts/publish-image.sh](scripts/publish-image.sh) builds linux/amd64, pushes `:<package version>` and `:<short git sha>`, and prints `ghcr.io/<owner>/fio-mcp@sha256:…`. Pin that digest in Compose. It refuses to run on a dirty tree.
+
+   It builds with `docker buildx` when that is installed and falls back to `docker build --platform linux/amd64` otherwise. Set `DOCKER` to change the docker command, for example `DOCKER="sudo -n docker"` where docker needs sudo (log in with the same command). Add `--dry-run` (or set `DRY_RUN=1`) to build and tag the image locally without pushing:
+
+   ```sh
+   DOCKER="sudo -n docker" npm run publish:image -- --dry-run ghcr.io/<owner>/fio-mcp
+   ```
 
 3. If the package is private, give TrueNAS a read-only pull credential: in Apps → Configuration → Docker Registries (or the app's image pull secret), add `ghcr.io` with your GitHub user and a token that has only the `read:packages` scope.
 
