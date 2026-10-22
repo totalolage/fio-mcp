@@ -1,6 +1,6 @@
 // @effect-diagnostics unstableApiUsage:off
 import { assert, describe, it } from "@effect/vitest";
-import { Deferred, Effect, Layer, Queue, Sink, Stdio, Stream } from "effect";
+import { Deferred, Effect, Fiber, Layer, Queue, Sink, Stdio, Stream } from "effect";
 import { SERVER_INFO, ToolsLive } from "../src/app.js";
 import { makeFioToolkit } from "../src/mcp/fio-tools.js";
 import { layerStdio } from "../src/transport/stdio.js";
@@ -26,7 +26,7 @@ const startStdio = Effect.fnUntraced(function* () {
   });
   // Launched on its own fiber: the stdio protocol interrupts the fiber that
   // built it once stdout closes, as a process would exit.
-  yield* Effect.forkScoped(
+  const server = yield* Effect.forkScoped(
     Layer.launch(
       ToolsLive.pipe(
         Layer.provide(layerStdio(SERVER_INFO)),
@@ -38,7 +38,8 @@ const startStdio = Effect.fnUntraced(function* () {
   const send = (message: object) => Queue.offer(stdin, encoder.encode(`${JSON.stringify(message)}\n`));
   const request = Effect.fnUntraced(function* (message: object) {
     yield* send(message);
-    return JSON.parse(yield* Queue.take(stdout));
+    // A server that fails to start fails the test instead of hanging it.
+    return JSON.parse(yield* Effect.raceFirst(Queue.take(stdout), Fiber.join(server)));
   });
   return { send, request, written };
 });
