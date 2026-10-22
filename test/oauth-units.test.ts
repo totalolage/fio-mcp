@@ -46,7 +46,7 @@ describe("URL rules", () => {
     for (const ok of ["https://app.example/cb", "http://127.0.0.1:1234/cb", "http://[::1]/cb", "http://localhost:8080/cb?x=1"]) {
       assert.isUndefined(redirectUriProblem(ok), ok);
     }
-    for (const bad of ["http://app.example/cb", "http://127.0.0.2/cb", "myapp://cb", "https://app.example/cb#f", "https://u@app.example/cb", "https://", "https://app.example/\u001b]52;c;x\u0007", "https://app.example/a b"]) {
+    for (const bad of ["http://app.example/cb", "http://127.0.0.2/cb", "myapp://cb", "https://app.example/cb#f", "https://u@app.example/cb", "https://", "https://app.example/\u001b]52;c;x\u0007", "https://app.example/a b", "http://127.0.0.1:0/cb", "http://127.0.0.1:99999/cb"]) {
       assert.isDefined(redirectUriProblem(bad), bad);
     }
   });
@@ -59,6 +59,10 @@ describe("URL rules", () => {
     assert.isFalse(redirectUriMatches("http://127.0.0.1/cb", "http://127.0.0.1:1/cb?x"));
     assert.isFalse(redirectUriMatches("https://app.example:443/cb", "https://app.example/cb"));
     assert.isFalse(redirectUriMatches("https://app.example/cb", "https://app.example/CB"));
+    assert.isTrue(redirectUriMatches("http://127.0.0.1/cb", "http://127.0.0.1:65535/cb"));
+    for (const bad of ["http://127.0.0.1:99999/cb", "http://127.0.0.1:0/cb", "http://user@127.0.0.1/cb", "http://127.0.0.1:1/cb#x"]) {
+      assert.isFalse(redirectUriMatches("http://127.0.0.1/cb", bad), bad);
+    }
   });
 
   it("escapes HTML", () => {
