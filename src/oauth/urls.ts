@@ -43,9 +43,9 @@ export function isResource(presented: string, resource: string): boolean {
 }
 
 /**
- * A redirect URI a client may register: https, or http on a loopback host
- * (RFC 8252 §7.3), without fragment or credentials. Returns a problem or
- * undefined.
+ * A redirect URI a client may register or present: https, or http on a
+ * loopback host (RFC 8252 §7.3), with a port from 1 to 65535 if any, without
+ * fragment or credentials. Returns a problem or undefined.
  */
 export function redirectUriProblem(raw: string): string | undefined {
   if (raw.length > MAX_REDIRECT_URI_LENGTH) return `redirect URIs must be at most ${MAX_REDIRECT_URI_LENGTH} characters`;
@@ -53,7 +53,13 @@ export function redirectUriProblem(raw: string): string | undefined {
   const url = parse(raw);
   if (url === undefined) return "redirect URIs must be absolute URLs";
   if (raw.includes("#")) return "redirect URIs must not contain a fragment";
-  if (url.username !== "" || url.password !== "") return "redirect URIs must not contain credentials";
+  // The parsed URL drops an empty userinfo (`http://@host/`) and an empty port (`http://host:/`).
+  const authority = /^[^:]*:\/\/([^/?#]*)/.exec(raw)?.[1] ?? "";
+  if (authority === "") return "redirect URIs must be absolute URLs"; // e.g. `http:////@host/`, `http:host/`
+  if (url.username !== "" || url.password !== "" || authority.includes("@")) {
+    return "redirect URIs must not contain credentials";
+  }
+  if (url.port === "0" || authority.endsWith(":")) return "redirect URIs must use a port from 1 to 65535";
   if (url.protocol === "https:" && url.hostname !== "") return undefined;
   if (url.protocol === "http:" && LOOPBACK_HOSTS.has(url.hostname)) return undefined;
   return "redirect URIs must use https, or http on 127.0.0.1, [::1] or localhost";
@@ -66,9 +72,11 @@ const withoutLoopbackPort = (uri: string) => uri.replace(LOOPBACK_AUTHORITY, (_m
 
 /**
  * Exact string match, except that a registered loopback http URI matches
- * the same URI on any port (RFC 8252 §7.3).
+ * the same URI on any port (RFC 8252 §7.3). A presented URI that is not a
+ * valid redirect URI never matches, so it is never redirected to.
  */
 export function redirectUriMatches(registered: string, presented: string): boolean {
+  if (redirectUriProblem(presented) !== undefined) return false;
   if (registered === presented) return true;
   if (!LOOPBACK_AUTHORITY.test(registered) || !LOOPBACK_AUTHORITY.test(presented)) return false;
   return withoutLoopbackPort(registered) === withoutLoopbackPort(presented);

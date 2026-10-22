@@ -1,8 +1,10 @@
 import { NodeFileSystem } from "@effect/platform-node";
 import { assert, describe, it } from "@effect/vitest";
 import { type Cause, Clock, Effect, Fiber, Layer, Option, Queue, Redacted, Sink, Stdio, Stream, Terminal } from "effect";
+import { HttpServerRequest } from "effect/http";
 import { SqlClient } from "effect/sql";
 import { TestClock } from "effect/testing";
+import { Accounts, makeAccounts } from "../src/accounts.js";
 import { databaseLayer, SERVER_MIGRATIONS } from "../src/cache/db.js";
 import { CommandFailed, hashPasswordCommand, listClientsCommand, revokeAllTokensCommand, revokeClientCommand } from "../src/oauth/cli.js";
 import {
@@ -16,6 +18,7 @@ import {
 import { DEFAULT_THROTTLE, delayAfter, makeLoginGuard } from "../src/oauth/login.js";
 import { escapeHtml } from "../src/oauth/pages.js";
 import { makeWindowLimiter } from "../src/oauth/rate-limit.js";
+import { makeOAuthServer } from "../src/oauth/server.js";
 import { MAX_SESSIONS, makeSessions, type PendingAuthorization } from "../src/oauth/sessions.js";
 import { makeOAuthStore } from "../src/oauth/store.js";
 import { isResource, parsePublicUrl, redirectUriMatches, redirectUriProblem } from "../src/oauth/urls.js";
@@ -46,7 +49,7 @@ describe("URL rules", () => {
     for (const ok of ["https://app.example/cb", "http://127.0.0.1:1234/cb", "http://[::1]/cb", "http://localhost:8080/cb?x=1"]) {
       assert.isUndefined(redirectUriProblem(ok), ok);
     }
-    for (const bad of ["http://app.example/cb", "http://127.0.0.2/cb", "myapp://cb", "https://app.example/cb#f", "https://u@app.example/cb", "https://", "https://app.example/\u001b]52;c;x\u0007", "https://app.example/a b"]) {
+    for (const bad of ["http://app.example/cb", "http://127.0.0.2/cb", "myapp://cb", "https://app.example/cb#f", "https://u@app.example/cb", "https://", "https://app.example/\u001b]52;c;x\u0007", "https://app.example/a b", "http://127.0.0.1:0/cb", "http://127.0.0.1:99999/cb", "http://127.0.0.1:/cb", "http://@127.0.0.1/cb", "http:////@127.0.0.1/cb", "http:127.0.0.1/cb"]) {
       assert.isDefined(redirectUriProblem(bad), bad);
     }
   });
@@ -59,11 +62,37 @@ describe("URL rules", () => {
     assert.isFalse(redirectUriMatches("http://127.0.0.1/cb", "http://127.0.0.1:1/cb?x"));
     assert.isFalse(redirectUriMatches("https://app.example:443/cb", "https://app.example/cb"));
     assert.isFalse(redirectUriMatches("https://app.example/cb", "https://app.example/CB"));
+    assert.isTrue(redirectUriMatches("http://127.0.0.1/cb", "http://127.0.0.1:65535/cb"));
+    for (const bad of ["http://127.0.0.1:99999/cb", "http://127.0.0.1:0/cb", "http://user@127.0.0.1/cb", "http://127.0.0.1:1/cb#x"]) {
+      assert.isFalse(redirectUriMatches("http://127.0.0.1/cb", bad), bad);
+    }
   });
 
   it("escapes HTML", () => {
     assert.strictEqual(escapeHtml(`<a href="x" onclick='y'>&</a>`), "&lt;a href=&quot;x&quot; onclick=&#39;y&#39;&gt;&amp;&lt;/a&gt;");
   });
+});
+
+describe("authorization endpoint request target", () => {
+  const services = Layer.mergeAll(
+    databaseLayer(":memory:", SERVER_MIGRATIONS).pipe(Layer.provide(NodeFileSystem.layer)),
+    Layer.effect(Accounts, Effect.map(makeAccounts([]), Accounts.of)),
+  );
+
+  it.effect("shows an error page for an absolute-form target that is not a URL", () =>
+    Effect.gen(function* () {
+      const parsed = parsePasswordHash(yield* hashPassword(Redacted.make("correct horse battery"), FAST));
+      if (!("hash" in parsed)) return assert.fail("hash did not parse");
+      const server = yield* makeOAuthServer({ publicUrl: "https://fio.example.net", passwordHash: Redacted.make(parsed) });
+      const authorize = server.routes.find((route) => route.method === "GET" && route.path === "/authorize");
+      if (authorize === undefined) return assert.fail("no /authorize route");
+      // The Node adapter keeps a target it cannot parse as is, and the router still routes `GET http://[/authorize` here.
+      const request = HttpServerRequest.fromWeb(new Request("https://fio.example.net/authorize")).modify({ url: "http://[/authorize" });
+      const response = yield* authorize.handler(request);
+      assert.strictEqual(response.status, 400);
+      assert.isUndefined(response.headers.location);
+    }).pipe(Effect.provide(services)),
+  );
 });
 
 describe("secrets", () => {

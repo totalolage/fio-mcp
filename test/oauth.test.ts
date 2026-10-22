@@ -435,6 +435,14 @@ describe("dynamic client registration", () => {
   });
 });
 
+// Loopback redirect URIs that differ from LOOPBACK_REDIRECT only in an invalid port, userinfo, or a fragment.
+const MALFORMED_REDIRECTS = [
+  "http://127.0.0.1:99999/callback",
+  "http://127.0.0.1:0/callback",
+  "http://user@127.0.0.1/callback",
+  "http://127.0.0.1:5555/callback#x",
+];
+
 describe("authorization endpoint", () => {
   const validParams = async (redirectUri = LOOPBACK_REDIRECT) => {
     const { body } = await register(harness, [redirectUri]);
@@ -461,6 +469,17 @@ describe("authorization endpoint", () => {
       expect(response.status).toBe(400);
       expect(response.headers.get("location")).toBeNull();
       expect(response.headers.get("content-type")).toContain("text/html");
+    }
+  });
+
+  it("shows an error page (no redirect) for malformed redirect URIs", async () => {
+    const params = await validParams();
+    // A protocol error (plain PKCE) would otherwise be redirected to the presented URI.
+    for (const [uri, method] of MALFORMED_REDIRECTS.flatMap((uri) => [[uri, "plain"], [uri, "S256"]] as const)) {
+      const response = await harness.fetch(authorizationUrl({ ...params, redirect_uri: uri, code_challenge_method: method }));
+      expect(response.status, `${uri} ${method}`).toBe(400);
+      expect(response.headers.get("location"), `${uri} ${method}`).toBeNull();
+      expect(response.headers.get("content-type"), `${uri} ${method}`).toContain("text/html");
     }
   });
 
@@ -682,6 +701,14 @@ describe("token endpoint", () => {
     expect(second.response.status).toBe(400);
     expect(second.body.error).toBe("invalid_grant");
     expect((await postMcp(harness, { authorization: `Bearer ${first.body.access_token}` })).status).toBe(401);
+  });
+
+  it("rejects a malformed redirect_uri", async () => {
+    for (const uri of MALFORMED_REDIRECTS) {
+      const { response, body } = await exchange(await codeFor(harness), { redirect_uri: uri });
+      expect(response.status, uri).toBe(400);
+      expect(body.error, uri).toBe("invalid_grant");
+    }
   });
 
   it("rejects an expired code", async () => {
