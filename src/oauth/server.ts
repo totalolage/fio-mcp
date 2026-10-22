@@ -28,6 +28,7 @@ import {
 } from "./errors.js";
 import { DEFAULT_THROTTLE, makeLoginGuard, type ThrottlePolicy } from "./login.js";
 import { consentPage, errorPage, loginPage, pageHeaders, redirectFormTarget } from "./pages.js";
+import { makeWindowLimiter } from "./rate-limit.js";
 import { type AuthSession, makeSessions, type PendingAuthorization, SESSION_COOKIE, SESSION_TTL_MS } from "./sessions.js";
 import { type Client, type Grant, makeOAuthStore, type OAuthStore } from "./store.js";
 import { isResource, MCP_RESOURCE_PATH, redirectUriMatches, redirectUriProblem, withParams } from "./urls.js";
@@ -64,6 +65,10 @@ export const LIMITS = {
   maxClientName: 100,
   maxState: 1024,
   maxBodyBytes: 16 * 1024,
+  /** Sign-ins (/authorize requests that start a session) per client address, and per client, per window. */
+  authorizationsPerAddress: 20,
+  authorizationsPerClient: 20,
+  authorizationWindowMs: 10 * 60_000,
 } as const;
 
 export const PROTECTED_RESOURCE_PATH = "/.well-known/oauth-protected-resource";
@@ -116,7 +121,13 @@ const html = (body: string, status = 200, formTargets: ReadonlyArray<string> = [
     headers: { ...pageHeaders(formTargets), ...extra },
   });
 
-const pageError = (error: PageError) => html(errorPage(error.title, error.detail), error.status);
+const pageError = (error: PageError) =>
+  html(
+    errorPage(error.title, error.detail),
+    error.status,
+    [],
+    error.retryAfterSeconds === undefined ? {} : { "retry-after": String(error.retryAfterSeconds) },
+  );
 
 const sessionCookie = (value: string, maxAgeMs: number) =>
   Cookies.setUnsafe(Cookies.empty, SESSION_COOKIE, value, {
@@ -208,6 +219,16 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
   const resourceMetadataUrl = `${issuer}${PROTECTED_RESOURCE_PATH}${MCP_RESOURCE_PATH}`;
   const accountNames = accounts.list.map((account) => account.name);
   const registrations: Array<number> = [];
+  const authorizationsByAddress = makeWindowLimiter({
+    limit: LIMITS.authorizationsPerAddress,
+    windowMs: LIMITS.authorizationWindowMs,
+    maxKeys: 10_000,
+  });
+  const authorizationsByClient = makeWindowLimiter({
+    limit: LIMITS.authorizationsPerClient,
+    windowMs: LIMITS.authorizationWindowMs,
+    maxKeys: LIMITS.maxClients * 2,
+  });
   const trustedProxies = settings.trustedProxies ?? [];
   const addressOf = (request: HttpServerRequest.HttpServerRequest) => clientAddress(request, trustedProxies);
 
@@ -418,6 +439,22 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
     }
     const pending = yield* Effect.result(authorizationRequest(params, target.client, target.redirectUri));
     if (Result.isFailure(pending)) return errorRedirect(target.redirectUri, state, pending.failure);
+    // Anyone can start sign-ins; each holds memory for SESSION_TTL_MS.
+    const now = yield* Clock.currentTimeMillis;
+    const address = addressOf(request);
+    const clientId = target.client.clientId;
+    const wait = Math.max(authorizationsByAddress.retryAfter(address, now), authorizationsByClient.retryAfter(clientId, now));
+    if (wait > 0) {
+      yield* Effect.logDebug("oauth: refused a sign-in: too many started from one address or for one client");
+      return yield* new PageError({
+        status: 429,
+        title: "Too many sign-in attempts",
+        detail: `Too many sign-ins were started recently. Try again in ${wait} s.`,
+        retryAfterSeconds: wait,
+      });
+    }
+    authorizationsByAddress.record(address, now);
+    authorizationsByClient.record(clientId, now);
     const issued = yield* sessions.start(pending.success);
     return redirect("/login", sessionCookie(Redacted.value(issued.cookie), SESSION_TTL_MS));
   });

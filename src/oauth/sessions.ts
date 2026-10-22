@@ -11,7 +11,13 @@ import { hashSecret, newSigningKey, randomSecret, safeEqual, sign } from "./cryp
 
 export const SESSION_COOKIE = "__Host-fio-mcp-auth";
 export const SESSION_TTL_MS = 10 * 60_000;
-const MAX_SESSIONS = 200;
+/**
+ * Sessions held at once. Anyone can start one, so sign-ins in progress are
+ * capped apart from signed-in ones (which need the password): at the cap
+ * the oldest of the same kind makes room, so starting sign-ins never ends a
+ * signed-in session.
+ */
+export const MAX_SESSIONS = { pending: 100, signedIn: 20 } as const;
 
 /** A validated /authorize request, waiting for login and consent. */
 export interface PendingAuthorization {
@@ -42,18 +48,18 @@ export const makeSessions = Effect.fn("AuthSessions.make")(function* () {
   const key = yield* newSigningKey;
   const sessions = new Map<string, AuthSession>();
 
-  const prune = (now: number) => {
+  /** Drops expired sessions, then the oldest of `loggedIn`'s kind until one more fits. */
+  const prune = (now: number, loggedIn: boolean) => {
     for (const [id, session] of sessions) if (session.expiresAt <= now) sessions.delete(id);
-    while (sessions.size >= MAX_SESSIONS) {
-      const oldest = sessions.keys().next();
-      if (oldest.done === true) break;
-      sessions.delete(oldest.value);
-    }
+    const cap = loggedIn ? MAX_SESSIONS.signedIn : MAX_SESSIONS.pending;
+    // Insertion order is age order: a signed-in session is re-inserted at login.
+    const sameKind = [...sessions.values()].filter((session) => session.loggedIn === loggedIn);
+    for (const session of sameKind.slice(0, Math.max(0, sameKind.length - cap + 1))) sessions.delete(session.key);
   };
 
   const issue = Effect.fnUntraced(function* (request: PendingAuthorization, loggedIn: boolean, expiresAt?: number) {
     const now = yield* Clock.currentTimeMillis;
-    prune(now);
+    prune(now, loggedIn);
     const id = Redacted.value(yield* randomSecret(""));
     const session: AuthSession = {
       key: hashSecret(id),
