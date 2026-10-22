@@ -2,7 +2,7 @@ import { request as nodeRequest } from "node:http";
 import { assert, describe, it } from "@effect/vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { Context, Deferred, Effect, Exit, Fiber, Layer, Redacted, Schema } from "effect";
+import { Context, Deferred, Effect, Exit, Fiber, Layer, Schema } from "effect";
 import { McpServer, Tool, Toolkit } from "effect/ai";
 import { HttpRouter, HttpServer, HttpServerResponse } from "effect/http";
 import { SERVER_INFO, ToolsLive } from "../src/app.js";
@@ -13,13 +13,13 @@ import { Auth, Unauthorized } from "../src/transport/auth.js";
 import { makeFrameRedactor } from "../src/transport/frame-redaction.js";
 import { type HttpTransportConfig, isAllowedHost, serveHttp } from "../src/transport/http.js";
 import { CurrentPrincipal } from "../src/transport/principal.js";
-import { ACCOUNT_NAMES, AUTH_TOKEN, FIO_TOKEN, testConfig, testServices } from "./support/transport.js";
+import { ACCOUNT_NAMES, FIO_TOKEN, testConfig, testServices } from "./support/transport.js";
 
 const transport = (overrides: Partial<HttpTransportConfig> = {}): HttpTransportConfig => ({
   kind: "http",
   host: "127.0.0.1",
   port: 0,
-  authToken: undefined,
+  auth: { kind: "unauthenticated" },
   allowedOrigins: [],
   allowedHosts: [],
   ...overrides,
@@ -43,7 +43,7 @@ const WhoAmILive = McpServer.toolkit(WhoAmIToolkit).pipe(
 /** Serves the app on an ephemeral port for the rest of the scope. */
 const startServer = Effect.fnUntraced(function* (
   config: HttpTransportConfig,
-  auth: Layer.Layer<Auth, never, HttpRouter.HttpRouter> = Auth.layerFrom(config.authToken),
+  auth: Layer.Layer<Auth, never, HttpRouter.HttpRouter> = Auth.layerOpen,
 ) {
   const release = yield* Deferred.make<void>();
   const app = serveHttp(Layer.mergeAll(ToolsLive, WhoAmILive), auth, SERVER_INFO, config).pipe(
@@ -135,10 +135,13 @@ describe("HTTP transport", () => {
     Effect.gen(function* () {
       const { base } = yield* startServer(
         transport({
-          authToken: Redacted.make(AUTH_TOKEN),
           allowedHosts: ["fio.example.test"],
           allowedOrigins: ["https://fio.example.test"],
         }),
+        Layer.succeed(
+          Auth,
+          Auth.of({ authenticate: () => Effect.fail(new Unauthorized({ challenge: "Bearer" })) }),
+        ),
       );
       const headerSets: Array<Record<string, string>> = [
         {},
@@ -150,46 +153,6 @@ describe("HTTP transport", () => {
         assert.strictEqual(response.status, 200);
         assert.deepStrictEqual(JSON.parse(response.body), { status: "ok" });
       }
-    }).pipe(Effect.scoped),
-  );
-
-  it.live("requires the bearer token on /mcp when one is configured", () =>
-    Effect.gen(function* () {
-      const { base } = yield* startServer(transport({ authToken: Redacted.make(AUTH_TOKEN) }));
-
-      const missing = yield* postInitialize(base);
-      assert.strictEqual(missing.status, 401);
-      assert.strictEqual(missing.headers["www-authenticate"], "Bearer");
-
-      const wrong = yield* postInitialize(base, { authorization: `Bearer ${AUTH_TOKEN}x` });
-      assert.strictEqual(wrong.status, 401);
-      assert.strictEqual(wrong.headers["www-authenticate"], 'Bearer error="invalid_token"');
-
-      const otherScheme = yield* postInitialize(base, { authorization: `Basic ${AUTH_TOKEN}` });
-      assert.strictEqual(otherScheme.status, 401);
-
-      // Only /mcp is authenticated; other routes belong to whoever adds them.
-      assert.strictEqual((yield* raw(`${base}/other`)).status, 404);
-
-      // The router maps all of these to McpServer's routes (each answers 200
-      // with the token); none may skip authentication.
-      for (const path of ["/MCP", "/mcp/", "//mcp", "/%6dcp", "/mcp;x"]) {
-        const variant = yield* raw(`${base}${path}`, {
-          method: "POST",
-          headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
-          body: INITIALIZE,
-        });
-        assert.strictEqual(variant.status, 401, `POST ${path}`);
-      }
-      assert.strictEqual((yield* raw(`${base}/mcp`, { method: "DELETE" })).status, 401);
-      assert.strictEqual((yield* raw(`${base}/mcp`)).status, 401);
-
-      const denied = yield* Effect.exit(connect(base));
-      assert.isTrue(Exit.isFailure(denied));
-
-      const client = yield* connect(base, { authorization: `Bearer ${AUTH_TOKEN}` });
-      const tools = yield* Effect.promise(() => client.listTools());
-      assert.deepStrictEqual(tools.tools.map((t) => t.name).sort(), FIO_TOOL_NAMES);
     }).pipe(Effect.scoped),
   );
 

@@ -2,7 +2,7 @@ import { createServer } from "node:http";
 import { NodeHttpServer } from "@effect/platform-node";
 import { Effect, Layer, Result, Stream, type Types } from "effect";
 import { McpServer } from "effect/ai";
-import { HttpBody, HttpMiddleware, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
+import { HttpBody, HttpEffect, HttpMiddleware, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 import type { TransportConfig } from "../config.js";
 import { Redactor } from "../redaction.js";
 import { Auth } from "./auth.js";
@@ -84,6 +84,15 @@ const unauthorized = (challenge: string) =>
 
 const forbidden = HttpServerResponse.empty({ status: 403 });
 
+const unavailable = HttpServerResponse.empty({ status: 503, headers: { "retry-after": "5" } });
+
+// What McpServer answers for a session id it does not know.
+const unknownSession = HttpServerResponse.empty({ status: 404 });
+
+const MCP_SESSION_HEADER = "mcp-session-id";
+/** Tracked MCP sessions; beyond this the oldest are forgotten (their clients re-initialize). */
+const MAX_TRACKED_SESSIONS = 10_000;
+
 /**
  * Every route: response redaction, and (except /healthz) the Host allowlist.
  * Paths are compared literally; any other spelling of /healthz is checked.
@@ -110,16 +119,52 @@ const guard = (allowedHosts: ReadonlyArray<string>) =>
  * a path comparison: the router also matches /MCP, /mcp/, //mcp and
  * percent-encoded spellings. The principal reaches tool handlers as
  * `CurrentPrincipal`.
+ *
+ * MCP sessions are bound to the principal's subject (the OAuth grant) that
+ * initialized them. McpServer finds sessions by id alone, so a session id
+ * presented by another grant, or one no longer tracked, is answered 404 like
+ * an unknown session and the client starts a new one. Refreshing tokens
+ * keeps the grant, so sessions survive refresh.
  */
 const mcpAuth = HttpRouter.middleware(
   Effect.gen(function* () {
     const auth = yield* Auth;
+    const owners = new Map<string, string>();
+    const bind = (session: string, subject: string) => {
+      owners.set(session, subject);
+      while (owners.size > MAX_TRACKED_SESSIONS) {
+        const oldest = owners.keys().next();
+        if (oldest.done === true) break;
+        owners.delete(oldest.value);
+      }
+    };
     return Effect.fnUntraced(function* (
       httpEffect: Effect.Effect<HttpServerResponse.HttpServerResponse, Types.unhandled>,
     ) {
-      const principal = yield* Effect.result(auth.authenticate(yield* HttpServerRequest.HttpServerRequest));
-      if (Result.isFailure(principal)) return unauthorized(principal.failure.challenge);
-      return yield* Effect.provideService(httpEffect, CurrentPrincipal, principal.success);
+      const request = yield* HttpServerRequest.HttpServerRequest;
+      const principal = yield* Effect.result(auth.authenticate(request));
+      if (Result.isFailure(principal)) {
+        const failure = principal.failure;
+        return failure._tag === "AuthUnavailable" ? unavailable : unauthorized(failure.challenge);
+      }
+      const subject = principal.success.subject;
+      const session = request.headers[MCP_SESSION_HEADER];
+      if (session !== undefined && owners.get(session) !== subject) return unknownSession;
+      const response = yield* Effect.provideService(httpEffect, CurrentPrincipal, principal.success);
+      if (session === undefined) {
+        // McpServer sets a new session's id in a pre-response handler; this
+        // one is appended after it, and runs before the client sees the id.
+        yield* HttpEffect.appendPreResponseHandler((_request, final) =>
+          Effect.sync(() => {
+            const created = final.headers[MCP_SESSION_HEADER];
+            if (created !== undefined) bind(created, subject);
+            return final;
+          }),
+        );
+      } else if (request.method === "DELETE" && response.status < 300) {
+        owners.delete(session);
+      }
+      return response;
     });
   }),
 );

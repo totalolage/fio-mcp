@@ -29,6 +29,8 @@
         "ignoreEffectErrorsInTscExitCode": false,
         "allowedUnstableApis": [
           "effect/Stdio",
+          "effect/Terminal",
+          "effect/ByteSize",
           "@effect/vitest",
           "effect/testing",
           "effect/FileSystem",

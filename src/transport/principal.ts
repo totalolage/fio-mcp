@@ -10,7 +10,8 @@ import { Context, Layer } from "effect";
  * services present when tools are registered and lays them over each call,
  * so on HTTP a principal provided at registration would shadow the
  * per-request one. Left out of the HTTP layers, the handler sees the request
- * fiber's value.
+ * fiber's value. The default grants nothing, so a call that somehow misses
+ * the guard is denied.
  */
 export interface Principal {
   readonly subject: string;
@@ -25,7 +26,7 @@ export const LOCAL_PRINCIPAL: Principal = { subject: "local", scopes: "all", acc
 export const NO_PRINCIPAL: Principal = { subject: "none", scopes: [], accounts: [] };
 
 export const CurrentPrincipal = Context.Reference<Principal>("fio-mcp/transport/CurrentPrincipal", {
-  defaultValue: () => LOCAL_PRINCIPAL,
+  defaultValue: () => NO_PRINCIPAL,
 });
 
 /** For transports with one trusted local client (stdio): full access, provided at tool registration. */

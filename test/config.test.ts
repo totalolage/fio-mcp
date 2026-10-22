@@ -5,6 +5,7 @@ import { assert, describe, it } from "@effect/vitest";
 import { Effect, Redacted } from "effect";
 import { MIN_RATE_LIMIT_INTERVAL_MS } from "../src/config.js";
 import { ConfigError } from "../src/errors.js";
+import { hashPassword } from "../src/oauth/crypto.js";
 import { loadConfigFrom, PAY_TOKEN, READ_TOKEN } from "./fixtures.js";
 
 const configError = (env: Record<string, string>) =>
@@ -82,16 +83,6 @@ describe("loadConfig", () => {
         FIO_ACCOUNTS_FILE: secretFile(`${JSON.stringify([{ name: "a", token: PAY_TOKEN }])}\n`),
       });
       assert.strictEqual(multi.accounts[0]?.name, "a");
-      const http = yield* loadConfigFrom({
-        FIO_TOKEN: READ_TOKEN,
-        FIO_MCP_TRANSPORT: "http",
-        FIO_MCP_AUTH_TOKEN_FILE: secretFile("bearer-secret-0123456789\n"),
-      });
-      assert.strictEqual(http.transport.kind, "http");
-      if (http.transport.kind === "http") {
-        assert.strictEqual(http.transport.authToken && Redacted.value(http.transport.authToken), "bearer-secret-0123456789");
-      }
-      assert.strictEqual(http.secrets.length, 2);
     }),
   );
 
@@ -105,15 +96,6 @@ describe("loadConfig", () => {
       assert.strictEqual(
         yield* configError({ FIO_ACCOUNTS: "[]", FIO_ACCOUNTS_FILE: path }),
         "Set either FIO_ACCOUNTS or FIO_ACCOUNTS_FILE, not both",
-      );
-      assert.strictEqual(
-        yield* configError({
-          FIO_TOKEN: READ_TOKEN,
-          FIO_MCP_TRANSPORT: "http",
-          FIO_MCP_AUTH_TOKEN: "x".repeat(20),
-          FIO_MCP_AUTH_TOKEN_FILE: path,
-        }),
-        "Set either FIO_MCP_AUTH_TOKEN or FIO_MCP_AUTH_TOKEN_FILE, not both",
       );
       const missing = yield* configError({ FIO_TOKEN_FILE: "/nonexistent/fio-token" });
       assert.strictEqual(missing, "FIO_TOKEN_FILE: cannot read /nonexistent/fio-token");
@@ -144,7 +126,6 @@ describe("loadConfig", () => {
         { FIO_TOKEN: READ_TOKEN, FIO_RATE_LIMIT_INTERVAL_MS: "soon" },
         { FIO_TOKEN: READ_TOKEN, FIO_MCP_TRANSPORT: "carrier-pigeon" },
         { FIO_TOKEN: READ_TOKEN, FIO_MCP_TRANSPORT: "http", FIO_MCP_PORT: "70000" },
-        { FIO_TOKEN: READ_TOKEN, FIO_MCP_TRANSPORT: "http", FIO_MCP_AUTH_TOKEN: "short" },
         { FIO_TOKEN: READ_TOKEN, FIO_BACKFILL_FROM: "2024-02-30" },
         { FIO_TOKEN: READ_TOKEN, FIO_SYNC_INTERVAL_MINUTES: "1" },
         { FIO_TOKEN: READ_TOKEN, FIO_CACHE_ENABLED: "maybe" },
@@ -204,11 +185,119 @@ describe("loadConfig", () => {
     }),
   );
 
+  it.effect("loads OAuth HTTP auth config and normalizes the public origin", () =>
+    Effect.gen(function* () {
+      const hash = yield* hashPassword(Redacted.make("test-admin-password"), { ln: 14, r: 8, p: 1 });
+      const hashFile = secretFile(`${hash}\n`);
+      const env = {
+        FIO_TOKEN: READ_TOKEN,
+        FIO_MCP_TRANSPORT: "http",
+        FIO_MCP_PUBLIC_URL: "https://fio.example.test",
+        FIO_MCP_ADMIN_PASSWORD_HASH_FILE: hashFile,
+      };
+
+      const config = yield* loadConfigFrom(env);
+      assert.strictEqual(config.transport.kind, "http");
+      if (config.transport.kind === "http") {
+        assert.strictEqual(config.transport.auth.kind, "oauth");
+        if (config.transport.auth.kind === "oauth") {
+          assert.strictEqual(config.transport.auth.publicUrl, "https://fio.example.test");
+        }
+      }
+
+      const normalized = yield* loadConfigFrom({ ...env, FIO_MCP_PUBLIC_URL: "https://FIO.example.test/" });
+      assert.strictEqual(normalized.transport.kind, "http");
+      if (normalized.transport.kind === "http" && normalized.transport.auth.kind === "oauth") {
+        assert.strictEqual(normalized.transport.auth.publicUrl, "https://fio.example.test");
+      }
+    }),
+  );
+
+  it.effect("requires OAuth settings unless unauthenticated HTTP is explicitly allowed", () =>
+    Effect.gen(function* () {
+      const env = { FIO_TOKEN: READ_TOKEN, FIO_MCP_TRANSPORT: "http" };
+      const message = yield* configError(env);
+      assert.include(message, "HTTP mode requires FIO_MCP_PUBLIC_URL and FIO_MCP_ADMIN_PASSWORD_HASH_FILE");
+
+      const open = yield* loadConfigFrom({ ...env, FIO_MCP_ALLOW_UNAUTHENTICATED: "true" });
+      assert.strictEqual(open.transport.kind, "http");
+      if (open.transport.kind === "http") assert.strictEqual(open.transport.auth.kind, "unauthenticated");
+    }),
+  );
+
+  it.effect("requires both OAuth public URL and password hash file", () =>
+    Effect.gen(function* () {
+      const publicOnly = yield* configError({
+        FIO_TOKEN: READ_TOKEN,
+        FIO_MCP_TRANSPORT: "http",
+        FIO_MCP_PUBLIC_URL: "https://fio.example.test",
+      });
+      assert.include(publicOnly, "FIO_MCP_ADMIN_PASSWORD_HASH_FILE is not");
+
+      const hashOnly = yield* configError({
+        FIO_TOKEN: READ_TOKEN,
+        FIO_MCP_TRANSPORT: "http",
+        FIO_MCP_ADMIN_PASSWORD_HASH_FILE: secretFile("unused\n"),
+      });
+      assert.include(hashOnly, "FIO_MCP_PUBLIC_URL is not");
+    }),
+  );
+
+  it.effect("ignores the removed static bearer token: HTTP mode still requires OAuth", () =>
+    Effect.gen(function* () {
+      const value = "legacy-bearer-secret-value";
+      const message = yield* configError({
+        FIO_TOKEN: READ_TOKEN,
+        FIO_MCP_TRANSPORT: "http",
+        FIO_MCP_AUTH_TOKEN: value,
+      });
+      assert.include(message, "HTTP mode requires FIO_MCP_PUBLIC_URL and FIO_MCP_ADMIN_PASSWORD_HASH_FILE");
+      assert.notInclude(message, value);
+    }),
+  );
+
+  it.effect("validates OAuth public URL origins and allows loopback HTTP", () =>
+    Effect.gen(function* () {
+      const hash = yield* hashPassword(Redacted.make("test-admin-password"), { ln: 14, r: 8, p: 1 });
+      const common = {
+        FIO_TOKEN: READ_TOKEN,
+        FIO_MCP_TRANSPORT: "http",
+        FIO_MCP_ADMIN_PASSWORD_HASH_FILE: secretFile(`${hash}\n`),
+      };
+
+      const path = yield* configError({ ...common, FIO_MCP_PUBLIC_URL: "https://fio.example.test/base" });
+      assert.include(path, "must be an origin");
+      const insecure = yield* configError({ ...common, FIO_MCP_PUBLIC_URL: "http://fio.example.test" });
+      assert.include(insecure, "must use https");
+
+      const loopback = yield* loadConfigFrom({ ...common, FIO_MCP_PUBLIC_URL: "http://127.0.0.1:3000" });
+      assert.strictEqual(loopback.transport.kind, "http");
+      if (loopback.transport.kind === "http" && loopback.transport.auth.kind === "oauth") {
+        assert.strictEqual(loopback.transport.auth.publicUrl, "http://127.0.0.1:3000");
+      }
+    }),
+  );
+
+  it.effect("rejects malformed password hash files without echoing their contents", () =>
+    Effect.gen(function* () {
+      const secret = "not-a-hash-secretvalue";
+      const message = yield* configError({
+        FIO_TOKEN: READ_TOKEN,
+        FIO_MCP_TRANSPORT: "http",
+        FIO_MCP_PUBLIC_URL: "https://fio.example.test",
+        FIO_MCP_ADMIN_PASSWORD_HASH_FILE: secretFile(secret),
+      });
+      assert.include(message, "is not a fio-mcp password hash");
+      assert.notInclude(message, "secretvalue");
+    }),
+  );
+
   it.effect("reads HTTP transport and cache settings", () =>
     Effect.gen(function* () {
       const config = yield* loadConfigFrom({
         FIO_TOKEN: READ_TOKEN,
         FIO_MCP_TRANSPORT: "HTTP",
+        FIO_MCP_ALLOW_UNAUTHENTICATED: "true",
         FIO_MCP_PORT: "8080",
         FIO_MCP_ALLOWED_ORIGINS: "https://a.example, https://b.example",
         FIO_MCP_ALLOWED_HOSTS: "Fio.Example:443,localhost",
@@ -221,7 +310,7 @@ describe("loadConfig", () => {
         kind: "http",
         host: "0.0.0.0",
         port: 8080,
-        authToken: undefined,
+        auth: { kind: "unauthenticated" },
         allowedOrigins: ["https://a.example", "https://b.example"],
         allowedHosts: ["fio.example:443", "localhost"],
       });
