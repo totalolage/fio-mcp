@@ -231,6 +231,15 @@ describe("metadata and the /mcp challenge", () => {
     expect(response.headers.get("www-authenticate")).toContain('error="invalid_token"');
   });
 
+  it("never admits more sessions per grant than the limit, even concurrently", async () => {
+    const { access } = await tokensFor(harness);
+    const statuses = await Promise.all(
+      Array.from({ length: MAX_SESSIONS_PER_SUBJECT + 8 }, () => postMcp(harness, { authorization: `Bearer ${access}` })),
+    ).then((responses) => responses.map((r) => r.status));
+    expect(statuses.filter((s) => s === 200)).toHaveLength(MAX_SESSIONS_PER_SUBJECT);
+    expect(statuses.filter((s) => s === 429)).toHaveLength(8);
+  });
+
   it("rejects an expired access token and accepts it before expiry", async () => {
     const { access } = await tokensFor(harness);
     expect((await postMcp(harness, { authorization: `Bearer ${access}` })).status).toBe(200);

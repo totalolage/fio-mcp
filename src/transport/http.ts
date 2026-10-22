@@ -118,8 +118,8 @@ const guard = (allowedHosts: ReadonlyArray<string>) =>
     { global: true },
   );
 
-/** A tracked MCP session: the subject (OAuth grant) that opened it and when it was last used. */
-interface SessionOwner {
+/** A session slot: the subject (OAuth grant) holding it and when it was last used. */
+interface Slot {
   readonly subject: string;
   lastSeen: number;
 }
@@ -127,68 +127,68 @@ interface SessionOwner {
 /**
  * Which subject owns which MCP session, with admission limits. McpServer
  * keeps HTTP sessions until a DELETE and offers no other way to end them, so
- * new sessions are refused at capacity instead of forgetting live ones; a
- * session idle for SESSION_IDLE_MS gives up its slot (it then answers 404).
+ * new sessions are refused at capacity instead of forgetting live ones. A
+ * slot is reserved before an initialization is dispatched and becomes the
+ * session's once its id is known; a reservation whose response never went
+ * out keeps its slot (a session may exist). A slot unused for
+ * SESSION_IDLE_MS is given up when its subject or the server needs room (its
+ * session then answers 404).
  */
 const makeSessionOwners = () => {
-  const owners = new Map<string, SessionOwner>();
-  const pending = new Map<string, number>();
-  let pendingTotal = 0;
+  const sessions = new Map<string, Slot>();
+  const reservations = new Map<number, Slot>();
+  let nextReservation = 0;
 
   const countOf = (subject: string) => {
-    let count = pending.get(subject) ?? 0;
-    for (const owner of owners.values()) if (owner.subject === subject) count++;
+    let count = 0;
+    for (const slot of sessions.values()) if (slot.subject === subject) count++;
+    for (const slot of reservations.values()) if (slot.subject === subject) count++;
     return count;
   };
 
-  /** The longest-idle session (of `subject`, or of anyone) idle beyond SESSION_IDLE_MS. */
-  const idlest = (now: number, subject?: string) => {
-    let found: [string, SessionOwner] | undefined;
-    for (const entry of owners) {
-      const [, owner] = entry;
-      if (subject !== undefined && owner.subject !== subject) continue;
-      if (owner.lastSeen > now - SESSION_IDLE_MS) continue;
-      if (found === undefined || owner.lastSeen < found[1].lastSeen) found = entry;
-    }
-    return found?.[0];
+  /** Frees the longest-idle slot (of `subject`, or of anyone) idle beyond SESSION_IDLE_MS. */
+  const reclaimIdle = (now: number, subject?: string): boolean => {
+    let found: { readonly map: Map<string, Slot> | Map<number, Slot>; readonly key: string | number; readonly slot: Slot } | undefined;
+    const consider = (map: Map<string, Slot> | Map<number, Slot>, key: string | number, slot: Slot) => {
+      if (subject !== undefined && slot.subject !== subject) return;
+      if (slot.lastSeen > now - SESSION_IDLE_MS) return;
+      if (found === undefined || slot.lastSeen < found.slot.lastSeen) found = { map, key, slot };
+    };
+    for (const [key, slot] of sessions) consider(sessions, key, slot);
+    for (const [key, slot] of reservations) consider(reservations, key, slot);
+    if (found === undefined) return false;
+    if (typeof found.key === "string") sessions.delete(found.key);
+    else reservations.delete(found.key);
+    return true;
   };
 
-  /** Reserves room for one new session; "subject" or "global" when full. */
-  const admit = (subject: string, now: number): "ok" | "subject" | "global" => {
-    if (countOf(subject) >= MAX_SESSIONS_PER_SUBJECT) {
-      const idle = idlest(now, subject);
-      if (idle === undefined) return "subject";
-      owners.delete(idle);
-    }
-    if (owners.size + pendingTotal >= MAX_TRACKED_SESSIONS) {
-      const idle = idlest(now);
-      if (idle === undefined) return "global";
-      owners.delete(idle);
-    }
-    pending.set(subject, (pending.get(subject) ?? 0) + 1);
-    pendingTotal++;
-    return "ok";
+  /** A reservation for one new session, or which limit is reached. */
+  const admit = (subject: string, now: number): number | "subject" | "global" => {
+    if (countOf(subject) >= MAX_SESSIONS_PER_SUBJECT && !reclaimIdle(now, subject)) return "subject";
+    if (sessions.size + reservations.size >= MAX_TRACKED_SESSIONS && !reclaimIdle(now)) return "global";
+    const id = nextReservation++;
+    reservations.set(id, { subject, lastSeen: now });
+    return id;
   };
 
-  const release = (subject: string) => {
-    const left = (pending.get(subject) ?? 1) - 1;
-    if (left <= 0) pending.delete(subject);
-    else pending.set(subject, left);
-    pendingTotal = Math.max(0, pendingTotal - 1);
+  /** The response for a reservation went out: it becomes `session`'s slot, or is freed when none was created. */
+  const settle = (reservation: number, session: string | undefined, now: number) => {
+    const slot = reservations.get(reservation);
+    reservations.delete(reservation);
+    if (slot !== undefined && session !== undefined) sessions.set(session, { subject: slot.subject, lastSeen: now });
   };
 
   /** Whether `session` belongs to `subject`; marks it used. */
   const owns = (session: string, subject: string, now: number) => {
-    const owner = owners.get(session);
-    if (owner === undefined || owner.subject !== subject) return false;
-    owner.lastSeen = now;
+    const slot = sessions.get(session);
+    if (slot === undefined || slot.subject !== subject) return false;
+    slot.lastSeen = now;
     return true;
   };
 
-  const bind = (session: string, subject: string, now: number) => owners.set(session, { subject, lastSeen: now });
-  const forget = (session: string) => owners.delete(session);
+  const forget = (session: string) => sessions.delete(session);
 
-  return { admit, release, owns, bind, forget };
+  return { admit, settle, owns, forget };
 };
 
 const tooManySessions = HttpServerResponse.empty({ status: 429, headers: { "retry-after": "60" } });
@@ -232,28 +232,20 @@ const mcpAuth = HttpRouter.middleware(
       }
       if (request.method !== "POST") return yield* handle;
       // A POST without a session id may initialize one: reserve its slot first.
-      const admission = sessions.admit(subject, now);
-      if (admission !== "ok") return admission === "subject" ? tooManySessions : unavailable;
-      let released = false;
-      const release = () => {
-        if (!released) sessions.release(subject);
-        released = true;
-      };
+      const reservation = sessions.admit(subject, now);
+      if (reservation === "subject") return tooManySessions;
+      if (reservation === "global") return unavailable;
+      const response = yield* handle;
       // McpServer sets a new session's id in a pre-response handler; this
       // one is appended after it, and runs before the client sees the id.
-      return yield* handle.pipe(
-        Effect.tap(() =>
-          HttpEffect.appendPreResponseHandler((_request, final) =>
-            Effect.sync(() => {
-              const created = final.headers[MCP_SESSION_HEADER];
-              if (created !== undefined) sessions.bind(created, subject, now);
-              release();
-              return final;
-            }),
-          ),
-        ),
-        Effect.ensuring(Effect.sync(release)),
+      // Without a response (interrupted), the reservation keeps its slot.
+      yield* HttpEffect.appendPreResponseHandler((_request, final) =>
+        Effect.map(Clock.currentTimeMillis, (sent) => {
+          sessions.settle(reservation, final.headers[MCP_SESSION_HEADER], sent);
+          return final;
+        }),
       );
+      return response;
     });
   }),
 );
