@@ -29,6 +29,9 @@ export function redact(text: string): string {
     out = out.split(token).join(REDACTED);
     const encoded = encodeURIComponent(token);
     if (encoded !== token) out = out.split(encoded).join(REDACTED);
+    // Tool results are JSON.stringify'd before redaction.
+    const jsonEscaped = JSON.stringify(token).slice(1, -1);
+    if (jsonEscaped !== token) out = out.split(jsonEscaped).join(REDACTED);
   }
   return out.replace(TOKEN_PATH, (_match, segment: string) => `/${segment}/${REDACTED}`);
 }

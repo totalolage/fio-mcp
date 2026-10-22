@@ -52,7 +52,7 @@ FIO issues one token per account. To use several, set `FIO_ACCOUNTS` to a JSON a
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `FIO_RATE_LIMIT_INTERVAL_MS` | `30000` | Minimum gap between requests with the same token. |
+| `FIO_RATE_LIMIT_INTERVAL_MS` | `30000` | Minimum gap between requests with the same token. Values below `30000` (FIO's limit) are rejected at startup. |
 | `FIO_MAX_WAIT_MS` | `25000` | Longest a tool call may wait for the rate limiter before failing with "retry after N s". |
 | `FIO_REQUEST_TIMEOUT_MS` | `20000` | HTTP timeout per request. |
 | `FIO_API_BASE_URL` | `https://fioapi.fio.cz/v1/rest` | API base URL. Change it only for testing. |
@@ -151,7 +151,7 @@ Orders are sent in the order FIO requires (domestic, euro, foreign), and all tex
 - **Uploading does not pay anything by itself.** Per FIO's documentation, an imported batch must be signed by an authorized person in Internetbanking (SMS or Fio signature) before FIO processes it. Treat an upload as real anyway: it creates a pending batch in the bank.
 - Payment tools are always listed, but FIO refuses uploads from a read-only token. Give the server a read-only token unless you need payments.
 - `submit_payment_orders` requires `confirm: true` and is annotated destructive, so MCP clients that ask before destructive actions will ask. Have the model show you `preview_payment_orders` output first.
-- Validation covers formats, lengths, and enums from the PDF and `importIB.xsd`: account and bank-code patterns, symbols, dates, 2-decimal amounts, BIC, IBAN checksum, ISO country, payment-reason codes, and fee codes. FIO's character-set classes (for example "no diacritics" in euro beneficiary names) are described in the tool schema but not enforced locally. FIO rejects such a batch with a validation error instead of creating it.
+- Validation covers formats, lengths, and enums from the PDF and `importIB.xsd`: account and bank-code patterns, symbols, dates, 2-decimal amounts, BIC, IBAN checksum, the XSD's country list (`country_type`), payment-reason codes, and fee codes. FIO's character-set classes (for example "no diacritics" in euro beneficiary names) are described in the tool schema but not enforced locally. FIO rejects such a batch with a validation error instead of creating it.
 - If the outcome is uncertain, the server says so instead of reporting a rejection. That covers a timeout or network failure during upload, an unexpected HTTP status, an unparseable response, or a response with a missing status or an error status alongside a batch ID. Check pending batches in Internetbanking before submitting again, or the orders may be duplicated.
 - Amounts must be exact to the cent, from 0.01 up to 999,999,999,999.99.
 - The payer account is fixed by the token's account: the configured `accountNumber`, or the number read from a downloaded statement.
@@ -169,7 +169,7 @@ FIO allows **one request per token every 30 seconds**, for any operation, and an
 
 - Tokens never appear in tool results or logs. They are redacted from error messages, response excerpts, and URLs (read tokens are part of the URL path).
 - Logs go to stderr only. Stdout is the MCP channel.
-- Config errors name the bad field but never echo its value.
+- Config errors name the bad field but never echo its value. Configured tokens are registered for redaction before validation starts.
 
 ## Development
 
@@ -183,6 +183,7 @@ src/
   rate-limiter.ts     per-token serialized queue
   statement.ts        JSON statement normalisation
   payments.ts         order schemas and import XML builder
+  fio-countries.ts    country codes from the XSD's country_type enumeration
   import-response.ts  import response parser
   redact.ts           token redaction and stderr logger
   errors.ts           error types and HTTP status mapping

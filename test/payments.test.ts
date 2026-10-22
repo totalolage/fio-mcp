@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { FIO_COUNTRY_CODES } from "../src/fio-countries.js";
 import {
   buildImportXml,
   escapeXml,
@@ -196,6 +197,19 @@ describe("payment validation", () => {
     rejects({ ...foreign, paymentReason: undefined });
     rejects({ ...foreign, benefCountry: "USA" });
     rejects({ ...foreign, bic: undefined });
+  });
+
+  it("accepts only countries in the XSD's country_type enumeration", () => {
+    // ZZ, EU and UK are alpha-2 shaped but absent from fio_xml_type.xsd, which rejects them.
+    for (const code of ["ZZ", "EU", "UK", "de"]) {
+      rejects({ ...euro, benefCountry: code });
+      rejects({ ...foreign, benefCountry: code });
+    }
+    for (const code of ["CZ", "SK", "GB", "XK"]) {
+      expect(paymentOrderSchema.safeParse({ ...foreign, benefCountry: code }).success, code).toBe(true);
+    }
+    expect(FIO_COUNTRY_CODES).toHaveLength(253);
+    expect(new Set(FIO_COUNTRY_CODES).size).toBe(253);
   });
 
   it("serialises amounts exactly to the cent", () => {

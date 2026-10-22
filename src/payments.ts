@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { FIO_COUNTRY_CODES } from "./fio-countries.js";
 
 /**
  * Payment orders for FIO's XML import (PDF §6.3, schema importIB.xsd).
@@ -76,7 +77,14 @@ const bic = z
   .string()
   .regex(/^[A-Z]{6}[A-Z0-9]{2}([A-Z0-9]{3})?$/, "must be an 8 or 11 character BIC (ISO 9362)");
 
-const country = z.string().regex(/^[A-Z]{2}$/, "must be an ISO 3166 alpha-2 country code such as DE");
+const FIO_COUNTRIES: ReadonlySet<string> = new Set(FIO_COUNTRY_CODES);
+
+// The XSD's country_type is a closed enumeration; checked by lookup rather than
+// z.enum so the tool schema does not carry all 253 codes.
+const country = z
+  .string()
+  .regex(/^[A-Z]{2}$/, "must be an ISO 3166 alpha-2 country code such as DE")
+  .refine((v) => FIO_COUNTRIES.has(v), "is not a country code FIO accepts (fio_xml_type.xsd country_type)");
 
 const paymentReason = z.enum(PAYMENT_REASONS);
 
