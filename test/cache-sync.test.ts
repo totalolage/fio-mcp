@@ -26,6 +26,7 @@ import {
   serveFrom,
   setNow,
   settle,
+  statement,
   TODAY,
   TOKEN_A,
   tx,
@@ -385,6 +386,36 @@ describe("cache sync", () => {
         yield* Ref.set(fio.calls, []);
         yield* runToEnd({ kind: "backfill" });
         assert.deepStrictEqual(ranges(yield* Ref.get(fio.calls)), ["2000-01-01..2004-12-31"]);
+      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+    }),
+  );
+
+  it.effect("a response with a movement lacking an ID fails the job and leaves coverage, rows and pending unchanged", () =>
+    Effect.gen(function* () {
+      yield* setNow();
+      const fio = yield* fakeFio(serveFrom(movements));
+      yield* Effect.gen(function* () {
+        yield* runToEnd({ kind: "backfill" });
+        yield* setNow(NOW + 3 * DAY_MS);
+        yield* fio.setScript((call) =>
+          Effect.succeed(statement(call.from, call.to, [tx(3, "2026-10-20", -1), tx(9, "2026-10-24", 5, { id: null })])),
+        );
+        const job = yield* runToEnd({ kind: "incremental" });
+        assert.strictEqual(job.status, "failed");
+        assert.include(job.lastError ?? "", "without a movement ID or date");
+        const cache = yield* enabledCache;
+        const key = yield* cache.boundAccount(yield* account());
+        assert.deepStrictEqual(yield* cache.store.coveredRanges(key), [{ from: "2000-01-01", to: TODAY }]);
+        const kept = yield* cache.store.transactionsIn(key, { from: "2026-10-20", to: "2026-10-25" });
+        assert.deepStrictEqual(
+          kept.map((t) => [t.id, t.amount]),
+          [
+            [3, -42.5],
+            [4, 1000],
+          ],
+        );
+        // The window stays pending for the next run.
+        assert.deepStrictEqual((yield* cache.store.syncState(TOKEN_FP)).pending, [{ from: "2026-10-12", to: "2026-10-25" }]);
       }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
     }),
   );

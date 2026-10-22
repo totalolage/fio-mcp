@@ -393,12 +393,26 @@ export const makeCacheStore = Effect.fn("CacheStore.make")(function* () {
   const putSyncState = (tokenFingerprint: string, state: SyncState) =>
     writeSyncState(tokenFingerprint, state).pipe(Effect.asVoid, cacheFailure("save the sync state"));
 
-  /** Rows, coverage, binding, account header and sync state of one response, in one transaction. */
+  /**
+   * Rows, coverage, binding, account header and sync state of one response, in
+   * one transaction. A response with a movement lacking its ID or date stores
+   * nothing: dropping the movement and recording the days as covered would
+   * serve an incomplete list as complete.
+   */
   const commit = (input: CommitInput): Effect.Effect<CommitResult, CacheError | FioResponseError> => {
     const accountKey = accountKeyOf(input.statement.info);
-    return accountKey === undefined
-      ? Effect.fail(new FioResponseError({ detail: "The FIO statement header has no account number or bank code." }))
-      : commitFor(input, accountKey);
+    if (accountKey === undefined) {
+      return Effect.fail(new FioResponseError({ detail: "The FIO statement header has no account number or bank code." }));
+    }
+    const malformed = input.statement.transactions.filter((tx) => tx.id === null || tx.date === null).length;
+    if (malformed > 0) {
+      return Effect.fail(
+        new FioResponseError({
+          detail: `The FIO response has ${malformed} movement(s) without a movement ID or date; nothing from it was cached.`,
+        }),
+      );
+    }
+    return commitFor(input, accountKey);
   };
 
   const commitFor = Effect.fn("CacheStore.commit")(

@@ -18,6 +18,7 @@ import {
   disabledCacheLayer,
   enabledCache,
   fakeFio,
+  type PeriodsScript,
   serveFrom,
   setNow,
   statement,
@@ -212,6 +213,24 @@ describe("get_transactions with the cache", () => {
         const calls = (yield* Ref.get(fio.calls)).length;
         assert.strictEqual((yield* tools.get_transactions({ ...old, source: "fio" })).source, "fio");
         assert.strictEqual((yield* Ref.get(fio.calls)).length, calls + 1);
+      }).pipe(Effect.provide(Layer.mergeAll(cacheLayer(config(), fio.api), LocalPrincipalLive)));
+    }),
+  );
+
+  it.effect("auto keeps asking FIO while its response has a movement without an ID", () =>
+    Effect.gen(function* () {
+      yield* setNow();
+      const malformed: PeriodsScript = (call) =>
+        Effect.succeed(statement(call.from, call.to, [tx(1, "2026-10-05", -10), tx(2, "2026-10-06", 20, { id: null })]));
+      const fio = yield* fakeFio(malformed);
+      yield* Effect.gen(function* () {
+        const tools = yield* fioTools;
+        const args = { dateFrom: "2026-10-01", dateTo: TODAY };
+        assert.strictEqual((yield* tools.get_transactions(args)).source, "fio");
+        assert.strictEqual((yield* tools.get_transactions(args)).source, "fio");
+        assert.strictEqual((yield* Ref.get(fio.calls)).length, 2);
+        // Nothing was stored, so the cache is not even bound to the token.
+        assert.instanceOf(yield* Effect.flip(tools.get_transactions({ ...args, source: "cache" })), InvalidInput);
       }).pipe(Effect.provide(Layer.mergeAll(cacheLayer(config(), fio.api), LocalPrincipalLive)));
     }),
   );

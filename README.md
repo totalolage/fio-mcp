@@ -206,6 +206,7 @@ FIO allows one request per token every 30 seconds, so fio-mcp keeps a local SQLi
 - **Only date ranges.** The cache downloads with `/periods` and never uses `/last`, so it never moves the download marker that `get_new_transactions` and other programs rely on.
 - **Bound to the account, not the name.** Cached data belongs to the bank account (account number and bank code) that FIO reported for the token that downloaded it. If you point an account name at a different token or account, the old data is not shown for it; the cache answers "not verified for this token yet" until a sync confirms the account.
 - **Upserts.** Movements are stored by FIO's movement ID; downloading a day again updates late-booked or changed movements. Nothing is deleted.
+- **Whole responses only.** A response with a movement that lacks its ID or date is not stored at all, and its days stay uncached, so the cache never claims a day it holds only part of. A sync stops with that error in `lastError`; `get_transactions` answers from FIO.
 - **Background priority.** Sync requests wait behind every tool call in the rate limiter, and never fail for lack of a slot: they wait.
 
 ### Sync
