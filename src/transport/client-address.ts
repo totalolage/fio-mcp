@@ -25,9 +25,17 @@ const parseAddress = (input: string): NetAddress.IpAddress | undefined => {
   return Result.isSuccess(inet) ? NetAddress.toCanonical(inet.success.address) : undefined;
 };
 
-/** A FIO_MCP_TRUSTED_PROXIES entry: an IP address or a CIDR network. */
+/**
+ * A FIO_MCP_TRUSTED_PROXIES entry: an IP address or a CIDR network.
+ * IPv4-mapped IPv6 networks are refused (peers are matched as IPv4, so they
+ * would never match); write them as IPv4.
+ */
 export const parseTrustedProxy = (entry: string): IpNetwork.IpNetwork | undefined => {
-  if (entry.includes("/")) return Result.getOrUndefined(IpNetwork.fromString(entry));
+  if (entry.includes("/")) {
+    const network = Result.getOrUndefined(IpNetwork.fromString(entry));
+    const address = network?.address;
+    return address !== undefined && NetAddress.isIpv6Address(address) && NetAddress.isIpv4Mapped(address) ? undefined : network;
+  }
   const address = parseAddress(entry);
   return address === undefined ? undefined : Result.getOrUndefined(IpNetwork.fromAddress(address, NetAddress.width(address)));
 };

@@ -54,5 +54,8 @@ describe("parseTrustedProxy", () => {
     assert.isUndefined(parseTrustedProxy("traefik"));
     assert.isUndefined(parseTrustedProxy("172.18.0.0/40"));
     assert.isUndefined(parseTrustedProxy("172.18.0.1:80/16"));
+    // Peers are matched as IPv4; a mapped network would never match.
+    assert.isUndefined(parseTrustedProxy("::ffff:172.18.0.0/112"));
+    assert.isDefined(parseTrustedProxy("::ffff:172.18.0.2"));
   });
 });
