@@ -1,6 +1,7 @@
 import { assert, describe, it } from "@effect/vitest";
 import { Deferred, Effect, Fiber, Layer, Queue, Sink, Stdio, Stream } from "effect";
 import { SERVER_INFO, ToolsLive } from "../src/app.js";
+import { makeCacheToolkit } from "../src/mcp/cache-tools.js";
 import { makeFioToolkit } from "../src/mcp/fio-tools.js";
 import { layerStdio } from "../src/transport/stdio.js";
 import { ACCOUNT_NAMES, FIO_TOKEN, testConfig, testServices } from "./support/transport.js";
@@ -60,7 +61,10 @@ describe("stdio transport", () => {
       const list = yield* request({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
       assert.deepStrictEqual(
         list.result.tools.map((t: { name: string }) => t.name).sort(),
-        Object.keys(makeFioToolkit(ACCOUNT_NAMES).tools).sort(),
+        [
+          ...Object.keys(makeFioToolkit(ACCOUNT_NAMES).tools),
+          ...Object.keys(makeCacheToolkit(ACCOUNT_NAMES).tools),
+        ].sort(),
       );
 
       // McpServer echoes the unknown tool name in its own error text.

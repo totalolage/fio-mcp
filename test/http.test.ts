@@ -6,6 +6,7 @@ import { Context, Deferred, Effect, Exit, Fiber, Layer, Redacted, Schema } from 
 import { McpServer, Tool, Toolkit } from "effect/ai";
 import { HttpRouter, HttpServer, HttpServerResponse } from "effect/http";
 import { SERVER_INFO, ToolsLive } from "../src/app.js";
+import { makeCacheToolkit } from "../src/mcp/cache-tools.js";
 import { makeFioToolkit } from "../src/mcp/fio-tools.js";
 import { makeRedactor } from "../src/redaction.js";
 import { Auth, Unauthorized } from "../src/transport/auth.js";
@@ -109,7 +110,11 @@ const connect = (base: string, headers: Record<string, string> = {}) =>
 const textOf = (result: Awaited<ReturnType<Client["callTool"]>>) =>
   (result.content as Array<{ type: string; text?: string }>).map((c) => c.text ?? "").join("\n");
 
-const FIO_TOOL_NAMES = [...Object.keys(makeFioToolkit(ACCOUNT_NAMES).tools), "whoami"].sort();
+const FIO_TOOL_NAMES = [
+  ...Object.keys(makeFioToolkit(ACCOUNT_NAMES).tools),
+  ...Object.keys(makeCacheToolkit(ACCOUNT_NAMES).tools),
+  "whoami",
+].sort();
 
 describe("HTTP transport", () => {
   it.live("initializes, lists every tool and calls get_server_status", () =>

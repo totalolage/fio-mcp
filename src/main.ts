@@ -9,11 +9,16 @@ const USAGE = "usage: fio-mcp            serve MCP (FIO_MCP_TRANSPORT=stdio|http
 const serve = Layer.launch(AppLive);
 
 /** No arguments serves MCP; `backup <dest>` runs the backup and exits. */
-const command = (args: ReadonlyArray<string>): Effect.Effect<void, Effect.Error<typeof serve> | CommandFailed> => {
+const command = (
+  args: ReadonlyArray<string>,
+): Effect.Effect<void, Effect.Error<typeof serve> | Effect.Error<ReturnType<typeof backup>> | CommandFailed> => {
   if (args.length === 0) return serve;
   const [name, dest, ...rest] = args;
   if (name === "backup" && dest !== undefined && dest !== "" && rest.length === 0) {
-    return backup(dest).pipe(Effect.andThen(Effect.logInfo(`backup written to ${dest}`)));
+    return backup(dest).pipe(
+      Effect.tap(({ bytes }) => Effect.logInfo(`backup written to ${dest} (${bytes} bytes)`)),
+      Effect.asVoid,
+    );
   }
   return Effect.fail(new CommandFailed({ message: USAGE }));
 };

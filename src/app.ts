@@ -2,8 +2,11 @@ import { NodeFileSystem, NodeStdio } from "@effect/platform-node";
 import { Effect, Layer, Schema } from "effect";
 import { McpProtocol } from "effect/ai";
 import { Accounts } from "./accounts.js";
+import { backupDatabase, DatabaseLive } from "./cache/db.js";
+import { CacheLive, CacheSyncLive } from "./cache/service.js";
 import { AppConfig } from "./config.js";
 import { FioApiLive } from "./fio-api-live.js";
+import { CACHE_INSTRUCTIONS, CacheToolsLive } from "./mcp/cache-tools.js";
 import { FioToolsLive, SERVER_INSTRUCTIONS } from "./mcp/fio-tools.js";
 import { RateLimiter } from "./rate-limiter.js";
 import { LoggerLive, Redactor } from "./redaction.js";
@@ -21,7 +24,7 @@ export const MCP_PROTOCOLS = [McpProtocol.v2025_11_25, McpProtocol.v2025_06_18, 
 export const SERVER_INFO: ServerInfo = {
   name: SERVER_NAME,
   version: SERVER_VERSION,
-  instructions: SERVER_INSTRUCTIONS,
+  instructions: `${SERVER_INSTRUCTIONS} ${CACHE_INSTRUCTIONS}`,
   protocols: MCP_PROTOCOLS,
 };
 
@@ -35,24 +38,23 @@ export const BaseLive = Layer.mergeAll(Redactor.layer, Accounts.layer, RateLimit
 // every MCP session (stdio has one; HTTP has one per client).
 
 /**
- * Services beyond FioApi, built on `BaseLive` (e.g. the SQLite cache's
- * database and repository layers). Merge them here so they join the single
- * services graph.
+ * One instance per process: one rate limiter per token, one FIO client, one
+ * SQLite cache. With FIO_CACHE_ENABLED=false the cache opens no database.
  */
-const ExtraServicesLive = Layer.empty;
+export const ServicesLive = CacheLive.pipe(
+  Layer.provideMerge(FioApiLive.pipe(Layer.provideMerge(BaseLive))),
+  Layer.provide(NodeFileSystem.layer),
+);
 
-/** One instance per process: one rate limiter per token, one database. */
-export const ServicesLive = Layer.mergeAll(FioApiLive, ExtraServicesLive).pipe(Layer.provideMerge(BaseLive));
-
-/** Tool registrations (`McpServer.toolkit(...)` layers). Merge cache tools here. */
-export const ToolsLive = Layer.mergeAll(FioToolsLive);
+/** Tool registrations (`McpServer.toolkit(...)` layers). */
+export const ToolsLive = Layer.mergeAll(FioToolsLive, CacheToolsLive);
 
 /**
- * Long-running background work (e.g. startup and periodic sync). Layers here
- * must fork (`Effect.forkScoped`) instead of running inline: layer
- * construction finishes before the transport answers `initialize`.
+ * Long-running background work: startup and periodic cache sync. Layers here
+ * fork instead of running inline, so the transport answers `initialize`
+ * without waiting for FIO.
  */
-export const BackgroundLive = Layer.empty;
+export const BackgroundLive = CacheSyncLive;
 
 /** Tools and background work on a shared services graph, behind a transport. */
 const withServices = <A, E, R>(transport: Layer.Layer<A, E, R>) =>
@@ -78,11 +80,15 @@ export class CommandFailed extends Schema.TaggedError<CommandFailed>()("CommandF
 }) {}
 
 /**
- * `fio-mcp backup <dest>`: copies the cache database to `dest`. Composition
- * point for the cache's backup effect; provide what it needs here.
+ * `fio-mcp backup <dest>`: writes a consistent copy of the live cache
+ * database to `dest` with `VACUUM INTO` (safe while the server runs).
  */
-export const backup = (dest: string): Effect.Effect<void, CommandFailed> =>
-  Effect.fail(new CommandFailed({ message: `backup to ${dest} is not available in this build` }));
+export const backup = (dest: string) =>
+  backupDatabase(dest).pipe(
+    Effect.provide(
+      DatabaseLive.pipe(Layer.provideMerge(AppConfig.layer), Layer.provideMerge(NodeFileSystem.layer)),
+    ),
+  );
 
 /** The redacting stderr logger, for everything the app layers fork. */
 export const AppLoggerLive = LoggerLive.pipe(

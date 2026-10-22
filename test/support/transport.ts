@@ -1,5 +1,6 @@
 import { Deferred, Effect, Layer, Redacted } from "effect";
 import { Accounts } from "../../src/accounts.js";
+import { TransactionCache } from "../../src/cache/service.js";
 import { AppConfig, type AppConfigShape, type TransportConfig } from "../../src/config.js";
 import { FioApi } from "../../src/fio-api.js";
 import { RateLimiter } from "../../src/rate-limiter.js";
@@ -97,7 +98,7 @@ export const fakeFioApi = (release: Deferred.Deferred<void>) =>
 
 /** The app's services with a fake FioApi; one instance shared by every session. */
 export const testServices = (config: AppConfigShape, release: Deferred.Deferred<void>) =>
-  fakeFioApi(release).pipe(
+  Layer.mergeAll(fakeFioApi(release), Layer.succeed(TransactionCache, { enabled: false })).pipe(
     Layer.provideMerge(Layer.mergeAll(Redactor.layer, Accounts.layer, RateLimiter.layer)),
     Layer.provideMerge(AppConfig.layerFrom(config)),
   );

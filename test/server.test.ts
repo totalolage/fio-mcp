@@ -17,14 +17,18 @@ import { connect as connectHarness, type Harness, text } from "./support/mcp.js"
 
 const ALL_TOOLS = [
   "export_transactions",
+  "get_cache_status",
   "get_last_statement",
   "get_new_transactions",
   "get_server_status",
   "get_statement",
   "get_transactions",
   "preview_payment_orders",
+  "search_transactions",
   "set_download_marker",
   "submit_payment_orders",
+  "summarize_transactions",
+  "sync_transactions",
 ];
 
 const ok = (body: string): FioHttpReply => ({ status: 200, body });
@@ -85,6 +89,7 @@ describe("tool set", () => {
     expect(await names()).toEqual(ALL_TOOLS);
     for (const tool of await tools()) {
       if (tool.name === "get_server_status") continue;
+      if (tool.name === "get_cache_status") continue;
       expect(tool.inputSchema.properties?.account, tool.name).toMatchObject({ enum: ["personal", "business"] });
       expect(tool.inputSchema.required, tool.name).toContain("account");
     }
@@ -111,6 +116,34 @@ describe("tool set", () => {
         rateLimit: expect.objectContaining({ intervalSeconds: 0, last409At: null }),
       }),
     ]);
+  });
+});
+
+describe("cache and FIO over one MCP session", () => {
+  it("lists all tools, fetches from FIO, then answers a search from the cache without FIO", async () => {
+    const { call, names, requests } = await connect([readAccount()], ok(STATEMENT_JSON), {
+      cache: {
+        enabled: true,
+        dbPath: ":memory:",
+        syncOnStartup: false,
+        syncIntervalMinutes: 0,
+        backfillFrom: "2000-01-01",
+        overlapDays: 10,
+        maxAgeMinutes: 60,
+      },
+    });
+    expect(await names()).toEqual(ALL_TOOLS);
+    const live = data(
+      await call("get_transactions", { dateFrom: "2012-06-26", dateTo: "2012-06-30", source: "fio" }),
+    );
+    expect(live).toMatchObject({ source: "fio", transactionCount: 2 });
+    expect(await requests()).toHaveLength(1);
+    const found = data(await call("search_transactions", { counterparty: "Novák" }));
+    expect(found).toMatchObject({ source: "cache", total: 1 });
+    expect(found.transactions[0]).toMatchObject({ id: 1148734530, counterpartyName: "Pavel, Novák" });
+    expect(found.freshness).toMatchObject({ coveredFrom: "2012-06-26", coveredTo: "2012-06-30" });
+    // The cache answered: still one FIO request.
+    expect(await requests()).toHaveLength(1);
   });
 });
 
