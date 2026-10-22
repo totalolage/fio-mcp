@@ -30,8 +30,11 @@ export const cacheFailure =
 export type Migrations = Record<string, Effect.Effect<void, SqlError.SqlError, SqlClient.SqlClient>>;
 
 /**
- * Cache migrations. The cache owns ids 0001–0099; other modules use their
- * own id range and are merged with `{ ...CACHE_MIGRATIONS, ...others }`.
+ * Cache migrations. Other modules contribute their own record, merged as
+ * `{ ...CACHE_MIGRATIONS, ...others }`. Ids form ONE increasing sequence
+ * across all modules: the migrator skips every id at or below the latest
+ * applied one, so a new migration from any module takes the next id after
+ * the highest existing id (never a reserved lower range).
  */
 export const CACHE_MIGRATIONS: Migrations = {
   "0001_create_cache": Effect.gen(function* () {
