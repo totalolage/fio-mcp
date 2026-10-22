@@ -653,7 +653,7 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
 
   const refresh = Effect.fnUntraced(function* (client: Client, form: URLSearchParams) {
     const token = yield* required(form, "refresh_token");
-    yield* checkResource(form, false);
+    yield* checkResource(form, true);
     const scope = yield* param(form, "scope");
     const requested = scope === undefined ? undefined : parseScopes(scope);
     if (requested !== undefined && Result.isFailure(requested)) return yield* requested.failure;

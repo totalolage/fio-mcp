@@ -677,6 +677,7 @@ describe("token endpoint", () => {
       grant_type: "refresh_token",
       client_id: first.clientId,
       refresh_token: first.refresh,
+      resource: RESOURCE,
     });
     expect(replay.body.error).toBe("invalid_grant");
     // Family revoked: the current access and refresh tokens die too.
@@ -685,6 +686,7 @@ describe("token endpoint", () => {
       grant_type: "refresh_token",
       client_id: first.clientId,
       refresh_token: second.refresh,
+      resource: RESOURCE,
     });
     expect(afterReplay.body.error).toBe("invalid_grant");
   });
@@ -696,12 +698,14 @@ describe("token endpoint", () => {
       grant_type: "refresh_token",
       client_id: String(body.client_id),
       refresh_token: owner.refresh,
+      resource: RESOURCE,
     });
     expect(stolen.body.error).toBe("invalid_grant");
     const wider = await tokenRequest(harness, {
       grant_type: "refresh_token",
       client_id: owner.clientId,
       refresh_token: owner.refresh,
+      resource: RESOURCE,
       scope: "fio:read fio:payments",
     });
     expect(wider.body.error).toBe("invalid_scope");
@@ -710,9 +714,22 @@ describe("token endpoint", () => {
       grant_type: "refresh_token",
       client_id: owner.clientId,
       refresh_token: owner.refresh,
+      resource: RESOURCE,
       scope: "fio:read",
     });
     expect(still.response.status).toBe(200);
+  });
+
+  it("requires this server's resource on refresh without consuming the token", async () => {
+    const owner = await tokensFor(harness);
+    const refresh = { grant_type: "refresh_token", client_id: owner.clientId, refresh_token: owner.refresh };
+    const missing = await tokenRequest(harness, refresh);
+    expect(missing.response.status).toBe(400);
+    expect(missing.body.error).toBe("invalid_request");
+    const foreign = await tokenRequest(harness, { ...refresh, resource: "https://other.example.test/mcp" });
+    expect(foreign.body.error).toBe("invalid_target");
+    const ok = await tokenRequest(harness, { ...refresh, resource: RESOURCE });
+    expect(ok.response.status).toBe(200);
   });
 
   it("revocation of another client's token is refused; unknown tokens are accepted", async () => {
