@@ -54,13 +54,16 @@ export function withAccount<F extends Schema.Struct.Fields>(
   fields: F,
   accountNames: ReadonlyArray<string>,
 ): Schema.Struct<F & AccountFields> {
-  const schema =
+  const all: Schema.Struct.Fields =
     accountNames.length > 1
-      ? Schema.Struct({
+      ? {
           ...fields,
           account: Schema.Literals(accountNames).annotate({ description: `Account to use: ${accountNames.join(", ")}.` }),
-        })
-      : Schema.Struct(fields);
+        }
+      : fields;
+  // MCP needs an object-rooted JSON Schema; an empty Struct encodes to
+  // `{ not: { type: "null" } }`, so a tool without parameters uses EmptyParams.
+  const schema = Object.keys(all).length === 0 ? Tool.EmptyParams : Schema.Struct(all);
   // The runtime schema is narrower than the declared type (account is
   // required with several accounts and absent with one); handlers only read
   // `account` as an optional name.

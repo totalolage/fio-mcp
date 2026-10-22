@@ -23,7 +23,7 @@ const UPLOAD_UNCERTAIN_SHORT =
 const Year = Schema.Int.check(Schema.isBetween({ minimum: 1990, maximum: 2200 }));
 const StatementNumber = Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 999 }));
 
-const tool = <const Name extends string, P extends Schema.Struct<Schema.Struct.Fields>>(
+const tool = <const Name extends string, P extends Schema.Struct<Schema.Struct.Fields> | Tool.EmptyParams>(
   name: Name,
   description: string,
   parameters: P,
@@ -132,7 +132,7 @@ export function makeFioToolkit(accountNames: ReadonlyArray<string>) {
     tool(
       "get_server_status",
       "Show configured accounts (names only, never tokens), their FIO account numbers and currencies where known, and each token's rate-limit state. No network call.",
-      Schema.Struct({}),
+      Tool.EmptyParams,
     ),
     { title: "Server status", readOnly: true, openWorld: false },
   );
