@@ -53,8 +53,12 @@ export function redirectUriProblem(raw: string): string | undefined {
   const url = parse(raw);
   if (url === undefined) return "redirect URIs must be absolute URLs";
   if (raw.includes("#")) return "redirect URIs must not contain a fragment";
-  if (url.username !== "" || url.password !== "") return "redirect URIs must not contain credentials";
-  if (url.port === "0") return "redirect URIs must use a port from 1 to 65535";
+  // The parsed URL drops an empty userinfo (`http://@host/`) and an empty port (`http://host:/`).
+  const authority = /^[^:]*:\/\/([^/?#]*)/.exec(raw)?.[1] ?? "";
+  if (url.username !== "" || url.password !== "" || authority.includes("@")) {
+    return "redirect URIs must not contain credentials";
+  }
+  if (url.port === "0" || authority.endsWith(":")) return "redirect URIs must use a port from 1 to 65535";
   if (url.protocol === "https:" && url.hostname !== "") return undefined;
   if (url.protocol === "http:" && LOOPBACK_HOSTS.has(url.hostname)) return undefined;
   return "redirect URIs must use https, or http on 127.0.0.1, [::1] or localhost";
