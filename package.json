@@ -20,8 +20,11 @@
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "test": "vitest run",
+    "generate": "node scripts/generate-fio-client.ts",
+    "generate:check": "npm run generate && git diff --exit-code -- src/generated",
     "check": "npm run typecheck && npm run lint && npm test",
     "start": "node dist/main.js",
+    "publish:image": "sh scripts/publish-image.sh",
     "prepare": "effect-tsgo patch --typescript --no-oxlint && npm run build"
   },
   "dependencies": {
