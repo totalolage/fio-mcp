@@ -156,6 +156,14 @@ export const makeCacheHandlers = Effect.fn("CacheTools.handlers")(function* (too
     ? Effect.succeed(cacheService)
     : Effect.fail(new InvalidInput({ detail: CACHE_DISABLED }));
 
+  /** The first cached day: covered or holding a movement (statements are stored without coverage). */
+  const earliestCached = Effect.fnUntraced(function* (cache: EnabledCache, accountKey: string, fallback: string) {
+    const covered = yield* cache.store.coveredRanges(accountKey);
+    const { earliestMovement } = yield* cache.store.stats(accountKey);
+    const candidates = [covered[0]?.from, earliestMovement ?? undefined].filter((d): d is string => d !== undefined);
+    return candidates.reduce(minDate, fallback);
+  });
+
   /** The account, its verified bank account key, and the range the filters span. */
   const scope = Effect.fnUntraced(function* (name: string | undefined, args: FilterArgs) {
     const cache = yield* enabled;
@@ -163,9 +171,9 @@ export const makeCacheHandlers = Effect.fn("CacheTools.handlers")(function* (too
     yield* checkFilters(args);
     const accountKey = yield* cache.boundAccount(account);
     const today = yield* pragueToday;
-    const covered = yield* cache.store.coveredRanges(accountKey);
     const to = args.dateTo ?? today;
-    const range: DayRange = { from: args.dateFrom ?? minDate(covered[0]?.from ?? to, to), to };
+    const from = args.dateFrom ?? (yield* earliestCached(cache, accountKey, to));
+    const range: DayRange = { from: minDate(from, to), to };
     return { cache, account, accountKey, range };
   });
 

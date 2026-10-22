@@ -260,7 +260,7 @@ function transactionRecord(accountKey: string, tx: Transaction & { id: number; d
  * FIO does not document whether period bounds are inclusive; the header is
  * its own statement of what the response contains.
  */
-function coveredBy(requested: DayRange | undefined, info: StatementInfo): DayRange | undefined {
+export function coveredBy(requested: DayRange | undefined, info: StatementInfo): DayRange | undefined {
   if (requested === undefined) return undefined;
   const reported: DayRange = { from: info.dateStart ?? requested.from, to: info.dateEnd ?? requested.to };
   return intersect(requested, reported);

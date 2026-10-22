@@ -3,6 +3,7 @@ import { McpServer, Tool, Toolkit } from "effect/ai";
 import { type Account, Accounts } from "../accounts.js";
 import { type DayRange, minDate, pragueToday } from "../cache/dates.js";
 import { CACHE_DISABLED, type EnabledCache, type Freshness, TransactionCache } from "../cache/service.js";
+import { coveredBy } from "../cache/store.js";
 import { AppConfig } from "../config.js";
 import { InvalidInput, PAYMENT_TOKEN_HINT, PermissionDenied, UploadOutcomeUnknown } from "../errors.js";
 import { FioApi, MERCHANT_FORMATS, MOVEMENT_FORMATS, STATEMENT_FORMATS } from "../fio-api.js";
@@ -10,7 +11,7 @@ import { type ImportResult, looksLikeMissingPaymentPermission, parseImportRespon
 import { buildImportXml, PaymentOrders, summarizeOrders } from "../payments.js";
 import { RateLimiter } from "../rate-limiter.js";
 import { Redactor } from "../redaction.js";
-import { parseLastStatement } from "../statement.js";
+import { parseLastStatement, type StatementInfo } from "../statement.js";
 import { annotateTool, DateParam, JsonObject, ToolFailure, withAccount } from "./common.js";
 
 export const SERVER_INSTRUCTIONS =
@@ -192,17 +193,31 @@ export const makeFioHandlers = Effect.fn("FioTools.handlers")(function* (toolkit
     return yield* enabled.servable(accountKey.value, range).pipe(Effect.orElseSucceed(() => false));
   });
 
-  const liveFreshness = Effect.fnUntraced(function* (range: DayRange) {
+  /** Freshness of a FIO answer: the requested days up to today that its header covers. */
+  const liveFreshness = Effect.fnUntraced(function* (range: DayRange, info: StatementInfo) {
     const now = DateTime.formatIso(yield* DateTime.now);
-    const to = minDate(range.to, yield* pragueToday);
+    const effective: DayRange = { from: range.from, to: minDate(range.to, yield* pragueToday) };
+    if (effective.from > effective.to) {
+      // Only future days: nothing can be booked yet.
+      return {
+        lastSyncAt: now,
+        coveredFrom: null,
+        coveredTo: null,
+        coveredRanges: [],
+        oldestFetchAt: now,
+        historyLimited: false,
+        complete: true,
+      } satisfies Freshness;
+    }
+    const covered = coveredBy(effective, info);
     return {
       lastSyncAt: now,
-      coveredFrom: range.from,
-      coveredTo: to,
-      coveredRanges: [{ from: range.from, to }],
+      coveredFrom: covered?.from ?? null,
+      coveredTo: covered?.to ?? null,
+      coveredRanges: covered === undefined ? [] : [covered],
       oldestFetchAt: now,
       historyLimited: false,
-      complete: true,
+      complete: covered !== undefined && covered.from === effective.from && covered.to === effective.to,
     } satisfies Freshness;
   });
   const accountStatus = Effect.fnUntraced(function* (acc: Account) {
@@ -232,7 +247,7 @@ export const makeFioHandlers = Effect.fn("FioTools.handlers")(function* (toolkit
           }
           const statement = yield* fio.periods(acc, dateFrom, dateTo);
           if (cache !== undefined) yield* cache.writeThrough(acc, statement, range);
-          return { account: acc.name, source: "fio", ...statement, freshness: yield* liveFreshness(range) };
+          return { account: acc.name, source: "fio", ...statement, freshness: yield* liveFreshness(range, statement.info) };
         }),
       ),
 

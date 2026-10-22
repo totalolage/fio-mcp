@@ -324,21 +324,67 @@ describe("cache sync", () => {
     }),
   );
 
-  it.effect("waits and retries when the token stays busy instead of failing the job", () =>
+  it.effect("waits and retries as long as the token stays busy instead of failing the job", () =>
     Effect.gen(function* () {
       yield* setNow();
       const fio = yield* fakeFio((call, n) =>
-        n < 2 ? Effect.fail(new RateLimited({ retryAfterSeconds: 30, reason: "busy" })) : serveFrom(movements)(call, n),
+        n < 8 ? Effect.fail(new RateLimited({ retryAfterSeconds: 30, reason: "busy" })) : serveFrom(movements)(call, n),
       );
       yield* Effect.gen(function* () {
         const fiber = yield* Effect.forkChild(runToEnd({ kind: "backfill" }));
-        yield* settle;
-        yield* TestClock.adjust(30_000);
-        yield* settle;
-        yield* TestClock.adjust(30_000);
+        for (let i = 0; i < 8; i++) {
+          yield* settle;
+          yield* TestClock.adjust(30_000);
+        }
         const job = yield* Fiber.join(fiber);
         assert.strictEqual(job.status, "completed");
-        assert.strictEqual((yield* Ref.get(fio.calls)).length, 3);
+        assert.strictEqual((yield* Ref.get(fio.calls)).length, 9);
+      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+    }),
+  );
+
+  it.effect("a single day over 50,000 movements inside unlocked history leaves blocked and is not retried", () =>
+    Effect.gen(function* () {
+      yield* setNow();
+      const bigDay = "2010-06-15";
+      const fio = yield* fakeFio(historyLocked(serveFrom(movements)));
+      yield* Effect.gen(function* () {
+        yield* runToEnd({ kind: "backfill" });
+        yield* fio.setScript((call, n) =>
+          call.from <= bigDay && call.to >= bigDay ? Effect.fail(new TooManyItems()) : serveFrom(movements)(call, n),
+        );
+        const unlocked = yield* runToEnd({ kind: "backfill" });
+        assert.deepStrictEqual(unlocked.failedDays, [bigDay]);
+        assert.deepStrictEqual(unlocked.blocked, []);
+        assert.isFalse(unlocked.historyLimited);
+        yield* Ref.set(fio.calls, []);
+        yield* runToEnd({ kind: "backfill" });
+        assert.deepStrictEqual(yield* Ref.get(fio.calls), []);
+        // An explicit retry of failed days asks for it again.
+        yield* runToEnd({ kind: "backfill", retryFailed: true });
+        assert.deepStrictEqual(ranges(yield* Ref.get(fio.calls)), [`${bigDay}..${bigDay}`]);
+      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+    }),
+  );
+
+  it.effect("a response whose header covers less leaves the rest uncovered for the next backfill", () =>
+    Effect.gen(function* () {
+      yield* setNow();
+      const fio = yield* fakeFio((call, n) =>
+        Effect.map(serveFrom(movements)(call, n), (s) => ({
+          ...s,
+          info: { ...s.info, dateStart: call.from < "2005-01-01" ? "2005-01-01" : call.from },
+        })),
+      );
+      yield* Effect.gen(function* () {
+        const job = yield* runToEnd({ kind: "backfill" });
+        assert.strictEqual(job.status, "completed");
+        const cache = yield* enabledCache;
+        const key = yield* cache.boundAccount(yield* account());
+        assert.deepStrictEqual(yield* cache.store.coveredRanges(key), [{ from: "2005-01-01", to: TODAY }]);
+        yield* Ref.set(fio.calls, []);
+        yield* runToEnd({ kind: "backfill" });
+        assert.deepStrictEqual(ranges(yield* Ref.get(fio.calls)), ["2000-01-01..2004-12-31"]);
       }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
     }),
   );

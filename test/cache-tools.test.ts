@@ -252,7 +252,37 @@ describe("get_transactions with the cache", () => {
         const key = yield* cache.boundAccount(yield* account());
         assert.strictEqual((yield* cache.store.stats(key)).rowCount, 3);
         assert.deepStrictEqual(yield* cache.store.coveredRanges(key), []);
+        // Unfiltered queries reach back to the earliest stored movement, not just covered days.
+        const found = yield* (yield* cacheTools).search_transactions({});
+        assert.deepStrictEqual(ids(found.transactions), [42, 2, 1]);
+        assert.isFalse((found.freshness as { complete: boolean }).complete);
       }).pipe(Effect.provide(cacheLayer(config(), api)));
+    }),
+  );
+
+  it.effect("live freshness follows the period FIO's header reports", () =>
+    Effect.gen(function* () {
+      yield* setNow();
+      const fio = yield* fakeFio((call, n) =>
+        Effect.map(serveFrom(fixture)(call, n), (s) => ({ ...s, info: { ...s.info, dateStart: "2026-02-01" } })),
+      );
+      yield* Effect.gen(function* () {
+        const tools = yield* fioTools;
+        const result = yield* tools.get_transactions({ dateFrom: "2026-01-01", dateTo: "2026-12-31", source: "fio" });
+        const freshness = result.freshness as { complete: boolean; coveredRanges: unknown };
+        assert.isFalse(freshness.complete);
+        assert.deepStrictEqual(freshness.coveredRanges, [{ from: "2026-02-01", to: TODAY }]);
+        const future = yield* tools.get_transactions({ dateFrom: "2026-11-01", dateTo: "2026-11-30", source: "fio" });
+        assert.deepStrictEqual(future.freshness, {
+          lastSyncAt: "2026-10-22T10:00:00.000Z",
+          coveredFrom: null,
+          coveredTo: null,
+          coveredRanges: [],
+          oldestFetchAt: "2026-10-22T10:00:00.000Z",
+          historyLimited: false,
+          complete: true,
+        });
+      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
     }),
   );
 });

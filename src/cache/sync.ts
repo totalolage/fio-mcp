@@ -14,7 +14,7 @@ import {
   splitNewestFirst,
   subtractDays,
 } from "./dates.js";
-import type { CacheStore, SyncState } from "./store.js";
+import { type CacheStore, coveredBy, type SyncState } from "./store.js";
 
 /**
  * Background sync of FIO movements into the cache, one job per token at a
@@ -39,7 +39,7 @@ import type { CacheStore, SyncState } from "./store.js";
 export const UNLOCKED_HISTORY_DAYS = 90;
 /** Length of one Internetbanking history unlock. */
 const UNLOCK_SECONDS = 600;
-const MAX_RETRIES = 5;
+const MAX_TRANSPORT_RETRIES = 5;
 
 export type SyncRequest =
   | {
@@ -138,8 +138,13 @@ export const makeCacheSync = Effect.fn("CacheSync.make")(function* (
       // Background calls wait without a budget; RateLimited here means FIO
       // kept answering 409 (another program uses the token). Wait and retry.
       Effect.retry({
-        while: (error: FioRequestError) => error._tag === "RateLimited" || error._tag === "FioTransportError",
-        times: MAX_RETRIES,
+        while: (error: FioRequestError) => error._tag === "FioTransportError",
+        times: MAX_TRANSPORT_RETRIES,
+        schedule: Schedule.spaced(Duration.millis(config.rateLimitIntervalMs)),
+      }),
+      // As long as it takes: the job is interruptible and its progress is saved.
+      Effect.retry({
+        while: (error: FioRequestError) => error._tag === "RateLimited",
         schedule: Schedule.spaced(Duration.millis(config.rateLimitIntervalMs)),
       }),
       Effect.result,
@@ -191,6 +196,14 @@ export const makeCacheSync = Effect.fn("CacheSync.make")(function* (
         yield* Ref.update(progress, (p) => ({ ...p, requests: p.requests + 1 }));
         if (Result.isSuccess(outcome)) {
           const statement = outcome.success;
+          // A success shows the range needs no unlock, so all of it leaves `blocked`. Days the
+          // header does not cover stay uncovered, and the next backfill plan asks for them again.
+          const covered = coveredBy(range, statement.info);
+          if (covered === undefined || covered.from !== range.from || covered.to !== range.to) {
+            yield* Effect.logWarning(
+              `cache sync ${account.name}: FIO answered ${range.from}..${range.to} for ${statement.info.dateStart}..${statement.info.dateEnd}`,
+            );
+          }
           const blocked = subtractRange(state.blocked, range);
           const next: SyncState = {
             ...state,
@@ -236,7 +249,13 @@ export const makeCacheSync = Effect.fn("CacheSync.make")(function* (
           if (rangeLength(range) === 1) {
             yield* Effect.logWarning(`cache sync ${account.name}: ${range.from} has over 50,000 movements; skipped`);
             queue = rest;
-            yield* save({ ...state, pending: queue, failedDays: [...state.failedDays, range.from], lastAttemptAt: now });
+            yield* save({
+              ...state,
+              pending: queue,
+              blocked: subtractRange(state.blocked, range),
+              failedDays: [...state.failedDays, range.from],
+              lastAttemptAt: now,
+            });
           } else {
             queue = [...splitNewestFirst(range), ...rest];
             yield* save({ ...state, pending: queue, lastAttemptAt: now });
@@ -275,7 +294,8 @@ export const makeCacheSync = Effect.fn("CacheSync.make")(function* (
       const span: DayRange = { from: target, to: today };
       const skip = new Set(state.failedDays);
       if (accountKey !== undefined) for (const day of yield* store.coveredDaySet(accountKey, span)) skip.add(day);
-      const wanted = normalizeRanges([...state.blocked, ...subtractDays(span, skip)]);
+      const failed = state.failedDays.map((day) => ({ from: day, to: day }));
+      const wanted = withoutPending(normalizeRanges([...state.blocked, ...subtractDays(span, skip)]), failed);
       // Pending ranges stay as they are, so a resumed 413 split stays split.
       return fetchOrder([...state.pending, ...withoutPending(wanted, state.pending)], recentStart);
     });
