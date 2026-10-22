@@ -173,7 +173,10 @@ export const makeCacheHandlers = Effect.fn("CacheTools.handlers")(function* (too
     const today = yield* pragueToday;
     const to = args.dateTo ?? today;
     const from = args.dateFrom ?? (yield* earliestCached(cache, accountKey, to));
-    const range: DayRange = { from: minDate(from, to), to };
+    if (from > to) {
+      return yield* new InvalidInput({ detail: `dateFrom must not be after dateTo (default today, ${today}).` });
+    }
+    const range: DayRange = { from, to };
     return { cache, account, accountKey, range };
   });
 

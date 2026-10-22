@@ -83,6 +83,7 @@ describe("cache query tools", () => {
         const invalid = yield* Effect.flip(search({ minAmount: 10, maxAmount: 1 }));
         assert.instanceOf(invalid, InvalidInput);
         assert.instanceOf(yield* Effect.flip(search({ dateFrom: "2026-02-02", dateTo: "2026-02-01" })), InvalidInput);
+        assert.instanceOf(yield* Effect.flip(search({ dateFrom: "2026-11-01" })), InvalidInput);
       }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
     }),
   );
