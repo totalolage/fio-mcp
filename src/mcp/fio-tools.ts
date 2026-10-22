@@ -1,6 +1,8 @@
-import { Effect, Layer, Schema } from "effect";
+import { DateTime, Effect, Layer, Option, Schema } from "effect";
 import { McpServer, Tool, Toolkit } from "effect/ai";
 import { type Account, Accounts } from "../accounts.js";
+import { type DayRange, minDate, pragueToday } from "../cache/dates.js";
+import { CACHE_DISABLED, type EnabledCache, type Freshness, TransactionCache } from "../cache/service.js";
 import { AppConfig } from "../config.js";
 import { InvalidInput, PAYMENT_TOKEN_HINT, PermissionDenied, UploadOutcomeUnknown } from "../errors.js";
 import { FioApi, MERCHANT_FORMATS, MOVEMENT_FORMATS, STATEMENT_FORMATS } from "../fio-api.js";
@@ -36,10 +38,13 @@ export function makeFioToolkit(accountNames: ReadonlyArray<string>) {
   const GetTransactions = annotateTool(
     tool(
       "get_transactions",
-      "List account movements between two dates (inclusive, YYYY-MM-DD) with the account header (balances, IBAN). Does not move the download marker. Data older than 90 days requires the owner to unlock history in Internetbanking first.",
+      "List account movements between two dates (inclusive, YYYY-MM-DD) with the account header (balances, IBAN). Does not move the download marker. source=auto (default) answers from the local cache when every day of the range is cached and current, otherwise asks FIO and stores the result; source=cache never calls FIO (header balances are then null; see lastKnownBalance); source=fio always asks FIO. The result says which `source` answered and its `freshness`. Data older than 90 days requires the owner to unlock history in Internetbanking first.",
       params({
         dateFrom: DateParam("First day (YYYY-MM-DD)."),
         dateTo: DateParam("Last day (YYYY-MM-DD)."),
+        source: Schema.optionalKey(
+          Schema.Literals(["auto", "fio", "cache"]).annotate({ description: "Where to read from; default auto." }),
+        ),
       }),
     ),
     { title: "Transactions for a date range", readOnly: true, openWorld: true },
@@ -175,7 +180,31 @@ export const makeFioHandlers = Effect.fn("FioTools.handlers")(function* (toolkit
   const limiter = yield* RateLimiter;
   const redactor = yield* Redactor;
   const config = yield* AppConfig;
+  // Optional so the FIO tools also run without the cache layer (then source=auto means FIO).
+  const cacheService = Option.getOrUndefined(yield* Effect.serviceOption(TransactionCache));
+  const cache = cacheService?.enabled ? cacheService : undefined;
   const out = <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.map(effect, redactor.redactDeep);
+
+  /** Whether auto may answer from the cache; cache trouble means "ask FIO". */
+  const cacheCanServe = Effect.fnUntraced(function* (enabled: EnabledCache, acc: Account, range: DayRange) {
+    const accountKey = yield* Effect.option(enabled.boundAccount(acc));
+    if (Option.isNone(accountKey)) return false;
+    return yield* enabled.servable(accountKey.value, range).pipe(Effect.orElseSucceed(() => false));
+  });
+
+  const liveFreshness = Effect.fnUntraced(function* (range: DayRange) {
+    const now = DateTime.formatIso(yield* DateTime.now);
+    const to = minDate(range.to, yield* pragueToday);
+    return {
+      lastSyncAt: now,
+      coveredFrom: range.from,
+      coveredTo: to,
+      coveredRanges: [{ from: range.from, to }],
+      oldestFetchAt: now,
+      historyLimited: false,
+      complete: true,
+    } satisfies Freshness;
+  });
   const accountStatus = Effect.fnUntraced(function* (acc: Account) {
     const details = yield* accounts.details(acc);
     return {
@@ -187,13 +216,23 @@ export const makeFioHandlers = Effect.fn("FioTools.handlers")(function* (toolkit
   });
 
   return toolkit.of({
-    get_transactions: ({ account, dateFrom, dateTo }) =>
+    get_transactions: ({ account, dateFrom, dateTo, source = "auto" }) =>
       out(
         Effect.gen(function* () {
           const acc = yield* accounts.resolve(account);
           yield* checkRange(dateFrom, dateTo);
+          const range: DayRange = { from: dateFrom, to: dateTo };
+          if (source === "cache") {
+            if (cache === undefined) return yield* new InvalidInput({ detail: CACHE_DISABLED });
+            return { account: acc.name, source: "cache", ...(yield* cache.read(acc, range)) };
+          }
+          if (source === "auto" && cache !== undefined && (yield* cacheCanServe(cache, acc, range))) {
+            const cached = yield* Effect.option(cache.read(acc, range));
+            if (Option.isSome(cached)) return { account: acc.name, source: "cache", ...cached.value };
+          }
           const statement = yield* fio.periods(acc, dateFrom, dateTo);
-          return { account: acc.name, ...statement };
+          if (cache !== undefined) yield* cache.writeThrough(acc, statement, range);
+          return { account: acc.name, source: "fio", ...statement, freshness: yield* liveFreshness(range) };
         }),
       ),
 
@@ -202,6 +241,7 @@ export const makeFioHandlers = Effect.fn("FioTools.handlers")(function* (toolkit
         Effect.gen(function* () {
           const acc = yield* accounts.resolve(account);
           const statement = yield* fio.statement(acc, year, number);
+          if (cache !== undefined) yield* cache.record(acc, statement);
           return { account: acc.name, ...statement };
         }),
       ),
@@ -211,6 +251,7 @@ export const makeFioHandlers = Effect.fn("FioTools.handlers")(function* (toolkit
         Effect.gen(function* () {
           const acc = yield* accounts.resolve(account);
           const statement = yield* fio.last(acc);
+          if (cache !== undefined) yield* cache.record(acc, statement);
           return { account: acc.name, markerAdvanced: statement.transactionCount > 0, ...statement };
         }),
       ),
