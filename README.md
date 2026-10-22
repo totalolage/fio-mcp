@@ -161,7 +161,7 @@ Data older than 90 days is only served after the account owner unlocks full hist
 | `search_transactions` | Filter cached movements by date range, amount range (absolute), direction (`in`/`out`), counterparty (name or account, substring), text in the message, comment or user identification, VS/KS/SS, type and currency. Paged (`limit` up to 1000, `offset`, `order`). Returns the rows, the total and `freshness`. |
 | `summarize_transactions` | Totals by `month`, `counterparty` or `type`, always split by currency: count, income, expense, net (exact to the cent). Same filters. |
 | `get_cache_status` | Per account: whether the cache is verified for its token, covered date ranges, last sync, row count, last known balance and its date, the running sync job, and whether history is limited to 90 days (with the unlock steps). |
-| `sync_transactions` | Starts (or joins) a background sync for an account: `mode=incremental` (default) or `mode=backfill` (optionally `from` a date). Waits up to `FIO_MAX_WAIT_MS` and returns the job status. This one does call FIO, at background priority. |
+| `sync_transactions` | Starts (or joins) a background sync for an account: `mode=incremental` (default), `mode=backfill` (optionally `from` a date), or `refresh: {from, to}` to re-download days that are already cached. Waits up to `FIO_MAX_WAIT_MS` and returns the job status. This one does call FIO, at background priority. |
 
 Every answer from the cache includes `freshness`: the covered ranges in the requested period, the last successful sync, the oldest download among the days returned, whether history is limited, and `complete` (every requested day is cached).
 
@@ -206,8 +206,9 @@ FIO allows one request per token every 30 seconds, so fio-mcp keeps a local SQLi
 
 - **Only date ranges.** The cache downloads with `/periods` and never uses `/last`, so it never moves the download marker that `get_new_transactions` and other programs rely on.
 - **Bound to the account, not the name.** Cached data belongs to the bank account (account number and bank code) that FIO reported for the token that downloaded it. If you point an account name at a different token or account, the old data is not shown for it; the cache answers "not verified for this token yet" until a sync confirms the account.
-- **Upserts.** Movements are stored by FIO's movement ID; downloading a day again updates late-booked or changed movements. Nothing is deleted.
-- **Background priority.** Sync requests wait behind every tool call in the rate limiter, and never fail for lack of a slot: they wait.
+- **Upserts.** Movements are stored by FIO's movement ID; downloading a day again updates late-booked or changed movements. Only a refresh deletes: it removes movements that FIO no longer lists for the days it re-downloaded.
+- **Whole responses only.** A response with a movement that lacks its ID or date is not stored at all, and its days stay uncached, so the cache never claims a day it holds only part of. A sync stops with that error in `lastError`; `get_transactions` answers from FIO.
+- **Background priority.** Sync requests yield to tool calls in the rate limiter, up to a starvation bound (see [Rate limiting](#rate-limiting)), and never fail for lack of a slot: they wait.
 
 ### Sync
 
@@ -215,6 +216,7 @@ FIO allows one request per token every 30 seconds, so fio-mcp keeps a local SQLi
 - **Incremental:** downloads from `FIO_SYNC_OVERLAP_DAYS` before the newest cached day up to today. With nothing cached it runs the backfill instead.
 - **Periodic:** `FIO_SYNC_INTERVAL_MINUTES` repeats the incremental sync. Each run is one request per token (30 s of that token's budget). With an interval of 15 minutes that is 96 requests a day, and a tool call arriving while a sync request is running waits up to 30 s for its slot. In stdio mode the process usually lives only as long as the client session, so the startup sync is enough; in HTTP mode an interval of 30–60 minutes is a reasonable choice.
 - **On demand:** `sync_transactions`.
+- **Refresh:** `sync_transactions` with `refresh: {"from": "2025-01-01", "to": "2025-03-31"}` re-downloads those days even where they are cached (backfill skips cached days), at background priority and with the same 413 splitting as the backfill. Changed movements are updated, and movements FIO no longer lists for a downloaded day are deleted, because a date-range download is FIO's complete list for those days. Days after today are ignored. Days older than 90 days need a history unlock first; without one FIO refuses them and they are listed as `blocked`. A later backfill downloads them again but deletes nothing, so after the unlock run the same refresh again. A movement FIO moved to another day appears there only once that day is downloaded too, so refresh both dates. An interrupted refresh finishes before the next sync job does anything else, including the startup sync.
 
 ### Backfill and history older than 90 days
 
@@ -231,7 +233,7 @@ Each request takes 30 s, so about 20 chunks fit in one unlock; a large history m
 
 With `source=auto` (the default) the answer comes from the cache only when every day of the requested range is cached and each day is either *settled* (downloaded at least `FIO_SYNC_OVERLAP_DAYS` after it, so late bookings are in) or *fresh* (downloaded within `FIO_CACHE_MAX_AGE_MINUTES`). Otherwise the server asks FIO and stores the result. A cached answer has no opening/closing balance for the range (FIO only reports those for an actual download); it reports the last known balance and its date instead.
 
-Movements older than the overlap window are assumed final. If FIO changes an old movement, re-run a backfill for that period (`sync_transactions mode=backfill from=<date>`).
+Movements older than the overlap window are assumed final. If FIO changes or cancels an old movement, refresh that period (`sync_transactions` with `refresh: {"from": "<first day>", "to": "<last day>"}`); a backfill skips days that are already cached.
 
 ### Backup
 

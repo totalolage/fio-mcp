@@ -7,8 +7,8 @@ import { FioApi } from "../fio-api.js";
 import type { NormalizedStatement, StatementInfo, Transaction } from "../statement.js";
 import { addDays, type DayRange, minDate, pragueDateOf, pragueToday, rangeLength } from "./dates.js";
 import { DatabaseLive } from "./db.js";
-import { type CachedAccount, type CacheStore, makeCacheStore } from "./store.js";
-import { type CacheSyncShape, makeCacheSync } from "./sync.js";
+import { type CachedAccount, type CacheStore, makeCacheStore, type SyncMode } from "./store.js";
+import { type CacheSyncShape, makeCacheSync, type SyncRequest } from "./sync.js";
 
 /**
  * The transaction cache as the tools see it. With FIO_CACHE_ENABLED=false
@@ -255,14 +255,23 @@ const syncAll = Effect.fn("CacheSync.syncAll")(function* (
   }
 });
 
+const resumeRequest = (mode: SyncMode | null): SyncRequest => {
+  switch (mode) {
+    case "incremental":
+      return { kind: "incremental" };
+    case "refresh":
+      return { kind: "refresh" };
+    default:
+      return { kind: "backfill" };
+  }
+};
+
 /** What startup runs for one token: the full startup sync, or only an interrupted job. */
 const startupRequest = (cache: EnabledCache, config: AppConfigShape) => (account: Account) =>
   config.cache.syncOnStartup
     ? Effect.succeedSome({ kind: "startup" as const })
     : Effect.map(cache.store.syncState(account.tokenFingerprint), (state) =>
-        state.pending.length > 0
-          ? Option.some(state.mode === "incremental" ? { kind: "incremental" as const } : { kind: "backfill" as const })
-          : Option.none(),
+        state.pending.length > 0 ? Option.some(resumeRequest(state.mode)) : Option.none(),
       );
 
 /**

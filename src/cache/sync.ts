@@ -33,6 +33,11 @@ import { type CacheStore, coveredBy, type SyncState } from "./store.js";
  *
  * Incremental sync re-fetches [newest covered day − overlapDays, today],
  * which picks up late bookings and edits.
+ *
+ * Refresh re-fetches a requested range whether or not it is covered, with
+ * the same 413 and 422 handling, and makes the cache match FIO for every day
+ * a response covers: changed movements are updated and movements FIO no
+ * longer lists are deleted.
  */
 
 /** FIO serves this many most recent days without a history unlock. */
@@ -49,6 +54,8 @@ export type SyncRequest =
       readonly retryFailed?: boolean | undefined;
     }
   | { readonly kind: "incremental" }
+  /** Re-fetch `range` even where covered; without a range, only finish an interrupted refresh. */
+  | { readonly kind: "refresh"; readonly range?: DayRange | undefined }
   /** Startup: backfill whatever is missing (blocked history first), then incremental. */
   | { readonly kind: "startup" };
 
@@ -185,6 +192,7 @@ export const makeCacheSync = Effect.fn("CacheSync.make")(function* (
 
     /** Fetches `queue` front to back. Returns false when an unexpected error stopped it. */
     const drain = Effect.fnUntraced(function* (initial: ReadonlyArray<DayRange>, mode: SyncState["mode"]) {
+      const replace = mode === "refresh";
       let queue = initial;
       yield* save({ ...state, pending: queue, mode, lastError: state.blocked.length > 0 ? unlockMessage : null });
       while (queue.length > 0) {
@@ -197,7 +205,8 @@ export const makeCacheSync = Effect.fn("CacheSync.make")(function* (
         if (Result.isSuccess(outcome)) {
           const statement = outcome.success;
           // A success shows the range needs no unlock, so all of it leaves `blocked`. Days the
-          // header does not cover stay uncovered, and the next backfill plan asks for them again.
+          // header does not cover keep their state: uncovered ones are planned again by the next
+          // backfill, and a refresh leaves covered ones as they were.
           const covered = coveredBy(range, statement.info);
           if (covered === undefined || covered.from !== range.from || covered.to !== range.to) {
             yield* Effect.logWarning(
@@ -223,6 +232,7 @@ export const makeCacheSync = Effect.fn("CacheSync.make")(function* (
               statement,
               coverage: range,
               fetchedAt: now,
+              replace,
               syncState: { ...next, historyLimited: next.blocked.length > 0 },
             }),
           );
@@ -238,8 +248,9 @@ export const makeCacheSync = Effect.fn("CacheSync.make")(function* (
             rangesDone: p.rangesDone + 1,
             rowsWritten: p.rowsWritten + committed.success.rowsWritten,
           }));
+          const deleted = committed.success.rowsDeleted;
           yield* Effect.logInfo(
-            `cache sync ${account.name}: ${range.from}..${range.to} stored ${committed.success.rowsWritten} movements`,
+            `cache sync ${account.name}: ${range.from}..${range.to} stored ${committed.success.rowsWritten} movements${deleted > 0 ? `, deleted ${deleted} FIO no longer lists` : ""}`,
           );
           queue = rest;
           continue;
@@ -321,17 +332,30 @@ export const makeCacheSync = Effect.fn("CacheSync.make")(function* (
       return yield* drain(fetchOrder([...state.pending, ...withoutPending([window], state.pending)], recentStart), "incremental");
     });
 
-    let ok: boolean;
-    switch (request.kind) {
-      case "backfill":
-        ok = yield* backfill(request.from, request.retryFailed);
-        break;
-      case "incremental":
-        ok = yield* incremental(undefined);
-        break;
-      case "startup":
-        ok = (yield* backfill(undefined)) && (yield* incremental(startedAt));
-        break;
+    const refresh = (range: DayRange | undefined) => {
+      const wanted = range === undefined ? [] : [{ from: range.from, to: minDay(range.to, today) }];
+      return drain(fetchOrder([...state.pending, ...withoutPending(wanted, state.pending)], recentStart), "refresh");
+    };
+
+    // Ranges an interrupted refresh left pending finish as a refresh before any other job, so they
+    // still drop what FIO no longer lists.
+    const interruptedRefresh = request.kind !== "refresh" && state.mode === "refresh" && state.pending.length > 0;
+    let ok = !interruptedRefresh || (yield* refresh(undefined));
+    if (ok) {
+      switch (request.kind) {
+        case "backfill":
+          ok = yield* backfill(request.from, request.retryFailed);
+          break;
+        case "incremental":
+          ok = yield* incremental(undefined);
+          break;
+        case "refresh":
+          ok = yield* refresh(request.range);
+          break;
+        case "startup":
+          ok = (yield* backfill(undefined)) && (yield* incremental(startedAt));
+          break;
+      }
     }
     const finishedAt = yield* Clock.currentTimeMillis;
     yield* report({ status: ok ? "completed" : "failed", finishedAt, current: null });

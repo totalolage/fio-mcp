@@ -14,6 +14,7 @@ import {
   config,
   enabledCache,
   fakeFio,
+  NOW,
   serveFrom,
   setNow,
   statement,
@@ -228,5 +229,39 @@ describe("cache store", () => {
       }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
     }),
   );
-});
 
+  it.effect("a response with a movement lacking an ID or date stores nothing and covers no day", () =>
+    Effect.gen(function* () {
+      yield* setNow();
+      const fio = yield* fakeFio(serveFrom([]));
+      yield* Effect.gen(function* () {
+        const cache = yield* enabledCache;
+        const acc = yield* account();
+        const earlier = { from: "2026-10-20", to: "2026-10-20" };
+        yield* cache.writeThrough(acc, statement(earlier.from, earlier.to, [tx(1, "2026-10-20", -10)]), earlier);
+        const key = yield* cache.boundAccount(acc);
+        const range = { from: "2026-10-20", to: TODAY };
+        for (const broken of [tx(3, TODAY, 5, { id: null }), tx(4, TODAY, 5, { date: null })]) {
+          const result = yield* Effect.flip(
+            cache.store.commit({
+              accountName: acc.name,
+              tokenFingerprint: acc.tokenFingerprint,
+              statement: statement(range.from, range.to, [tx(1, "2026-10-20", -999), tx(2, "2026-10-21", 20), broken]),
+              coverage: range,
+              fetchedAt: NOW,
+            }),
+          );
+          assert.strictEqual(result._tag, "FioResponseError");
+        }
+        assert.deepStrictEqual(yield* cache.store.coveredRanges(key), [earlier]);
+        const read = yield* cache.read(acc, range);
+        assert.deepStrictEqual(
+          read.transactions.map((t) => [t.id, t.amount]),
+          [[1, -10]],
+        );
+        assert.isFalse(read.freshness.complete);
+        assert.isFalse(yield* cache.servable(key, range));
+      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+    }),
+  );
+});
