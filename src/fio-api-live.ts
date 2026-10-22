@@ -129,15 +129,10 @@ const toFioError =
           Effect.flatMap((body) => Effect.fail(errorForStatus(reason.response.status, redactor.excerpt(body), operation))),
         );
       case "TransportError": {
-        const detail = redactor.redact(causeMessages(reason.cause)).replace(URL_PATTERN, "<url>").slice(0, 300);
+        const cause = causeMessages(reason.cause);
         const what = reason.description ?? "The request failed.";
-        return Effect.fail(
-          new FioTransportError({
-            kind: "network",
-            detail: detail === "" ? what : `${what} (${detail})`,
-            dispatched: true,
-          }),
-        );
+        const detail = redactor.redact(cause === "" ? what : `${what} (${cause})`).replace(URL_PATTERN, "<url>");
+        return Effect.fail(new FioTransportError({ kind: "network", detail: detail.slice(0, 400), dispatched: true }));
       }
       case "EncodeError":
       case "InvalidUrlError":

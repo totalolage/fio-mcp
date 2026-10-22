@@ -14,8 +14,9 @@
  * - `{ status?, body?, contentType?, headers?, delayMs? }`: an HTTP response
  *   (status defaults to 200, body to empty). `delayMs` sleeps on the Clock
  *   first, so TestClock controls it.
- * - `{ transportError, delayMs? }`: fails like a network error
- *   (HttpClientError with a TransportError reason whose cause has that message).
+ * - `{ transportError, description?, delayMs? }`: fails like a network error
+ *   (HttpClientError with a TransportError reason whose cause has that
+ *   message, and the given description).
  * Queued replies are used first, in order; then the handler. A request with
  * neither dies with a message naming it.
  *
@@ -47,6 +48,8 @@ export interface FioHttpResponse {
 
 export interface FioHttpTransportFailure {
   readonly transportError: string;
+  /** Optional TransportError description (some clients put the URL there). */
+  readonly description?: string;
   readonly delayMs?: number;
 }
 
@@ -165,7 +168,11 @@ const make = Effect.fnUntraced(function* (options: FioHttpOptions) {
       if (reply.delayMs !== undefined && reply.delayMs > 0) yield* Effect.sleep(reply.delayMs);
       if ("transportError" in reply) {
         return yield* new HttpClientError.HttpClientError({
-          reason: new HttpClientError.TransportError({ request, cause: new Error(reply.transportError) }),
+          reason: new HttpClientError.TransportError({
+            request,
+            cause: new Error(reply.transportError),
+            ...(reply.description === undefined ? {} : { description: reply.description }),
+          }),
         });
       }
       const status = reply.status ?? 200;

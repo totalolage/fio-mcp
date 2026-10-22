@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { AddressInfo } from "node:net";
 import { assert, describe, it } from "@effect/vitest";
 import { Effect, Exit, Fiber, Layer, Logger, Redacted, References, Tracer } from "effect";
-import { HttpClient, HttpClientError, HttpClientRequest } from "effect/http";
+import { FetchHttpClient, HttpClient, HttpClientError, HttpClientRequest } from "effect/http";
 import { TestClock } from "effect/testing";
 import { Accounts } from "../src/accounts.js";
 import { AppConfig, type AppConfigShape } from "../src/config.js";
@@ -194,6 +194,18 @@ describe("FioApi", () => {
         const shape = yield* failure(api.periods(acct, "2024-01-01", "2024-01-31"));
         assert.strictEqual(shape._tag, "FioResponseError");
         assert.include(shape.message, "documented shape");
+      }).pipe(Effect.provide(testLayer())),
+    );
+
+    it.effect("an epoch date outside the Date range is a FioResponseError, not a defect", () =>
+      Effect.gen(function* () {
+        const api = yield* FioApi;
+        const acct = yield* account;
+        const farFuture = structuredClone(STATEMENT);
+        Object.assign(farFuture.accountStatement.info, { dateStart: 1e100 });
+        yield* FioHttp.enqueue(json(farFuture));
+        const error = yield* failure(api.last(acct));
+        assert.strictEqual(error._tag, "FioResponseError");
       }).pipe(Effect.provide(testLayer())),
     );
 
@@ -392,6 +404,20 @@ describe("FioApi", () => {
           assert.isTrue(error.dispatched);
           assert.include(error.detail, "ECONNREFUSED");
         }
+      }).pipe(Effect.provide(testLayer())),
+    );
+
+    it.effect("a transport description with the URL is redacted too", () =>
+      Effect.gen(function* () {
+        const api = yield* FioApi;
+        const acct = yield* account;
+        yield* FioHttp.enqueue({
+          transportError: "socket hang up",
+          description: `GET ${BASE_URL}/last/${TOKEN}/transactions.json failed`,
+        });
+        const error = yield* failure(api.last(acct));
+        assert.strictEqual(error._tag, "FioTransportError");
+        if (error._tag === "FioTransportError") assert.include(error.detail, "socket hang up");
       }).pipe(Effect.provide(testLayer())),
     );
 
@@ -607,13 +633,18 @@ describe("FioApiLive over fetch", () => {
         }),
     );
 
-  const liveLayer = (port: number) =>
+  const liveLayer = (port: number, config: Partial<AppConfigShape> = {}) =>
     FioApiLive.pipe(
       Layer.provideMerge(
         Layer.mergeAll(Accounts.layer, RateLimiter.layerFrom({ intervalMs: 0, maxWaitMs: 1_000 }), Redactor.layer),
       ),
       Layer.provideMerge(
-        AppConfig.layerFrom({ ...baseConfig, baseUrl: `http://127.0.0.1:${port}/v1/rest`, requestTimeoutMs: 5_000 }),
+        AppConfig.layerFrom({
+          ...baseConfig,
+          baseUrl: `http://127.0.0.1:${port}/v1/rest`,
+          requestTimeoutMs: 5_000,
+          ...config,
+        }),
       ),
     );
 
@@ -651,6 +682,52 @@ describe("FioApiLive over fetch", () => {
       assert.match(upload?.body ?? "", /name="file"; filename="orders\.xml"/);
       assert.match(upload?.body ?? "", /Content-Type: application\/xml/);
       assert.isFalse(hits.some((hit) => hit.url.includes("import") && hit.url.includes(TOKEN)));
+    }).pipe(Effect.scoped),
+  );
+
+  it.live("the timeout covers a body that stalls after the headers", () =>
+    Effect.gen(function* () {
+      const { port } = yield* localFio((_path, _req, res) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.write('{"accountStatement":');
+      });
+      const error = yield* Effect.gen(function* () {
+        const api = yield* FioApi;
+        return yield* failure(api.last(yield* account));
+      }).pipe(Effect.provide(liveLayer(port, { requestTimeoutMs: 300 })));
+      assert.strictEqual(error._tag, "FioTransportError");
+      if (error._tag === "FioTransportError") {
+        assert.strictEqual(error.kind, "timeout");
+        assert.isTrue(error.dispatched);
+      }
+    }).pipe(Effect.scoped),
+  );
+
+  it.live("a body over the limit is refused and the response is closed", () =>
+    Effect.gen(function* () {
+      let closed = false;
+      const { port } = yield* localFio((_path, _req, res) => {
+        res.writeHead(200, { "content-type": "text/csv" });
+        const timer = setInterval(() => res.write("x".repeat(512)), 5);
+        res.on("close", () => {
+          clearInterval(timer);
+          closed = true;
+        });
+      });
+      const layer = fioApiLayer({ maxResponseBytes: 4096 }).pipe(
+        Layer.provide(FetchHttpClient.layer),
+        Layer.provideMerge(
+          Layer.mergeAll(Accounts.layer, RateLimiter.layerFrom({ intervalMs: 0, maxWaitMs: 1_000 }), Redactor.layer),
+        ),
+        Layer.provideMerge(AppConfig.layerFrom({ ...baseConfig, baseUrl: `http://127.0.0.1:${port}/v1/rest` })),
+      );
+      const error = yield* Effect.gen(function* () {
+        const api = yield* FioApi;
+        return yield* failure(api.periodsRaw(yield* account, "2024-01-01", "2024-01-31", "csv"));
+      }).pipe(Effect.provide(layer));
+      assert.strictEqual(error._tag, "FioResponseError");
+      yield* Effect.sleep(200);
+      assert.isTrue(closed);
     }).pipe(Effect.scoped),
   );
 
