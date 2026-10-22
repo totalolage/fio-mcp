@@ -8,8 +8,8 @@ import { FIO_COUNTRY_CODES } from "./fio-countries.js";
  * Validation follows the stricter of the PDF tables and the XSD
  * (fio_xml_type.xsd). Character-set classes from the PDF (`e`, `x`, `i`) are
  * documented in field descriptions but not enforced beyond rejecting control
- * characters; FIO validates them server-side and rejects the batch with
- * errorCode 1 rather than creating it.
+ * characters and anything XML 1.0 cannot carry; FIO validates them server-side
+ * and rejects the batch with errorCode 1 rather than creating it.
  */
 
 /** Payment reasons ("platební titul", PDF §6.3.4); identical to the XSD enumeration. */
@@ -33,6 +33,11 @@ export const MAX_ORDERS_PER_BATCH = 100;
 
 // biome-ignore lint/suspicious/noControlCharactersInRegex: matching control characters is the point
 const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
+// Outside XML 1.0's Char production: U+FFFE, U+FFFF and lone surrogates (with
+// the u flag a valid pair is one code point and does not match). A lone
+// surrogate would also be replaced by U+FFFD on upload, so FIO would get
+// different bytes from the previewed XML.
+const NON_XML_CHARS = /[\ud800-\udfff\ufffe\uffff]/u;
 
 const text = (max: number, what: string) =>
   Schema.Trim.check(
@@ -40,6 +45,9 @@ const text = (max: number, what: string) =>
     Schema.isMaxLength(max, { message: `must be at most ${max} characters` }),
     Schema.makeFilter((v: string) => !CONTROL_CHARS.test(v), {
       message: "must not contain control characters or line breaks",
+    }),
+    Schema.makeFilter((v: string) => !NON_XML_CHARS.test(v), {
+      message: "must not contain U+FFFE, U+FFFF or unpaired surrogates (not valid in XML)",
     }),
   ).annotate({ description: what });
 

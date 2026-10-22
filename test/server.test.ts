@@ -329,8 +329,11 @@ describe("payment tools", () => {
 
   it("uploads exactly the previewed XML as a multipart import and parses the result", async () => {
     const { call, requests } = await connect([payAccount()], ok(IMPORT_OK_XML));
-    const preview = data(await call("preview_payment_orders", { orders: [domesticOrder] }));
-    const result = await call("submit_payment_orders", { orders: [domesticOrder], confirm: true });
+    // Non-ASCII text, including an astral character (a surrogate pair), must reach FIO byte for byte.
+    const order = { ...domesticOrder, messageForRecipient: "Nájem za říjen, Žluťoučký kůň 😀" };
+    const preview = data(await call("preview_payment_orders", { orders: [order] }));
+    expect(preview.xml).toContain("<messageForRecipient>Nájem za říjen, Žluťoučký kůň 😀</messageForRecipient>");
+    const result = await call("submit_payment_orders", { orders: [order], confirm: true });
     const submitted = data(result);
     expect(text(result)).not.toContain(PAY_TOKEN);
     const recorded = await requests();
@@ -341,8 +344,23 @@ describe("payment tools", () => {
     expect(upload?.files).toEqual([
       expect.objectContaining({ field: "file", filename: "orders.xml", text: preview.xml }),
     ]);
+    // The recorded text is the UTF-8 decoding of the uploaded file, so equal encodings mean equal bytes.
+    const encode = (value: string) => new TextEncoder().encode(value);
+    expect(encode(upload?.files[0]?.text ?? "")).toEqual(encode(preview.xml));
     expect(submitted.result).toMatchObject({ accepted: true, batchIds: ["105545555"] });
     expect(submitted.nextStep).toMatch(/NOT executed/);
+  });
+
+  it("rejects text XML cannot carry before previewing or uploading", async () => {
+    const { call, fetched } = await connect([payAccount()], ok(IMPORT_OK_XML));
+    for (const comment of ["a\uffffb", "a\ud800b"]) {
+      const order = { ...domesticOrder, comment };
+      const preview = await call("preview_payment_orders", { orders: [order] });
+      expect(preview.isError).toBe(true);
+      expect(text(preview)).toMatch(/not valid in XML/);
+      expect((await call("submit_payment_orders", { orders: [order], confirm: true })).isError).toBe(true);
+    }
+    expect(await fetched()).toBe(0);
   });
 
   it("requires explicit confirmation to submit", async () => {
