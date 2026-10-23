@@ -111,6 +111,16 @@ describe("grant account identity", () => {
     }).pipe(Effect.provide(db)),
   );
 
+  it.effect("covers every account configured with a granted token", () =>
+    Effect.gen(function* () {
+      yield* grantFor([account("main", READ_TOKEN)]);
+      const principal = yield* reloadedPrincipal;
+      // The same FIO account under a second name.
+      const list = [account("main", READ_TOKEN), account("alias", READ_TOKEN), account("savings", PAY_TOKEN)];
+      assert.deepStrictEqual(yield* visibleNames(principal, list), ["main", "alias"]);
+    }).pipe(Effect.provide(db)),
+  );
+
   it.effect("revokes grants made by account name when migrating", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
