@@ -1,9 +1,10 @@
 import { Clock, Effect, Option, Redacted, Semaphore } from "effect";
-import { type PasswordHash, verifyPassword } from "./crypto.js";
+import { type PasswordHash, type PasswordHashError, verifyPassword } from "./crypto.js";
 
 /**
  * Admin password checks with failed-login throttling per client address.
- * One check runs at a time (scrypt needs 128 MiB); a request that arrives
+ * One check runs at a time across all addresses (scrypt needs 128 MiB with
+ * the hash-password defaults, at most 256 MiB); a request that arrives
  * while another is being checked is turned away instead of queued, so a
  * flood cannot pile up memory or slip past the throttle. Logs carry counts
  * only: no address, no password.
@@ -58,6 +59,7 @@ export interface LoginGuard {
 export const makeLoginGuard = Effect.fn("LoginGuard.make")(function* (
   expected: Redacted.Redacted<PasswordHash>,
   policy: ThrottlePolicy = DEFAULT_THROTTLE,
+  verify: (password: Redacted.Redacted<string>, hash: PasswordHash) => Effect.Effect<boolean, PasswordHashError> = verifyPassword,
 ) {
   const failures = new Map<string, Failures>();
   const lock = yield* Semaphore.make(1);
@@ -90,7 +92,7 @@ export const makeLoginGuard = Effect.fn("LoginGuard.make")(function* (
     if (entry !== undefined && entry.nextAllowedAt > before) {
       return { _tag: "Throttled", retryAfterSeconds: Math.ceil((entry.nextAllowedAt - before) / 1000) } satisfies LoginResult;
     }
-    const ok = yield* verifyPassword(password, Redacted.value(expected)).pipe(Effect.orElseSucceed(() => false));
+    const ok = yield* verify(password, Redacted.value(expected)).pipe(Effect.orElseSucceed(() => false));
     const now = yield* Clock.currentTimeMillis;
     if (ok) {
       failures.delete(address);

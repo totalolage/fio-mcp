@@ -334,6 +334,24 @@ describe("loadConfig", () => {
     }),
   );
 
+  it.effect("accepts a hash file with a trailing LF or CRLF and rejects captured prompts without echoing them", () =>
+    Effect.gen(function* () {
+      const hash = yield* hashPassword(Redacted.make("test-admin-password"), { ln: 14, r: 8, p: 1 });
+      const env = { FIO_TOKEN: READ_TOKEN, FIO_MCP_TRANSPORT: "http", FIO_MCP_PUBLIC_URL: "https://fio.example.test" };
+      for (const content of [`${hash}\n`, `${hash}\r\n`]) {
+        const config = yield* loadConfigFrom({ ...env, FIO_MCP_ADMIN_PASSWORD_HASH_FILE: secretFile(content) });
+        assert.strictEqual(config.transport.kind, "http");
+      }
+      // What `docker run -t … > admin.hash` captured: the prompts land in the file.
+      const path = secretFile(`Admin password: \n${hash}\n`);
+      const message = yield* configError({ ...env, FIO_MCP_ADMIN_PASSWORD_HASH_FILE: path });
+      assert.strictEqual(message, "FIO_MCP_ADMIN_PASSWORD_HASH_FILE: file must contain exactly one hash line");
+      assert.notInclude(message, path);
+      assert.notInclude(message, "Admin password");
+      assert.notInclude(message, hash);
+    }),
+  );
+
   it.effect("reads trusted proxies and rejects invalid entries without echoing them", () =>
     Effect.gen(function* () {
       const env = { FIO_TOKEN: READ_TOKEN, FIO_MCP_TRANSPORT: "http", FIO_MCP_ALLOW_UNAUTHENTICATED: "true" };

@@ -1,6 +1,6 @@
 import { NodeFileSystem } from "@effect/platform-node";
 import { assert, describe, it } from "@effect/vitest";
-import { type Cause, Clock, Effect, Fiber, Layer, Option, Queue, Redacted, Sink, Stdio, Stream, Terminal } from "effect";
+import { type Cause, Clock, Deferred, Effect, Fiber, Layer, Option, Queue, Redacted, Sink, Stdio, Stream, Terminal } from "effect";
 import { HttpServerRequest } from "effect/http";
 import { SqlClient } from "effect/sql";
 import { TestClock } from "effect/testing";
@@ -424,5 +424,57 @@ describe("admin commands", () => {
       assert.include(all.out.join(""), "Revoked 1 active grants");
       assert.isTrue(Option.isNone(yield* store.accessGrant("access_fio_client_b", now)));
     }).pipe(Effect.provide(db)),
+  );
+});
+
+describe("hash-password output", () => {
+  it.effect("writes only the hash line to stdout and the prompts to stderr", () =>
+    Effect.gen(function* () {
+      const io = fakeStdio("", true);
+      yield* hashPasswordCommand(FAST).pipe(
+        Effect.provide(Layer.mergeAll(io.layer, fakeTerminal(["typed admin password", "typed admin password"]))),
+      );
+      const out = io.out.join("");
+      assert.match(out, /^\$scrypt\$[^\n]+\n$/);
+      assert.notInstanceOf(parsePasswordHash(out), PasswordHashError);
+      assert.include(io.err.join(""), "Admin password: ");
+      assert.include(io.err.join(""), "Repeat the password: ");
+    }),
+  );
+});
+
+describe("sign-in scrypt bound", () => {
+  it.effect("runs at most one password check at a time across all addresses", () =>
+    Effect.gen(function* () {
+      const parsed = parsePasswordHash(yield* hashPassword(Redacted.make("the right password"), FAST));
+      if (parsed instanceof PasswordHashError) return assert.fail("hash did not parse");
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let running = 0;
+      let peak = 0;
+      const verify = () =>
+        Effect.gen(function* () {
+          running++;
+          peak = Math.max(peak, running);
+          yield* Deferred.succeed(entered, undefined);
+          yield* Deferred.await(release);
+          return false;
+        }).pipe(Effect.ensuring(Effect.sync(() => running--)));
+      const guard = yield* makeLoginGuard(Redacted.make(parsed), DEFAULT_THROTTLE, verify);
+      const wrong = Redacted.make("the wrong password");
+      const fibers = yield* Effect.forEach(Array.from({ length: 10 }, (_, i) => `10.0.0.${i}`), (address) =>
+        Effect.forkChild(guard.attempt(address, wrong), { startImmediately: true }),
+      );
+      yield* Deferred.await(entered);
+      // Released before any assertion: the admitted check is uninterruptible.
+      yield* Deferred.succeed(release, undefined);
+      const results = yield* Effect.forEach(fibers, Fiber.join);
+      assert.strictEqual(peak, 1);
+      assert.strictEqual(results.filter((result) => result._tag === "Rejected").length, 1);
+      assert.strictEqual(results.filter((result) => result._tag === "Throttled").length, 9);
+      // Once the check ends, the next sign-in is checked.
+      assert.strictEqual((yield* guard.attempt("10.0.0.99", wrong))._tag, "Rejected");
+      assert.strictEqual(peak, 1);
+    }),
   );
 });
