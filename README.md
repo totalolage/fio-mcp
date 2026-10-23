@@ -216,7 +216,7 @@ FIO allows one request per token every 30 seconds, so fio-mcp keeps a local SQLi
 - **Incremental:** downloads from `FIO_SYNC_OVERLAP_DAYS` before the newest cached day up to today. With nothing cached it runs the backfill instead.
 - **Periodic:** `FIO_SYNC_INTERVAL_MINUTES` repeats the incremental sync. Each run is one request per token (30 s of that token's budget). With an interval of 15 minutes that is 96 requests a day, and a tool call arriving while a sync request is running waits up to 30 s for its slot. In stdio mode the process usually lives only as long as the client session, so the startup sync is enough; in HTTP mode an interval of 30–60 minutes is a reasonable choice.
 - **On demand:** `sync_transactions`.
-- **Refresh:** `sync_transactions` with `refresh: {"from": "2025-01-01", "to": "2025-03-31"}` re-downloads those days even where they are cached (backfill skips cached days), at background priority and with the same 413 splitting as the backfill. Changed movements are updated, and movements FIO no longer lists for a downloaded day are deleted, because a date-range download is FIO's complete list for those days. Days after today are ignored. Days older than 90 days need a history unlock first; without one FIO refuses them and they are listed as `blocked`. A later backfill downloads them again but deletes nothing, so after the unlock run the same refresh again. A movement FIO moved to another day appears there only once that day is downloaded too, so refresh both dates. An interrupted refresh finishes before the next sync job does anything else, including the startup sync.
+- **Refresh:** `sync_transactions` with `refresh: {"from": "2025-01-01", "to": "2025-03-31"}` re-downloads those days even where they are cached (backfill skips cached days), at background priority and with the same 413 splitting as the backfill. Changed movements are updated, and movements FIO no longer lists for a downloaded day are deleted, because a date-range download is FIO's complete list for those days. Days after today are ignored. Days older than 90 days need a history unlock first; without one FIO refuses them and they are listed as `blocked`. A later backfill downloads them again but deletes nothing, so after the unlock run the same refresh again. A movement FIO moved to another day appears there only once that day is downloaded too, so refresh both dates. An interrupted refresh finishes before the next sync job does anything else, including the startup sync. Days another kind of job left pending are only updated, never pruned, unless they are in a requested refresh range.
 
 ### Backfill and history older than 90 days
 
@@ -353,7 +353,7 @@ The [Dockerfile](Dockerfile) builds from a clean clone with only `docker build .
 - `HEALTHCHECK` fetches `/healthz` on localhost with Node (no curl needed).
 - `ENTRYPOINT ["node", "/app/dist/main.js"]`, so `docker exec <container> node dist/main.js <command>` runs the CLI.
 
-Pass secrets as files. TrueNAS mounts them under `/run/secrets` (root:10000, mode 0440), so add the container user to group 10000. Example Compose service (TrueNAS Custom App):
+Pass secrets as files. TrueNAS mounts them under `/run/secrets` (root:10000, mode 0440), so add the container user to group 10000. Example Compose service (TrueNAS Custom App), with Traefik connecting through the published port:
 
 ```yaml
 services:
@@ -377,12 +377,25 @@ services:
     volumes:
       - /mnt/local-hdd/Applications/fio-mcp:/data     # writable by the container user
       - /path/to/secrets:/run/secrets:ro
-    labels:
-      traefik.enable: "true"
-      traefik.http.routers.fio-mcp.rule: Host(`fio.nas.kalny.net`)
-      traefik.http.routers.fio-mcp.tls: "true"
-      traefik.http.services.fio-mcp.loadbalancer.server.port: "3000"
 ```
+
+The container has no Traefik labels: Traefik's Docker provider would route to the container's own address, not to the published port. Route through Traefik's file provider instead:
+
+```yaml
+http:
+  routers:
+    fio-mcp:
+      rule: Host(`fio.nas.kalny.net`)
+      tls: {}
+      service: fio-mcp
+  services:
+    fio-mcp:
+      loadBalancer:
+        servers:
+          - url: http://<nas-address>:3000   # the published port
+```
+
+To connect over a shared Docker network instead, drop `ports`, put Traefik's Docker-provider labels (`traefik.enable`, the router rule and `traefik.http.services.fio-mcp.loadbalancer.server.port: "3000"`) on the service, and set `FIO_MCP_TRUSTED_PROXIES` to Traefik's address on that network (see [Reverse proxy](#reverse-proxy)).
 
 To fill in history older than 90 days after an Internetbanking unlock, restart the container within the 10-minute window; the startup sync retries the refused history first. See [Backfill](#backfill-and-history-older-than-90-days).
 
