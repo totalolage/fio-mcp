@@ -102,7 +102,10 @@ export const DEFAULT_OVERLAP_DAYS = 10;
 export const DEFAULT_CACHE_MAX_AGE_MINUTES = 60;
 export const MIN_SYNC_INTERVAL_MINUTES = 5;
 
-const ACCOUNT_NAME_CONTROL = /\p{Cc}/u;
+// Control and format characters (Cc, Cf: e.g. U+200B, U+202E) and line or
+// paragraph separators are invisible or reorder text, so a name could look
+// like another one on the consent page.
+const ACCOUNT_NAME_INVISIBLE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
 // URL-safe characters only: tokens go into URL paths, and protocol-level
 // redaction can then never cut through JSON or SSE framing.
 const TOKEN = new RegExp(`^[A-Za-z0-9._~-]{${MIN_TOKEN_LENGTH},}$`);
@@ -111,7 +114,7 @@ const CURRENCY = /^[A-Z]{3}$/;
 const DATE = /^(?!0000)\d{4}-\d{2}-\d{2}$/;
 
 const FIELD_RULES = {
-  name: "must be 1-64 Unicode code points after trimming, with no control characters",
+  name: "must be 1-64 Unicode code points after trimming, with no control, format or line separator characters",
   token: `must be at least ${MIN_TOKEN_LENGTH} characters of letters, digits, '.', '_', '~' or '-' (FIO tokens are 64 characters)`,
   accountNumber: "must be the FIO account number without bank code (1-10 digits)",
   currency: "must be an ISO 4217 code such as CZK",
@@ -205,7 +208,7 @@ const isCalendarDate = (value: string): boolean => {
 const RawAccount = Schema.Record(Schema.String, Schema.Unknown);
 
 const validAccountName = (value: string): boolean => {
-  if (ACCOUNT_NAME_CONTROL.test(value)) return false;
+  if (ACCOUNT_NAME_INVISIBLE.test(value)) return false;
   const length = Array.from(value.trim()).length;
   return length >= 1 && length <= 64;
 };

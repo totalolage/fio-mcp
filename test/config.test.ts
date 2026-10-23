@@ -77,17 +77,27 @@ describe("loadConfig", () => {
 
   it.effect("rejects invalid account names without echoing their values", () =>
     Effect.gen(function* () {
-      const invalidNames = ["", "   ", "😀".repeat(65), "Account\nName", "Account\tName"];
+      const invalidNames = [
+        "",
+        "   ",
+        "😀".repeat(65),
+        "Account\nName",
+        "Account\tName",
+        // Format characters (zero-width space, right-to-left override) and a line separator.
+        "Account\u200BName",
+        "\u202Eniam",
+        "Account\u2028Name",
+      ];
       for (const name of invalidNames) {
         const message = yield* configError({ FIO_ACCOUNTS: JSON.stringify([{ name, token: READ_TOKEN }]) });
-        assert.match(message, /^Invalid account configuration: FIO_ACCOUNTS\[0\]\.name must be 1-64 Unicode code points after trimming, with no control characters$/);
+        assert.match(message, /^Invalid account configuration: FIO_ACCOUNTS\[0\]\.name must be 1-64 Unicode code points after trimming, with no control, format or line separator characters$/);
         if (name !== "") assert.notInclude(message, name);
       }
 
       const single = yield* configError({ FIO_TOKEN: PAY_TOKEN, FIO_ACCOUNT_NAME: "   " });
       assert.strictEqual(
         single,
-        "Invalid account configuration: FIO_ACCOUNT_NAME must be 1-64 Unicode code points after trimming, with no control characters",
+        "Invalid account configuration: FIO_ACCOUNT_NAME must be 1-64 Unicode code points after trimming, with no control, format or line separator characters",
       );
       const singleControl = yield* configError({ FIO_TOKEN: PAY_TOKEN, FIO_ACCOUNT_NAME: "Account\tName" });
       assert.notInclude(singleControl, "Account\tName");
