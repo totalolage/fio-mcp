@@ -8,7 +8,7 @@ import { SqlClient } from "effect/sql";
 import { backupDatabase, CACHE_MIGRATIONS, databaseLayer, migrate, SERVER_MIGRATIONS } from "../src/cache/db.js";
 import { NOT_VERIFIED } from "../src/cache/service.js";
 import { makeCacheStore } from "../src/cache/store.js";
-import { InvalidInput } from "../src/errors.js";
+import { CacheError, InvalidInput } from "../src/errors.js";
 import {
   account,
   cacheLayer,
@@ -51,42 +51,45 @@ describe("cache database", () => {
     }).pipe(withDb(":memory:")),
   );
 
-  it.effect("migrating marks pending ranges an interrupted refresh left as replacing and all others as upserting", () =>
+  it.effect("migrating legacy pending ranges makes every range upsert-only", () =>
     Effect.gen(function* () {
-      const sql = yield* SqlClient.SqlClient;
-      const october = { from: "2026-10-16", to: "2026-10-20" };
-      const earlier = { from: "2026-10-01", to: "2026-10-15" };
-      const states = [
-        ["refresh-fp", "refresh", [october, earlier]],
-        ["backfill-fp", "backfill", [october, earlier]],
-        ["incremental-fp", "incremental", [october]],
-        ["idle-fp", null, []],
-      ] as const;
-      for (const [fp, mode, pending] of states) {
-        yield* sql`INSERT INTO sync_state ${sql.insert({ token_fingerprint: fp, mode, pending_json: JSON.stringify(pending) })}`;
-      }
-      assert.deepStrictEqual(yield* migrate(SERVER_MIGRATIONS), [[3, "pending_range_replace"]]);
-      const store = yield* makeCacheStore();
-      const pending = (fp: string) => Effect.map(store.syncState(fp), (state) => state.pending);
-      assert.deepStrictEqual(yield* pending("refresh-fp"), [
-        { ...october, replace: true },
-        { ...earlier, replace: true },
-      ]);
-      assert.deepStrictEqual(yield* pending("backfill-fp"), [
-        { ...october, replace: false },
-        { ...earlier, replace: false },
-      ]);
-      assert.deepStrictEqual(yield* pending("incremental-fp"), [{ ...october, replace: false }]);
-      assert.deepStrictEqual(yield* pending("idle-fp"), []);
-    }).pipe(
-      Effect.provide(
-        databaseLayer(
-          ":memory:",
-          // A database deployed before the migration: the cache and OAuth tables only.
-          Object.fromEntries(Object.entries(SERVER_MIGRATIONS).filter(([id]) => id < "0003")),
-        ).pipe(Layer.provide(NodeFileSystem.layer)),
-      ),
-    ),
+      const beforeMigration = Object.fromEntries(Object.entries(SERVER_MIGRATIONS).filter(([id]) => id < "0003"));
+      const oldDatabase = () => databaseLayer(":memory:", beforeMigration).pipe(Layer.provide(NodeFileSystem.layer));
+
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const october = { from: "2026-10-16", to: "2026-10-20" };
+        const earlier = { from: "2026-10-01", to: "2026-10-15" };
+        const states = [
+          ["refresh-fp", "refresh", [october, earlier]],
+          ["backfill-fp", "backfill", [october, earlier]],
+          ["incremental-fp", "incremental", [october]],
+          ["idle-fp", null, []],
+        ] as const;
+        for (const [fp, mode, pending] of states) {
+          yield* sql`INSERT INTO sync_state ${sql.insert({ token_fingerprint: fp, mode, pending_json: JSON.stringify(pending) })}`;
+        }
+        assert.deepStrictEqual(yield* migrate(SERVER_MIGRATIONS), [[3, "pending_range_replace"]]);
+        const store = yield* makeCacheStore();
+        const pending = (fp: string) => Effect.map(store.syncState(fp), (state) => state.pending);
+        assert.deepStrictEqual(yield* pending("refresh-fp"), [
+          { ...october, replace: false },
+          { ...earlier, replace: false },
+        ]);
+        assert.deepStrictEqual(yield* pending("backfill-fp"), [
+          { ...october, replace: false },
+          { ...earlier, replace: false },
+        ]);
+        assert.deepStrictEqual(yield* pending("incremental-fp"), [{ ...october, replace: false }]);
+        assert.deepStrictEqual(yield* pending("idle-fp"), []);
+      }).pipe(Effect.provide(oldDatabase()));
+
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`INSERT INTO sync_state (token_fingerprint, mode, pending_json) VALUES ('malformed-fp', 'refresh', '{')`;
+        assert.instanceOf(yield* Effect.flip(migrate(SERVER_MIGRATIONS)), CacheError);
+      }).pipe(Effect.provide(oldDatabase()));
+    }),
   );
 
   it.effect("creates the directory 0700 and the file 0600, in WAL mode, and reopens it", () =>

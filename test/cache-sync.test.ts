@@ -1,11 +1,14 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { NodeFileSystem } from "@effect/platform-node";
 import { assert, describe, it } from "@effect/vitest";
 import { Deferred, Effect, Fiber, Layer, Option, Redacted, Ref } from "effect";
+import { SqlClient } from "effect/sql";
 import { TestClock } from "effect/testing";
 import { tokenFingerprint } from "../src/accounts.js";
 import { addDays } from "../src/cache/dates.js";
+import { databaseLayer, SERVER_MIGRATIONS } from "../src/cache/db.js";
 import { CacheSyncLive } from "../src/cache/service.js";
 import { historyUnlockMessage, type SyncRequest } from "../src/cache/sync.js";
 import {
@@ -681,6 +684,57 @@ describe("cache sync", () => {
         assert.deepStrictEqual(state.pending, []);
         assert.strictEqual(state.mode, null);
       }).pipe(Effect.provide(CacheSyncLive.pipe(Layer.provideMerge(cacheLayer(config({ cache: { dbPath } }), second.api)))));
+    }),
+  );
+
+  it.effect("legacy mixed refresh ranges resume without deleting cached movements after migration", () =>
+    Effect.gen(function* () {
+      yield* setNow();
+      const dbPath = join(mkdtempSync(join(tmpdir(), "fio-cache-")), "fio.sqlite");
+      const a = { from: "2026-10-15", to: "2026-10-15" };
+      const b = { from: "2026-10-16", to: "2026-10-16" };
+      const accountKey = "2000000001/2010";
+      const beforeMigration = Object.fromEntries(Object.entries(SERVER_MIGRATIONS).filter(([id]) => id < "0003"));
+
+      // The old schema stores the refresh mode and pending ranges without per-range replace flags.
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`
+          INSERT INTO accounts (account_key, account_id, bank_id, updated_at)
+          VALUES (${accountKey}, '2000000001', '2010', ${NOW})
+        `;
+        yield* sql`
+          INSERT INTO bindings (token_fingerprint, account_key, account_name, verified_at)
+          VALUES (${TOKEN_FP}, ${accountKey}, 'main', ${NOW})
+        `;
+        yield* sql`
+          INSERT INTO transactions (account_key, movement_id, date, amount, currency, raw_json, first_seen_at, updated_at)
+          VALUES
+            (${accountKey}, 1, ${a.from}, 1, 'CZK', '{}', ${NOW}, ${NOW}),
+            (${accountKey}, 2, ${b.from}, 2, 'CZK', '{}', ${NOW}, ${NOW})
+        `;
+        yield* sql`
+          INSERT INTO sync_state (token_fingerprint, account_key, mode, pending_json)
+          VALUES (${TOKEN_FP}, ${accountKey}, 'refresh', ${JSON.stringify([b, a])})
+        `;
+      }).pipe(Effect.provide(databaseLayer(dbPath, beforeMigration).pipe(Layer.provide(NodeFileSystem.layer))));
+
+      // FIO still lists B's movement, but returns no movement for A.
+      const fio = yield* fakeFio(serveFrom([tx(2, b.from, 2)]));
+      yield* Effect.gen(function* () {
+        yield* settle;
+        const cache = yield* enabledCache;
+        const job = Option.getOrThrow(yield* cache.sync.awaitJob(yield* account(), 3_600_000));
+        assert.strictEqual(job.status, "completed");
+        assert.strictEqual(job.kind, "refresh");
+        assert.deepStrictEqual(ranges(yield* Ref.get(fio.calls)), ["2026-10-16..2026-10-16", "2026-10-15..2026-10-15"]);
+        const key = yield* cache.boundAccount(yield* account());
+        const rows = yield* cache.store.transactionsIn(key, { from: a.from, to: b.to });
+        assert.deepStrictEqual(
+          rows.map((row) => row.id),
+          [1, 2],
+        );
+      }).pipe(Effect.provide(CacheSyncLive.pipe(Layer.provideMerge(cacheLayer(config({ cache: { dbPath } }), fio.api)))));
     }),
   );
 

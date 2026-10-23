@@ -118,13 +118,12 @@ export const CACHE_MIGRATIONS: Migrations = {
       )
     `;
   }),
-  // Each pending range records whether it replaces. Ranges an interrupted refresh left keep
-  // replacing; every other pending range only upserts.
+  // Legacy pending ranges do not identify which ranges were explicitly refreshed, so resume all as upserts.
   "0003_pending_range_replace": Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     yield* sql`
       UPDATE sync_state SET pending_json = (
-        SELECT json_group_array(json_set(value, '$.replace', json(CASE WHEN sync_state.mode = 'refresh' THEN 'true' ELSE 'false' END)))
+        SELECT json_group_array(json_set(value, '$.replace', json('false')))
         FROM (SELECT value FROM json_each(sync_state.pending_json) ORDER BY key)
       )
     `;
