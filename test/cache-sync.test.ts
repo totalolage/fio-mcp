@@ -415,7 +415,9 @@ describe("cache sync", () => {
           ],
         );
         // The window stays pending for the next run.
-        assert.deepStrictEqual((yield* cache.store.syncState(TOKEN_FP)).pending, [{ from: "2026-10-12", to: "2026-10-25" }]);
+        assert.deepStrictEqual((yield* cache.store.syncState(TOKEN_FP)).pending, [
+          { from: "2026-10-12", to: "2026-10-25", replace: false },
+        ]);
       }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
     }),
   );
@@ -532,7 +534,7 @@ describe("cache sync", () => {
         assert.deepStrictEqual(ranges(yield* Ref.get(fio.calls)), ["2025-03-01..2025-03-31"]);
         const state = yield* (yield* enabledCache).store.syncState(TOKEN_FP);
         assert.strictEqual(state.mode, "refresh");
-        assert.deepStrictEqual(state.pending, [{ from: "2025-03-01", to: "2025-03-31" }]);
+        assert.deepStrictEqual(state.pending, [{ from: "2025-03-01", to: "2025-03-31", replace: true }]);
       }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
     }),
   );
@@ -549,7 +551,7 @@ describe("cache sync", () => {
         assert.strictEqual(job.status, "failed");
         const state = yield* (yield* enabledCache).store.syncState(TOKEN_FP);
         assert.strictEqual(state.mode, "refresh");
-        assert.deepStrictEqual(state.pending, [{ from: "2026-10-15", to: TODAY }]);
+        assert.deepStrictEqual(state.pending, [{ from: "2026-10-15", to: TODAY, replace: true }]);
       }).pipe(Effect.provide(cacheLayer(config({ cache: { dbPath } }), first.api)));
 
       // Movement 4 was cancelled meanwhile; the resumed job still deletes it.
@@ -567,6 +569,84 @@ describe("cache sync", () => {
           rows.map((t) => t.id),
           [3],
         );
+      }).pipe(Effect.provide(CacheSyncLive.pipe(Layer.provideMerge(cacheLayer(config({ cache: { dbPath } }), second.api)))));
+    }),
+  );
+
+  it.effect("a refresh replaces only its own days while finishing another job's pending range as an upsert", () =>
+    Effect.gen(function* () {
+      yield* setNow();
+      const a = { from: "2026-10-15", to: "2026-10-15" };
+      const b = { from: "2026-10-16", to: "2026-10-16" };
+      // FIO no longer lists movement 3 on day B, and returns nothing for day A.
+      const fio = yield* fakeFio(serveFrom([tx(2, b.from, 2)]));
+      yield* Effect.gen(function* () {
+        const cache = yield* enabledCache;
+        const acc = yield* account();
+        yield* cache.writeThrough(acc, statement(a.from, a.to, [tx(1, a.from, 1)]), a);
+        yield* cache.writeThrough(acc, statement(b.from, b.to, [tx(2, b.from, 2), tx(3, b.from, 3)]), b);
+        const key = yield* cache.boundAccount(acc);
+        yield* cache.store.putSyncState(TOKEN_FP, {
+          ...(yield* cache.store.syncState(TOKEN_FP)),
+          mode: "backfill",
+          pending: [{ ...a, replace: false }],
+        });
+        const job = yield* runToEnd({ kind: "refresh", range: b });
+        assert.strictEqual(job.status, "completed");
+        assert.deepStrictEqual(ranges(yield* Ref.get(fio.calls)), ["2026-10-16..2026-10-16", "2026-10-15..2026-10-15"]);
+        const rows = yield* cache.store.transactionsIn(key, { from: a.from, to: b.to });
+        assert.deepStrictEqual(
+          rows.map((t) => t.id),
+          [1, 2],
+        );
+        assert.deepStrictEqual((yield* cache.store.syncState(TOKEN_FP)).pending, []);
+      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+    }),
+  );
+
+  it.effect("an interrupted refresh that also held a backfill range resumes each range in its own mode", () =>
+    Effect.gen(function* () {
+      yield* setNow();
+      const dbPath = join(mkdtempSync(join(tmpdir(), "fio-cache-")), "fio.sqlite");
+      const a = { from: "2026-10-15", to: "2026-10-15" };
+      const b = { from: "2026-10-16", to: "2026-10-16" };
+      const first = yield* fakeFio(() => Effect.fail(new FioServerError({ status: 503, excerpt: "" })));
+      yield* Effect.gen(function* () {
+        const cache = yield* enabledCache;
+        const acc = yield* account();
+        yield* cache.writeThrough(acc, statement(a.from, a.to, [tx(1, a.from, 1)]), a);
+        yield* cache.writeThrough(acc, statement(b.from, b.to, [tx(2, b.from, 2), tx(3, b.from, 3)]), b);
+        yield* cache.store.putSyncState(TOKEN_FP, {
+          ...(yield* cache.store.syncState(TOKEN_FP)),
+          mode: "backfill",
+          pending: [{ ...a, replace: false }],
+        });
+        assert.strictEqual((yield* runToEnd({ kind: "refresh", range: b })).status, "failed");
+        const state = yield* cache.store.syncState(TOKEN_FP);
+        assert.strictEqual(state.mode, "refresh");
+        assert.deepStrictEqual(state.pending, [
+          { ...b, replace: true },
+          { ...a, replace: false },
+        ]);
+      }).pipe(Effect.provide(cacheLayer(config({ cache: { dbPath } }), first.api)));
+
+      // After a restart FIO lists movement 2 only: B drops movement 3, A keeps movement 1.
+      const second = yield* fakeFio(serveFrom([tx(2, b.from, 2)]));
+      yield* Effect.gen(function* () {
+        yield* settle;
+        const cache = yield* enabledCache;
+        const job = Option.getOrThrow(yield* cache.sync.awaitJob(yield* account(), 3_600_000));
+        assert.strictEqual(job.status, "completed");
+        assert.deepStrictEqual(ranges(yield* Ref.get(second.calls)), ["2026-10-16..2026-10-16", "2026-10-15..2026-10-15"]);
+        const key = yield* cache.boundAccount(yield* account());
+        const rows = yield* cache.store.transactionsIn(key, { from: a.from, to: b.to });
+        assert.deepStrictEqual(
+          rows.map((t) => t.id),
+          [1, 2],
+        );
+        const state = yield* cache.store.syncState(TOKEN_FP);
+        assert.deepStrictEqual(state.pending, []);
+        assert.strictEqual(state.mode, null);
       }).pipe(Effect.provide(CacheSyncLive.pipe(Layer.provideMerge(cacheLayer(config({ cache: { dbPath } }), second.api)))));
     }),
   );

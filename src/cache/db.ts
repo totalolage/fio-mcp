@@ -118,6 +118,17 @@ export const CACHE_MIGRATIONS: Migrations = {
       )
     `;
   }),
+  // Each pending range records whether it replaces. Ranges an interrupted refresh left keep
+  // replacing; every other pending range only upserts.
+  "0003_pending_range_replace": Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`
+      UPDATE sync_state SET pending_json = (
+        SELECT json_group_array(json_set(value, '$.replace', json(CASE WHEN sync_state.mode = 'refresh' THEN 'true' ELSE 'false' END)))
+        FROM (SELECT value FROM json_each(sync_state.pending_json) ORDER BY key)
+      )
+    `;
+  }),
 };
 
 const MIGRATIONS_TABLE = "fio_mcp_migrations";

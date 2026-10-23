@@ -14,12 +14,17 @@ import { cacheFailure } from "./db.js";
 
 export type SyncMode = "backfill" | "incremental" | "refresh";
 
+/** A range still to fetch. `replace` (a refresh) also deletes the movements FIO no longer lists. */
+export interface PendingRange extends DayRange {
+  readonly replace: boolean;
+}
+
 export interface SyncState {
   readonly accountKey: string | null;
   /** The interrupted job's mode while `pending` is non-empty. */
   readonly mode: SyncMode | null;
-  /** Ranges still to fetch, in fetch order. */
-  readonly pending: ReadonlyArray<DayRange>;
+  /** Ranges still to fetch, in fetch order, each in its own mode. */
+  readonly pending: ReadonlyArray<PendingRange>;
   /** Ranges FIO refused with HTTP 422 (history older than 90 days is locked). */
   readonly blocked: ReadonlyArray<DayRange>;
   /** Single days that still exceeded 50,000 movements. */
@@ -200,8 +205,12 @@ interface SyncStateRow {
 }
 
 const RangesJson = Schema.fromJsonString(Schema.Array(Schema.Struct({ from: Schema.String, to: Schema.String })));
+const PendingJson = Schema.fromJsonString(
+  Schema.Array(Schema.Struct({ from: Schema.String, to: Schema.String, replace: Schema.Boolean })),
+);
 const DaysJson = Schema.fromJsonString(Schema.Array(Schema.String));
 const decodeRanges = Schema.decodeUnknownEffect(RangesJson);
+const decodePending = Schema.decodeUnknownEffect(PendingJson);
 const decodeDays = Schema.decodeUnknownEffect(DaysJson);
 
 /** The bank account a statement belongs to, from its header. */
@@ -360,7 +369,7 @@ export const makeCacheStore = Effect.fn("CacheStore.make")(function* () {
       return {
         accountKey: row.account_key,
         mode: row.mode === "backfill" || row.mode === "incremental" || row.mode === "refresh" ? row.mode : null,
-        pending: yield* decodeRanges(row.pending_json),
+        pending: yield* decodePending(row.pending_json),
         blocked: yield* decodeRanges(row.blocked_json),
         failedDays: yield* decodeDays(row.failed_days_json),
         historyLimited: row.history_limited !== 0,

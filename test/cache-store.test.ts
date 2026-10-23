@@ -5,8 +5,9 @@ import { NodeFileSystem } from "@effect/platform-node";
 import { assert, describe, it } from "@effect/vitest";
 import { Effect, Layer, Redacted } from "effect";
 import { SqlClient } from "effect/sql";
-import { backupDatabase, databaseLayer, migrate } from "../src/cache/db.js";
+import { backupDatabase, CACHE_MIGRATIONS, databaseLayer, migrate } from "../src/cache/db.js";
 import { NOT_VERIFIED } from "../src/cache/service.js";
+import { makeCacheStore } from "../src/cache/store.js";
 import { InvalidInput } from "../src/errors.js";
 import {
   account,
@@ -44,10 +45,47 @@ describe("cache database", () => {
       assert.deepStrictEqual(yield* migrate(), []);
       const sql = yield* SqlClient.SqlClient;
       const [applied] = yield* sql<{ n: number }>`SELECT COUNT(*) AS n FROM fio_mcp_migrations`;
-      assert.strictEqual(applied?.n, 1);
+      assert.strictEqual(applied?.n, Object.keys(CACHE_MIGRATIONS).length);
       const [tempStore] = yield* sql<{ temp_store: number }>`PRAGMA temp_store`;
       assert.strictEqual(tempStore?.temp_store, 2);
     }).pipe(withDb(":memory:")),
+  );
+
+  it.effect("migrating marks pending ranges an interrupted refresh left as replacing and all others as upserting", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const october = { from: "2026-10-16", to: "2026-10-20" };
+      const earlier = { from: "2026-10-01", to: "2026-10-15" };
+      const states = [
+        ["refresh-fp", "refresh", [october, earlier]],
+        ["backfill-fp", "backfill", [october, earlier]],
+        ["incremental-fp", "incremental", [october]],
+        ["idle-fp", null, []],
+      ] as const;
+      for (const [fp, mode, pending] of states) {
+        yield* sql`INSERT INTO sync_state ${sql.insert({ token_fingerprint: fp, mode, pending_json: JSON.stringify(pending) })}`;
+      }
+      assert.strictEqual((yield* migrate()).length, Object.keys(CACHE_MIGRATIONS).length - 1);
+      const store = yield* makeCacheStore();
+      const pending = (fp: string) => Effect.map(store.syncState(fp), (state) => state.pending);
+      assert.deepStrictEqual(yield* pending("refresh-fp"), [
+        { ...october, replace: true },
+        { ...earlier, replace: true },
+      ]);
+      assert.deepStrictEqual(yield* pending("backfill-fp"), [
+        { ...october, replace: false },
+        { ...earlier, replace: false },
+      ]);
+      assert.deepStrictEqual(yield* pending("incremental-fp"), [{ ...october, replace: false }]);
+      assert.deepStrictEqual(yield* pending("idle-fp"), []);
+    }).pipe(
+      Effect.provide(
+        databaseLayer(
+          ":memory:",
+          Object.fromEntries(Object.entries(CACHE_MIGRATIONS).filter(([id]) => id === "0001_create_cache")),
+        ).pipe(Layer.provide(NodeFileSystem.layer)),
+      ),
+    ),
   );
 
   it.effect("creates the directory 0700 and the file 0600, in WAL mode, and reopens it", () =>
