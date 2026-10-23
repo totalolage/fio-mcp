@@ -1,8 +1,9 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { Clock, Effect, Redacted } from "effect";
+import { Clock, Effect, Option, Redacted } from "effect";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { tokenFingerprint } from "../src/accounts.js";
 import { hashSecret, randomSecret } from "../src/oauth/crypto.js";
 import { DEFAULT_THROTTLE } from "../src/oauth/login.js";
 import { LIMITS } from "../src/oauth/server.js";
@@ -27,6 +28,7 @@ import {
   tokenRequest,
   tokensFor,
 } from "./support/oauth.js";
+import { FIO_TOKEN } from "./support/transport.js";
 
 const MAX_SESSIONS_PER_SUBJECT = SESSION_LIMITS.maxPerSubject;
 
@@ -165,6 +167,14 @@ describe("OAuth end to end with the MCP SDK client", () => {
     expect(status.accounts.map((a: { name: string }) => a.name)).toEqual(["main", "savings"]);
     await client.close();
   });
+
+  it("binds the consented account names to their tokens' fingerprints", async () => {
+    const { access } = await tokensFor(harness, { accounts: ["main"] });
+    const grant = await harness.store((store) =>
+      Effect.flatMap(Clock.currentTimeMillis, (now) => store.accessGrant(hashSecret(access), now)),
+    );
+    expect(Option.getOrUndefined(grant)?.accountFingerprints).toEqual([tokenFingerprint(Redacted.make(FIO_TOKEN))]);
+  });
 });
 
 describe("metadata and the /mcp challenge", () => {
@@ -214,7 +224,7 @@ describe("metadata and the /mcp challenge", () => {
           grantId: "fio_grant_foreign",
           clientId,
           scopes: ["fio:read"],
-          accounts: ["main"],
+          accountFingerprints: ["main"],
           resource: "https://other.example.test/mcp",
         };
         yield* store.createGrant(

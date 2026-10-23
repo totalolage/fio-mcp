@@ -370,7 +370,7 @@ describe("admin commands", () => {
       const now = yield* Clock.currentTimeMillis;
       const setup = Effect.fnUntraced(function* (clientId: string) {
         yield* store.insertClient({ clientId, clientName: null, redirectUris: ["https://a.example/cb"], createdAt: now, lastUsedAt: null }, 10);
-        const grant = { grantId: `grant_${clientId}`, clientId, scopes: ["fio:read"], accounts: ["main"], resource: "https://fio.example.test/mcp" };
+        const grant = { grantId: `grant_${clientId}`, clientId, scopes: ["fio:read"], accountFingerprints: ["main"], resource: "https://fio.example.test/mcp" };
         yield* store.createGrant(grant, { codeHash: `c_${clientId}`, clientId, redirectUri: "https://a.example/cb", codeChallenge: "x", expiresAt: now + 60_000 }, now);
         yield* store.insertTokens(grant.grantId, pair(clientId, 0));
         return grant;
@@ -404,7 +404,7 @@ describe("admin commands", () => {
         yield* store.insertClient({ clientId, clientName: `App ${clientId}`, redirectUris: ["https://a.example/cb"], createdAt: now, lastUsedAt: null }, 10);
         const grantId = `grant_${clientId}`;
         yield* store.createGrant(
-          { grantId, clientId, scopes: ["fio:read"], accounts: ["main"], resource: "https://fio.example.test/mcp" },
+          { grantId, clientId, scopes: ["fio:read"], accountFingerprints: ["main"], resource: "https://fio.example.test/mcp" },
           { codeHash: `code_${clientId}`, clientId, redirectUri: "https://a.example/cb", codeChallenge: "x", expiresAt: now + 60_000 },
           now,
         );

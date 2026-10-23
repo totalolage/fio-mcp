@@ -1,4 +1,4 @@
-import { Effect, Option, Schema } from "effect";
+import { Clock, Effect, Option, Schema } from "effect";
 import { SqlClient } from "effect/sql";
 import type { Migrations } from "../cache/db.js";
 import { ServerError } from "./errors.js";
@@ -11,8 +11,9 @@ import { ServerError } from "./errors.js";
  */
 
 /**
- * Continues the one migration id sequence after the cache's 0001 (the
- * migrator skips ids at or below the latest applied one).
+ * Ids share one sequence with the cache's migrations (the migrator skips ids
+ * at or below the latest applied one): 0002 follows the cache's 0001, 0004
+ * its 0003.
  */
 export const OAUTH_MIGRATIONS: Migrations = {
   "0002_create_oauth": Effect.gen(function* () {
@@ -60,6 +61,15 @@ export const OAUTH_MIGRATIONS: Migrations = {
     `;
     yield* sql`CREATE INDEX oauth_tokens_by_grant ON oauth_tokens (grant_id)`;
   }),
+  // Grants named accounts by display name, so a rename could hand a grant to
+  // another token's account. They now hold token fingerprints; every older
+  // grant is revoked and its clients authorize again.
+  "0004_grant_account_fingerprints": Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const now = yield* Clock.currentTimeMillis;
+    yield* sql`UPDATE oauth_grants SET revoked_at = ${now} WHERE revoked_at IS NULL`;
+    yield* sql`ALTER TABLE oauth_grants RENAME COLUMN accounts_json TO account_fingerprints_json`;
+  }),
 };
 
 export interface Client {
@@ -79,7 +89,8 @@ export interface Grant {
   readonly grantId: string;
   readonly clientId: string;
   readonly scopes: ReadonlyArray<string>;
-  readonly accounts: ReadonlyArray<string>;
+  /** Token fingerprints (Account.tokenFingerprint) of the consented accounts, never names. */
+  readonly accountFingerprints: ReadonlyArray<string>;
   readonly resource: string;
 }
 
@@ -155,7 +166,7 @@ interface GrantRow {
   readonly grant_id: string;
   readonly client_id: string;
   readonly scopes: string;
-  readonly accounts_json: string;
+  readonly account_fingerprints_json: string;
   readonly resource: string;
 }
 
@@ -171,7 +182,7 @@ const toGrant = (row: GrantRow): Grant => ({
   grantId: row.grant_id,
   clientId: row.client_id,
   scopes: row.scopes.split(" ").filter((s) => s !== ""),
-  accounts: decodeList(row.accounts_json),
+  accountFingerprints: decodeList(row.account_fingerprints_json),
   resource: row.resource,
 });
 
@@ -253,7 +264,7 @@ export const makeOAuthStore = Effect.fn("OAuthStore.make")(function* (maxRotatio
               grant_id: grant.grantId,
               client_id: grant.clientId,
               scopes: grant.scopes.join(" "),
-              accounts_json: encodeList(grant.accounts),
+              account_fingerprints_json: encodeList(grant.accountFingerprints),
               resource: grant.resource,
               created_at: now,
               revoked_at: null,
@@ -289,7 +300,7 @@ export const makeOAuthStore = Effect.fn("OAuthStore.make")(function* (maxRotatio
           const [row] = yield* sql<
             GrantRow & { redirect_uri: string; code_challenge: string; expires_at: number; used_at: number | null; revoked_at: number | null }
           >`
-            SELECT g.grant_id, g.client_id, g.scopes, g.accounts_json, g.resource, g.revoked_at,
+            SELECT g.grant_id, g.client_id, g.scopes, g.account_fingerprints_json, g.resource, g.revoked_at,
                    c.redirect_uri, c.code_challenge, c.expires_at, c.used_at
             FROM oauth_codes c JOIN oauth_grants g ON g.grant_id = c.grant_id
             WHERE c.code_hash = ${codeHash}
@@ -340,7 +351,7 @@ export const makeOAuthStore = Effect.fn("OAuthStore.make")(function* (maxRotatio
       .withTransaction(
         Effect.gen(function* () {
           const [row] = yield* sql<GrantRow & { expires_at: number; rotated_at: number | null; revoked_at: number | null }>`
-            SELECT g.grant_id, g.client_id, g.scopes, g.accounts_json, g.resource, g.revoked_at, t.expires_at, t.rotated_at
+            SELECT g.grant_id, g.client_id, g.scopes, g.account_fingerprints_json, g.resource, g.revoked_at, t.expires_at, t.rotated_at
             FROM oauth_tokens t JOIN oauth_grants g ON g.grant_id = t.grant_id
             WHERE t.token_hash = ${refreshHash} AND t.kind = 'refresh'
           `;
@@ -382,7 +393,7 @@ export const makeOAuthStore = Effect.fn("OAuthStore.make")(function* (maxRotatio
   /** The grant behind a live, unexpired access token. */
   const accessGrant = (accessHash: string, now: number) =>
     sql<GrantRow>`
-      SELECT g.grant_id, g.client_id, g.scopes, g.accounts_json, g.resource
+      SELECT g.grant_id, g.client_id, g.scopes, g.account_fingerprints_json, g.resource
       FROM oauth_tokens t JOIN oauth_grants g ON g.grant_id = t.grant_id
       WHERE t.token_hash = ${accessHash} AND t.kind = 'access' AND t.expires_at > ${now} AND g.revoked_at IS NULL
     `.pipe(

@@ -16,14 +16,15 @@ import { Context, Layer } from "effect";
 export interface Principal {
   readonly subject: string;
   readonly scopes: "all" | ReadonlyArray<string>;
-  readonly accounts: "all" | ReadonlyArray<string>;
+  /** Token fingerprints (Account.tokenFingerprint) of the granted accounts. */
+  readonly accountFingerprints: "all" | ReadonlyArray<string>;
 }
 
 /** The stdio client (the user's own process) and the unauthenticated HTTP mode. */
-export const LOCAL_PRINCIPAL: Principal = { subject: "local", scopes: "all", accounts: "all" };
+export const LOCAL_PRINCIPAL: Principal = { subject: "local", scopes: "all", accountFingerprints: "all" };
 
 /** No identity: every scope and account check fails. */
-export const NO_PRINCIPAL: Principal = { subject: "none", scopes: [], accounts: [] };
+export const NO_PRINCIPAL: Principal = { subject: "none", scopes: [], accountFingerprints: [] };
 
 export const CurrentPrincipal = Context.Reference<Principal>("fio-mcp/transport/CurrentPrincipal", {
   defaultValue: () => NO_PRINCIPAL,

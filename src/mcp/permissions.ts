@@ -11,7 +11,11 @@ import { CurrentPrincipal, type Principal } from "../transport/principal.js";
  * fio:read     every tool, including sync, the download marker, and payment previews
  * fio:payments additionally needed by submit_payment_orders
  *
- * Tools that act on an account also need that account in the grant.
+ * Tools that act on an account also need that account in the grant. Grants
+ * name accounts by token fingerprint, never by display name: renaming an
+ * account keeps its grants, a new token under an old name gets none, and a
+ * rotated token drops the account from existing grants until the user
+ * consents again.
  */
 
 export const SCOPE_READ = "fio:read";
@@ -21,7 +25,7 @@ export const SCOPES = [SCOPE_READ, SCOPE_PAYMENTS] as const;
 export const READ: ReadonlyArray<string> = [SCOPE_READ];
 export const PAYMENTS: ReadonlyArray<string> = [SCOPE_READ, SCOPE_PAYMENTS];
 
-const allows = (granted: Principal["scopes"] | Principal["accounts"], item: string) =>
+const allows = (granted: Principal["scopes"] | Principal["accountFingerprints"], item: string) =>
   granted === "all" || granted.includes(item);
 
 /** Fails unless the caller holds every scope in `scopes`. */
@@ -38,7 +42,7 @@ export const requireScopes = Effect.fnUntraced(function* (scopes: ReadonlyArray<
 /** Fails unless the caller's grant covers `account`. */
 export const requireAccount = Effect.fnUntraced(function* (account: Account) {
   const principal = yield* CurrentPrincipal;
-  if (!allows(principal.accounts, account.name)) {
+  if (!allows(principal.accountFingerprints, account.tokenFingerprint)) {
     return yield* new PermissionDenied({
       detail: `This client's authorization does not cover the account "${account.name}". Reconnect the client to fio-mcp and select the account on the consent page.`,
     });
@@ -62,4 +66,4 @@ export const permittedAccount = Effect.fnUntraced(function* (
 
 /** The configured accounts the caller's grant covers. */
 export const visibleAccounts = (list: ReadonlyArray<Account>) =>
-  Effect.map(CurrentPrincipal, (principal) => list.filter((account) => allows(principal.accounts, account.name)));
+  Effect.map(CurrentPrincipal, (principal) => list.filter((account) => allows(principal.accountFingerprints, account.tokenFingerprint)));

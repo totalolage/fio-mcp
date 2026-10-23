@@ -303,6 +303,8 @@ Add `https://<host>/mcp` (for example `https://fio.home.arpa/mcp`) as a remote M
 - **Scopes.** `fio:read` covers every reading tool, the cache tools, sync, the download marker, and payment previews. `fio:payments` additionally allows `submit_payment_orders`.
 - **Accounts** the client may use.
 
+A grant covers the accounts behind the chosen FIO tokens, not their names. Renaming an account keeps its grants; giving an old name to another token does not pass the grant on. Replacing an account's token (FIO tokens expire within 180 days) removes that account from existing grants: its calls are refused until you reconnect the client and select it again. Accounts configured with the same token are the same FIO account, so a grant for one covers them all. Grants made before this rule (by name) were revoked on upgrade; reconnect those clients.
+
 Every tool stays listed. A call outside the grant answers "You don't have permissions to do that."; to widen a grant, remove and re-add the server in the client. `get_server_status` and `get_cache_status` show only granted accounts.
 
 ### How it works

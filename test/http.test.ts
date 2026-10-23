@@ -41,7 +41,7 @@ const WhoAmILive = McpServer.toolkit(WhoAmIToolkit).pipe(
       whoami: () =>
         Effect.gen(function* () {
           const principal = yield* CurrentPrincipal;
-          return { subject: principal.subject, accounts: principal.accounts };
+          return { subject: principal.subject, accounts: principal.accountFingerprints };
         }),
     }),
   ),
@@ -267,7 +267,7 @@ describe("HTTP transport", () => {
             const subject = /^Bearer (alice|bob)$/.exec(request.headers.authorization ?? "")?.[1];
             return subject === undefined
               ? Effect.fail(new Unauthorized({ challenge: 'Bearer resource_metadata="/.well-known/test"' }))
-              : Effect.succeed({ subject, scopes: ["fio:read"], accounts: [subject === "alice" ? "main" : "savings"] });
+              : Effect.succeed({ subject, scopes: ["fio:read"], accountFingerprints: [subject === "alice" ? "main" : "savings"] });
           },
         }),
         HttpRouter.add("GET", "/.well-known/test", HttpServerResponse.text("metadata")),

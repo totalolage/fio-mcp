@@ -249,7 +249,7 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
     return {
       subject: grant.value.grantId,
       scopes: grant.value.scopes,
-      accounts: grant.value.accounts,
+      accountFingerprints: grant.value.accountFingerprints,
     } satisfies Principal;
   });
 
@@ -566,7 +566,9 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
         expiredCookie,
       );
     }
-    const chosenAccounts = accountNames.filter((name) => form.getAll("account").includes(name));
+    // The form carries names for display; the grant binds the tokens behind them.
+    const chosen = form.getAll("account");
+    const chosenAccounts = accounts.list.filter((account) => chosen.includes(account.name));
     if (chosenAccounts.length === 0) return renderConsent(session, 400, "Select at least one account.");
     const scopes = form.getAll("scope").includes(SCOPE_PAYMENTS) ? [SCOPE_READ, SCOPE_PAYMENTS] : [SCOPE_READ];
     const client = yield* store.client(pending.clientId).pipe(Effect.orElseSucceed(() => Option.none<Client>()));
@@ -584,7 +586,7 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
       grantId: yield* randomId("fio_grant_"),
       clientId: pending.clientId,
       scopes,
-      accounts: chosenAccounts,
+      accountFingerprints: [...new Set(chosenAccounts.map((account) => account.tokenFingerprint))],
       resource: pending.resource,
     };
     yield* store

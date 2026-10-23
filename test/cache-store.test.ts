@@ -69,7 +69,10 @@ describe("cache database", () => {
         for (const [fp, mode, pending] of states) {
           yield* sql`INSERT INTO sync_state ${sql.insert({ token_fingerprint: fp, mode, pending_json: JSON.stringify(pending) })}`;
         }
-        assert.deepStrictEqual(yield* migrate(SERVER_MIGRATIONS), [[3, "pending_range_replace"]]);
+        assert.deepStrictEqual(yield* migrate(SERVER_MIGRATIONS), [
+          [3, "pending_range_replace"],
+          [4, "grant_account_fingerprints"],
+        ]);
         const store = yield* makeCacheStore();
         const pending = (fp: string) => Effect.map(store.syncState(fp), (state) => state.pending);
         assert.deepStrictEqual(yield* pending("refresh-fp"), [
