@@ -24,7 +24,8 @@
     "generate:check": "npm run generate && git diff --exit-code -- src/generated",
     "check": "npm run typecheck && npm run lint && npm test",
     "start": "node dist/main.js",
-    "publish:image": "sh scripts/publish-image.sh",
+    "ship:image": "sh scripts/ship-image.sh",
+    "test:scripts": "sh test/ship-image.test.sh",
     "prepare": "effect-tsgo patch --typescript --no-oxlint && npm run build"
   },
   "dependencies": {
