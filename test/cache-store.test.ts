@@ -5,7 +5,7 @@ import { NodeFileSystem } from "@effect/platform-node";
 import { assert, describe, it } from "@effect/vitest";
 import { Effect, Layer, Redacted } from "effect";
 import { SqlClient } from "effect/sql";
-import { backupDatabase, CACHE_MIGRATIONS, databaseLayer, migrate } from "../src/cache/db.js";
+import { backupDatabase, CACHE_MIGRATIONS, databaseLayer, migrate, SERVER_MIGRATIONS } from "../src/cache/db.js";
 import { NOT_VERIFIED } from "../src/cache/service.js";
 import { makeCacheStore } from "../src/cache/store.js";
 import { InvalidInput } from "../src/errors.js";
@@ -65,7 +65,7 @@ describe("cache database", () => {
       for (const [fp, mode, pending] of states) {
         yield* sql`INSERT INTO sync_state ${sql.insert({ token_fingerprint: fp, mode, pending_json: JSON.stringify(pending) })}`;
       }
-      assert.strictEqual((yield* migrate()).length, Object.keys(CACHE_MIGRATIONS).length - 1);
+      assert.deepStrictEqual(yield* migrate(SERVER_MIGRATIONS), [[3, "pending_range_replace"]]);
       const store = yield* makeCacheStore();
       const pending = (fp: string) => Effect.map(store.syncState(fp), (state) => state.pending);
       assert.deepStrictEqual(yield* pending("refresh-fp"), [
@@ -82,7 +82,8 @@ describe("cache database", () => {
       Effect.provide(
         databaseLayer(
           ":memory:",
-          Object.fromEntries(Object.entries(CACHE_MIGRATIONS).filter(([id]) => id === "0001_create_cache")),
+          // A database deployed before the migration: the cache and OAuth tables only.
+          Object.fromEntries(Object.entries(SERVER_MIGRATIONS).filter(([id]) => id < "0003")),
         ).pipe(Layer.provide(NodeFileSystem.layer)),
       ),
     ),

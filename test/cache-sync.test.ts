@@ -604,6 +604,39 @@ describe("cache sync", () => {
     }),
   );
 
+  it.effect("a refresh inside a pending backfill range replaces only the requested days", () =>
+    Effect.gen(function* () {
+      yield* setNow();
+      const span = { from: "2026-10-14", to: "2026-10-18" };
+      // FIO no longer lists movements 1, 3 and 4; only day 16 is asked to be refreshed.
+      const fio = yield* fakeFio(serveFrom([tx(2, "2026-10-16", 2)]));
+      yield* Effect.gen(function* () {
+        const cache = yield* enabledCache;
+        const acc = yield* account();
+        const cached = [tx(1, "2026-10-14", 1), tx(2, "2026-10-16", 2), tx(3, "2026-10-16", 3), tx(4, "2026-10-18", 4)];
+        yield* cache.writeThrough(acc, statement(span.from, span.to, cached), span);
+        const key = yield* cache.boundAccount(acc);
+        yield* cache.store.putSyncState(TOKEN_FP, {
+          ...(yield* cache.store.syncState(TOKEN_FP)),
+          mode: "backfill",
+          pending: [{ ...span, replace: false }],
+        });
+        const job = yield* runToEnd({ kind: "refresh", range: { from: "2026-10-16", to: "2026-10-16" } });
+        assert.strictEqual(job.status, "completed");
+        assert.deepStrictEqual(ranges(yield* Ref.get(fio.calls)), [
+          "2026-10-17..2026-10-18",
+          "2026-10-16..2026-10-16",
+          "2026-10-14..2026-10-15",
+        ]);
+        const rows = yield* cache.store.transactionsIn(key, span);
+        assert.deepStrictEqual(
+          rows.map((t) => t.id),
+          [1, 2, 4],
+        );
+      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+    }),
+  );
+
   it.effect("an interrupted refresh that also held a backfill range resumes each range in its own mode", () =>
     Effect.gen(function* () {
       yield* setNow();
