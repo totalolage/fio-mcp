@@ -85,7 +85,7 @@ FIO issues one token per account. To use several, set `FIO_ACCOUNTS` to a JSON a
 | `FIO_MCP_TRANSPORT` | `stdio` | `stdio` or `http`. |
 | `FIO_MCP_HOST` | `0.0.0.0` | HTTP bind address. |
 | `FIO_MCP_PORT` | `3000` | HTTP port. |
-| `FIO_MCP_PUBLIC_URL` | none; **required in HTTP mode** | The https origin clients use, without a path (e.g. `https://fio.nas.kalny.net`). It is the OAuth issuer, and tokens are valid only for `<origin>/mcp`. It is never derived from `Host` or `X-Forwarded-*`. |
+| `FIO_MCP_PUBLIC_URL` | none; **required in HTTP mode** | The https origin clients use, without a path (e.g. `https://fio.home.arpa`). It is the OAuth issuer, and tokens are valid only for `<origin>/mcp`. It is never derived from `Host` or `X-Forwarded-*`. |
 | `FIO_MCP_ADMIN_PASSWORD_HASH_FILE` | none; **required in HTTP mode** | File containing the admin password's scrypt hash, from `fio-mcp hash-password`. |
 | `FIO_MCP_ALLOW_UNAUTHENTICATED` | `false` | `true` runs HTTP mode without OAuth: every caller gets full access, and a security warning is logged at startup. Only for a trusted test setup. |
 | `FIO_MCP_ALLOWED_HOSTS` | any | Comma-separated `Host` values accepted (DNS-rebinding defence); an entry without a port matches any port. Include the public host. |
@@ -298,7 +298,7 @@ HTTP mode is protected by OAuth, with fio-mcp as its own authorization server (M
 
 ### Connecting a client
 
-Add `https://<host>/mcp` (for example `https://fio.nas.kalny.net/mcp`) as a remote MCP server in your client. The client opens the sign-in page; enter the admin password, then choose on the consent page, which shows the client's name and redirect URI:
+Add `https://<host>/mcp` (for example `https://fio.home.arpa/mcp`) as a remote MCP server in your client. The client opens the sign-in page; enter the admin password, then choose on the consent page, which shows the client's name and redirect URI:
 
 - **Scopes.** `fio:read` covers every reading tool, the cache tools, sync, the download marker, and payment previews. `fio:payments` additionally allows `submit_payment_orders`.
 - **Accounts** the client may use.
@@ -339,7 +339,7 @@ Forward the whole host, or at least `/mcp`, `/.well-known/oauth-protected-resour
 
 Set `FIO_MCP_TRUSTED_PROXIES` to the proxy's address as fio-mcp sees it:
 
-- **Traefik connects through a published port** (Docker NAT): on the TrueNAS setup above, connections arrive from the gateway of fio-mcp's Docker network, not from Traefik's container (`docker network inspect <network> --format '{{(index .IPAM.Config 0).Gateway}}'`). `172.16.0.0/12` covers the 172.17.0.0/16 to 172.31.0.0/16 networks that Docker hands out first from its default address pools, so it keeps working when the network is recreated with another subnet (later networks come from 192.168.0.0/16). Whether the source address is rewritten depends on Docker's proxy and masquerading settings, so check the gateway and your setup. Trade-off: any container on those networks can choose its own throttling key.
+- **Traefik connects through a published port** (Docker NAT): on the TrueNAS setup above, connections arrive from the gateway of fio-mcp's Docker network, not from Traefik's container (`docker network inspect <network> --format '{{(index .IPAM.Config 0).Gateway}}'`). `172.16.0.0/12` covers the 172.17.0.0/16 to 172.31.0.0/16 networks that Docker hands out first from its default address pools, so it keeps working when the network is recreated with another subnet (later networks come from its 192.168 pool). Whether the source address is rewritten depends on Docker's proxy and masquerading settings, so check the gateway and your setup. Trade-off: any container on those networks can choose its own throttling key.
 - **Traefik shares a Docker network with fio-mcp** and connects to the container directly: use Traefik's container address on that network (`docker inspect <traefik> --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}'`). Give it a static address, or trust the network's subnet (`docker network inspect <network> --format '{{(index .IPAM.Config 0).Subnet}}'`); then any container on that network can choose its own throttling key, so prefer a network shared only by Traefik and fio-mcp.
 
 Traefik appends the client's address to `X-Forwarded-For`; addresses a client adds itself sit further left and are ignored.
@@ -358,7 +358,8 @@ Pass secrets as files. TrueNAS mounts them under `/run/secrets` (root:10000, mod
 ```yaml
 services:
   fio-mcp:
-    image: ghcr.io/<owner>/fio-mcp@sha256:<digest>   # printed by npm run publish:image
+    image: fio-mcp:<version>-<sha>                     # the tag= line printed by npm run ship:image
+    pull_policy: never                                 # loaded over ssh, never pulled from a registry
     user: "568:568"
     group_add: ["10000"]
     read_only: true
@@ -369,13 +370,13 @@ services:
       - "3000:3000"                                    # Traefik connects through this published port
     environment:
       FIO_TOKEN_FILE: /run/secrets/fio_token          # or FIO_ACCOUNTS_FILE
-      FIO_MCP_PUBLIC_URL: https://fio.nas.kalny.net
+      FIO_MCP_PUBLIC_URL: https://fio.home.arpa
       FIO_MCP_ADMIN_PASSWORD_HASH_FILE: /run/secrets/fio_mcp_admin_hash
-      FIO_MCP_ALLOWED_HOSTS: fio.nas.kalny.net
+      FIO_MCP_ALLOWED_HOSTS: fio.home.arpa
       FIO_MCP_TRUSTED_PROXIES: 172.16.0.0/12             # Docker bridge gateways (Traefik via the published port)
       FIO_SYNC_INTERVAL_MINUTES: "60"
     volumes:
-      - /mnt/local-hdd/Applications/fio-mcp:/data     # writable by the container user
+      - /mnt/<pool>/fio-mcp:/data                       # writable by the container user
       - /path/to/secrets:/run/secrets:ro
 ```
 
@@ -385,7 +386,7 @@ The container has no Traefik labels: Traefik's Docker provider would route to th
 http:
   routers:
     fio-mcp:
-      rule: Host(`fio.nas.kalny.net`)
+      rule: Host(`fio.home.arpa`)
       tls: {}
       service: fio-mcp
   services:
@@ -399,31 +400,56 @@ To connect over a shared Docker network instead, drop `ports`, put Traefik's Doc
 
 To fill in history older than 90 days after an Internetbanking unlock, restart the container within the 10-minute window; the startup sync retries the refused history first. See [Backfill](#backfill-and-history-older-than-90-days).
 
-### Publishing the image
+### Shipping the image to your server
 
-Images are built locally and pushed by hand; there is no CI.
+Images never go through a registry. [scripts/ship-image.sh](scripts/ship-image.sh) builds the image on your machine and streams it to the docker host over ssh (`docker save | gzip | ssh <host> "gunzip | sudo -n docker load"`). There is no CI.
 
-1. Create a GitHub personal access token (classic) with the `write:packages` scope and log in:
+Prerequisites:
 
-   ```sh
-   echo <token> | docker login ghcr.io -u <github-user> --password-stdin
-   ```
+- A key-based ssh host alias for the server in `~/.ssh/config`. ssh runs with `BatchMode=yes`, so it never prompts: the key must load from the config or your ssh agent, and the host key must already be in `known_hosts`.
 
-2. From a clean checkout (no uncommitted or untracked files):
+  ```
+  Host nas
+    HostName <server-address>
+    User <user>
+    IdentityFile ~/.ssh/<key>
+  ```
 
-   ```sh
-   npm run publish:image -- ghcr.io/<owner>/fio-mcp     # or FIO_MCP_IMAGE=ghcr.io/<owner>/fio-mcp npm run publish:image
-   ```
+- On the server, that user can run docker without a password prompt, e.g. through passwordless sudo (`sudo -n docker version` works over `ssh nas`).
+- `gzip` locally and `gunzip` on the server, or pass `--no-compress`.
 
-   [scripts/publish-image.sh](scripts/publish-image.sh) builds linux/amd64, pushes `:<package version>` and `:<short git sha>`, and prints `ghcr.io/<owner>/fio-mcp@sha256:…`. Pin that digest in Compose. It refuses to run on a dirty tree.
+From a clean checkout (no uncommitted or untracked files):
 
-   It builds with `docker buildx` when that is installed and falls back to `docker build --platform linux/amd64` otherwise. Set `DOCKER` to change the docker command, for example `DOCKER="sudo -n docker"` where docker needs sudo (log in with the same command). Add `--dry-run` (or set `DRY_RUN=1`) to build and tag the image locally without pushing:
+```sh
+npm run ship:image
+```
 
-   ```sh
-   DOCKER="sudo -n docker" npm run publish:image -- --dry-run ghcr.io/<owner>/fio-mcp
-   ```
+It builds linux/amd64, tags `fio-mcp:<package version>-<short git sha>` and `fio-mcp:<package version>` (no registry prefix), checks that ssh and the remote docker work, ships the image, and checks that the server reports the same image ID as the local build. It refuses to run on a dirty tree. Progress goes to stderr; stdout gets two lines:
 
-3. If the package is private, give TrueNAS a read-only pull credential: in Apps → Configuration → Docker Registries (or the app's image pull secret), add `ghcr.io` with your GitHub user and a token that has only the `read:packages` scope.
+```
+tag=fio-mcp:0.2.0-1a2b3c4
+image_id=sha256:<64 hex digits>
+```
+
+Put the `tag=` value in the Compose `image:` (with `pull_policy: never`, so the server never looks for it in a registry), and compare `image_id=` with `docker image inspect --format '{{.Id}}' <tag>` on the server if you want to pin it.
+
+Settings:
+
+| Variable / flag | Default | Effect |
+| --- | --- | --- |
+| `FIO_MCP_SSH_HOST` | `nas` | ssh destination, usually the host alias above |
+| `FIO_MCP_REMOTE_DOCKER` | `sudo -n docker` | docker command on the server |
+| `DOCKER` | `docker` | local docker command, e.g. `DOCKER="sudo -n docker"` where docker needs sudo |
+| `--no-compress` | off | stream the image uncompressed (no gzip or gunzip needed) |
+| `--dry-run` or `DRY_RUN=1` | off | build and tag locally and print the two lines, without contacting the server |
+
+It builds with `docker buildx` when that is installed and falls back to `docker build --platform linux/amd64` otherwise. To try the build without touching the server:
+
+```sh
+DOCKER="sudo -n docker" npm run ship:image -- --dry-run
+```
+
+`npm run test:scripts` tests the script against stand-in `docker` and `ssh` commands.
 
 ## Development
 
@@ -484,7 +510,7 @@ src/
   mcp/                  tool definitions and handlers (FIO tools, cache tools)
   transport/            stdio and HTTP transports, auth seam, frame redaction
 openapi/fio-api.yaml    FIO REST API spec
-scripts/                client generator, image publish script
+scripts/                client generator, image ship script
 lint/                   Biome Grit rules
 test/                   vitest + @effect/vitest suites
 ```
