@@ -16,7 +16,7 @@ import {
   verifyPassword,
 } from "../src/oauth/crypto.js";
 import { DEFAULT_THROTTLE, delayAfter, makeLoginGuard } from "../src/oauth/login.js";
-import { escapeHtml } from "../src/oauth/pages.js";
+import { consentPage, escapeHtml } from "../src/oauth/pages.js";
 import { makeWindowLimiter } from "../src/oauth/rate-limit.js";
 import { makeOAuthServer } from "../src/oauth/server.js";
 import { MAX_SESSIONS, makeSessions, type PendingAuthorization } from "../src/oauth/sessions.js";
@@ -70,6 +70,20 @@ describe("URL rules", () => {
 
   it("escapes HTML", () => {
     assert.strictEqual(escapeHtml(`<a href="x" onclick='y'>&</a>`), "&lt;a href=&quot;x&quot; onclick=&#39;y&#39;&gt;&amp;&lt;/a&gt;");
+  });
+
+  it("escapes account names in consent checkbox labels and values", () => {
+    const html = consentPage({
+      clientId: "fio_client_test",
+      clientName: null,
+      redirectUri: "http://127.0.0.1:45678/callback",
+      csrf: "csrf",
+      paymentsRequested: false,
+      accounts: ["<b>&"],
+      error: undefined,
+    });
+    assert.include(html, 'value="&lt;b&gt;&amp;" checked> &lt;b&gt;&amp;</label>');
+    assert.notInclude(html, 'value="<b>&"');
   });
 });
 

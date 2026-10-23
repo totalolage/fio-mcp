@@ -95,6 +95,15 @@ describe("tool set", () => {
     }
   });
 
+  it("keeps printable account names with spaces in the in-memory tool schema enum", async () => {
+    const { tools } = await connect([readAccount("Business Credit"), payAccount("Účet Běžný")]);
+    for (const tool of await tools()) {
+      if (tool.name === "get_server_status") continue;
+      if (tool.name === "get_cache_status") continue;
+      expect(tool.inputSchema.properties?.account, tool.name).toMatchObject({ enum: ["Business Credit", "Účet Běžný"] });
+    }
+  });
+
   it("rejects an account argument on a single-account server", async () => {
     const { call, fetched } = await connect([readAccount()]);
     const result = await call("get_last_statement", { account: "other" });

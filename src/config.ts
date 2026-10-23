@@ -102,7 +102,7 @@ export const DEFAULT_OVERLAP_DAYS = 10;
 export const DEFAULT_CACHE_MAX_AGE_MINUTES = 60;
 export const MIN_SYNC_INTERVAL_MINUTES = 5;
 
-const ACCOUNT_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/;
+const ACCOUNT_NAME_CONTROL = /\p{Cc}/u;
 // URL-safe characters only: tokens go into URL paths, and protocol-level
 // redaction can then never cut through JSON or SSE framing.
 const TOKEN = new RegExp(`^[A-Za-z0-9._~-]{${MIN_TOKEN_LENGTH},}$`);
@@ -111,7 +111,7 @@ const CURRENCY = /^[A-Z]{3}$/;
 const DATE = /^(?!0000)\d{4}-\d{2}-\d{2}$/;
 
 const FIELD_RULES = {
-  name: "must be 1-32 characters of letters, digits, _ or -, starting with a letter or digit",
+  name: "must be 1-64 Unicode code points after trimming, with no control characters",
   token: `must be at least ${MIN_TOKEN_LENGTH} characters of letters, digits, '.', '_', '~' or '-' (FIO tokens are 64 characters)`,
   accountNumber: "must be the FIO account number without bank code (1-10 digits)",
   currency: "must be an ISO 4217 code such as CZK",
@@ -204,6 +204,12 @@ const isCalendarDate = (value: string): boolean => {
 
 const RawAccount = Schema.Record(Schema.String, Schema.Unknown);
 
+const validAccountName = (value: string): boolean => {
+  if (ACCOUNT_NAME_CONTROL.test(value)) return false;
+  const length = Array.from(value.trim()).length;
+  return length >= 1 && length <= 64;
+};
+
 /** Validates one account object, describing failures by field name and rule only. */
 const parseAccount = Effect.fn("config.parseAccount")(function* (raw: unknown, index: number | undefined) {
   const where = index === undefined ? undefined : `FIO_ACCOUNTS[${index}]`;
@@ -222,7 +228,9 @@ const parseAccount = Effect.fn("config.parseAccount")(function* (raw: unknown, i
     problems.push(`${label(field)} ${FIELD_RULES[field]}`);
     return undefined;
   };
-  const name = text("name", ACCOUNT_NAME, true);
+  const rawName = raw.name;
+  const name = Predicate.isString(rawName) && validAccountName(rawName) ? rawName.trim() : undefined;
+  if (name === undefined) problems.push(`${label("name")} ${FIELD_RULES.name}`);
   const token = text("token", TOKEN, true);
   const accountNumber = text("accountNumber", ACCOUNT_NUMBER, false);
   const currency = text("currency", CURRENCY, false);
@@ -250,11 +258,14 @@ const loadAccounts = Effect.fn("config.loadAccounts")(function* () {
     const accounts = yield* Effect.forEach(parsed, (raw: unknown, index) => parseAccount(raw, index));
     const firstIndex = new Map<string, number>();
     for (const [index, account] of accounts.entries()) {
-      const earlier = firstIndex.get(account.name);
+      const key = account.name.toLowerCase();
+      const earlier = firstIndex.get(key);
       if (earlier !== undefined) {
-        return yield* fail(`FIO_ACCOUNTS[${index}].name repeats the name of FIO_ACCOUNTS[${earlier}]; names must be unique`);
+        return yield* fail(
+          `FIO_ACCOUNTS[${index}].name repeats the name of FIO_ACCOUNTS[${earlier}]; names must be unique ignoring case after trimming`,
+        );
       }
-      firstIndex.set(account.name, index);
+      firstIndex.set(key, index);
     }
     return accounts;
   }
@@ -263,12 +274,16 @@ const loadAccounts = Effect.fn("config.loadAccounts")(function* () {
       "No FIO token configured: set FIO_TOKEN (or FIO_TOKEN_FILE), or FIO_ACCOUNTS (or FIO_ACCOUNTS_FILE) for several accounts",
     );
   }
-  const name = yield* optionalVar("FIO_ACCOUNT_NAME");
+  // Keep an explicitly empty value so it fails the account-name rule instead
+  // of silently falling back to the default name.
+  const configuredName = yield* Config.option(Config.String("FIO_ACCOUNT_NAME")).pipe(
+    Effect.mapError(() => new ConfigError({ detail: "Could not read FIO_ACCOUNT_NAME" })),
+  );
   const accountNumber = yield* optionalVar("FIO_ACCOUNT_NUMBER");
   const currency = yield* optionalVar("FIO_ACCOUNT_CURRENCY");
   const account = yield* parseAccount(
     {
-      name: Option.getOrElse(name, () => DEFAULT_ACCOUNT_NAME),
+      name: Option.getOrElse(configuredName, () => DEFAULT_ACCOUNT_NAME),
       token: Redacted.value(single.value),
       ...(Option.isSome(accountNumber) ? { accountNumber: accountNumber.value } : {}),
       ...(Option.isSome(currency) ? { currency: currency.value.toUpperCase() } : {}),

@@ -56,6 +56,60 @@ describe("loadConfig", () => {
     }),
   );
 
+  it.effect("trims account names and accepts printable Unicode", () =>
+    Effect.gen(function* () {
+      const config = yield* loadConfigFrom({
+        FIO_ACCOUNTS: JSON.stringify([
+          { name: "  Business Credit  ", token: READ_TOKEN },
+          { name: " Účet Běžný ", token: PAY_TOKEN },
+        ]),
+      });
+      assert.deepStrictEqual(config.accounts.map((account) => account.name), ["Business Credit", "Účet Běžný"]);
+
+      const codePoints = "😀".repeat(64);
+      const bounded = yield* loadConfigFrom({ FIO_ACCOUNTS: JSON.stringify([{ name: codePoints, token: READ_TOKEN }]) });
+      assert.strictEqual(bounded.accounts[0]?.name, codePoints);
+
+      const single = yield* loadConfigFrom({ FIO_TOKEN: PAY_TOKEN, FIO_ACCOUNT_NAME: "  Business Credit  " });
+      assert.strictEqual(single.accounts[0]?.name, "Business Credit");
+    }),
+  );
+
+  it.effect("rejects invalid account names without echoing their values", () =>
+    Effect.gen(function* () {
+      const invalidNames = ["", "   ", "😀".repeat(65), "Account\nName", "Account\tName"];
+      for (const name of invalidNames) {
+        const message = yield* configError({ FIO_ACCOUNTS: JSON.stringify([{ name, token: READ_TOKEN }]) });
+        assert.match(message, /^Invalid account configuration: FIO_ACCOUNTS\[0\]\.name must be 1-64 Unicode code points after trimming, with no control characters$/);
+        if (name !== "") assert.notInclude(message, name);
+      }
+
+      const single = yield* configError({ FIO_TOKEN: PAY_TOKEN, FIO_ACCOUNT_NAME: "   " });
+      assert.strictEqual(
+        single,
+        "Invalid account configuration: FIO_ACCOUNT_NAME must be 1-64 Unicode code points after trimming, with no control characters",
+      );
+      const singleControl = yield* configError({ FIO_TOKEN: PAY_TOKEN, FIO_ACCOUNT_NAME: "Account\tName" });
+      assert.notInclude(singleControl, "Account\tName");
+      const singleTooLong = yield* configError({ FIO_TOKEN: PAY_TOKEN, FIO_ACCOUNT_NAME: "😀".repeat(65) });
+      assert.notInclude(singleTooLong, "😀".repeat(65));
+    }),
+  );
+
+  it.effect("rejects account names that differ only by case after trimming", () =>
+    Effect.gen(function* () {
+      const names = ["Business", " business "];
+      const message = yield* configError({
+        FIO_ACCOUNTS: JSON.stringify(names.map((name, index) => ({ name, token: index === 0 ? READ_TOKEN : PAY_TOKEN }))),
+      });
+      assert.strictEqual(
+        message,
+        "FIO_ACCOUNTS[1].name repeats the name of FIO_ACCOUNTS[0]; names must be unique ignoring case after trimming",
+      );
+      assert.notInclude(message, "Business");
+    }),
+  );
+
   it.effect("reads several accounts from FIO_ACCOUNTS", () =>
     Effect.gen(function* () {
       const config = yield* loadConfigFrom({
@@ -164,7 +218,7 @@ describe("loadConfig", () => {
         { FIO_ACCOUNTS: `[{"name":"a","token":"${READ_TOKEN}"` },
         { FIO_ACCOUNTS: JSON.stringify([{ name: "a", token: READ_TOKEN, unknownKey: true }]) },
         { FIO_ACCOUNTS: JSON.stringify([{ name: "a", token: READ_TOKEN }, { name: "a", token: PAY_TOKEN }]) },
-        { FIO_ACCOUNTS: JSON.stringify([{ name: "bad name", token: READ_TOKEN }]) },
+        { FIO_ACCOUNTS: JSON.stringify([{ name: "bad\nname", token: READ_TOKEN }]) },
         { FIO_TOKEN: READ_TOKEN, FIO_RATE_LIMIT_INTERVAL_MS: "soon" },
         { FIO_TOKEN: READ_TOKEN, FIO_MCP_TRANSPORT: "carrier-pigeon" },
         { FIO_TOKEN: READ_TOKEN, FIO_MCP_TRANSPORT: "http", FIO_MCP_PORT: "70000" },
@@ -186,12 +240,12 @@ describe("loadConfig", () => {
         { FIO_TOKEN: PAY_TOKEN, FIO_MAX_WAIT_MS: READ_TOKEN },
         { FIO_TOKEN: PAY_TOKEN, FIO_REQUEST_TIMEOUT_MS: READ_TOKEN },
         { FIO_TOKEN: PAY_TOKEN, FIO_RATE_LIMIT_INTERVAL_MS: READ_TOKEN },
-        { FIO_TOKEN: PAY_TOKEN, FIO_ACCOUNT_NAME: READ_TOKEN },
+        { FIO_TOKEN: PAY_TOKEN, FIO_ACCOUNT_NAME: `${READ_TOKEN}\n` },
         { FIO_TOKEN: PAY_TOKEN, FIO_ACCOUNT_NUMBER: READ_TOKEN },
         { FIO_TOKEN: PAY_TOKEN, FIO_ACCOUNT_CURRENCY: READ_TOKEN },
         { FIO_TOKEN: PAY_TOKEN, FIO_MCP_TRANSPORT: READ_TOKEN },
         { FIO_TOKEN: PAY_TOKEN, FIO_BACKFILL_FROM: READ_TOKEN },
-        { FIO_ACCOUNTS: JSON.stringify([{ name: READ_TOKEN, token: PAY_TOKEN }]) },
+        { FIO_ACCOUNTS: JSON.stringify([{ name: `${READ_TOKEN}\n`, token: PAY_TOKEN }]) },
         { FIO_ACCOUNTS: JSON.stringify([{ name: "a", token: PAY_TOKEN, [READ_TOKEN]: true }]) },
         { FIO_ACCOUNTS: JSON.stringify([{ name: "a", token: PAY_TOKEN, currency: READ_TOKEN }]) },
         { FIO_ACCOUNTS: JSON.stringify([READ_TOKEN]) },

@@ -40,7 +40,7 @@ Everything is set through environment variables. The FIO secrets (`FIO_TOKEN`, `
 | Variable | Required | Meaning |
 |---|---|---|
 | `FIO_TOKEN` | yes | The API token (FIO issues 64 characters; at least 32 letters, digits, `.`, `_`, `~` or `-` are required). |
-| `FIO_ACCOUNT_NAME` | no | Name shown to the model. Default `default`. |
+| `FIO_ACCOUNT_NAME` | no | Name shown to the model. Trimmed; 1–64 Unicode code points with no control characters. Default `default`. |
 | `FIO_ACCOUNT_NUMBER` | no | Your FIO account number without bank code (e.g. `2400222222`). Used as the payer for payment orders. If unset, the server reads it from the first statement it downloads. |
 | `FIO_ACCOUNT_CURRENCY` | no | Account currency (e.g. `CZK`). Default currency for payment orders. Also learned from statements. |
 
@@ -55,7 +55,7 @@ FIO issues one token per account. To use several, set `FIO_ACCOUNTS` to a JSON a
 ]
 ```
 
-`name` must be 1–32 letters, digits, `_` or `-`, and unique. Setting both `FIO_TOKEN` and `FIO_ACCOUNTS` is an error.
+Names are trimmed and must be 1–64 Unicode code points with no control characters. Other printable Unicode, including spaces and diacritics, is allowed. Names must be unique ignoring case after trimming. Setting both `FIO_TOKEN` and `FIO_ACCOUNTS` is an error.
 
 ### Tuning
 
