@@ -402,7 +402,7 @@ To fill in history older than 90 days after an Internetbanking unlock, restart t
 
 ### Shipping the image to your server
 
-Images never go through a registry. [scripts/ship-image.sh](scripts/ship-image.sh) builds the image on your machine and streams it to the docker host over ssh (`docker save | gzip | ssh <host> "gunzip | sudo -n docker load"`). There is no CI.
+Images never go through a registry. [scripts/ship-image.sh](scripts/ship-image.sh) builds the image on your machine and streams it to the docker host over ssh (`docker save | gzip | ssh <host> "sudo -n docker load"`). Docker load reads gzip-compressed tar input directly. There is no CI.
 
 Prerequisites:
 
@@ -416,7 +416,7 @@ Prerequisites:
   ```
 
 - On the server, that user can run docker without a password prompt, e.g. through passwordless sudo (`sudo -n docker version` works over `ssh nas`).
-- `gzip` locally and `gunzip` on the server, or pass `--no-compress`.
+- `gzip` locally, or pass `--no-compress`.
 
 From a clean checkout (no uncommitted or untracked files):
 
@@ -442,7 +442,7 @@ Settings:
 | `FIO_MCP_SSH_HOST` | `nas` | ssh destination, usually the host alias above |
 | `FIO_MCP_REMOTE_DOCKER` | `sudo -n docker` | docker command on the server |
 | `DOCKER` | `docker` | local docker command, e.g. `DOCKER="sudo -n docker"` where docker needs sudo |
-| `--no-compress` | off | stream the image uncompressed (no gzip or gunzip needed) |
+| `--no-compress` | off | stream the image uncompressed (no local gzip needed) |
 | `--dry-run` or `DRY_RUN=1` | off | build and tag locally and print the two lines, without contacting the server |
 
 It builds with `docker buildx` when that is installed and falls back to `docker build --platform linux/amd64` otherwise. To try the build without touching the server:

@@ -15,7 +15,7 @@
 # DOCKER                 local docker command, e.g. DOCKER="sudo -n docker".
 # --dry-run (or DRY_RUN=1) builds and tags the image locally and prints what
 # would be shipped, without contacting the host.
-# --no-compress streams the image uncompressed (no gzip/gunzip needed).
+# --no-compress streams the image uncompressed (no local gzip needed).
 #
 # stdout gets only two lines, tag=<tag> and image_id=<id>; everything else
 # goes to stderr.
@@ -84,7 +84,22 @@ esac
 tag=fio-mcp:$version-$sha
 
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+cleanup() {
+  if [ -n "${tmp:-}" ]; then
+    rm -rf "$tmp" || :
+    tmp=
+  fi
+}
+handle_signal() {
+  signal_status=$1
+  cleanup
+  trap - EXIT
+  exit "$signal_status"
+}
+trap cleanup EXIT
+trap 'handle_signal 129' HUP
+trap 'handle_signal 130' INT
+trap 'handle_signal 143' TERM
 
 # Build output goes to stderr: stdout is reserved for the result lines.
 if docker buildx version >/dev/null 2>&1; then
@@ -116,15 +131,9 @@ if [ -n "$dry_run" ]; then
   exit 0
 fi
 
-# Fail before streaming the image if ssh, the remote docker or gunzip is
-# unusable.
-check='docker'
-if [ -n "$compress" ]; then
-  check="gunzip and docker"
-  preflight="command -v gunzip >/dev/null && $remote_docker version --format '{{.Server.Version}}'"
-else
-  preflight="$remote_docker version --format '{{.Server.Version}}'"
-fi
+# Fail before streaming the image if ssh or the remote docker is unusable.
+check=docker
+preflight="$remote_docker version --format '{{.Server.Version}}'"
 if ! remote "$preflight" >&2; then
   echo "error: cannot run $check on $host as '$remote_docker' over ssh; check the ssh host alias, the key, and passwordless sudo for docker" >&2
   exit 1
@@ -140,7 +149,7 @@ echo "shipping $tag to $host" >&2
 if [ -n "$compress" ]; then
   stage "docker save" docker save "$tag" |
     stage gzip gzip -c |
-    stage ssh remote "gunzip | $remote_docker load" >&2
+    stage ssh remote "$remote_docker load" >&2
 else
   stage "docker save" docker save "$tag" |
     stage ssh remote "$remote_docker load" >&2
