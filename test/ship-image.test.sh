@@ -3,6 +3,8 @@
 # PATH. Nothing is built and ssh is never run.
 #
 # Usage: npm run test:scripts
+#    or: SHIP_SH="bash --posix" sh test/ship-image.test.sh (the shell that
+#        runs the script; default sh)
 set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -23,11 +25,18 @@ case $1 in
     [ "$2" = version ] && exit 0
     echo "buildx build output"
     ;;
-  build) echo "build output" ;;
+  build)
+    [ -z "${SHIM_BUILD_FAIL:-}" ] || exit 5
+    echo "build output"
+    ;;
   image) echo "$SHIM_LOCAL_ID" ;;
   save)
     [ -z "${SHIM_SAVE_FAIL:-}" ] || exit 3
-    echo "image bytes"
+    if [ -n "${SHIM_SAVE_BIG:-}" ]; then
+      yes "image bytes" | head -c 20000000
+    else
+      echo "image bytes"
+    fi
     ;;
   *) exit 64 ;;
 esac
@@ -40,13 +49,21 @@ cat >"$work/bin/ssh" <<'EOF'
 } >>"$SHIM_LOG/ssh.log"
 eval "cmd=\${$#}"
 case $cmd in
-  *' version '*) [ -z "${SHIM_PREFLIGHT_FAIL:-}" ] || exit 255 ;;
+  *' version '*)
+    [ -z "${SHIM_PREFLIGHT_FAIL:-}" ] || exit 255
+    echo "29.0.0"
+    ;;
   *' load')
+    # Exits successfully without reading, so only the writers see EPIPE.
+    [ -z "${SHIM_LOAD_EARLY:-}" ] || exit 0
     cat >"$SHIM_LOG/payload"
     [ -z "${SHIM_LOAD_FAIL:-}" ] || exit 255
     echo "Loaded image: from load"
     ;;
-  *' image inspect '*) echo "${SHIM_REMOTE_ID:-$SHIM_LOCAL_ID}" ;;
+  *' image inspect '*)
+    [ -z "${SHIM_INSPECT_FAIL:-}" ] || exit 1
+    echo "${SHIM_REMOTE_ID:-$SHIM_LOCAL_ID}"
+    ;;
   *) exit 64 ;;
 esac
 EOF
@@ -55,7 +72,14 @@ cat >"$work/bin/gzip" <<EOF
 [ -z "\${SHIM_GZIP_FAIL:-}" ] || exit 4
 exec $real_gzip "\$@"
 EOF
-chmod +x "$work/bin/docker" "$work/bin/ssh" "$work/bin/gzip"
+# Stands in for sudo in DOCKER="sudo -n docker".
+cat >"$work/bin/sudo" <<'EOF'
+#!/bin/sh
+echo "$*" >>"$SHIM_LOG/sudo.log"
+[ "$1" = -n ] && shift
+exec "$@"
+EOF
+chmod +x "$work/bin/docker" "$work/bin/ssh" "$work/bin/gzip" "$work/bin/sudo"
 
 # A throwaway clean repository holding the script and a package.json.
 repo=$work/repo
@@ -71,9 +95,10 @@ tag=fio-mcp:1.2.3-$sha
 failures=0
 case_name=
 
-knobs='DRY_RUN DOCKER FIO_MCP_SSH_HOST FIO_MCP_REMOTE_DOCKER SHIM_BUILDX SHIM_SAVE_FAIL SHIM_GZIP_FAIL SHIM_LOAD_FAIL SHIM_PREFLIGHT_FAIL SHIM_REMOTE_ID'
+knobs='DRY_RUN DOCKER FIO_MCP_SSH_HOST FIO_MCP_REMOTE_DOCKER SHIM_BUILDX SHIM_BUILD_FAIL SHIM_SAVE_FAIL SHIM_SAVE_BIG SHIM_GZIP_FAIL SHIM_LOAD_FAIL SHIM_LOAD_EARLY SHIM_PREFLIGHT_FAIL SHIM_INSPECT_FAIL SHIM_REMOTE_ID'
 # shellcheck disable=SC2086 # word list on purpose
 unset $knobs
+ship_sh=${SHIP_SH:-sh}
 
 # [KNOB=value...] ship [args...]: runs the script with fresh shim logs and
 # sets $status. Knobs are passed explicitly and cleared afterwards, because
@@ -83,11 +108,14 @@ ship() {
   mkdir "$work/log"
   : >"$work/log/docker.log"
   status=0
+  # shellcheck disable=SC2086 # SHIP_SH may be "bash --posix"
   env PATH="$work/bin:$PATH" SHIM_LOG="$work/log" SHIM_LOCAL_ID="$local_id" \
-    DRY_RUN="${DRY_RUN:-}" FIO_MCP_SSH_HOST="${FIO_MCP_SSH_HOST:-}" FIO_MCP_REMOTE_DOCKER="${FIO_MCP_REMOTE_DOCKER:-}" \
-    SHIM_BUILDX="${SHIM_BUILDX:-}" SHIM_SAVE_FAIL="${SHIM_SAVE_FAIL:-}" SHIM_GZIP_FAIL="${SHIM_GZIP_FAIL:-}" \
-    SHIM_LOAD_FAIL="${SHIM_LOAD_FAIL:-}" SHIM_PREFLIGHT_FAIL="${SHIM_PREFLIGHT_FAIL:-}" SHIM_REMOTE_ID="${SHIM_REMOTE_ID:-}" \
-    sh "$repo/scripts/ship-image.sh" "$@" >"$work/out" 2>"$work/err" || status=$?
+    DRY_RUN="${DRY_RUN:-}" DOCKER="${DOCKER:-}" FIO_MCP_SSH_HOST="${FIO_MCP_SSH_HOST:-}" FIO_MCP_REMOTE_DOCKER="${FIO_MCP_REMOTE_DOCKER:-}" \
+    SHIM_BUILDX="${SHIM_BUILDX:-}" SHIM_BUILD_FAIL="${SHIM_BUILD_FAIL:-}" SHIM_SAVE_FAIL="${SHIM_SAVE_FAIL:-}" \
+    SHIM_SAVE_BIG="${SHIM_SAVE_BIG:-}" SHIM_GZIP_FAIL="${SHIM_GZIP_FAIL:-}" SHIM_LOAD_FAIL="${SHIM_LOAD_FAIL:-}" \
+    SHIM_LOAD_EARLY="${SHIM_LOAD_EARLY:-}" SHIM_PREFLIGHT_FAIL="${SHIM_PREFLIGHT_FAIL:-}" \
+    SHIM_INSPECT_FAIL="${SHIM_INSPECT_FAIL:-}" SHIM_REMOTE_ID="${SHIM_REMOTE_ID:-}" \
+    $ship_sh "$repo/scripts/ship-image.sh" "$@" >"$work/out" 2>"$work/err" || status=$?
   # shellcheck disable=SC2086
   unset $knobs
 }
@@ -148,6 +176,29 @@ SHIM_BUILDX=1 ship
 expect_status 0
 grep -Fqx "buildx build --platform linux/amd64 --tag $tag --tag fio-mcp:1.2.3 --load ." "$work/log/docker.log" ||
   fail "buildx call: $(cat "$work/log/docker.log")"
+
+case_name="runs every local docker call through DOCKER"
+DOCKER="sudo -n docker" ship
+expect_status 0
+expect_stdout_result
+[ "$(wc -l <"$work/log/sudo.log")" -eq "$(wc -l <"$work/log/docker.log")" ] ||
+  fail "docker calls bypassed DOCKER: $(cat "$work/log/sudo.log")"
+grep -Fqx -- "-n docker save $tag" "$work/log/sudo.log" || fail "save did not use DOCKER"
+
+case_name="fails when the build fails"
+SHIM_BUILD_FAIL=1 ship
+expect_failure
+[ ! -e "$work/log/ssh.log" ] || fail "ssh was called"
+
+case_name="fails when the remote end closes the stream early"
+SHIM_SAVE_BIG=1 SHIM_LOAD_EARLY=1 ship
+expect_failure
+expect_err "shipping $tag to nas failed"
+
+case_name="fails when the remote image cannot be inspected"
+SHIM_INSPECT_FAIL=1 ship
+expect_failure
+expect_err "cannot inspect $tag on nas"
 
 case_name="fails when the remote image ID differs"
 SHIM_REMOTE_ID=$other_id ship

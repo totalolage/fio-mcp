@@ -157,6 +157,7 @@ if ! remote_id=$(remote "$remote_docker image inspect --format '{{.Id}}' $tag");
 fi
 if [ "$remote_id" != "$id" ]; then
   echo "error: $tag on $host has image ID '$remote_id', but the local image is $id" >&2
+  echo "(the IDs also differ when one daemon uses the containerd image store and the other the classic one)" >&2
   exit 1
 fi
 

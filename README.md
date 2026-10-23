@@ -424,14 +424,16 @@ From a clean checkout (no uncommitted or untracked files):
 npm run ship:image
 ```
 
-It builds linux/amd64, tags `fio-mcp:<package version>-<short git sha>` and `fio-mcp:<package version>` (no registry prefix), checks that ssh and the remote docker work, ships the image, and checks that the server reports the same image ID as the local build. It refuses to run on a dirty tree. Progress goes to stderr; stdout gets two lines:
+It builds linux/amd64, tags `fio-mcp:<package version>-<short git sha>` and `fio-mcp:<package version>` (no registry prefix), checks that ssh and the remote docker work, ships the image, and checks that the server reports the same image ID as the local build. It refuses to run on a dirty tree. Progress goes to stderr; stdout gets two lines (run `npm run --silent ship:image` to keep npm's own banner out of stdout):
 
 ```
 tag=fio-mcp:0.2.0-1a2b3c4
 image_id=sha256:<64 hex digits>
 ```
 
-Put the `tag=` value in the Compose `image:` (with `pull_policy: never`, so the server never looks for it in a registry), and compare `image_id=` with `docker image inspect --format '{{.Id}}' <tag>` on the server if you want to pin it.
+Put the `tag=` value in the Compose `image:` (with `pull_policy: never`, so the server never looks for it in a registry), and compare `image_id=` with `docker image inspect --format '{{.Id}}' <tag>` on the server to verify what a deployment runs.
+
+The ID check assumes both docker daemons use the same image store: the classic store reports the image's config digest, the containerd image store its manifest digest, so the IDs differ between the two even for the same image.
 
 Settings:
 
