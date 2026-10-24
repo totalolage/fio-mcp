@@ -11,17 +11,18 @@ The API reference this server is built against is in [docs/fio-api.md](docs/fio-
 ## Requirements
 
 - Node.js 22.13 or newer (24 LTS recommended; the cache uses the built-in `node:sqlite`)
+- [Bun](https://bun.com) 1.4.2 as the package manager and script runner (the server itself runs on Node)
 - One or more FIO API tokens, created in Internetbanking under **Nastavení → API**
 
 ## Install and build
 
 ```sh
-npm install          # also patches TypeScript for Effect diagnostics and builds dist/
-npm run build        # compiles to dist/
-npm test
+bun install          # also patches TypeScript for Effect diagnostics and builds dist/
+bun run build        # compiles to dist/
+bun run test
 ```
 
-Run it with `node dist/main.js` or, once installed as a package, `npx fio-mcp`. By default it speaks MCP over stdio and logs only to stderr. See [HTTP transport and OAuth](#http-transport-and-oauth) for running it as a network service.
+Run it with `node dist/main.js` or, once installed as a package, `bunx fio-mcp`. By default it speaks MCP over stdio and logs only to stderr. See [HTTP transport and OAuth](#http-transport-and-oauth) for running it as a network service.
 
 | Command | What it does |
 |---|---|
@@ -323,7 +324,7 @@ HTTP sessions list only what the grant allows; stdio lists everything. Without `
 - **Clients** register without a secret. Redirect URIs must be https, or http on a loopback address (`127.0.0.1`, `[::1]`, `localhost`) on any port; they must match exactly except for the loopback port. Client ID metadata documents are not supported, because the server never fetches URLs. At most 100 clients and 20 registrations per hour; a client that never completes a sign-in is removed after an hour, and one without a live grant 24 hours after its last use.
 - **Tokens** are random and stored only as SHA-256 hashes. Authorization codes are single-use and live 60 s; access tokens 1 hour; refresh tokens 30 days, rotated on every use. Reusing an old refresh token or an authorization code revokes the whole grant. Tokens are bound to the audience `<public url>/mcp`, and every token request, refresh included, must name it as `resource`.
 - **MCP sessions** are bound to the grant that opened them; another grant presenting the session id gets 404. Each grant may hold 32 sessions and the server 1,000. When full, a session unused for an hour is ended (its id then answers 404) to make room; otherwise new sessions are refused (429 for the grant, 503 for the server).
-- **Limits on /mcp:** request bodies up to 1 MiB (413 beyond; a 100-order payment import is about 100 KB), initialize requests up to 64 KiB, and 16 requests in progress per grant (429).
+- **Limits on /mcp:** request bodies up to 1 MiB (413 beyond; a 100-order payment import is about 100 KB), initialize requests up to 64 KiB, and 16 requests in progress per grant (429). On Effect 4.0.5, chunked uploads with no Content-Length that exceed the limit are cut off with a connection reset rather than a 413 until the Effect 4.0.6 upgrade.
 - **Sign-in** compares the password against the scrypt hash in constant time, one check at a time across all clients; a sign-in that arrives during a check gets 429 instead of waiting, so a flood cannot stack scrypt's memory. Each check needs about 128 MiB of scrypt workspace with the `hash-password` defaults (N=2^17, r=8, p=1; hashes needing more than 256 MiB are refused), and the container peaked at about 256 MiB during one. The trade-off: sign-ins from many addresses can keep the check busy and delay yours. After 5 failures from a client address, attempts wait 1, 2, 4 and 8 s; the 10th consecutive failure locks the address out for 15 minutes. An address may start 20 sign-ins per 10 minutes (429). Up to 100 sign-ins in progress and 20 signed-in sessions are kept; starting sign-ins never ends a signed-in one, and a flood through one client displaces that client's own sign-ins first. Behind a reverse proxy, set `FIO_MCP_TRUSTED_PROXIES`, or every browser shares the proxy's address: one person's failed logins lock everyone out, and 20 sign-ins block new ones for everyone for 10 minutes. Logs record counts only.
 - **Pages** use a short-lived, server-side, signed cookie (`HttpOnly`, `Secure`, `SameSite=Lax`, 10 minutes), a CSRF token on every form, an Origin check, and strict headers (CSP with `frame-ancestors 'none'`, `no-store`).
 
@@ -360,7 +361,7 @@ Pass secrets as files. TrueNAS mounts them under `/run/secrets` (root:10000, mod
 ```yaml
 services:
   fio-mcp:
-    image: fio-mcp:<version>-<sha>                     # the tag= line printed by npm run ship:image
+    image: fio-mcp:<version>-<sha>                     # the tag= line printed by bun run ship:image
     pull_policy: never                                 # loaded over ssh, never pulled from a registry
     user: "568:568"
     group_add: ["10000"]
@@ -423,10 +424,10 @@ Prerequisites:
 From a clean checkout (no uncommitted or untracked files):
 
 ```sh
-npm run ship:image
+bun run ship:image
 ```
 
-It builds linux/amd64, tags `fio-mcp:<package version>-<short git sha>` and `fio-mcp:<package version>` (no registry prefix), checks that ssh and the remote docker work, ships the image, and checks that the server reports the same image ID as the local build. It refuses to run on a dirty tree. Progress goes to stderr; stdout gets two lines (run `npm run --silent ship:image` to keep npm's own banner out of stdout):
+It builds linux/amd64, tags `fio-mcp:<package version>-<short git sha>` and `fio-mcp:<package version>` (no registry prefix), checks that ssh and the remote docker work, ships the image, and checks that the server reports the same image ID as the local build. It refuses to run on a dirty tree. Progress goes to stderr; stdout gets two lines:
 
 ```
 tag=fio-mcp:0.2.0-1a2b3c4
@@ -450,25 +451,34 @@ Settings:
 It builds with `docker buildx` when that is installed and falls back to `docker build --platform linux/amd64` otherwise. To try the build without touching the server:
 
 ```sh
-DOCKER="sudo -n docker" npm run ship:image -- --dry-run
+DOCKER="sudo -n docker" bun run ship:image -- --dry-run
 ```
 
-`npm run test:scripts` tests the script against stand-in `docker` and `ssh` commands.
+`bun run test:scripts` tests the script against stand-in `docker` and `ssh` commands.
 
 ## Development
 
 The server is written with [Effect](https://effect.website) 4. Services are `Context.Service` classes with static layers, expected failures are `Schema.TaggedError` classes, tool parameters are Effect Schemas, and the MCP server is Effect's own (`effect/ai` `McpServer`), so there is no zod and the MCP SDK is only a test dependency.
 
 ```sh
-npm run typecheck    # tsc with Effect diagnostics
-npm run lint         # Biome, including the Effect rules in lint/*.grit
-npm test             # vitest + @effect/vitest
-npm run check        # all three
+bun run typecheck    # tsc with Effect diagnostics
+bun run lint         # Biome, including the Effect rules in lint/*.grit
+bun run test         # vitest + @effect/vitest (not `bun test`, which is Bun's own runner)
+bun run check        # all three
 ```
 
 ### Effect diagnostics in tsc
 
-`npm install` runs `prepare`, which calls `effect-tsgo patch --typescript --no-oxlint` (from `@effect/tsgo`, as in deskohub). It patches the TypeScript 7 compiler so `tsc` also reports the Effect language-service diagnostics configured in `tsconfig.json`'s `@effect/language-service` plugin block. Floating Effects, unhandled errors or requirements, `any`/`unknown` in error channels, global `fetch`, `try/catch` inside generators and similar are errors, and warnings fail the build too. If `npm run typecheck` stops reporting `effect(...)` diagnostics, run `npx effect-tsgo patch --typescript --no-oxlint` again. Editors need the same patched TypeScript or the Effect language-service extension.
+`bun install` runs `prepare`, which calls `effect-tsgo patch --typescript --no-oxlint` (from `@effect/tsgo`, as in deskohub). It patches the TypeScript 7 compiler so `tsc` also reports the Effect language-service diagnostics configured in `tsconfig.json`'s `@effect/language-service` plugin block. Floating Effects, unhandled errors or requirements, `any`/`unknown` in error channels, global `fetch`, `try/catch` inside generators and similar are errors, and warnings fail the build too. If `bun run typecheck` stops reporting `effect(...)` diagnostics, run `bunx effect-tsgo patch --typescript --no-oxlint` again. Editors need the same patched TypeScript or the Effect language-service extension.
+
+### Dependencies
+
+`bunfig.toml` and `package.json` set the install policy:
+
+- `minimumReleaseAge = 604800`: `bun install` and `bun update` only resolve versions published at least 7 days earlier. There are no exceptions (`minimumReleaseAgeExcludes`): if the code needs a newer release, wait until it is 7 days old.
+- `"trustedDependencies": []`: no dependency's `preinstall`, `install` or `postinstall` script runs, including the packages Bun would otherwise trust by default. Only this project's own `prepare` runs. `bun pm untrusted` lists dependencies whose scripts were skipped.
+- `exact = true`: `bun add` saves exact versions.
+- `bun.lock` is a text lockfile and is committed. Builds use `bun install --frozen-lockfile`, which fails instead of changing the lockfile. The age check runs only when versions are resolved, not against versions already in `bun.lock`, so review lockfile changes from other sources (hand edits, other Bun versions) yourself.
 
 ### Lint rules
 
@@ -487,8 +497,8 @@ Biome runs its recommended rules (with `noExplicitAny` and `noConsole` as errors
 FIO's REST API is described in [openapi/fio-api.yaml](openapi/fio-api.yaml) (OpenAPI 3.1, written from FIO's PDF v1.9; see docs/fio-api.md). `src/generated/effect.gen.ts` is generated from it with `@effect/openapi-generator` and committed, as in deskohub; never edit it by hand.
 
 1. Edit `openapi/fio-api.yaml`.
-2. Run `npm run generate` (`scripts/generate-fio-client.ts`, run by Node's TypeScript type stripping).
-3. Commit the spec and the regenerated file together. `npm run generate:check` regenerates and fails on any difference.
+2. Run `bun run generate` (`scripts/generate-fio-client.ts`, run by Node's TypeScript type stripping).
+3. Commit the spec and the regenerated file together. `bun run generate:check` regenerates and fails on any difference.
 
 The generator only decodes JSON success bodies. Operations that FioApi reads as raw text (CSV, XML, OFX, raw JSON, the import response) carry `x-raw-body: true`; the script turns their success bodies into binary in a temporary copy of the spec before generating, and refuses unmarked non-JSON success bodies. `src/fio-api-live.ts` wraps the generated `make()` in the `FioApi` service: base URL, the token (unwrapped from `Redacted` only to build the request), the rate limiter, the request timeout including the body, a 64 MiB response limit, no redirects, no tracing of FIO URLs, and the mapping of every HTTP status and client failure to the tagged errors above.
 

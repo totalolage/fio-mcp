@@ -4,12 +4,13 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { Context, Deferred, Effect, Exit, Fiber, Layer, Schema } from "effect";
 import { McpServer, Tool, Toolkit } from "effect/ai";
-import { HttpRouter, HttpServer, HttpServerResponse } from "effect/http";
+import { HttpRouter, HttpServer, HttpServerRequest, HttpServerResponse } from "effect/http";
 import { SERVER_INFO, ToolsLive } from "../src/app.js";
 import { makeCacheToolkit } from "../src/mcp/cache-tools.js";
 import { makeFioToolkit } from "../src/mcp/fio-tools.js";
 import { makeRedactor } from "../src/redaction.js";
 import { Auth, Unauthorized } from "../src/transport/auth.js";
+import { clientAddress } from "../src/transport/client-address.js";
 import { makeFrameRedactor } from "../src/transport/frame-redaction.js";
 import {
   type HttpTransportConfig,
@@ -88,11 +89,15 @@ const raw = (url: string, options: { method?: string; headers?: Record<string, s
       }),
   );
 
-/** POSTs `total` bytes in chunks without a Content-Length; resolves with the status even if the server stops reading. */
+/**
+ * POSTs `total` bytes in chunks without a Content-Length; resolves with the
+ * status even if the server stops reading, or "reset" if the server drops the
+ * connection before answering.
+ */
 const postChunked = (url: string, total: number) =>
   Effect.promise(
     () =>
-      new Promise<number>((resolve, reject) => {
+      new Promise<number | "reset">((resolve, reject) => {
         const req = nodeRequest(
           url,
           {
@@ -104,7 +109,10 @@ const postChunked = (url: string, total: number) =>
             resolve(res.statusCode ?? 0);
           },
         );
-        req.on("error", (error) => (req.writableEnded ? undefined : reject(error)));
+        // A no-op once the response has resolved the promise.
+        req.on("error", (error: NodeJS.ErrnoException) =>
+          error.code === "ECONNRESET" || error.code === "EPIPE" ? resolve("reset") : reject(error),
+        );
         const chunk = Buffer.alloc(64 * 1024, "x");
         let sent = 0;
         const pump = () => {
@@ -222,7 +230,10 @@ describe("HTTP transport", () => {
         body: "x".repeat(MAX_BODY_BYTES + 1),
       });
       assert.strictEqual(big.status, 413);
-      assert.strictEqual(yield* postChunked(`${base}/mcp`, 4 * MAX_BODY_BYTES), 413);
+      // Effect 4.0.5 destroys the request once a streamed body passes
+      // MaxBodySize, so the connection resets before the 413 can be sent.
+      // The reset is accepted only until Effect 4.0.6; restore the 413-only assertion then.
+      assert.include([413, "reset"], yield* postChunked(`${base}/mcp`, 4 * MAX_BODY_BYTES));
       assert.strictEqual((yield* postInitialize(base)).status, 200);
     }).pipe(Effect.scoped),
   );
@@ -255,6 +266,30 @@ describe("HTTP transport", () => {
       const holder = yield* Fiber.join(fibers[1 - limited]!);
       assert.notStrictEqual(holder.isError, true);
       assert.strictEqual(JSON.parse(textOf(holder)).account, "main");
+    }).pipe(Effect.scoped),
+  );
+
+  it.live("takes the client address from the socket, not from X-Forwarded-For", () =>
+    Effect.gen(function* () {
+      // Effect 4.0.5 has no peerAddress: clientAddress reads remoteAddress,
+      // which only HttpMiddleware.xForwardedHeaders would replace, and only
+      // when X-Forwarded-Host is present.
+      const auth = Layer.mergeAll(
+        Auth.layerOpen,
+        HttpRouter.add(
+          "GET",
+          "/address",
+          Effect.gen(function* () {
+            const request = yield* HttpServerRequest.HttpServerRequest;
+            return HttpServerResponse.text(clientAddress(request, []));
+          }),
+        ),
+      );
+      const { base } = yield* startServer(transport(), auth);
+      const response = yield* raw(`${base}/address`, {
+        headers: { "x-forwarded-for": "192.0.2.1", "x-forwarded-host": "127.0.0.1", "x-real-ip": "192.0.2.2" },
+      });
+      assert.strictEqual(response.body, "127.0.0.1");
     }).pipe(Effect.scoped),
   );
 

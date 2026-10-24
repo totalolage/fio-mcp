@@ -2,7 +2,8 @@
 # databases, worktrees and node_modules out of the build context.
 *
 !package.json
-!package-lock.json
+!bun.lock
+!bunfig.toml
 !tsconfig.json
 !tsconfig.build.json
 !src/
