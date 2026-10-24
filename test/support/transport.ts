@@ -1,36 +1,15 @@
-import { Deferred, Effect, Layer, Redacted } from "effect";
+import { type Deferred, Layer, Redacted } from "effect";
 import { Accounts } from "../../src/accounts.js";
-import { TransactionCache } from "../../src/cache/service.js";
-import { AppConfig, type AppConfigShape, type TransportConfig } from "../../src/config.js";
-import { FioApi } from "../../src/fio-api.js";
+import { Transactions } from "../../src/cache/service.js";
+import { type AppConfigShape, MAX_RESPONSE_BYTES, type TransportConfig } from "../../src/config.js";
 import { RateLimiter } from "../../src/rate-limiter.js";
 import { Redactor } from "../../src/redaction.js";
-import type { NormalizedStatement } from "../../src/statement.js";
+import { seededConfig } from "./config.js";
+import { slotHoldingFio } from "./fio-api.js";
 
 /** A FIO-shaped read token (64 URL-safe characters). */
 export const FIO_TOKEN = "fioT0ken-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRS";
 export const SAVINGS_TOKEN = "savingsT0ken-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMN";
-
-export const STATEMENT: NormalizedStatement = {
-  info: {
-    accountId: "2900000000",
-    bankId: "2010",
-    currency: "CZK",
-    iban: "CZ0000000000000000000000",
-    bic: "FIOBCZPPXXX",
-    openingBalance: 100,
-    closingBalance: 100,
-    dateStart: "2026-01-01",
-    dateEnd: "2026-01-31",
-    yearList: null,
-    idList: null,
-    idFrom: null,
-    idTo: null,
-    idLastDownload: null,
-  },
-  transactionCount: 0,
-  transactions: [],
-};
 
 export const ACCOUNT_NAMES = ["main", "savings"];
 
@@ -51,6 +30,7 @@ export function testConfig(transport: TransportConfig = { kind: "stdio" }): AppC
     // fails fast at arrival instead of waiting.
     maxWaitMs: 5_000,
     requestTimeoutMs: 1_000,
+    maxResponseBytes: MAX_RESPONSE_BYTES,
     transport,
     cache: {
       enabled: false,
@@ -64,36 +44,10 @@ export function testConfig(transport: TransportConfig = { kind: "stdio" }): AppC
   };
 }
 
-/**
- * A FioApi whose `periods` goes through the real RateLimiter and holds its
- * slot until `release` completes. Every other call dies: tests must not
- * reach them.
- */
-export const fakeFioApi = (release: Deferred.Deferred<void>) =>
-  Layer.effect(
-    FioApi,
-    Effect.gen(function* () {
-      const limiter = yield* RateLimiter;
-      const unused = Effect.die("not used by transport tests");
-      return FioApi.of({
-        periods: (account, _from, _to, priority) =>
-          limiter.run(account.tokenFingerprint, priority ?? "interactive", Effect.as(Deferred.await(release), STATEMENT)),
-        periodsRaw: () => unused,
-        statement: () => unused,
-        statementRaw: () => unused,
-        last: () => unused,
-        setLastId: () => unused,
-        setLastDate: () => unused,
-        lastStatement: () => unused,
-        merchantRaw: () => unused,
-        importXml: () => unused,
-      });
-    }),
-  );
-
 /** The app's services with a fake FioApi; one instance shared by every session. */
 export const testServices = (config: AppConfigShape, release: Deferred.Deferred<void>) =>
-  Layer.mergeAll(fakeFioApi(release), Layer.succeed(TransactionCache, { enabled: false })).pipe(
-    Layer.provideMerge(Layer.mergeAll(Redactor.layer, Accounts.layer, RateLimiter.layer)),
-    Layer.provideMerge(AppConfig.layerFrom(config)),
+  Transactions.Disabled.pipe(
+    Layer.provideMerge(slotHoldingFio(release)),
+    Layer.provideMerge(Layer.mergeAll(Redactor.Default, Accounts.Default, RateLimiter.Default)),
+    Layer.provideMerge(seededConfig(config)),
   );

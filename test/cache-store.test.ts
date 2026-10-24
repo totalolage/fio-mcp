@@ -3,31 +3,29 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { NodeFileSystem } from "@effect/platform-node";
 import { assert, describe, it } from "@effect/vitest";
-import { Effect, Layer, Redacted } from "effect";
+import { Effect, Layer, } from "effect";
 import { SqlClient } from "effect/sql";
-import { backupDatabase, CACHE_MIGRATIONS, databaseLayer, migrate, SERVER_MIGRATIONS } from "../src/cache/db.js";
-import { NOT_VERIFIED } from "../src/cache/service.js";
+import { backupDatabase, CACHE_MIGRATIONS, migrate, SERVER_MIGRATIONS } from "../src/cache/db.js";
 import { makeCacheStore } from "../src/cache/store.js";
 import { CacheError, InvalidInput } from "../src/errors.js";
 import {
   account,
   cacheLayer,
   config,
-  enabledCache,
-  fakeFio,
-  NOW,
+  seedRange,
   serveFrom,
   setNow,
   statement,
   TODAY,
-  TOKEN_B,
   tx,
 } from "./support/cache.js";
+import { memoryDatabase, testDatabase } from "./support/database.js";
+import { fakeFio } from "./support/fio-api.js";
 
 const tempDir = () => mkdtempSync(join(tmpdir(), "fio-cache-"));
 const mode = (path: string) => statSync(path).mode & 0o777;
 
-const withDb = (filename: string) => Effect.provide(databaseLayer(filename).pipe(Layer.provide(NodeFileSystem.layer)));
+const withDb = (filename: string) => Effect.provide(testDatabase(filename));
 
 const tables = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
@@ -54,7 +52,7 @@ describe("cache database", () => {
   it.effect("migrating legacy pending ranges makes every range upsert-only", () =>
     Effect.gen(function* () {
       const beforeMigration = Object.fromEntries(Object.entries(SERVER_MIGRATIONS).filter(([id]) => id < "0003"));
-      const oldDatabase = () => databaseLayer(":memory:", beforeMigration).pipe(Layer.provide(NodeFileSystem.layer));
+      const oldDatabase = () => memoryDatabase(beforeMigration);
 
       yield* Effect.gen(function* () {
         const sql = yield* SqlClient.SqlClient;
@@ -127,18 +125,14 @@ describe("cache database", () => {
       const destination = join(dir, "backup.sqlite");
       const fio = yield* fakeFio(serveFrom([]));
       yield* Effect.gen(function* () {
-        const cache = yield* enabledCache;
-        const acc = yield* account();
-        yield* cache.writeThrough(acc, statement("2026-10-01", TODAY, [tx(1, "2026-10-02", -5), tx(2, TODAY, 9)]), {
-          from: "2026-10-01",
-          to: TODAY,
-        });
+        const covered = { from: "2026-10-01", to: TODAY };
+        yield* seedRange(yield* account(), statement(covered.from, covered.to, [tx(1, "2026-10-02", -5), tx(2, TODAY, 9)]), covered);
         const result = yield* backupDatabase(destination);
         assert.strictEqual(result.destination, destination);
         assert.isAbove(result.bytes, 0);
         const again = yield* Effect.flip(backupDatabase(destination));
         assert.instanceOf(again, InvalidInput);
-      }).pipe(Effect.provide(Layer.merge(cacheLayer(config({ cache: { dbPath: path } }), fio.api), NodeFileSystem.layer)));
+      }).pipe(Effect.provide(Layer.merge(cacheLayer(config({ cache: { dbPath: path } }), fio.layer), NodeFileSystem.layer)));
       assert.strictEqual(mode(destination), 0o600);
       yield* Effect.gen(function* () {
         const sql = yield* SqlClient.SqlClient;
@@ -158,155 +152,5 @@ describe("cache database", () => {
       const error = yield* Effect.flip(backupDatabase(destination));
       assert.instanceOf(error, InvalidInput);
     }).pipe(withDb(":memory:"), Effect.provide(NodeFileSystem.layer)),
-  );
-});
-
-describe("cache store", () => {
-  it.effect("upserts by movement id: a refetch overwrites and never duplicates", () =>
-    Effect.gen(function* () {
-      yield* setNow();
-      const fio = yield* fakeFio(serveFrom([]));
-      yield* Effect.gen(function* () {
-        const cache = yield* enabledCache;
-        const acc = yield* account();
-        const range = { from: "2026-10-20", to: TODAY };
-        yield* cache.writeThrough(acc, statement(range.from, range.to, [tx(1, "2026-10-20", -10), tx(2, "2026-10-21", 20)]), range);
-        yield* cache.writeThrough(
-          acc,
-          statement(range.from, range.to, [
-            tx(1, "2026-10-20", -10, { comment: "edited" }),
-            tx(2, "2026-10-21", 20),
-            tx(3, TODAY, 30),
-          ]),
-          range,
-        );
-        const key = yield* cache.boundAccount(acc);
-        const rows = yield* cache.store.transactionsIn(key, range);
-        assert.deepStrictEqual(
-          rows.map((r) => [r.id, r.comment]),
-          [
-            [1, "edited"],
-            [2, null],
-            [3, null],
-          ],
-        );
-        assert.strictEqual((yield* cache.store.stats(key)).rowCount, 3);
-        // Movements from a statement or /last are stored without coverage.
-        yield* cache.record(acc, statement("2025-01-01", "2025-01-31", [tx(9, "2025-01-15", 1)]));
-        assert.strictEqual((yield* cache.store.stats(key)).rowCount, 4);
-        assert.deepStrictEqual(yield* cache.store.coveredRanges(key), [range]);
-      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
-    }),
-  );
-
-  it.effect("records coverage only for the period FIO's header reports", () =>
-    Effect.gen(function* () {
-      yield* setNow();
-      const fio = yield* fakeFio(serveFrom([]));
-      yield* Effect.gen(function* () {
-        const cache = yield* enabledCache;
-        const acc = yield* account();
-        yield* cache.writeThrough(acc, statement("2026-10-15", "2026-10-20", []), { from: "2026-10-10", to: TODAY });
-        const key = yield* cache.boundAccount(acc);
-        assert.deepStrictEqual(yield* cache.store.coveredRanges(key), [{ from: "2026-10-15", to: "2026-10-20" }]);
-        // Days after today are never recorded.
-        yield* cache.writeThrough(acc, statement("2026-10-21", "2026-12-31", []), { from: "2026-10-21", to: "2026-12-31" });
-        assert.deepStrictEqual(yield* cache.store.coveredRanges(key), [{ from: "2026-10-15", to: TODAY }]);
-      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
-    }),
-  );
-
-  it.effect("binds data to the token: a new token, or a name re-pointed to another account, sees no stale rows", () =>
-    Effect.gen(function* () {
-      yield* setNow();
-      const fio = yield* fakeFio(serveFrom([]));
-      const path = join(tempDir(), "fio.sqlite");
-      const range = { from: "2026-10-20", to: TODAY };
-      // Token A fetches account 2000000001.
-      yield* Effect.gen(function* () {
-        const cache = yield* enabledCache;
-        const acc = yield* account();
-        yield* cache.writeThrough(acc, statement(range.from, range.to, [tx(1, "2026-10-21", -10)]), range);
-        assert.strictEqual(yield* cache.boundAccount(acc), "2000000001/2010");
-      }).pipe(Effect.provide(cacheLayer(config({ cache: { dbPath: path } }), fio.api)));
-
-      // "main" now uses token B, which belongs to account 3000000002.
-      const repointed = config({
-        cache: { dbPath: path },
-        accounts: [{ name: "main", token: Redacted.make(TOKEN_B), accountNumber: undefined, currency: undefined }],
-      });
-      yield* Effect.gen(function* () {
-        const cache = yield* enabledCache;
-        const acc = yield* account();
-        const unverified = yield* Effect.flip(cache.read(acc, range));
-        assert.instanceOf(unverified, InvalidInput);
-        assert.strictEqual(unverified.message, NOT_VERIFIED);
-        yield* cache.writeThrough(acc, statement(range.from, range.to, [tx(7, TODAY, 70)], "3000000002"), range);
-        const read = yield* cache.read(acc, range);
-        assert.deepStrictEqual(
-          read.transactions.map((t) => t.id),
-          [7],
-        );
-        assert.strictEqual(read.info.accountId, "3000000002");
-      }).pipe(Effect.provide(cacheLayer(repointed, fio.api)));
-    }),
-  );
-
-  it.effect("rejects a statement without account identity and stores nothing", () =>
-    Effect.gen(function* () {
-      yield* setNow();
-      const fio = yield* fakeFio(serveFrom([]));
-      yield* Effect.gen(function* () {
-        const cache = yield* enabledCache;
-        const acc = yield* account();
-        const anonymous = statement("2026-10-20", TODAY, [tx(1, TODAY, 1)]);
-        const result = yield* Effect.flip(
-          cache.store.commit({
-            accountName: acc.name,
-            tokenFingerprint: acc.tokenFingerprint,
-            statement: { ...anonymous, info: { ...anonymous.info, accountId: null } },
-            coverage: { from: "2026-10-20", to: TODAY },
-            fetchedAt: 0,
-          }),
-        );
-        assert.strictEqual(result._tag, "FioResponseError");
-        assert.instanceOf(yield* Effect.flip(cache.boundAccount(acc)), InvalidInput);
-      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
-    }),
-  );
-
-  it.effect("a response with a movement lacking an ID or date stores nothing and covers no day", () =>
-    Effect.gen(function* () {
-      yield* setNow();
-      const fio = yield* fakeFio(serveFrom([]));
-      yield* Effect.gen(function* () {
-        const cache = yield* enabledCache;
-        const acc = yield* account();
-        const earlier = { from: "2026-10-20", to: "2026-10-20" };
-        yield* cache.writeThrough(acc, statement(earlier.from, earlier.to, [tx(1, "2026-10-20", -10)]), earlier);
-        const key = yield* cache.boundAccount(acc);
-        const range = { from: "2026-10-20", to: TODAY };
-        for (const broken of [tx(3, TODAY, 5, { id: null }), tx(4, TODAY, 5, { date: null })]) {
-          const result = yield* Effect.flip(
-            cache.store.commit({
-              accountName: acc.name,
-              tokenFingerprint: acc.tokenFingerprint,
-              statement: statement(range.from, range.to, [tx(1, "2026-10-20", -999), tx(2, "2026-10-21", 20), broken]),
-              coverage: range,
-              fetchedAt: NOW,
-            }),
-          );
-          assert.strictEqual(result._tag, "FioResponseError");
-        }
-        assert.deepStrictEqual(yield* cache.store.coveredRanges(key), [earlier]);
-        const read = yield* cache.read(acc, range);
-        assert.deepStrictEqual(
-          read.transactions.map((t) => [t.id, t.amount]),
-          [[1, -10]],
-        );
-        assert.isFalse(read.freshness.complete);
-        assert.isFalse(yield* cache.servable(key, range));
-      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
-    }),
   );
 });

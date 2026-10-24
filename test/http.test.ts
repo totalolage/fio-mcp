@@ -51,7 +51,7 @@ const WhoAmILive = McpServer.toolkit(WhoAmIToolkit).pipe(
 /** Serves the app on an ephemeral port for the rest of the scope. */
 const startServer = Effect.fnUntraced(function* (
   config: HttpTransportConfig,
-  auth: Layer.Layer<Auth, never, HttpRouter.HttpRouter> = Auth.layerOpen,
+  auth: Layer.Layer<Auth, never, HttpRouter.HttpRouter> = Auth.Open,
 ) {
   const release = yield* Deferred.make<void>();
   const app = serveHttp(Layer.mergeAll(ToolsLive, WhoAmILive), auth, SERVER_INFO, config).pipe(

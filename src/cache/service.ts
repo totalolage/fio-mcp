@@ -1,18 +1,30 @@
-import { Clock, Context, DateTime, Effect, type FileSystem, Layer, Option, Schedule } from "effect";
-import type { SqlClient } from "effect/sql";
+import { Clock, Context, DateTime, Effect, Layer, Option, Schedule } from "effect";
 import { type Account, Accounts } from "../accounts.js";
-import { AppConfig, type AppConfigShape } from "../config.js";
-import { type CacheError, InvalidInput } from "../errors.js";
+import { AppConfig } from "../config.js";
+import { type CacheError, type FioRequestError, InvalidInput } from "../errors.js";
 import { FioApi } from "../fio-api.js";
 import type { NormalizedStatement, StatementInfo, Transaction } from "../statement.js";
 import { addDays, type DayRange, minDate, pragueDateOf, pragueToday, rangeLength } from "./dates.js";
-import { DatabaseLive } from "./db.js";
-import { type CachedAccount, type CacheStore, makeCacheStore, type SyncMode } from "./store.js";
-import { type CacheSyncShape, makeCacheSync, type SyncRequest } from "./sync.js";
+import { Database } from "./db.js";
+import { fromFio, type Source, selectSource, type TransactionsResult } from "./source.js";
+import {
+  type CachedAccount,
+  type GroupBy,
+  makeCacheStore,
+  type PendingRange,
+  type SummaryGroup,
+  type TransactionFilters,
+} from "./store.js";
+import { historyUnlockMessage, type JobProgress, makeCacheSync, type StartRequest } from "./sync.js";
+
+export type { Source, TransactionsResult } from "./source.js";
+export type { GroupBy, SummaryGroup, TransactionFilters } from "./store.js";
+export { historyUnlockMessage, type JobProgress, type StartRequest, type SyncRequest } from "./sync.js";
 
 /**
  * The transaction cache as the tools see it. With FIO_CACHE_ENABLED=false
- * the service is `{ enabled: false }` and no database is opened.
+ * the `Disabled` adapter answers date-range reads from FIO and no database
+ * is opened.
  */
 
 /** How complete and current cache-served data is, for the requested range. */
@@ -39,28 +51,117 @@ export interface CachedStatement {
   readonly freshness: Freshness;
 }
 
-export interface EnabledCache {
-  readonly enabled: true;
-  readonly store: CacheStore;
-  readonly sync: CacheSyncShape;
-  /** The bank account this token's data is bound to; InvalidInput until a FIO response verified it. */
-  readonly boundAccount: (account: Account) => Effect.Effect<string, InvalidInput | CacheError>;
-  readonly freshness: (account: Account, accountKey: string, range: DayRange) => Effect.Effect<Freshness, CacheError>;
-  /** Every day of the range is covered and settled (fetched ≥ overlapDays after it) or fresh (within maxAgeMinutes). */
-  readonly servable: (accountKey: string, range: DayRange) => Effect.Effect<boolean, CacheError>;
-  readonly read: (account: Account, range: DayRange) => Effect.Effect<CachedStatement, InvalidInput | CacheError>;
-  /** Stores a FIO /periods response for `range`; failures are logged, never raised. */
-  readonly writeThrough: (account: Account, statement: NormalizedStatement, range: DayRange) => Effect.Effect<void>;
-  /** Stores movements from a response that is not a full date range (no coverage); failures are logged. */
-  readonly record: (account: Account, statement: NormalizedStatement) => Effect.Effect<void>;
+export interface SearchQuery extends TransactionFilters {
+  readonly limit: number;
+  readonly offset: number;
+  readonly order: "asc" | "desc";
 }
 
-export type TransactionCacheShape = { readonly enabled: false } | EnabledCache;
+export interface SearchResult {
+  /** Every match, not just this page. */
+  readonly total: number;
+  readonly transactions: ReadonlyArray<Transaction>;
+  /** For the date range searched. */
+  readonly freshness: Freshness;
+}
 
-export class TransactionCache extends Context.Service<TransactionCache, TransactionCacheShape>()(
-  "fio-mcp/TransactionCache",
-) {
-  static readonly disabled = Layer.succeed(TransactionCache, { enabled: false });
+export interface SummaryQuery extends TransactionFilters {
+  readonly groupBy: GroupBy;
+  readonly limit: number;
+  readonly offset: number;
+}
+
+export interface SummaryResult {
+  readonly totalGroups: number;
+  readonly groups: ReadonlyArray<SummaryGroup>;
+  /** Per currency, over every match. */
+  readonly totals: ReadonlyArray<Omit<SummaryGroup, "key">>;
+  readonly freshness: Freshness;
+}
+
+/** A sync job's progress, times as ISO strings. */
+export type JobStatus = Omit<JobProgress, "startedAt" | "finishedAt"> & {
+  readonly startedAt: string | null;
+  readonly finishedAt: string | null;
+};
+
+export interface SyncStatus {
+  readonly lastSuccessAt: string | null;
+  readonly lastAttemptAt: string | null;
+  readonly lastError: string | null;
+  readonly pending: ReadonlyArray<PendingRange>;
+  readonly blocked: ReadonlyArray<DayRange>;
+  readonly failedDays: ReadonlyArray<string>;
+  readonly backfillTarget: string | null;
+  readonly historyLimited: boolean;
+  readonly historyLimitedSince: string | null;
+  /** The owner's steps to unlock older history, while it is limited. */
+  readonly historyUnlock?: string;
+}
+
+/** One account's cache state; `verified: false` until a FIO response bound the token to a bank account. */
+export type AccountCacheStatus =
+  | {
+      readonly name: string;
+      readonly verified: false;
+      readonly note: string;
+      readonly sync: SyncStatus;
+      readonly job: JobStatus | null;
+    }
+  | {
+      readonly name: string;
+      readonly verified: true;
+      readonly verifiedAt: string | null;
+      readonly bankAccount: string;
+      readonly iban: string | null;
+      readonly currency: string | null;
+      readonly lastKnownBalance: {
+        readonly amount: number;
+        readonly currency: string | null;
+        readonly date: string | null;
+      } | null;
+      readonly coveredRanges: ReadonlyArray<DayRange>;
+      readonly rowCount: number;
+      readonly earliestMovement: string | null;
+      readonly latestMovement: string | null;
+      readonly sync: SyncStatus;
+      readonly job: JobStatus | null;
+    };
+
+export type SyncOutcome =
+  /** `resume` found nothing pending, so no job runs. */
+  | { readonly started: false }
+  | {
+      readonly started: true;
+      /** A job for this token was already running and the request joined it. */
+      readonly joined: boolean;
+      readonly job: JobStatus;
+    };
+
+export interface TransactionsShape {
+  /** Fails with CACHE_DISABLED when the cache is disabled, so a tool can report that before its argument errors. */
+  readonly requireEnabled: Effect.Effect<void, InvalidInput>;
+  /** Date-range movements from the cache or FIO, by `source`; a FIO answer is written through. */
+  readonly transactions: (
+    account: Account,
+    range: DayRange,
+    source: Source,
+  ) => Effect.Effect<TransactionsResult, InvalidInput | CacheError | FioRequestError>;
+  /** Stores movements from a FIO read that is not a date range (statement, last). Never fails. */
+  readonly record: (account: Account, statement: NormalizedStatement) => Effect.Effect<void>;
+  /** One page of cached movements. `dateFrom` defaults to the first cached day, `dateTo` to today. */
+  readonly search: (account: Account, query: SearchQuery) => Effect.Effect<SearchResult, InvalidInput | CacheError>;
+  /** Grouped totals of cached movements, with the same filters and defaults as `search`. */
+  readonly summarize: (account: Account, query: SummaryQuery) => Effect.Effect<SummaryResult, InvalidInput | CacheError>;
+  /** Each account's cache state, in order. Disabled: fails even for no accounts. */
+  readonly status: (
+    accounts: ReadonlyArray<Account>,
+  ) => Effect.Effect<ReadonlyArray<AccountCacheStatus>, InvalidInput | CacheError>;
+  /**
+   * Starts or joins the token's sync job. With `waitMs`, waits up to that
+   * long and returns the job's progress then; without, returns at once.
+   */
+  readonly sync: (account: Account, request: StartRequest, waitMs?: number) => Effect.Effect<SyncOutcome, InvalidInput>;
 }
 
 export const NOT_VERIFIED =
@@ -69,6 +170,12 @@ export const NOT_VERIFIED =
 export const CACHE_DISABLED = "The local transaction cache is disabled (FIO_CACHE_ENABLED=false).";
 
 const iso = (millis: number | null) => (millis === null ? null : DateTime.formatIso(DateTime.makeUnsafe(millis)));
+
+const jobStatus = (job: JobProgress): JobStatus => ({
+  ...job,
+  startedAt: iso(job.startedAt),
+  finishedAt: iso(job.finishedAt),
+});
 
 function cachedInfo(account: Option.Option<CachedAccount>, range: DayRange): StatementInfo {
   const a = Option.getOrUndefined(account);
@@ -90,7 +197,7 @@ function cachedInfo(account: Option.Option<CachedAccount>, range: DayRange): Sta
   };
 }
 
-export const makeTransactionCache = Effect.fn("TransactionCache.make")(function* () {
+const makeTransactions = Effect.fn("Transactions.make")(function* () {
   const config = yield* AppConfig;
   const fio = yield* FioApi;
   const store = yield* makeCacheStore();
@@ -108,7 +215,7 @@ export const makeTransactionCache = Effect.fn("TransactionCache.make")(function*
   /** The range up to today; days after today have no movements yet. */
   const clamp = (range: DayRange, today: string): DayRange => ({ from: range.from, to: minDate(range.to, today) });
 
-  const freshness = Effect.fn("TransactionCache.freshness")(function* (
+  const freshness = Effect.fn("Transactions.freshness")(function* (
     account: Account,
     accountKey: string,
     range: DayRange,
@@ -130,7 +237,7 @@ export const makeTransactionCache = Effect.fn("TransactionCache.make")(function*
     } satisfies Freshness;
   });
 
-  const servable = Effect.fn("TransactionCache.servable")(function* (accountKey: string, range: DayRange) {
+  const servable = Effect.fn("Transactions.servable")(function* (accountKey: string, range: DayRange) {
     const today = yield* pragueToday;
     const now = yield* Clock.currentTimeMillis;
     const effective = clamp(range, today);
@@ -142,7 +249,7 @@ export const makeTransactionCache = Effect.fn("TransactionCache.make")(function*
     );
   });
 
-  const read = Effect.fn("TransactionCache.read")(function* (account: Account, range: DayRange) {
+  const read = Effect.fn("Transactions.read")(function* (account: Account, range: DayRange) {
     const accountKey = yield* boundAccount(account);
     const transactions = yield* store.transactionsIn(accountKey, range);
     const cached = yield* store.account(accountKey);
@@ -163,7 +270,7 @@ export const makeTransactionCache = Effect.fn("TransactionCache.make")(function*
       Effect.catch((error) => Effect.logWarning(`cache: could not store ${what}: ${error.message}`)),
     );
 
-  const writeThrough = Effect.fn("TransactionCache.writeThrough")(function* (
+  const writeThrough = Effect.fn("Transactions.writeThrough")(function* (
     account: Account,
     statement: NormalizedStatement,
     range: DayRange,
@@ -182,7 +289,7 @@ export const makeTransactionCache = Effect.fn("TransactionCache.make")(function*
     );
   });
 
-  const record = Effect.fn("TransactionCache.record")(function* (account: Account, statement: NormalizedStatement) {
+  const record = Effect.fn("Transactions.record")(function* (account: Account, statement: NormalizedStatement) {
     const now = yield* Clock.currentTimeMillis;
     yield* logged("movements")(
       store.commit({
@@ -194,101 +301,197 @@ export const makeTransactionCache = Effect.fn("TransactionCache.make")(function*
     );
   });
 
+  const unlockMessage = historyUnlockMessage(config.rateLimitIntervalMs);
+
+  const checkFilters = (filters: TransactionFilters) => {
+    if (filters.dateFrom !== undefined && filters.dateTo !== undefined && filters.dateFrom > filters.dateTo) {
+      return Effect.fail(new InvalidInput({ detail: "dateFrom must not be after dateTo." }));
+    }
+    if (filters.minAmount !== undefined && filters.maxAmount !== undefined && filters.minAmount > filters.maxAmount) {
+      return Effect.fail(new InvalidInput({ detail: "minAmount must not be greater than maxAmount." }));
+    }
+    return Effect.void;
+  };
+
+  /** The first cached day: covered or holding a movement (statements are stored without coverage). */
+  const earliestCached = Effect.fnUntraced(function* (accountKey: string, fallback: string) {
+    const covered = yield* store.coveredRanges(accountKey);
+    const { earliestMovement } = yield* store.stats(accountKey);
+    const candidates = [covered[0]?.from, earliestMovement ?? undefined].filter((d): d is string => d !== undefined);
+    return candidates.reduce(minDate, fallback);
+  });
+
+  /** The verified bank account key and the filters with their date range filled in. */
+  const scope = Effect.fnUntraced(function* (account: Account, filters: TransactionFilters) {
+    yield* checkFilters(filters);
+    const accountKey = yield* boundAccount(account);
+    const today = yield* pragueToday;
+    const to = filters.dateTo ?? today;
+    const from = filters.dateFrom ?? (yield* earliestCached(accountKey, to));
+    if (from > to) {
+      return yield* new InvalidInput({ detail: `dateFrom must not be after dateTo (default today, ${today}).` });
+    }
+    const range: DayRange = { from, to };
+    return { accountKey, range, filters: { ...filters, dateFrom: from, dateTo: to } };
+  });
+
+  const search = Effect.fn("Transactions.search")(function* (account: Account, query: SearchQuery) {
+    const { limit, offset, order, ...filters } = query;
+    const scoped = yield* scope(account, filters);
+    const found = yield* store.search(scoped.accountKey, scoped.filters, { limit, offset, order });
+    return { ...found, freshness: yield* freshness(account, scoped.accountKey, scoped.range) } satisfies SearchResult;
+  });
+
+  const summarize = Effect.fn("Transactions.summarize")(function* (account: Account, query: SummaryQuery) {
+    const { groupBy, limit, offset, ...filters } = query;
+    const scoped = yield* scope(account, filters);
+    const summary = yield* store.summarize(scoped.accountKey, scoped.filters, groupBy, { limit, offset });
+    return { ...summary, freshness: yield* freshness(account, scoped.accountKey, scoped.range) } satisfies SummaryResult;
+  });
+
+  const accountStatus = Effect.fnUntraced(function* (account: Account) {
+    const state = yield* store.syncState(account.tokenFingerprint);
+    const binding = yield* store.binding(account.tokenFingerprint);
+    const job = Option.getOrNull(Option.map(yield* sync.progress(account), jobStatus));
+    const syncStatus: SyncStatus = {
+      lastSuccessAt: iso(state.lastSuccessAt),
+      lastAttemptAt: iso(state.lastAttemptAt),
+      lastError: state.lastError,
+      pending: state.pending,
+      blocked: state.blocked,
+      failedDays: state.failedDays,
+      backfillTarget: state.backfillTarget,
+      historyLimited: state.historyLimited,
+      historyLimitedSince: iso(state.historyLimitedSince),
+      ...(state.historyLimited ? { historyUnlock: unlockMessage } : {}),
+    };
+    if (Option.isNone(binding)) {
+      return {
+        name: account.name,
+        verified: false,
+        note: "Not verified for this token yet; run sync_transactions.",
+        sync: syncStatus,
+        job,
+      } satisfies AccountCacheStatus;
+    }
+    const key = binding.value.accountKey;
+    const cached = Option.getOrUndefined(yield* store.account(key));
+    return {
+      name: account.name,
+      verified: true,
+      verifiedAt: iso(binding.value.verifiedAt),
+      bankAccount: cached === undefined ? key : `${cached.accountId}/${cached.bankId}`,
+      iban: cached?.iban ?? null,
+      currency: cached?.currency ?? null,
+      lastKnownBalance:
+        cached === undefined || cached.balance === null
+          ? null
+          : { amount: cached.balance, currency: cached.currency, date: cached.balanceDate },
+      coveredRanges: yield* store.coveredRanges(key),
+      ...(yield* store.stats(key)),
+      sync: syncStatus,
+      job,
+    } satisfies AccountCacheStatus;
+  });
+
+  const status = Effect.fn("Transactions.status")(function* (accounts: ReadonlyArray<Account>) {
+    return yield* Effect.forEach(accounts, (account) => accountStatus(account));
+  });
+
+  const startSync = Effect.fn("Transactions.sync")(function* (
+    account: Account,
+    request: StartRequest,
+    waitMs?: number,
+  ) {
+    const started = yield* sync.start(account, request);
+    if (Option.isNone(started)) return { started: false } satisfies SyncOutcome;
+    const job =
+      waitMs === undefined
+        ? started.value.progress
+        : Option.getOrElse(yield* sync.awaitJob(account, waitMs), () => started.value.progress);
+    return { started: true, joined: started.value.joined, job: jobStatus(job) } satisfies SyncOutcome;
+  });
+
   return {
-    enabled: true,
-    store,
-    sync,
-    boundAccount,
-    freshness,
-    servable,
-    read,
-    writeThrough,
+    requireEnabled: Effect.void,
+    transactions: selectSource(fio, { boundAccount, servable, read, writeThrough }),
     record,
-  } satisfies EnabledCache;
+    search,
+    summarize,
+    status,
+    sync: startSync,
+  } satisfies TransactionsShape;
 });
 
-/** The enabled cache on an existing SqlClient (tests provide an in-memory one). */
-export const TransactionCacheFromSql: Layer.Layer<
-  TransactionCache,
-  never,
-  SqlClient.SqlClient | AppConfig | FioApi
-> = Layer.effect(TransactionCache, Effect.map(makeTransactionCache(), TransactionCache.of));
+export class Transactions extends Context.Service<Transactions, TransactionsShape>()(
+  "fio-mcp/Transactions",
+) {
+  /** The enabled cache on the SqlClient in context (tests provide an in-memory one). */
+  static readonly Default = Layer.effect(Transactions, makeTransactions());
 
-/**
- * The cache on a database the caller provides (e.g. `DatabaseLive`, shared
- * with other users of the file); `{ enabled: false }` when the cache is off.
- */
-export const CacheOnDatabaseLive: Layer.Layer<TransactionCache, never, SqlClient.SqlClient | AppConfig | FioApi> =
-  Layer.unwrap(
+  /** FIO_CACHE_ENABLED=false: date-range reads go to FIO, nothing is stored, cache-only reads fail. */
+  static readonly Disabled = Layer.effect(
+    Transactions,
     Effect.gen(function* () {
-      const config = yield* AppConfig;
-      return config.cache.enabled ? TransactionCacheFromSql : TransactionCache.disabled;
+      const live = fromFio(yield* FioApi, () => Effect.void);
+      const disabled = Effect.fail(new InvalidInput({ detail: CACHE_DISABLED }));
+      return {
+        requireEnabled: disabled,
+        transactions: (account, range, source) => (source === "cache" ? disabled : live(account, range)),
+        record: () => Effect.void,
+        search: () => disabled,
+        summarize: () => disabled,
+        status: () => disabled,
+        sync: () => disabled,
+      } satisfies TransactionsShape;
     }),
   );
 
-/**
- * The cache from configuration with its own database: opens and migrates
- * FIO_DB_PATH when the cache is enabled, otherwise `{ enabled: false }`
- * without touching disk.
- */
-export const CacheLive: Layer.Layer<TransactionCache, CacheError, AppConfig | FileSystem.FileSystem | FioApi> =
-  Layer.unwrap(
+  /**
+   * The cache from configuration: on the server's database (FIO_DB_PATH)
+   * when enabled, otherwise `Disabled` without touching disk.
+   */
+  static readonly Live = Layer.unwrap(
     Effect.gen(function* () {
       const config = yield* AppConfig;
-      return config.cache.enabled ? TransactionCacheFromSql.pipe(Layer.provide(DatabaseLive)) : TransactionCache.disabled;
+      return config.cache.enabled
+        ? Transactions.Default.pipe(Layer.provide(Database.Live))
+        : Transactions.Disabled;
     }),
-  );
+  ).pipe(Layer.provide(Layer.mergeAll(FioApi.Live, AppConfig.Live)));
+}
 
+/** One request per token (accounts may share a token); a failure is logged and the next token goes on. */
 const syncAll = Effect.fn("CacheSync.syncAll")(function* (
-  cache: EnabledCache,
+  cache: TransactionsShape,
   accounts: ReadonlyArray<Account>,
-  choose: (account: Account) => Effect.Effect<Option.Option<Parameters<CacheSyncShape["start"]>[1]>, CacheError>,
+  request: StartRequest,
 ) {
   const seen = new Set<string>();
   for (const account of accounts) {
     if (seen.has(account.tokenFingerprint)) continue;
     seen.add(account.tokenFingerprint);
-    const request = yield* choose(account).pipe(
-      Effect.catch((error) => Effect.as(Effect.logWarning(`cache sync ${account.name}: ${error.message}`), Option.none())),
-    );
-    if (Option.isSome(request)) yield* cache.sync.start(account, request.value);
+    yield* cache
+      .sync(account, request)
+      .pipe(Effect.catch((error) => Effect.logWarning(`cache sync ${account.name}: ${error.message}`)));
   }
 });
-
-const resumeRequest = (mode: SyncMode | null): SyncRequest => {
-  switch (mode) {
-    case "incremental":
-      return { kind: "incremental" };
-    case "refresh":
-      return { kind: "refresh" };
-    default:
-      return { kind: "backfill" };
-  }
-};
-
-/** What startup runs for one token: the full startup sync, or only an interrupted job. */
-const startupRequest = (cache: EnabledCache, config: AppConfigShape) => (account: Account) =>
-  config.cache.syncOnStartup
-    ? Effect.succeedSome({ kind: "startup" as const })
-    : Effect.map(cache.store.syncState(account.tokenFingerprint), (state) =>
-        state.pending.length > 0 ? Option.some(resumeRequest(state.mode)) : Option.none(),
-      );
 
 /**
  * Background sync: at startup (cache.syncOnStartup, or to resume an
  * interrupted job) and every cache.syncIntervalMinutes when that is above 0.
  * Forked into the layer's scope; MCP initialization never waits for it.
  */
-export const CacheSyncLive: Layer.Layer<never, never, TransactionCache | Accounts | AppConfig> = Layer.effectDiscard(
+export const CacheSyncLive: Layer.Layer<never, never, Transactions | Accounts | AppConfig> = Layer.effectDiscard(
   Effect.gen(function* () {
-    const cache = yield* TransactionCache;
-    if (!cache.enabled) return;
-    const accounts = yield* Accounts;
     const config = yield* AppConfig;
-    yield* Effect.forkScoped(syncAll(cache, accounts.list, startupRequest(cache, config)));
+    if (!config.cache.enabled) return;
+    const cache = yield* Transactions;
+    const accounts = yield* Accounts;
+    yield* Effect.forkScoped(syncAll(cache, accounts.list, { kind: config.cache.syncOnStartup ? "startup" : "resume" }));
     const minutes = config.cache.syncIntervalMinutes;
     if (minutes > 0) {
-      const periodic = syncAll(cache, accounts.list, () => Effect.succeedSome({ kind: "incremental" as const }));
+      const periodic = syncAll(cache, accounts.list, { kind: "incremental" });
       yield* Effect.forkScoped(
         Effect.sleep(`${minutes} minutes`).pipe(Effect.andThen(Effect.repeat(periodic, Schedule.spaced(`${minutes} minutes`)))),
       );

@@ -14,7 +14,7 @@ import {
   splitNewestFirst,
   subtractDays,
 } from "./dates.js";
-import { type CacheStore, coveredBy, type PendingRange, type SyncState } from "./store.js";
+import { type CacheStore, coveredBy, type PendingRange, type SyncMode, type SyncState } from "./store.js";
 
 /**
  * Background sync of FIO movements into the cache, one job per token at a
@@ -60,6 +60,12 @@ export type SyncRequest =
   /** Startup: backfill whatever is missing (blocked history first), then incremental. */
   | { readonly kind: "startup" };
 
+/**
+ * A job request, or `resume`: join the token's running job, else finish its
+ * interrupted job in that job's mode; nothing when no range is pending.
+ */
+export type StartRequest = SyncRequest | { readonly kind: "resume" };
+
 export interface JobProgress {
   readonly account: string;
   readonly kind: SyncRequest["kind"];
@@ -84,8 +90,8 @@ export interface StartResult {
 }
 
 export interface CacheSyncShape {
-  /** Starts a job for the account's token, or returns the one already running. */
-  readonly start: (account: Account, request: SyncRequest) => Effect.Effect<StartResult>;
+  /** Starts a job for the account's token, or returns the one already running. None: `resume` found nothing to do. */
+  readonly start: (account: Account, request: StartRequest) => Effect.Effect<Option.Option<StartResult>>;
   /** Waits up to `timeoutMs` for the token's current job; its progress either way. */
   readonly awaitJob: (account: Account, timeoutMs: number) => Effect.Effect<Option.Option<JobProgress>>;
   /** The running or most recent job of the account's token in this process. */
@@ -127,6 +133,17 @@ function withoutPending<R extends DayRange>(ranges: ReadonlyArray<R>, pending: R
 
 const pendingAs = (ranges: ReadonlyArray<DayRange>, replace: boolean): ReadonlyArray<PendingRange> =>
   ranges.map((range) => ({ from: range.from, to: range.to, replace }));
+
+const resumeRequest = (mode: SyncMode | null): SyncRequest => {
+  switch (mode) {
+    case "incremental":
+      return { kind: "incremental" };
+    case "refresh":
+      return { kind: "refresh" };
+    default:
+      return { kind: "backfill" };
+  }
+};
 
 interface RunningJob {
   readonly account: Account;
@@ -405,16 +422,30 @@ export const makeCacheSync = Effect.fn("CacheSync.make")(function* (
     return yield* Ref.get(job.progress);
   });
 
+  /** The request that finishes the token's interrupted job; a store failure is logged and resumes nothing. */
+  const resumable = (account: Account) =>
+    store.syncState(account.tokenFingerprint).pipe(
+      Effect.map((state) =>
+        state.pending.length > 0 ? Option.some(resumeRequest(state.mode)) : Option.none<SyncRequest>(),
+      ),
+      Effect.catch((error) =>
+        Effect.as(Effect.logWarning(`cache sync ${account.name}: ${error.message}`), Option.none<SyncRequest>()),
+      ),
+    );
+
   const launch = Effect.fnUntraced(function* (
     map: Map<string, RunningJob>,
     account: Account,
-    request: SyncRequest,
-  ): Effect.fn.Return<readonly [StartResult, Map<string, RunningJob>]> {
+    start: StartRequest,
+  ): Effect.fn.Return<readonly [Option.Option<StartResult>, Map<string, RunningJob>]> {
     const existing = map.get(account.tokenFingerprint);
     if (existing !== undefined) {
       const current = yield* Ref.get(existing.progress);
-      if (current.status === "running") return [{ progress: current, joined: true } satisfies StartResult, map] as const;
+      if (current.status === "running") return [Option.some({ progress: current, joined: true }), map] as const;
     }
+    const resolved = start.kind === "resume" ? yield* resumable(account) : Option.some(start);
+    if (Option.isNone(resolved)) return [Option.none(), map] as const;
+    const request = resolved.value;
     const startedAt = yield* Clock.currentTimeMillis;
     const job: RunningJob = {
       account,
@@ -433,10 +464,10 @@ export const makeCacheSync = Effect.fn("CacheSync.make")(function* (
     );
     yield* Effect.forkIn(body, scope);
     const progress = yield* Ref.get(job.progress);
-    return [{ progress, joined: false } satisfies StartResult, new Map(map).set(account.tokenFingerprint, job)] as const;
+    return [Option.some({ progress, joined: false }), new Map(map).set(account.tokenFingerprint, job)] as const;
   });
 
-  const start = (account: Account, request: SyncRequest) =>
+  const start = (account: Account, request: StartRequest) =>
     SynchronizedRef.modifyEffect(jobs, (map) => launch(map, account, request));
 
   const progress = (account: Account) =>

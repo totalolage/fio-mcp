@@ -93,7 +93,7 @@ function deep(value: unknown, redact: (text: string) => string): unknown {
 }
 
 export class Redactor extends Context.Service<Redactor, RedactorShape>()("fio-mcp/Redactor") {
-  static readonly layer = Layer.effect(
+  static readonly Default = Layer.effect(
     Redactor,
     Effect.gen(function* () {
       const config = yield* AppConfig;
@@ -101,8 +101,7 @@ export class Redactor extends Context.Service<Redactor, RedactorShape>()("fio-mc
     }),
   );
 
-  /** For tests and tools that run without configured secrets. */
-  static readonly layerFrom = (secrets: ReadonlyArray<string>) => Layer.succeed(Redactor, makeRedactor(secrets));
+  static readonly Live = Redactor.Default.pipe(Layer.provide(AppConfig.Live));
 }
 
 /** Writes logfmt lines to stderr (stdout is the MCP stdio channel), redacted. */

@@ -6,7 +6,6 @@
  */
 
 import { createHash, randomBytes } from "node:crypto";
-import { NodeFileSystem } from "@effect/platform-node";
 import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 import type {
   OAuthClientInformationMixed,
@@ -17,14 +16,15 @@ import { Clock, type Context, Deferred, Duration, Effect, Exit, Layer, Logger, O
 import { HttpRouter, HttpServer, HttpServerRequest } from "effect/http";
 import type { SqlClient } from "effect/sql";
 import { SERVER_INFO, ToolsLive } from "../../src/app.js";
-import { databaseLayer, SERVER_MIGRATIONS } from "../../src/cache/db.js";
+import { SERVER_MIGRATIONS } from "../../src/cache/db.js";
 import type { HttpAuthConfig } from "../../src/config.js";
 import { hashPassword, type PasswordHash, parsePasswordHash } from "../../src/oauth/crypto.js";
 import type { ThrottlePolicy } from "../../src/oauth/login.js";
-import { OAuthLive } from "../../src/oauth/server.js";
 import { makeOAuthStore, type OAuthStore } from "../../src/oauth/store.js";
+import { Auth } from "../../src/transport/auth.js";
 import { parseTrustedProxy } from "../../src/transport/client-address.js";
 import { type HttpTransportConfig, httpRouterApp } from "../../src/transport/http.js";
+import { memoryDatabase } from "./database.js";
 import { testConfig, testServices } from "./transport.js";
 
 export const PUBLIC_URL = "https://fio.example.test";
@@ -94,7 +94,7 @@ export async function startOAuth(
   const config = testConfig(transport);
   const scope = await Effect.runPromise(Scope.make());
   const db: Context.Context<SqlClient.SqlClient> = await Effect.runPromise(
-    Layer.buildWithScope(databaseLayer(":memory:", SERVER_MIGRATIONS).pipe(Layer.provide(NodeFileSystem.layer)), scope),
+    Layer.buildWithScope(memoryDatabase(SERVER_MIGRATIONS), scope),
   );
   const release = await Effect.runPromise(Deferred.make<void>());
   const clock = new SkewedClock();
@@ -102,7 +102,7 @@ export async function startOAuth(
   const capture = Logger.make<unknown, void>((entry) => {
     logs.push(Logger.formatLogFmt.log(entry));
   });
-  const oauth = OAuthLive({ publicUrl: PUBLIC_URL, passwordHash: Redacted.make(hash), throttle: options.throttle, trustedProxies });
+  const oauth = Auth.oauth({ publicUrl: PUBLIC_URL, passwordHash: Redacted.make(hash), throttle: options.throttle, trustedProxies });
   // Request handlers run with the router's context, not the layer's: clock and logger are provided per request.
   const captureLayer = Logger.layer([capture]);
   const withClock = HttpRouter.middleware(

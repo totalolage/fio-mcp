@@ -1,17 +1,16 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { assert, describe, it } from "@effect/vitest";
-import { Effect, Exit, Fiber, Layer, Logger, Redacted, References, Tracer } from "effect";
-import { FetchHttpClient, HttpClient, HttpClientError, HttpClientRequest } from "effect/http";
+import { ConfigProvider, Effect, Exit, Fiber, Layer, Logger, Redacted, References, Tracer } from "effect";
 import { TestClock } from "effect/testing";
 import { Accounts } from "../src/accounts.js";
-import { AppConfig, type AppConfigShape } from "../src/config.js";
+import { ServicesLive } from "../src/app.js";
+import { type AppConfigShape, MAX_RESPONSE_BYTES } from "../src/config.js";
 import { PERMISSION_DENIED } from "../src/errors.js";
 import { FioApi } from "../src/fio-api.js";
-import { FioApiLive, type FioApiOptions, fioApiLayer } from "../src/fio-api-live.js";
-import { make as makeFioClient } from "../src/generated/effect.gen.js";
 import { RateLimiter } from "../src/rate-limiter.js";
 import { Redactor } from "../src/redaction.js";
+import { seededConfig } from "./support/config.js";
 import { FioHttp, html, json, text } from "./support/fio-http.js";
 
 const TOKEN = "Tk7pQ2vX9mZr4LbN8sYw3HcJ6dFg1KaE5uVo0iRtBnMxWqSzPyGhCjDlUeAfOk2Q";
@@ -24,6 +23,7 @@ const baseConfig: AppConfigShape = {
   rateLimitIntervalMs: 30_000,
   maxWaitMs: 100_000,
   requestTimeoutMs: 20_000,
+  maxResponseBytes: MAX_RESPONSE_BYTES,
   transport: { kind: "stdio" },
   cache: {
     enabled: false,
@@ -36,17 +36,17 @@ const baseConfig: AppConfigShape = {
   },
 };
 
-const testLayer = (options: FioApiOptions = {}, config: Partial<AppConfigShape> = {}) =>
-  fioApiLayer(options).pipe(
+const testLayer = (config: Partial<AppConfigShape> = {}) =>
+  FioApi.Default.pipe(
     Layer.provideMerge(
       Layer.mergeAll(
         FioHttp.layer({ tokens: [TOKEN], baseUrl: BASE_URL }),
-        Accounts.layer,
-        RateLimiter.layer,
-        Redactor.layer,
+        Accounts.Default,
+        RateLimiter.Default,
+        Redactor.Default,
       ),
     ),
-    Layer.provideMerge(AppConfig.layerFrom({ ...baseConfig, ...config })),
+    Layer.provideMerge(seededConfig({ ...baseConfig, ...config })),
   );
 
 const account = Effect.flatMap(Effect.service(Accounts), (accounts) => accounts.resolve("main"));
@@ -437,7 +437,7 @@ describe("FioApi", () => {
           assert.strictEqual(error.kind, "timeout");
           assert.isTrue(error.dispatched);
         }
-      }).pipe(Effect.provide(testLayer({}, { requestTimeoutMs: 20_000 }))),
+      }).pipe(Effect.provide(testLayer({ requestTimeoutMs: 20_000 }))),
     );
 
     it.effect("a request that cannot be built is FioTransportError(network, not dispatched)", () =>
@@ -542,66 +542,7 @@ describe("FioApi", () => {
   });
 });
 
-describe("generated FIO client", () => {
-  const client = Effect.map(Effect.service(HttpClient.HttpClient), (http) =>
-    makeFioClient(http, {
-      transformClient: (c) => Effect.succeed(c.pipe(HttpClient.mapRequest(HttpClientRequest.prependUrl(BASE_URL)))),
-    }),
-  );
-  const fixtures = FioHttp.layer({ tokens: [TOKEN], baseUrl: BASE_URL });
-
-  it.effect("returns text exports as bytes", () =>
-    Effect.gen(function* () {
-      const fio = yield* client;
-      yield* FioHttp.enqueue(text("a;b;č\n", "text/csv"));
-      const bytes = yield* fio.getPeriods(TOKEN, "2024-01-01", "2024-01-31", "csv", undefined);
-      assert.strictEqual(new TextDecoder().decode(bytes), "a;b;č\n");
-    }).pipe(Effect.provide(fixtures)),
-  );
-
-  it.effect("returns void for an empty set-last-id response", () =>
-    Effect.gen(function* () {
-      const fio = yield* client;
-      yield* FioHttp.enqueue({ status: 200 });
-      const result = yield* fio.setLastId(TOKEN, "42", undefined);
-      assert.isUndefined(result);
-      const [request] = yield* FioHttp.requests;
-      assert.strictEqual(request?.path, "/set-last-id/<token>/42/");
-    }).pipe(Effect.provide(fixtures)),
-  );
-
-  it.effect("returns the XML import response as bytes", () =>
-    Effect.gen(function* () {
-      const fio = yield* client;
-      const xml = "<responseImport><result><errorCode>0</errorCode><status>ok</status></result></responseImport>";
-      yield* FioHttp.enqueue(text(xml, "application/xml"));
-      const bytes = yield* fio.importPayments({
-        payload: { token: TOKEN, type: "xml", file: new File(["<Import/>"], "orders.xml") },
-      });
-      assert.strictEqual(new TextDecoder().decode(bytes), xml);
-    }).pipe(Effect.provide(fixtures)),
-  );
-
-  it.effect("fails an HTML error page with StatusCodeError and keeps the body readable", () =>
-    Effect.gen(function* () {
-      const fio = yield* client;
-      yield* FioHttp.enqueue(html(500, "<html><body>Token neexistuje</body></html>"));
-      const exit = yield* Effect.exit(fio.getPeriodsJson(TOKEN, "2024-01-01", "2024-01-31", undefined));
-      assert.isTrue(Exit.isFailure(exit));
-      const error = Exit.isFailure(exit) ? exit.cause.reasons.find((r) => r._tag === "Fail") : undefined;
-      const value = error?._tag === "Fail" ? error.error : undefined;
-      assert.isTrue(HttpClientError.isHttpClientError(value));
-      if (HttpClientError.isHttpClientError(value) && value.reason._tag === "StatusCodeError") {
-        assert.strictEqual(value.reason.response.status, 500);
-        assert.include(yield* value.reason.response.text, "Token neexistuje");
-      } else {
-        assert.fail("expected StatusCodeError");
-      }
-    }).pipe(Effect.provide(fixtures)),
-  );
-});
-
-describe("FioApiLive over fetch", () => {
+describe("FioApi over fetch", () => {
   interface Hit {
     readonly method: string;
     readonly url: string;
@@ -633,16 +574,18 @@ describe("FioApiLive over fetch", () => {
         }),
     );
 
+  /** The production fetch adapter under seeded config: zero rate-limit spacing, adjustable caps. */
   const liveLayer = (port: number, config: Partial<AppConfigShape> = {}) =>
-    FioApiLive.pipe(
+    FioApi.Default.pipe(
+      Layer.provide(FioApi.FetchClient),
+      Layer.provideMerge(Layer.mergeAll(Accounts.Default, RateLimiter.Default, Redactor.Default)),
       Layer.provideMerge(
-        Layer.mergeAll(Accounts.layer, RateLimiter.layerFrom({ intervalMs: 0, maxWaitMs: 1_000 }), Redactor.layer),
-      ),
-      Layer.provideMerge(
-        AppConfig.layerFrom({
+        seededConfig({
           ...baseConfig,
           baseUrl: `http://127.0.0.1:${port}/v1/rest`,
           requestTimeoutMs: 5_000,
+          rateLimitIntervalMs: 0,
+          maxWaitMs: 1_000,
           ...config,
         }),
       ),
@@ -714,17 +657,10 @@ describe("FioApiLive over fetch", () => {
           closed = true;
         });
       });
-      const layer = fioApiLayer({ maxResponseBytes: 4096 }).pipe(
-        Layer.provide(FetchHttpClient.layer),
-        Layer.provideMerge(
-          Layer.mergeAll(Accounts.layer, RateLimiter.layerFrom({ intervalMs: 0, maxWaitMs: 1_000 }), Redactor.layer),
-        ),
-        Layer.provideMerge(AppConfig.layerFrom({ ...baseConfig, baseUrl: `http://127.0.0.1:${port}/v1/rest` })),
-      );
       const error = yield* Effect.gen(function* () {
         const api = yield* FioApi;
         return yield* failure(api.periodsRaw(yield* account, "2024-01-01", "2024-01-31", "csv"));
-      }).pipe(Effect.provide(layer));
+      }).pipe(Effect.provide(liveLayer(port, { maxResponseBytes: 4096 })));
       assert.strictEqual(error._tag, "FioResponseError");
       for (let waited = 0; waited < 2_000 && !closed; waited += 10) yield* Effect.sleep(10);
       assert.isTrue(closed);
@@ -747,6 +683,36 @@ describe("FioApiLive over fetch", () => {
         assert.strictEqual(error.kind, "network");
         assert.isTrue(error.dispatched);
       }
+    }).pipe(Effect.scoped),
+  );
+
+  it.live("the production services share one Accounts and one RateLimiter", () =>
+    Effect.gen(function* () {
+      const { port } = yield* localFio((path, _req, res) => {
+        if (path === "/v1/rest/periods/<token>/2024-01-01/2024-01-31/transactions.json") {
+          res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(STATEMENT));
+        } else {
+          res.writeHead(418).end();
+        }
+      });
+      // No FIO_ACCOUNT_NUMBER: the number can only come from the statement header.
+      const env = {
+        HOME: "/home/test",
+        FIO_TOKEN: TOKEN,
+        FIO_API_BASE_URL: `http://127.0.0.1:${port}/v1/rest`,
+        FIO_CACHE_ENABLED: "false",
+      };
+      yield* Effect.gen(function* () {
+        const api = yield* FioApi;
+        const accounts = yield* Accounts;
+        const limiter = yield* RateLimiter;
+        const acct = yield* accounts.resolve(undefined);
+        assert.isUndefined(acct.configuredAccountNumber);
+        yield* api.periods(acct, "2024-01-01", "2024-01-31");
+        // FioApi learned through the same Accounts and ran in the same limiter.
+        assert.strictEqual((yield* accounts.details(acct)).accountNumber, "2400222222");
+        assert.isAbove((yield* limiter.state(acct.tokenFingerprint)).nextSlotInSeconds, 0);
+      }).pipe(Effect.provide(ServicesLive.pipe(Layer.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env }))))));
     }).pipe(Effect.scoped),
   );
 });

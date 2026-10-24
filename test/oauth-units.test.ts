@@ -1,11 +1,11 @@
-import { NodeFileSystem } from "@effect/platform-node";
+
 import { assert, describe, it } from "@effect/vitest";
 import { type Cause, Clock, Deferred, Effect, Fiber, Layer, Option, Queue, Redacted, Sink, Stdio, Stream, Terminal } from "effect";
 import { HttpServerRequest } from "effect/http";
 import { SqlClient } from "effect/sql";
 import { TestClock } from "effect/testing";
-import { Accounts, makeAccounts } from "../src/accounts.js";
-import { databaseLayer, SERVER_MIGRATIONS } from "../src/cache/db.js";
+import { Accounts } from "../src/accounts.js";
+import { SERVER_MIGRATIONS } from "../src/cache/db.js";
 import { CommandFailed, hashPasswordCommand, listClientsCommand, revokeAllTokensCommand, revokeClientCommand } from "../src/oauth/cli.js";
 import {
   hashPassword,
@@ -22,6 +22,9 @@ import { makeOAuthServer } from "../src/oauth/server.js";
 import { MAX_SESSIONS, makeSessions, type PendingAuthorization } from "../src/oauth/sessions.js";
 import { makeOAuthStore } from "../src/oauth/store.js";
 import { isResource, parsePublicUrl, redirectUriMatches, redirectUriProblem } from "../src/oauth/urls.js";
+import { testConfig } from "./fixtures.js";
+import { seededConfig } from "./support/config.js";
+import { memoryDatabase } from "./support/database.js";
 
 const FAST = { ln: 14, r: 8, p: 1 } as const;
 
@@ -89,8 +92,8 @@ describe("URL rules", () => {
 
 describe("authorization endpoint request target", () => {
   const services = Layer.mergeAll(
-    databaseLayer(":memory:", SERVER_MIGRATIONS).pipe(Layer.provide(NodeFileSystem.layer)),
-    Layer.effect(Accounts, Effect.map(makeAccounts([]), Accounts.of)),
+    memoryDatabase(SERVER_MIGRATIONS),
+    Accounts.Default.pipe(Layer.provide(seededConfig(testConfig([])))),
   );
 
   it.effect("shows an error page for an absolute-form target that is not a URL", () =>
@@ -361,7 +364,7 @@ describe("hash-password", () => {
 });
 
 describe("admin commands", () => {
-  const db = databaseLayer(":memory:", SERVER_MIGRATIONS).pipe(Layer.provide(NodeFileSystem.layer));
+  const db = memoryDatabase(SERVER_MIGRATIONS);
 
   it.effect("detects reuse of any earlier refresh token and ends a grant at the rotation limit", () =>
     Effect.gen(function* () {
