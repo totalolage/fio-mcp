@@ -4,7 +4,7 @@ import { type Cause, Clock, Deferred, Effect, Fiber, Layer, Option, Queue, Redac
 import { HttpServerRequest } from "effect/http";
 import { SqlClient } from "effect/sql";
 import { TestClock } from "effect/testing";
-import { Accounts, } from "../src/accounts.js";
+import { Accounts } from "../src/accounts.js";
 import { SERVER_MIGRATIONS } from "../src/cache/db.js";
 import { CommandFailed, hashPasswordCommand, listClientsCommand, revokeAllTokensCommand, revokeClientCommand } from "../src/oauth/cli.js";
 import {

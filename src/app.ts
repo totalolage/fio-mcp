@@ -3,7 +3,7 @@ import { Effect, Layer } from "effect";
 import { McpProtocol } from "effect/ai";
 import { Accounts } from "./accounts.js";
 import { backupDatabase, Database } from "./cache/db.js";
-import { CacheLive, CacheSyncLive } from "./cache/service.js";
+import { CacheSyncLive, TransactionCache } from "./cache/service.js";
 import { AppConfig, type HttpAuthConfig } from "./config.js";
 import { FioApi } from "./fio-api.js";
 import { CACHE_INSTRUCTIONS, CacheToolsLive } from "./mcp/cache-tools.js";
@@ -33,17 +33,24 @@ export const SERVER_INFO: ServerInfo = {
   protocols: MCP_PROTOCOLS,
 };
 
-/** Configuration, redaction and logging. Everything else builds on this. */
-export const BaseLive = Layer.mergeAll(AppConfig.Live, Redactor.Live, Accounts.Live, RateLimiter.Live);
-
 // Composition points. Each layer below is built once per process and shared by
 // every MCP session (stdio has one; HTTP has one per client).
 
 /**
  * One instance per process: one rate limiter per token, one FIO client, one
  * SQLite cache. With FIO_CACHE_ENABLED=false the cache opens no database.
+ * Every member closes its own requirements (mergeAll feeds no member from
+ * another); they share one AppConfig, Accounts, RateLimiter and database
+ * because one build memoizes each layer by reference.
  */
-export const ServicesLive = CacheLive.pipe(Layer.provideMerge(Layer.mergeAll(BaseLive, FioApi.Live)));
+export const ServicesLive = Layer.mergeAll(
+  AppConfig.Live,
+  Redactor.Live,
+  Accounts.Live,
+  RateLimiter.Live,
+  FioApi.Live,
+  TransactionCache.Live,
+);
 
 /** Tool registrations (`McpServer.toolkit(...)` layers). */
 export const ToolsLive = Layer.mergeAll(FioToolsLive, CacheToolsLive);

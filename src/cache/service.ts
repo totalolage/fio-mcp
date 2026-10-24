@@ -1,18 +1,19 @@
 import { Clock, Context, DateTime, Effect, Layer, Option, Schedule } from "effect";
-import type { SqlClient } from "effect/sql";
 import { type Account, Accounts } from "../accounts.js";
 import { AppConfig, type AppConfigShape } from "../config.js";
-import { type CacheError, type ConfigError, InvalidInput } from "../errors.js";
+import { type CacheError, type FioRequestError, InvalidInput } from "../errors.js";
 import { FioApi } from "../fio-api.js";
 import type { NormalizedStatement, StatementInfo, Transaction } from "../statement.js";
 import { addDays, type DayRange, minDate, pragueDateOf, pragueToday, rangeLength } from "./dates.js";
 import { Database } from "./db.js";
+import { fromFio, type Source, selectSource, type TransactionsResult } from "./source.js";
 import { type CachedAccount, type CacheStore, makeCacheStore, type SyncMode } from "./store.js";
 import { type CacheSyncShape, makeCacheSync, type SyncRequest } from "./sync.js";
 
 /**
  * The transaction cache as the tools see it. With FIO_CACHE_ENABLED=false
- * the service is `{ enabled: false }` and no database is opened.
+ * the `Disabled` adapter answers date-range reads from FIO and no database
+ * is opened.
  */
 
 /** How complete and current cache-served data is, for the requested range. */
@@ -39,7 +40,18 @@ export interface CachedStatement {
   readonly freshness: Freshness;
 }
 
-export interface EnabledCache {
+interface CacheReads {
+  /** Date-range movements from the cache or FIO, by `source`; a FIO answer is written through. */
+  readonly transactions: (
+    account: Account,
+    range: DayRange,
+    source: Source,
+  ) => Effect.Effect<TransactionsResult, InvalidInput | CacheError | FioRequestError>;
+  /** Stores movements from a FIO read that is not a date range (statement, last). Never fails. */
+  readonly record: (account: Account, statement: NormalizedStatement) => Effect.Effect<void>;
+}
+
+export interface EnabledCache extends CacheReads {
   readonly enabled: true;
   readonly store: CacheStore;
   readonly sync: CacheSyncShape;
@@ -51,17 +63,9 @@ export interface EnabledCache {
   readonly read: (account: Account, range: DayRange) => Effect.Effect<CachedStatement, InvalidInput | CacheError>;
   /** Stores a FIO /periods response for `range`; failures are logged, never raised. */
   readonly writeThrough: (account: Account, statement: NormalizedStatement, range: DayRange) => Effect.Effect<void>;
-  /** Stores movements from a response that is not a full date range (no coverage); failures are logged. */
-  readonly record: (account: Account, statement: NormalizedStatement) => Effect.Effect<void>;
 }
 
-export type TransactionCacheShape = { readonly enabled: false } | EnabledCache;
-
-export class TransactionCache extends Context.Service<TransactionCache, TransactionCacheShape>()(
-  "fio-mcp/TransactionCache",
-) {
-  static readonly disabled = Layer.succeed(TransactionCache, { enabled: false });
-}
+export type TransactionCacheShape = (CacheReads & { readonly enabled: false }) | EnabledCache;
 
 export const NOT_VERIFIED =
   "The cache is not verified for this token yet; run sync_transactions (or get_transactions with source=fio) first.";
@@ -90,7 +94,7 @@ function cachedInfo(account: Option.Option<CachedAccount>, range: DayRange): Sta
   };
 }
 
-export const makeTransactionCache = Effect.fn("TransactionCache.make")(function* () {
+const makeTransactionCache = Effect.fn("TransactionCache.make")(function* () {
   const config = yield* AppConfig;
   const fio = yield* FioApi;
   const store = yield* makeCacheStore();
@@ -204,40 +208,43 @@ export const makeTransactionCache = Effect.fn("TransactionCache.make")(function*
     read,
     writeThrough,
     record,
+    transactions: selectSource(fio, { boundAccount, servable, read, writeThrough }),
   } satisfies EnabledCache;
 });
 
-/** The enabled cache on an existing SqlClient (tests provide an in-memory one). */
-export const TransactionCacheFromSql: Layer.Layer<
-  TransactionCache,
-  never,
-  SqlClient.SqlClient | AppConfig | FioApi
-> = Layer.effect(TransactionCache, Effect.map(makeTransactionCache(), TransactionCache.of));
+export class TransactionCache extends Context.Service<TransactionCache, TransactionCacheShape>()(
+  "fio-mcp/TransactionCache",
+) {
+  /** The enabled cache on the SqlClient in context (tests provide an in-memory one). */
+  static readonly Default = Layer.effect(TransactionCache, makeTransactionCache());
 
-/**
- * The cache on a database the caller provides (e.g. `Database.Live`, shared
- * with other users of the file); `{ enabled: false }` when the cache is off.
- */
-export const CacheOnDatabaseLive: Layer.Layer<TransactionCache, never, SqlClient.SqlClient | AppConfig | FioApi> =
-  Layer.unwrap(
+  /** FIO_CACHE_ENABLED=false: date-range reads go to FIO, nothing is stored, cache-only reads fail. */
+  static readonly Disabled = Layer.effect(
+    TransactionCache,
     Effect.gen(function* () {
-      const config = yield* AppConfig;
-      return config.cache.enabled ? TransactionCacheFromSql : TransactionCache.disabled;
+      const live = fromFio(yield* FioApi, () => Effect.void);
+      return {
+        enabled: false,
+        transactions: (account, range, source) =>
+          source === "cache" ? Effect.fail(new InvalidInput({ detail: CACHE_DISABLED })) : live(account, range),
+        record: () => Effect.void,
+      } satisfies TransactionCacheShape;
     }),
   );
 
-/**
- * The cache from configuration with its own database: opens and migrates
- * FIO_DB_PATH when the cache is enabled, otherwise `{ enabled: false }`
- * without touching disk.
- */
-export const CacheLive: Layer.Layer<TransactionCache, CacheError | ConfigError, AppConfig | FioApi> =
-  Layer.unwrap(
+  /**
+   * The cache from configuration: on the server's database (FIO_DB_PATH)
+   * when enabled, otherwise `Disabled` without touching disk.
+   */
+  static readonly Live = Layer.unwrap(
     Effect.gen(function* () {
       const config = yield* AppConfig;
-      return config.cache.enabled ? TransactionCacheFromSql.pipe(Layer.provide(Database.Live)) : TransactionCache.disabled;
+      return config.cache.enabled
+        ? TransactionCache.Default.pipe(Layer.provide(Database.Live))
+        : TransactionCache.Disabled;
     }),
-  );
+  ).pipe(Layer.provide(Layer.mergeAll(FioApi.Live, AppConfig.Live)));
+}
 
 const syncAll = Effect.fn("CacheSync.syncAll")(function* (
   cache: EnabledCache,

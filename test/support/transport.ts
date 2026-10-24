@@ -46,7 +46,8 @@ export function testConfig(transport: TransportConfig = { kind: "stdio" }): AppC
 
 /** The app's services with a fake FioApi; one instance shared by every session. */
 export const testServices = (config: AppConfigShape, release: Deferred.Deferred<void>) =>
-  Layer.mergeAll(slotHoldingFio(release), Layer.succeed(TransactionCache, { enabled: false })).pipe(
+  TransactionCache.Disabled.pipe(
+    Layer.provideMerge(slotHoldingFio(release)),
     Layer.provideMerge(Layer.mergeAll(Redactor.Default, Accounts.Default, RateLimiter.Default)),
     Layer.provideMerge(seededConfig(config)),
   );

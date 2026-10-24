@@ -11,7 +11,7 @@ import { Effect, Layer, Redacted } from "effect";
 import { HttpRouter, HttpServer } from "effect/http";
 import { Accounts } from "../../src/accounts.js";
 import { SERVER_INFO, ToolsLive } from "../../src/app.js";
-import { TransactionCache, TransactionCacheFromSql } from "../../src/cache/service.js";
+import { TransactionCache } from "../../src/cache/service.js";
 import type { AppConfigShape } from "../../src/config.js";
 import { FioApi } from "../../src/fio-api.js";
 import { RateLimiter } from "../../src/rate-limiter.js";
@@ -44,8 +44,8 @@ export async function connect(config: AppConfigShape, route: FioHttpHandler | Fi
     ).pipe(Effect.scoped),
   );
   const cache = config.cache.enabled
-    ? TransactionCacheFromSql.pipe(Layer.provide(testDatabase(config.cache.dbPath)))
-    : TransactionCache.disabled;
+    ? TransactionCache.Default.pipe(Layer.provide(testDatabase(config.cache.dbPath)))
+    : TransactionCache.Disabled;
   const ServicesLive = cache.pipe(
     Layer.provideMerge(FioApi.Default),
     Layer.provideMerge(Layer.mergeAll(Redactor.Default, Accounts.Default, RateLimiter.Default)),

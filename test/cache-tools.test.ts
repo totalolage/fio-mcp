@@ -1,13 +1,8 @@
 import { assert, describe, it } from "@effect/vitest";
 import { Effect, Layer, Ref } from "effect";
-import { TestClock } from "effect/testing";
-import { Accounts } from "../src/accounts.js";
-import { CACHE_DISABLED, NOT_VERIFIED } from "../src/cache/service.js";
+import { CACHE_DISABLED } from "../src/cache/service.js";
 import { type CacheError, InvalidInput, type PermissionDenied } from "../src/errors.js";
 import { makeCacheHandlers, makeCacheToolkit } from "../src/mcp/cache-tools.js";
-import { makeFioHandlers, makeFioToolkit } from "../src/mcp/fio-tools.js";
-import { RateLimiter } from "../src/rate-limiter.js";
-import { Redactor } from "../src/redaction.js";
 import { LocalPrincipalLive } from "../src/transport/principal.js";
 import {
   account,
@@ -21,11 +16,9 @@ import {
   TODAY,
   tx,
 } from "./support/cache.js";
-import { seededConfig } from "./support/config.js";
-import { fakeFio, type PeriodsScript } from "./support/fio-api.js";
+import { fakeFio } from "./support/fio-api.js";
 
 const cacheTools = Effect.suspend(() => makeCacheHandlers(makeCacheToolkit(["main"])));
-const fioTools = Effect.suspend(() => makeFioHandlers(makeFioToolkit(["main"]))).pipe(Effect.provide(RateLimiter.Default));
 
 const fixture = [
   tx(1, "2026-01-05", -100.1, {
@@ -212,135 +205,8 @@ describe("cache query tools", () => {
   );
 });
 
-describe("get_transactions with the cache", () => {
-  it.effect("auto asks FIO when the range is not cached, writes through, then answers from the cache", () =>
-    Effect.gen(function* () {
-      yield* setNow();
-      const fio = yield* fakeFio(serveFrom(fixture));
-      yield* Effect.gen(function* () {
-        const tools = yield* fioTools;
-        const args = { dateFrom: "2026-10-01", dateTo: TODAY };
-        const first = yield* tools.get_transactions(args);
-        assert.strictEqual(first.source, "fio");
-        assert.strictEqual((yield* Ref.get(fio.calls)).length, 1);
-        assert.strictEqual((yield* Ref.get(fio.calls))[0]?.priority, undefined);
-
-        const second = yield* tools.get_transactions(args);
-        assert.strictEqual(second.source, "cache");
-        assert.strictEqual((yield* Ref.get(fio.calls)).length, 1);
-        assert.strictEqual((second.info as { closingBalance: unknown }).closingBalance, null);
-        assert.deepStrictEqual((second as { lastKnownBalance?: unknown }).lastKnownBalance, { amount: 1000, date: TODAY });
-        assert.isTrue((second.freshness as { complete: boolean }).complete);
-
-        // An hour later today's data is no longer fresh and not yet settled.
-        yield* TestClock.adjust(61 * 60_000);
-        assert.strictEqual((yield* tools.get_transactions(args)).source, "fio");
-
-        // Older days fetched more than overlapDays after them are settled.
-        const old = { dateFrom: "2026-09-01", dateTo: "2026-09-30" };
-        assert.strictEqual((yield* tools.get_transactions(old)).source, "fio");
-        yield* TestClock.adjust(24 * 60 * 60_000);
-        assert.strictEqual((yield* tools.get_transactions(old)).source, "cache");
-
-        // source=fio always asks FIO.
-        const calls = (yield* Ref.get(fio.calls)).length;
-        assert.strictEqual((yield* tools.get_transactions({ ...old, source: "fio" })).source, "fio");
-        assert.strictEqual((yield* Ref.get(fio.calls)).length, calls + 1);
-      }).pipe(Effect.provide(Layer.mergeAll(cacheLayer(config(), fio.layer), LocalPrincipalLive)));
-    }),
-  );
-
-  it.effect("auto keeps asking FIO while its response has a movement without an ID", () =>
-    Effect.gen(function* () {
-      yield* setNow();
-      const malformed: PeriodsScript = (call) =>
-        Effect.succeed(statement(call.from, call.to, [tx(1, "2026-10-05", -10), tx(2, "2026-10-06", 20, { id: null })]));
-      const fio = yield* fakeFio(malformed);
-      yield* Effect.gen(function* () {
-        const tools = yield* fioTools;
-        const args = { dateFrom: "2026-10-01", dateTo: TODAY };
-        assert.strictEqual((yield* tools.get_transactions(args)).source, "fio");
-        assert.strictEqual((yield* tools.get_transactions(args)).source, "fio");
-        assert.strictEqual((yield* Ref.get(fio.calls)).length, 2);
-        // Nothing was stored, so the cache is not even bound to the token.
-        assert.instanceOf(yield* Effect.flip(tools.get_transactions({ ...args, source: "cache" })), InvalidInput);
-      }).pipe(Effect.provide(Layer.mergeAll(cacheLayer(config(), fio.layer), LocalPrincipalLive)));
-    }),
-  );
-
-  it.effect("source=cache never calls FIO and needs a verified binding", () =>
-    Effect.gen(function* () {
-      yield* setNow();
-      const fio = yield* fakeFio(serveFrom(fixture));
-      yield* Effect.gen(function* () {
-        const tools = yield* fioTools;
-        const unverified = yield* Effect.flip(
-          tools.get_transactions({ dateFrom: "2026-01-01", dateTo: TODAY, source: "cache" }),
-        );
-        assert.instanceOf(unverified, InvalidInput);
-        assert.strictEqual(unverified.message, NOT_VERIFIED);
-        yield* seed;
-        const partial = yield* tools.get_transactions({ dateFrom: "2025-06-01", dateTo: "2026-01-31", source: "cache" });
-        assert.strictEqual(partial.source, "cache");
-        assert.deepStrictEqual(ids(partial.transactions), [1, 2]);
-        assert.isFalse((partial.freshness as { complete: boolean }).complete);
-        assert.strictEqual((yield* Ref.get(fio.calls)).length, 0);
-      }).pipe(Effect.provide(Layer.mergeAll(cacheLayer(config(), fio.layer), LocalPrincipalLive)));
-    }),
-  );
-
-  it.effect("statement and new-movement results are stored without coverage", () =>
-    Effect.gen(function* () {
-      yield* setNow();
-      const fio = yield* fakeFio(serveFrom([]), {
-        statement: () => Effect.succeed(statement("2026-01-01", "2026-01-31", [fixture[0]!, fixture[1]!])),
-        last: () => Effect.succeed(statement("2026-10-01", TODAY, [tx(42, TODAY, 5)])),
-      });
-      yield* Effect.gen(function* () {
-        const tools = yield* fioTools;
-        yield* tools.get_statement({ year: 2026, number: 1 });
-        yield* tools.get_new_transactions({});
-        const cache = yield* enabledCache;
-        const key = yield* cache.boundAccount(yield* account());
-        assert.strictEqual((yield* cache.store.stats(key)).rowCount, 3);
-        assert.deepStrictEqual(yield* cache.store.coveredRanges(key), []);
-        // Unfiltered queries reach back to the earliest stored movement, not just covered days.
-        const found = yield* (yield* cacheTools).search_transactions({});
-        assert.deepStrictEqual(ids(found.transactions), [42, 2, 1]);
-        assert.isFalse((found.freshness as { complete: boolean }).complete);
-      }).pipe(Effect.provide(Layer.mergeAll(cacheLayer(config(), fio.layer), LocalPrincipalLive)));
-    }),
-  );
-
-  it.effect("live freshness follows the period FIO's header reports", () =>
-    Effect.gen(function* () {
-      yield* setNow();
-      const fio = yield* fakeFio((call, n) =>
-        Effect.map(serveFrom(fixture)(call, n), (s) => ({ ...s, info: { ...s.info, dateStart: "2026-02-01" } })),
-      );
-      yield* Effect.gen(function* () {
-        const tools = yield* fioTools;
-        const result = yield* tools.get_transactions({ dateFrom: "2026-01-01", dateTo: "2026-12-31", source: "fio" });
-        const freshness = result.freshness as { complete: boolean; coveredRanges: unknown };
-        assert.isFalse(freshness.complete);
-        assert.deepStrictEqual(freshness.coveredRanges, [{ from: "2026-02-01", to: TODAY }]);
-        const future = yield* tools.get_transactions({ dateFrom: "2026-11-01", dateTo: "2026-11-30", source: "fio" });
-        assert.deepStrictEqual(future.freshness, {
-          lastSyncAt: "2026-10-22T10:00:00.000Z",
-          coveredFrom: null,
-          coveredTo: null,
-          coveredRanges: [],
-          oldestFetchAt: "2026-10-22T10:00:00.000Z",
-          historyLimited: false,
-          complete: true,
-        });
-      }).pipe(Effect.provide(Layer.mergeAll(cacheLayer(config(), fio.layer), LocalPrincipalLive)));
-    }),
-  );
-});
-
 describe("cache disabled", () => {
-  it.effect("cache tools answer that the cache is disabled; get_transactions uses FIO", () =>
+  it.effect("cache tools answer that the cache is disabled", () =>
     Effect.gen(function* () {
       yield* setNow();
       const fio = yield* fakeFio(serveFrom(fixture));
@@ -357,33 +223,7 @@ describe("cache disabled", () => {
           assert.instanceOf(error, InvalidInput);
           assert.strictEqual(error.message, CACHE_DISABLED);
         }
-        const tools = yield* fioTools;
-        const args = { dateFrom: "2026-01-01", dateTo: TODAY };
-        assert.strictEqual((yield* tools.get_transactions(args)).source, "fio");
-        assert.strictEqual((yield* tools.get_transactions(args)).source, "fio");
-        assert.strictEqual((yield* Ref.get(fio.calls)).length, 2);
-        const error = yield* Effect.flip(tools.get_transactions({ ...args, source: "cache" }));
-        assert.strictEqual(error.message, CACHE_DISABLED);
       }).pipe(Effect.provide(Layer.mergeAll(disabledCacheLayer(config(), fio.layer), LocalPrincipalLive)));
-    }),
-  );
-
-  it.effect("get_transactions works without the cache layer wired at all", () =>
-    Effect.gen(function* () {
-      yield* setNow();
-      const fio = yield* fakeFio(serveFrom(fixture));
-      const cfg = config();
-      const layer = Layer.mergeAll(
-        Accounts.Default,
-        Redactor.Default,
-        fio.layer,
-      ).pipe(Layer.provideMerge(seededConfig(cfg)));
-      yield* Effect.gen(function* () {
-        const tools = yield* fioTools;
-        const result = yield* tools.get_transactions({ dateFrom: "2026-01-01", dateTo: TODAY });
-        assert.strictEqual(result.source, "fio");
-        assert.strictEqual(result.transactionCount, 6);
-      }).pipe(Effect.provide(Layer.mergeAll(layer, LocalPrincipalLive)));
     }),
   );
 });

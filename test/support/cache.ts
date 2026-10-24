@@ -2,7 +2,7 @@
 import { Effect, Layer, Redacted } from "effect";
 import { TestClock } from "effect/testing";
 import { type Account, Accounts } from "../../src/accounts.js";
-import { TransactionCache, TransactionCacheFromSql } from "../../src/cache/service.js";
+import { TransactionCache } from "../../src/cache/service.js";
 import { type AppConfigShape, type CacheConfig, DEFAULT_BACKFILL_FROM, DEFAULT_CACHE_MAX_AGE_MINUTES, DEFAULT_OVERLAP_DAYS, MAX_RESPONSE_BYTES } from "../../src/config.js";
 import type { FioApi } from "../../src/fio-api.js";
 import { Redactor } from "../../src/redaction.js";
@@ -120,14 +120,14 @@ const baseLayer = (cfg: AppConfigShape, fio: Layer.Layer<FioApi>) =>
   Layer.mergeAll(Accounts.Default, Redactor.Default, fio).pipe(Layer.provideMerge(seededConfig(cfg)));
 
 export const cacheLayer = (cfg: AppConfigShape, fio: Layer.Layer<FioApi>) =>
-  TransactionCacheFromSql.pipe(
+  TransactionCache.Default.pipe(
     Layer.provideMerge(testDatabase(cfg.cache.dbPath)),
     Layer.provideMerge(baseLayer(cfg, fio)),
   );
 
 /** The same services with FIO_CACHE_ENABLED=false: no database at all. */
 export const disabledCacheLayer = (cfg: AppConfigShape, fio: Layer.Layer<FioApi>) =>
-  TransactionCache.disabled.pipe(Layer.provideMerge(baseLayer({ ...cfg, cache: { ...cfg.cache, enabled: false } }, fio)));
+  TransactionCache.Disabled.pipe(Layer.provideMerge(baseLayer({ ...cfg, cache: { ...cfg.cache, enabled: false } }, fio)));
 
 export const enabledCache = Effect.gen(function* () {
   const cache = yield* TransactionCache;
