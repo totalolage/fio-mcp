@@ -372,6 +372,42 @@ describe("accounts at /admin", () => {
     expect(await remove("fourth")).toContain("Nothing was cached under its current token, so nothing was deleted.");
   });
 
+  it("keeps what an earlier token cached when the current one cached nothing, and data another account's token reads", async () => {
+    const admin = await signedIn();
+    const movements = () =>
+      harness.sql(
+        Effect.flatMap(SqlClient.SqlClient, (sql) =>
+          Effect.map(sql<{ id: number }>`SELECT movement_id AS id FROM transactions ORDER BY movement_id`, (rows) => rows.map((row) => row.id)),
+        ),
+      );
+    const cache = (token: string, accountName: string, id: number, accountId?: string) =>
+      harness.sql(
+        Effect.flatMap(makeCacheStore(), (store) =>
+          store.commit({
+            accountName,
+            tokenFingerprint: tokenFingerprint(Redacted.make(token)),
+            statement: statement(TODAY, TODAY, [tx(id, TODAY, 5)], accountId),
+            fetchedAt: NOW,
+          }),
+        ),
+      );
+    const remove = async (name: string) =>
+      (await admin.act("/admin/accounts/remove", { id: idOf((await admin.page("/admin")).html, name), cache: "purge", confirm: "yes" })).message;
+
+    // Replaced before the new token downloaded anything: the old token's data cannot be told apart, so it stays.
+    await cache(SAVINGS_TOKEN, "savings", 505, "2000000009");
+    await admin.act("/admin/accounts/rotate", { id: idOf((await admin.page("/admin")).html, "savings"), token: THIRD_TOKEN });
+    expect(await remove("savings")).toContain("Removed “savings”. Nothing was cached under its current token, so nothing was deleted.");
+    expect(await movements()).toEqual([505]);
+
+    // Accounts with the same token keep it, all named; nothing is deleted.
+    await cache(FIO_TOKEN, "main", 606);
+    await admin.act("/admin/accounts/add", { name: "twin", token: FIO_TOKEN });
+    await admin.act("/admin/accounts/add", { name: "triplet", token: FIO_TOKEN });
+    expect(await remove("main")).toContain("Removed “main”. Its cached transactions were kept: “twin”, “triplet” use the same token.");
+    expect(await movements()).toEqual([505, 606]);
+  });
+
   it("tests a token with one read-only call through its rate limiter, which follows a replaced token", async () => {
     const admin = await signedIn();
     const page = await admin.page("/admin");

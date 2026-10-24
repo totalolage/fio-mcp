@@ -283,6 +283,30 @@ describe("cache purge for a removed token", () => {
     ),
   );
 
+  it.effect("keeps the data for a configured token and still drops the bindings of tokens no account uses", () =>
+    purgeFixture(({ store, bind, count }) =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`INSERT INTO coverage_days ${sql.insert({ account_key: "k1", day: "2026-01-01", fetched_at: 1 })}`;
+        yield* bind("fp-old", "k1");
+        yield* bind("fp-active", "k1");
+        yield* bind("fp-removed", "k1");
+        assert.deepStrictEqual(yield* store.purgeToken("fp-removed", new Set(["fp-active"])), {
+          kind: "shared",
+          tokenFingerprints: ["fp-active"],
+        });
+        assert.strictEqual(yield* count("transactions"), 1);
+        assert.strictEqual(yield* count("coverage_days"), 1);
+        assert.strictEqual(yield* count("accounts"), 1);
+        assert.deepStrictEqual(
+          yield* sql<{ fp: string }>`SELECT token_fingerprint AS fp FROM bindings UNION ALL SELECT token_fingerprint FROM sync_state`,
+          [{ fp: "fp-active" }, { fp: "fp-active" }],
+        );
+        assert.strictEqual(Option.map(yield* store.binding("fp-active"), (binding) => binding.verifiedAt).pipe(Option.getOrUndefined), 1);
+      }),
+    ),
+  );
+
   it.effect("deletes the data when only tokens no account uses are still bound, and their bindings", () =>
     purgeFixture(({ store, bind, count }) =>
       Effect.gen(function* () {
