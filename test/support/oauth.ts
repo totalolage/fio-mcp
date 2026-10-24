@@ -20,8 +20,8 @@ import { SERVER_MIGRATIONS } from "../../src/cache/db.js";
 import type { HttpAuthConfig } from "../../src/config.js";
 import { hashPassword, type PasswordHash, parsePasswordHash } from "../../src/oauth/crypto.js";
 import type { ThrottlePolicy } from "../../src/oauth/login.js";
-import { OAuthLive } from "../../src/oauth/server.js";
 import { makeOAuthStore, type OAuthStore } from "../../src/oauth/store.js";
+import { Auth } from "../../src/transport/auth.js";
 import { parseTrustedProxy } from "../../src/transport/client-address.js";
 import { type HttpTransportConfig, httpRouterApp } from "../../src/transport/http.js";
 import { memoryDatabase } from "./database.js";
@@ -102,7 +102,7 @@ export async function startOAuth(
   const capture = Logger.make<unknown, void>((entry) => {
     logs.push(Logger.formatLogFmt.log(entry));
   });
-  const oauth = OAuthLive({ publicUrl: PUBLIC_URL, passwordHash: Redacted.make(hash), throttle: options.throttle, trustedProxies });
+  const oauth = Auth.oauth({ publicUrl: PUBLIC_URL, passwordHash: Redacted.make(hash), throttle: options.throttle, trustedProxies });
   // Request handlers run with the router's context, not the layer's: clock and logger are provided per request.
   const captureLayer = Logger.layer([capture]);
   const withClock = HttpRouter.middleware(
