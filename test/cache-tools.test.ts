@@ -9,7 +9,7 @@ import {
   cacheLayer,
   config,
   disabledCacheLayer,
-  enabledCache,
+  seedRange,
   serveFrom,
   setNow,
   statement,
@@ -37,145 +37,93 @@ const fixture = [
 
 const COVERED = { from: "2026-01-01", to: TODAY };
 
-/** Caches the fixture for COVERED through write-through, as get_transactions source=fio would. */
+/** Caches the fixture for COVERED, as get_transactions source=fio would. */
 const seed = Effect.gen(function* () {
-  const cache = yield* enabledCache;
-  yield* cache.writeThrough(yield* account(), statement(COVERED.from, COVERED.to, fixture), COVERED);
+  yield* seedRange(yield* account(), statement(COVERED.from, COVERED.to, fixture), COVERED);
 });
 
 const ids = (rows: unknown) => (rows as ReadonlyArray<{ id: number }>).map((r) => r.id);
 
+// Query semantics are tested on TransactionCache (test/transaction-cache.test.ts);
+// these cases cover argument defaults, validation and the result envelope.
 describe("cache query tools", () => {
-  it.effect("search filters, pages and orders cached movements", () =>
+  it.effect("search_transactions pages with defaults and reports the cache as its source", () =>
     Effect.gen(function* () {
       yield* setNow();
       const fio = yield* fakeFio(serveFrom([]));
       yield* Effect.gen(function* () {
         yield* seed;
         const tools = yield* cacheTools;
-        const search = (args: Parameters<typeof tools.search_transactions>[0]) => tools.search_transactions(args);
-        assert.deepStrictEqual(ids((yield* search({ direction: "out", minAmount: 100 })).transactions), [7, 1]);
-        assert.deepStrictEqual(ids((yield* search({ counterparty: "albert" })).transactions), [4, 3, 1]);
-        assert.deepStrictEqual(ids((yield* search({ counterparty: "999/2010" })).transactions), [7]);
-        assert.deepStrictEqual(ids((yield* search({ text: "RENT" })).transactions), [7]);
-        assert.deepStrictEqual(ids((yield* search({ text: "nakup" })).transactions), [1]);
-        assert.deepStrictEqual(ids((yield* search({ variableSymbol: "2026001" })).transactions), [2]);
-        assert.deepStrictEqual(ids((yield* search({ type: "Platba kartou", maxAmount: 0.15 })).transactions), [3]);
-        assert.deepStrictEqual(ids((yield* search({ currency: "eur" })).transactions), [5]);
-        assert.deepStrictEqual(ids((yield* search({ dateFrom: "2026-02-01", dateTo: "2026-02-28", direction: "in" })).transactions), [5]);
-        const page = yield* search({ order: "asc", limit: 2, offset: 1 });
-        assert.deepStrictEqual(ids(page.transactions), [2, 3]);
-        assert.strictEqual(page.total, 6);
-        assert.strictEqual(page.source, "cache");
-        const freshness = page.freshness as { complete: boolean; coveredRanges: unknown; lastSyncAt: unknown };
-        assert.isTrue(freshness.complete);
-        assert.deepStrictEqual(freshness.coveredRanges, [COVERED]);
-
-        const invalid = yield* Effect.flip(search({ minAmount: 10, maxAmount: 1 }));
-        assert.instanceOf(invalid, InvalidInput);
-        assert.instanceOf(yield* Effect.flip(search({ dateFrom: "2026-02-02", dateTo: "2026-02-01" })), InvalidInput);
-        assert.instanceOf(yield* Effect.flip(search({ dateFrom: "2026-11-01" })), InvalidInput);
+        const all = yield* tools.search_transactions({});
+        assert.strictEqual(all.account, "main");
+        assert.strictEqual(all.source, "cache");
+        assert.strictEqual(all.limit, 100);
+        assert.strictEqual(all.offset, 0);
+        assert.strictEqual(all.returned, 6);
+        assert.deepStrictEqual(ids(all.transactions), [7, 5, 4, 3, 2, 1]);
+        const page = yield* tools.search_transactions({ order: "asc", limit: 2, offset: 1, counterparty: "albert" });
+        assert.deepStrictEqual(ids(page.transactions), [3, 4]);
+        assert.strictEqual(page.total, 3);
+        assert.strictEqual(page.returned, 2);
+        assert.isTrue((page.freshness as { complete: boolean }).complete);
+        assert.instanceOf(yield* Effect.flip(tools.search_transactions({ minAmount: 10, maxAmount: 1 })), InvalidInput);
       }).pipe(Effect.provide(Layer.mergeAll(cacheLayer(config(), fio.layer), LocalPrincipalLive)));
     }),
   );
 
-  it.effect("summaries group by month, counterparty and type, split by currency, in exact cents", () =>
+  it.effect("summarize_transactions returns the grouping with its totals", () =>
     Effect.gen(function* () {
       yield* setNow();
       const fio = yield* fakeFio(serveFrom([]));
       yield* Effect.gen(function* () {
         yield* seed;
         const tools = yield* cacheTools;
-        const byMonth = yield* tools.summarize_transactions({ groupBy: "month" });
-        assert.deepStrictEqual(byMonth.groups, [
-          { key: "2026-01", currency: "CZK", count: 2, income: 2500, expense: 100.1, net: 2399.9 },
-          { key: "2026-02", currency: "CZK", count: 2, income: 0, expense: 0.3, net: -0.3 },
-          { key: "2026-02", currency: "EUR", count: 1, income: 50, expense: 0, net: 50 },
-          { key: "2026-03", currency: "CZK", count: 1, income: 0, expense: 1000, net: -1000 },
-        ]);
-        assert.deepStrictEqual(byMonth.totals, [
-          { currency: "CZK", count: 5, income: 2500, expense: 1100.4, net: 1399.6 },
-          { currency: "EUR", count: 1, income: 50, expense: 0, net: 50 },
-        ]);
-        assert.strictEqual(byMonth.totalGroups, 4);
-
-        const byCounterparty = yield* tools.summarize_transactions({ groupBy: "counterparty", direction: "out" });
-        assert.deepStrictEqual(byCounterparty.groups, [
-          { key: "999/2010", currency: "CZK", count: 1, income: 0, expense: 1000, net: -1000 },
-          { key: "Albert Praha", currency: "CZK", count: 3, income: 0, expense: 100.4, net: -100.4 },
-        ]);
-
-        const byType = yield* tools.summarize_transactions({ groupBy: "type", limit: 1, offset: 0 });
+        const byType = yield* tools.summarize_transactions({ groupBy: "type", limit: 1 });
+        assert.strictEqual(byType.source, "cache");
+        assert.strictEqual(byType.groupBy, "type");
         assert.strictEqual(byType.totalGroups, 4);
         assert.deepStrictEqual(byType.groups, [
           { key: "Příjem", currency: "CZK", count: 1, income: 2500, expense: 0, net: 2500 },
         ]);
+        assert.strictEqual((byType.totals as ReadonlyArray<unknown>).length, 2);
+        assert.isTrue((byType.freshness as { complete: boolean }).complete);
       }).pipe(Effect.provide(Layer.mergeAll(cacheLayer(config(), fio.layer), LocalPrincipalLive)));
     }),
   );
 
-  it.effect("freshness reports gaps in the requested range", () =>
+  it.effect("get_cache_status lists the settings and each account's status", () =>
     Effect.gen(function* () {
       yield* setNow();
       const fio = yield* fakeFio(serveFrom([]));
       yield* Effect.gen(function* () {
         yield* seed;
         const tools = yield* cacheTools;
-        const result = yield* tools.search_transactions({ dateFrom: "2025-12-01", dateTo: "2026-12-31" });
-        assert.deepStrictEqual(result.freshness, {
-          lastSyncAt: null,
-          coveredFrom: COVERED.from,
-          coveredTo: TODAY,
-          coveredRanges: [COVERED],
-          oldestFetchAt: "2026-10-22T10:00:00.000Z",
-          historyLimited: false,
-          complete: false,
+        const result = yield* tools.get_cache_status();
+        assert.strictEqual(result.dbPath, ":memory:");
+        assert.deepStrictEqual(result.settings, {
+          syncOnStartup: false,
+          syncIntervalMinutes: 0,
+          backfillFrom: "2000-01-01",
+          overlapDays: 10,
+          maxAgeMinutes: 60,
         });
-      }).pipe(Effect.provide(Layer.mergeAll(cacheLayer(config(), fio.layer), LocalPrincipalLive)));
-    }),
-  );
-
-  it.effect("status and sync report per account", () =>
-    Effect.gen(function* () {
-      yield* setNow();
-      const fio = yield* fakeFio(serveFrom(fixture));
-      yield* Effect.gen(function* () {
-        const tools = yield* cacheTools;
-        const before = yield* tools.get_cache_status();
-        const [unverified] = before.accounts as ReadonlyArray<{ verified: boolean }>;
-        assert.isFalse(unverified?.verified);
-
-        const synced = yield* tools.sync_transactions({ mode: "backfill", from: "2026-01-01" });
-        const job = synced.job as { status: string; requests: number; kind: string };
-        assert.strictEqual(job.status, "completed");
-        assert.strictEqual(job.kind, "backfill");
-        assert.deepStrictEqual(
-          (yield* Ref.get(fio.calls)).map((c) => [c.from, c.to, c.priority]),
-          [["2026-01-01", TODAY, "background"]],
-        );
-
-        const after = yield* tools.get_cache_status();
-        const [status] = after.accounts as ReadonlyArray<Record<string, unknown>>;
+        const [status] = result.accounts as ReadonlyArray<Record<string, unknown>>;
+        assert.strictEqual(status?.name, "main");
         assert.strictEqual(status?.verified, true);
         assert.strictEqual(status?.rowCount, 6);
-        assert.deepStrictEqual(status?.coveredRanges, [COVERED]);
-        assert.deepStrictEqual(status?.lastKnownBalance, { amount: 1000, currency: "CZK", date: TODAY });
-        assert.strictEqual((status?.sync as { lastSuccessAt: string } | undefined)?.lastSuccessAt, "2026-10-22T10:00:00.000Z");
-
-        assert.instanceOf(yield* Effect.flip(tools.sync_transactions({ from: "2026-01-01" })), InvalidInput);
       }).pipe(Effect.provide(Layer.mergeAll(cacheLayer(config(), fio.layer), LocalPrincipalLive)));
     }),
   );
-  it.effect("sync_transactions refresh re-downloads cached days and validates its range", () =>
+
+  it.effect("sync_transactions validates its arguments before any FIO call, then reports the job", () =>
     Effect.gen(function* () {
       yield* setNow();
       const fio = yield* fakeFio(serveFrom(fixture));
       yield* Effect.gen(function* () {
-        yield* seed;
         const tools = yield* cacheTools;
-        yield* fio.setScript(serveFrom(fixture.map((t) => (t.id === 7 ? { ...t, amount: -1200 } : t))));
-
         const invalid = [
+          { from: "2026-01-01" },
+          { mode: "backfill" as const, from: "2026-10-23" },
           { refresh: { from: "2026-03-01", to: TODAY }, mode: "backfill" as const },
           { refresh: { from: "2026-03-01", to: TODAY }, from: "2026-03-01" },
           { refresh: { from: TODAY, to: "2026-03-01" } },
@@ -184,22 +132,21 @@ describe("cache query tools", () => {
         for (const args of invalid) assert.instanceOf(yield* Effect.flip(tools.sync_transactions(args)), InvalidInput);
         assert.deepStrictEqual(yield* Ref.get(fio.calls), []);
 
-        // A backfill skips the cached days, so the old amount stays.
-        yield* tools.sync_transactions({ mode: "backfill", from: "2026-03-01" });
-        assert.deepStrictEqual(yield* Ref.get(fio.calls), []);
-        const before = yield* tools.search_transactions({ text: "Rent March" });
-        assert.deepStrictEqual((before.transactions as ReadonlyArray<{ amount: number }>).map((t) => t.amount), [-1000]);
-
-        const synced = yield* tools.sync_transactions({ refresh: { from: "2026-03-01", to: TODAY } });
-        const job = synced.job as { status: string; kind: string };
+        const synced = yield* tools.sync_transactions({ mode: "backfill", from: "2026-01-01" });
+        assert.strictEqual(synced.account, "main");
+        assert.isFalse(synced.joinedRunningJob);
+        assert.strictEqual(synced.note, "The sync completed.");
+        const job = synced.job as { status: string; kind: string; startedAt: string };
         assert.strictEqual(job.status, "completed");
-        assert.strictEqual(job.kind, "refresh");
+        assert.strictEqual(job.kind, "backfill");
+        assert.strictEqual(job.startedAt, "2026-10-22T10:00:00.000Z");
         assert.deepStrictEqual(
           (yield* Ref.get(fio.calls)).map((c) => [c.from, c.to, c.priority]),
-          [["2026-03-01", TODAY, "background"]],
+          [["2026-01-01", TODAY, "background"]],
         );
-        const after = yield* tools.search_transactions({ text: "Rent March" });
-        assert.deepStrictEqual((after.transactions as ReadonlyArray<{ amount: number }>).map((t) => t.amount), [-1200]);
+
+        const refreshed = yield* tools.sync_transactions({ refresh: { from: "2026-03-01", to: TODAY } });
+        assert.strictEqual((refreshed.job as { kind: string }).kind, "refresh");
       }).pipe(Effect.provide(Layer.mergeAll(cacheLayer(config(), fio.layer), LocalPrincipalLive)));
     }),
   );

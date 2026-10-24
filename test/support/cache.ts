@@ -1,8 +1,10 @@
 
-import { Effect, Layer, Redacted } from "effect";
+import { Clock, Effect, Layer, Redacted } from "effect";
 import { TestClock } from "effect/testing";
 import { type Account, Accounts } from "../../src/accounts.js";
+import type { DayRange } from "../../src/cache/dates.js";
 import { TransactionCache } from "../../src/cache/service.js";
+import { makeCacheStore, type PendingRange, type SyncMode } from "../../src/cache/store.js";
 import { type AppConfigShape, type CacheConfig, DEFAULT_BACKFILL_FROM, DEFAULT_CACHE_MAX_AGE_MINUTES, DEFAULT_OVERLAP_DAYS, MAX_RESPONSE_BYTES } from "../../src/config.js";
 import type { FioApi } from "../../src/fio-api.js";
 import { Redactor } from "../../src/redaction.js";
@@ -129,10 +131,37 @@ export const cacheLayer = (cfg: AppConfigShape, fio: Layer.Layer<FioApi>) =>
 export const disabledCacheLayer = (cfg: AppConfigShape, fio: Layer.Layer<FioApi>) =>
   TransactionCache.Disabled.pipe(Layer.provideMerge(baseLayer({ ...cfg, cache: { ...cfg.cache, enabled: false } }, fio)));
 
-export const enabledCache = Effect.gen(function* () {
-  const cache = yield* TransactionCache;
-  if (!cache.enabled) return yield* Effect.die("cache disabled");
-  return cache;
+/** The account's cache status; dies unless the token is verified. */
+export const verifiedStatus = Effect.fnUntraced(function* (acc: Account) {
+  const [status] = yield* (yield* TransactionCache).status([acc]);
+  if (status === undefined || !status.verified) return yield* Effect.die("cache not verified");
+  return status;
+});
+
+/*
+ * Setup through the cache's internal store, on the test's SqlClient, for
+ * states the scripted FIO cannot produce. Assertions go through
+ * TransactionCache.
+ */
+
+/** Stores `statement` as FIO's answer for `range`, as a write-through does. */
+export const seedRange = Effect.fnUntraced(function* (acc: Account, statement: NormalizedStatement, range: DayRange) {
+  const store = yield* makeCacheStore();
+  const fetchedAt = yield* Clock.currentTimeMillis;
+  yield* Effect.orDie(
+    store.commit({ accountName: acc.name, tokenFingerprint: acc.tokenFingerprint, statement, coverage: range, fetchedAt }),
+  );
+});
+
+/** Persists an interrupted job: its mode and pending ranges. */
+export const seedPending = Effect.fnUntraced(function* (
+  acc: Account,
+  mode: SyncMode,
+  pending: ReadonlyArray<PendingRange>,
+) {
+  const store = yield* makeCacheStore();
+  const state = yield* Effect.orDie(store.syncState(acc.tokenFingerprint));
+  yield* Effect.orDie(store.putSyncState(acc.tokenFingerprint, { ...state, mode, pending }));
 });
 
 export const account = Effect.fnUntraced(function* (name = "main") {

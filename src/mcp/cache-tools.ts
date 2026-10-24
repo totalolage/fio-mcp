@@ -1,10 +1,14 @@
-import { DateTime, Effect, Layer, Option, Schema } from "effect";
+import { Effect, Layer, Schema } from "effect";
 import { McpServer, Tool, Toolkit } from "effect/ai";
-import { type Account, Accounts } from "../accounts.js";
-import { type DayRange, minDate, pragueToday } from "../cache/dates.js";
-import { CACHE_DISABLED, type EnabledCache, TransactionCache } from "../cache/service.js";
-import type { GroupBy, TransactionFilters } from "../cache/store.js";
-import { historyUnlockMessage, type JobProgress, type SyncRequest } from "../cache/sync.js";
+import { Accounts } from "../accounts.js";
+import { pragueToday } from "../cache/dates.js";
+import {
+  type GroupBy,
+  historyUnlockMessage,
+  type SyncRequest,
+  TransactionCache,
+  type TransactionFilters,
+} from "../cache/service.js";
 import { AppConfig } from "../config.js";
 import { InvalidInput } from "../errors.js";
 import { Redactor } from "../redaction.js";
@@ -120,21 +124,7 @@ export function makeCacheToolkit(accountNames: ReadonlyArray<string>) {
 
 export type CacheToolkit = ReturnType<typeof makeCacheToolkit>;
 
-const iso = (millis: number | null) => (millis === null ? null : DateTime.formatIso(DateTime.makeUnsafe(millis)));
-
-const formatJob = (job: JobProgress) => ({ ...job, startedAt: iso(job.startedAt), finishedAt: iso(job.finishedAt) });
-
 type FilterArgs = { readonly [K in keyof typeof filterFields]?: (typeof filterFields)[K]["Type"] | undefined };
-
-const checkFilters = (args: FilterArgs) => {
-  if (args.dateFrom !== undefined && args.dateTo !== undefined && args.dateFrom > args.dateTo) {
-    return Effect.fail(new InvalidInput({ detail: "dateFrom must not be after dateTo." }));
-  }
-  if (args.minAmount !== undefined && args.maxAmount !== undefined && args.minAmount > args.maxAmount) {
-    return Effect.fail(new InvalidInput({ detail: "minAmount must not be greater than maxAmount." }));
-  }
-  return Effect.void;
-};
 
 const toFilters = (args: FilterArgs): TransactionFilters => ({
   dateFrom: args.dateFrom,
@@ -153,86 +143,19 @@ const toFilters = (args: FilterArgs): TransactionFilters => ({
 
 export const makeCacheHandlers = Effect.fn("CacheTools.handlers")(function* (toolkit: CacheToolkit) {
   const accounts = yield* Accounts;
-  const cacheService = yield* TransactionCache;
+  const cache = yield* TransactionCache;
   const redactor = yield* Redactor;
   const config = yield* AppConfig;
   const unlockMessage = historyUnlockMessage(config.rateLimitIntervalMs);
   const out = <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.map(effect, redactor.redactDeep);
 
-  const enabled: Effect.Effect<EnabledCache, InvalidInput> = cacheService.enabled
-    ? Effect.succeed(cacheService)
-    : Effect.fail(new InvalidInput({ detail: CACHE_DISABLED }));
-
-  /** The first cached day: covered or holding a movement (statements are stored without coverage). */
-  const earliestCached = Effect.fnUntraced(function* (cache: EnabledCache, accountKey: string, fallback: string) {
-    const covered = yield* cache.store.coveredRanges(accountKey);
-    const { earliestMovement } = yield* cache.store.stats(accountKey);
-    const candidates = [covered[0]?.from, earliestMovement ?? undefined].filter((d): d is string => d !== undefined);
-    return candidates.reduce(minDate, fallback);
-  });
-
-  /** The account, its verified bank account key, and the range the filters span. */
-  const scope = Effect.fnUntraced(function* (name: string | undefined, args: FilterArgs) {
-    const account = yield* permittedAccount(accounts, name);
-    const cache = yield* enabled;
-    yield* checkFilters(args);
-    const accountKey = yield* cache.boundAccount(account);
-    const today = yield* pragueToday;
-    const to = args.dateTo ?? today;
-    const from = args.dateFrom ?? (yield* earliestCached(cache, accountKey, to));
-    if (from > to) {
-      return yield* new InvalidInput({ detail: `dateFrom must not be after dateTo (default today, ${today}).` });
-    }
-    const range: DayRange = { from, to };
-    return { cache, account, accountKey, range };
-  });
-
-  const accountStatus = Effect.fnUntraced(function* (cache: EnabledCache, account: Account) {
-    const state = yield* cache.store.syncState(account.tokenFingerprint);
-    const binding = yield* cache.store.binding(account.tokenFingerprint);
-    const job = Option.getOrNull(Option.map(yield* cache.sync.progress(account), formatJob));
-    const sync = {
-      lastSuccessAt: iso(state.lastSuccessAt),
-      lastAttemptAt: iso(state.lastAttemptAt),
-      lastError: state.lastError,
-      pending: state.pending,
-      blocked: state.blocked,
-      failedDays: state.failedDays,
-      backfillTarget: state.backfillTarget,
-      historyLimited: state.historyLimited,
-      historyLimitedSince: iso(state.historyLimitedSince),
-      ...(state.historyLimited ? { historyUnlock: unlockMessage } : {}),
-    };
-    if (Option.isNone(binding)) {
-      return { name: account.name, verified: false, note: "Not verified for this token yet; run sync_transactions.", sync, job };
-    }
-    const key = binding.value.accountKey;
-    const cached = Option.getOrUndefined(yield* cache.store.account(key));
-    return {
-      name: account.name,
-      verified: true,
-      verifiedAt: iso(binding.value.verifiedAt),
-      bankAccount: cached === undefined ? key : `${cached.accountId}/${cached.bankId}`,
-      iban: cached?.iban ?? null,
-      currency: cached?.currency ?? null,
-      lastKnownBalance:
-        cached === undefined || cached.balance === null
-          ? null
-          : { amount: cached.balance, currency: cached.currency, date: cached.balanceDate },
-      coveredRanges: yield* cache.store.coveredRanges(key),
-      ...(yield* cache.store.stats(key)),
-      sync,
-      job,
-    };
-  });
-
   return toolkit.of({
     search_transactions: (args) =>
       out(
         Effect.gen(function* () {
-          const { cache, account, accountKey, range } = yield* scope(args.account, args);
+          const account = yield* permittedAccount(accounts, args.account);
           const page = { limit: args.limit ?? DEFAULT_LIMIT, offset: args.offset ?? 0, order: args.order ?? "desc" };
-          const found = yield* cache.store.search(accountKey, { ...toFilters(args), dateFrom: range.from, dateTo: range.to }, page);
+          const found = yield* cache.search(account, { ...toFilters(args), ...page });
           return {
             account: account.name,
             source: "cache",
@@ -241,7 +164,7 @@ export const makeCacheHandlers = Effect.fn("CacheTools.handlers")(function* (too
             limit: page.limit,
             returned: found.transactions.length,
             transactions: found.transactions,
-            freshness: yield* cache.freshness(account, accountKey, range),
+            freshness: found.freshness,
           };
         }),
       ),
@@ -249,22 +172,11 @@ export const makeCacheHandlers = Effect.fn("CacheTools.handlers")(function* (too
     summarize_transactions: (args) =>
       out(
         Effect.gen(function* () {
-          const { cache, account, accountKey, range } = yield* scope(args.account, args);
+          const account = yield* permittedAccount(accounts, args.account);
           const groupBy: GroupBy = args.groupBy;
           const page = { limit: args.limit ?? DEFAULT_LIMIT, offset: args.offset ?? 0 };
-          const summary = yield* cache.store.summarize(
-            accountKey,
-            { ...toFilters(args), dateFrom: range.from, dateTo: range.to },
-            groupBy,
-            page,
-          );
-          return {
-            account: account.name,
-            source: "cache",
-            groupBy,
-            ...summary,
-            freshness: yield* cache.freshness(account, accountKey, range),
-          };
+          const summary = yield* cache.summarize(account, { ...toFilters(args), groupBy, ...page });
+          return { account: account.name, source: "cache", groupBy, ...summary };
         }),
       ),
 
@@ -272,7 +184,7 @@ export const makeCacheHandlers = Effect.fn("CacheTools.handlers")(function* (too
       out(
         Effect.gen(function* () {
           yield* requireScopes(READ);
-          const cache = yield* enabled;
+          const statuses = yield* cache.status(yield* visibleAccounts(accounts.list));
           return {
             dbPath: config.cache.dbPath,
             settings: {
@@ -282,7 +194,7 @@ export const makeCacheHandlers = Effect.fn("CacheTools.handlers")(function* (too
               overlapDays: config.cache.overlapDays,
               maxAgeMinutes: config.cache.maxAgeMinutes,
             },
-            accounts: yield* Effect.forEach(yield* visibleAccounts(accounts.list), (account) => accountStatus(cache, account)),
+            accounts: statuses,
           };
         }),
       ),
@@ -291,7 +203,6 @@ export const makeCacheHandlers = Effect.fn("CacheTools.handlers")(function* (too
       out(
         Effect.gen(function* () {
           const account = yield* permittedAccount(accounts, name);
-          const cache = yield* enabled;
           if (from !== undefined && mode !== "backfill") {
             return yield* new InvalidInput({ detail: "`from` applies to mode=backfill only." });
           }
@@ -308,22 +219,24 @@ export const makeCacheHandlers = Effect.fn("CacheTools.handlers")(function* (too
             if (refresh.from > today) return yield* new InvalidInput({ detail: "`refresh.from` is in the future." });
             request = { kind: "refresh", range: { from: refresh.from, to: refresh.to } };
           }
-          const started = yield* cache.sync.start(account, request);
-          const job = Option.getOrElse(yield* cache.sync.awaitJob(account, config.maxWaitMs), () => started.progress);
+          const outcome = yield* cache.sync(account, request, config.maxWaitMs);
+          // Only a resume can start nothing, and this tool never resumes.
+          if (!outcome.started) return yield* Effect.die("sync_transactions started no job");
+          const { joined, job } = outcome;
           const note =
             job.status === "running"
               ? "The sync continues in the background (one FIO request per 30 s). Call get_cache_status to follow it."
               : `The sync ${job.status}.`;
           return {
             account: account.name,
-            joinedRunningJob: started.joined,
+            joinedRunningJob: joined,
             // A joined job never takes on a refresh range, even when it is a refresh itself.
-            ...(started.joined && (refresh !== undefined || (mode !== undefined && started.progress.kind !== mode))
+            ...(joined && (refresh !== undefined || (mode !== undefined && job.kind !== mode))
               ? {
-                  warning: `A ${started.progress.kind} job was already running; it was joined instead of starting ${refresh === undefined ? mode : `a refresh of ${refresh.from}..${refresh.to}`}. Call sync_transactions again when it has finished.`,
+                  warning: `A ${job.kind} job was already running; it was joined instead of starting ${refresh === undefined ? mode : `a refresh of ${refresh.from}..${refresh.to}`}. Call sync_transactions again when it has finished.`,
                 }
               : {}),
-            job: formatJob(job),
+            job,
             note,
             ...(job.historyLimited ? { historyUnlock: unlockMessage } : {}),
           };
