@@ -275,7 +275,7 @@ describe("HTTP transport", () => {
       // which only HttpMiddleware.xForwardedHeaders would replace, and only
       // when X-Forwarded-Host is present.
       const auth = Layer.mergeAll(
-        Auth.layerOpen,
+        Auth.Open,
         HttpRouter.add(
           "GET",
           "/address",
