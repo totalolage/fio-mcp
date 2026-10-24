@@ -1,9 +1,8 @@
 import { assert, describe, it } from "@effect/vitest";
-import { Effect, Layer, Redacted, Ref } from "effect";
+import { Effect, Layer, Ref } from "effect";
 import { TestClock } from "effect/testing";
-import { Accounts, makeAccounts } from "../src/accounts.js";
+import { Accounts } from "../src/accounts.js";
 import { CACHE_DISABLED, NOT_VERIFIED } from "../src/cache/service.js";
-import { AppConfig } from "../src/config.js";
 import { type CacheError, InvalidInput, type PermissionDenied } from "../src/errors.js";
 import { FioApi } from "../src/fio-api.js";
 import { makeCacheHandlers, makeCacheToolkit } from "../src/mcp/cache-tools.js";
@@ -25,11 +24,10 @@ import {
   TODAY,
   tx,
 } from "./support/cache.js";
-
-const limiter = RateLimiter.layerFrom({ intervalMs: 30_000, maxWaitMs: 25_000 });
+import { seededConfig } from "./support/config.js";
 
 const cacheTools = Effect.suspend(() => makeCacheHandlers(makeCacheToolkit(["main"])));
-const fioTools = Effect.suspend(() => makeFioHandlers(makeFioToolkit(["main"]))).pipe(Effect.provide(limiter));
+const fioTools = Effect.suspend(() => makeFioHandlers(makeFioToolkit(["main"]))).pipe(Effect.provide(RateLimiter.Default));
 
 const fixture = [
   tx(1, "2026-01-05", -100.1, {
@@ -380,10 +378,10 @@ describe("cache disabled", () => {
       const fio = yield* fakeFio(serveFrom(fixture));
       const cfg = config();
       const layer = Layer.mergeAll(
-        Layer.effect(Accounts, Effect.map(makeAccounts(cfg.accounts), Accounts.of)),
-        Redactor.layerFrom(cfg.secrets.map(Redacted.value)),
+        Accounts.Default,
+        Redactor.Default,
         Layer.succeed(FioApi, fio.api),
-      ).pipe(Layer.provideMerge(AppConfig.layerFrom(cfg)));
+      ).pipe(Layer.provideMerge(seededConfig(cfg)));
       yield* Effect.gen(function* () {
         const tools = yield* fioTools;
         const result = yield* tools.get_transactions({ dateFrom: "2026-01-01", dateTo: TODAY });

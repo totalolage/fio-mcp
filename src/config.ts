@@ -1,3 +1,4 @@
+import { NodeFileSystem } from "@effect/platform-node";
 import { Config, Context, Effect, FileSystem, Layer, Option, Predicate, Redacted, Schema } from "effect";
 import type { IpNetwork } from "effect/net";
 import { ConfigError } from "./errors.js";
@@ -418,7 +419,7 @@ export const loadConfig = Effect.fn("config.load")(function* () {
 
 export class AppConfig extends Context.Service<AppConfig, AppConfigShape>()("fio-mcp/AppConfig") {
   /** Reads the environment (and `_FILE` secrets) through the current ConfigProvider. */
-  static readonly layer = Layer.effect(AppConfig, loadConfig());
+  static readonly Default = Layer.effect(AppConfig, loadConfig());
 
-  static readonly layerFrom = (config: AppConfigShape) => Layer.succeed(AppConfig, config);
+  static readonly Live = AppConfig.Default.pipe(Layer.provide(NodeFileSystem.layer));
 }

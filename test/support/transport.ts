@@ -1,11 +1,12 @@
 import { Deferred, Effect, Layer, Redacted } from "effect";
 import { Accounts } from "../../src/accounts.js";
 import { TransactionCache } from "../../src/cache/service.js";
-import { AppConfig, type AppConfigShape, type TransportConfig } from "../../src/config.js";
+import type { AppConfigShape, TransportConfig } from "../../src/config.js";
 import { FioApi } from "../../src/fio-api.js";
 import { RateLimiter } from "../../src/rate-limiter.js";
 import { Redactor } from "../../src/redaction.js";
 import type { NormalizedStatement } from "../../src/statement.js";
+import { seededConfig } from "./config.js";
 
 /** A FIO-shaped read token (64 URL-safe characters). */
 export const FIO_TOKEN = "fioT0ken-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRS";
@@ -94,6 +95,6 @@ export const fakeFioApi = (release: Deferred.Deferred<void>) =>
 /** The app's services with a fake FioApi; one instance shared by every session. */
 export const testServices = (config: AppConfigShape, release: Deferred.Deferred<void>) =>
   Layer.mergeAll(fakeFioApi(release), Layer.succeed(TransactionCache, { enabled: false })).pipe(
-    Layer.provideMerge(Layer.mergeAll(Redactor.layer, Accounts.layer, RateLimiter.layer)),
-    Layer.provideMerge(AppConfig.layerFrom(config)),
+    Layer.provideMerge(Layer.mergeAll(Redactor.Default, Accounts.Default, RateLimiter.Default)),
+    Layer.provideMerge(seededConfig(config)),
   );

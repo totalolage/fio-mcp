@@ -34,10 +34,7 @@ export const SERVER_INFO: ServerInfo = {
 };
 
 /** Configuration, redaction and logging. Everything else builds on this. */
-export const BaseLive = Layer.mergeAll(Redactor.layer, Accounts.layer, RateLimiter.layer).pipe(
-  Layer.provideMerge(AppConfig.layer),
-  Layer.provide(NodeFileSystem.layer),
-);
+export const BaseLive = Layer.mergeAll(AppConfig.Live, Redactor.Live, Accounts.Live, RateLimiter.Live);
 
 // Composition points. Each layer below is built once per process and shared by
 // every MCP session (stdio has one; HTTP has one per client).
@@ -95,7 +92,7 @@ export const AppLive = Layer.unwrap(
     const { transport } = yield* AppConfig;
     return transport.kind === "http" ? HttpAppLive(transport) : StdioAppLive;
   }),
-).pipe(Layer.provide(AppConfig.layer), Layer.provide(NodeFileSystem.layer));
+).pipe(Layer.provide(AppConfig.Live));
 
 /**
  * `fio-mcp backup <dest>`: writes a consistent copy of the live cache
@@ -104,7 +101,7 @@ export const AppLive = Layer.unwrap(
 export const backup = (dest: string) =>
   backupDatabase(dest).pipe(
     Effect.provide(
-      DatabaseLive.pipe(Layer.provideMerge(AppConfig.layer), Layer.provideMerge(NodeFileSystem.layer)),
+      DatabaseLive.pipe(Layer.provideMerge(AppConfig.Live), Layer.provideMerge(NodeFileSystem.layer)),
     ),
   );
 
@@ -112,7 +109,7 @@ const withDatabase = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   effect.pipe(
     Effect.provide(
       Layer.mergeAll(
-        DatabaseLive.pipe(Layer.provideMerge(AppConfig.layer), Layer.provideMerge(NodeFileSystem.layer)),
+        DatabaseLive.pipe(Layer.provideMerge(AppConfig.Live), Layer.provideMerge(NodeFileSystem.layer)),
         NodeStdio.layer,
       ),
     ),
@@ -124,8 +121,4 @@ export const revokeClient = (clientId: string) => withDatabase(revokeClientComma
 export const revokeAllTokens = withDatabase(revokeAllTokensCommand());
 
 /** The redacting stderr logger, for everything the app layers fork. */
-export const AppLoggerLive = LoggerLive.pipe(
-  Layer.provide(Redactor.layer),
-  Layer.provide(AppConfig.layer),
-  Layer.provide(NodeFileSystem.layer),
-);
+export const AppLoggerLive = LoggerLive.pipe(Layer.provide(Redactor.Live));

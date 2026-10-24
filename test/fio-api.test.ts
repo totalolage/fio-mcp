@@ -5,13 +5,14 @@ import { Effect, Exit, Fiber, Layer, Logger, Redacted, References, Tracer } from
 import { FetchHttpClient, HttpClient, HttpClientError, HttpClientRequest } from "effect/http";
 import { TestClock } from "effect/testing";
 import { Accounts } from "../src/accounts.js";
-import { AppConfig, type AppConfigShape } from "../src/config.js";
+import type { AppConfigShape } from "../src/config.js";
 import { PERMISSION_DENIED } from "../src/errors.js";
 import { FioApi } from "../src/fio-api.js";
 import { FioApiLive, type FioApiOptions, fioApiLayer } from "../src/fio-api-live.js";
 import { make as makeFioClient } from "../src/generated/effect.gen.js";
 import { RateLimiter } from "../src/rate-limiter.js";
 import { Redactor } from "../src/redaction.js";
+import { seededConfig } from "./support/config.js";
 import { FioHttp, html, json, text } from "./support/fio-http.js";
 
 const TOKEN = "Tk7pQ2vX9mZr4LbN8sYw3HcJ6dFg1KaE5uVo0iRtBnMxWqSzPyGhCjDlUeAfOk2Q";
@@ -41,12 +42,12 @@ const testLayer = (options: FioApiOptions = {}, config: Partial<AppConfigShape> 
     Layer.provideMerge(
       Layer.mergeAll(
         FioHttp.layer({ tokens: [TOKEN], baseUrl: BASE_URL }),
-        Accounts.layer,
-        RateLimiter.layer,
-        Redactor.layer,
+        Accounts.Default,
+        RateLimiter.Default,
+        Redactor.Default,
       ),
     ),
-    Layer.provideMerge(AppConfig.layerFrom({ ...baseConfig, ...config })),
+    Layer.provideMerge(seededConfig({ ...baseConfig, ...config })),
   );
 
 const account = Effect.flatMap(Effect.service(Accounts), (accounts) => accounts.resolve("main"));
@@ -635,14 +636,14 @@ describe("FioApiLive over fetch", () => {
 
   const liveLayer = (port: number, config: Partial<AppConfigShape> = {}) =>
     FioApiLive.pipe(
+      Layer.provideMerge(Layer.mergeAll(Accounts.Default, RateLimiter.Default, Redactor.Default)),
       Layer.provideMerge(
-        Layer.mergeAll(Accounts.layer, RateLimiter.layerFrom({ intervalMs: 0, maxWaitMs: 1_000 }), Redactor.layer),
-      ),
-      Layer.provideMerge(
-        AppConfig.layerFrom({
+        seededConfig({
           ...baseConfig,
           baseUrl: `http://127.0.0.1:${port}/v1/rest`,
           requestTimeoutMs: 5_000,
+          rateLimitIntervalMs: 0,
+          maxWaitMs: 1_000,
           ...config,
         }),
       ),
@@ -716,10 +717,15 @@ describe("FioApiLive over fetch", () => {
       });
       const layer = fioApiLayer({ maxResponseBytes: 4096 }).pipe(
         Layer.provide(FetchHttpClient.layer),
+        Layer.provideMerge(Layer.mergeAll(Accounts.Default, RateLimiter.Default, Redactor.Default)),
         Layer.provideMerge(
-          Layer.mergeAll(Accounts.layer, RateLimiter.layerFrom({ intervalMs: 0, maxWaitMs: 1_000 }), Redactor.layer),
+          seededConfig({
+            ...baseConfig,
+            baseUrl: `http://127.0.0.1:${port}/v1/rest`,
+            rateLimitIntervalMs: 0,
+            maxWaitMs: 1_000,
+          }),
         ),
-        Layer.provideMerge(AppConfig.layerFrom({ ...baseConfig, baseUrl: `http://127.0.0.1:${port}/v1/rest` })),
       );
       const error = yield* Effect.gen(function* () {
         const api = yield* FioApi;

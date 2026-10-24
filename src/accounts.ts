@@ -97,11 +97,13 @@ export const makeAccounts = Effect.fn("Accounts.make")(function* (configs: Reado
 });
 
 export class Accounts extends Context.Service<Accounts, AccountsShape>()("fio-mcp/Accounts") {
-  static readonly layer = Layer.effect(
+  static readonly Default = Layer.effect(
     Accounts,
     Effect.gen(function* () {
       const config = yield* AppConfig;
       return Accounts.of(yield* makeAccounts(config.accounts));
     }),
   );
+
+  static readonly Live = Accounts.Default.pipe(Layer.provide(AppConfig.Live));
 }

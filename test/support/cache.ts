@@ -1,11 +1,10 @@
 import { NodeFileSystem } from "@effect/platform-node";
 import { Effect, Layer, Redacted, Ref } from "effect";
 import { TestClock } from "effect/testing";
-import { type Account, Accounts, makeAccounts } from "../../src/accounts.js";
+import { type Account, Accounts } from "../../src/accounts.js";
 import { databaseLayer } from "../../src/cache/db.js";
 import { TransactionCache, TransactionCacheFromSql } from "../../src/cache/service.js";
 import {
-  AppConfig,
   type AppConfigShape,
   type CacheConfig,
   DEFAULT_BACKFILL_FROM,
@@ -16,6 +15,7 @@ import type { FioRequestError } from "../../src/errors.js";
 import { FioApi, type FioApiShape } from "../../src/fio-api.js";
 import { Redactor } from "../../src/redaction.js";
 import type { NormalizedStatement, Transaction } from "../../src/statement.js";
+import { seededConfig } from "./config.js";
 
 export const TOKEN_A = "a".repeat(64);
 export const TOKEN_B = "b".repeat(64);
@@ -161,10 +161,10 @@ export const serveFrom =
 /** Base services for cache tests: config, accounts, redactor, the DB at cache.dbPath (":memory:" by default), and the cache. */
 const baseLayer = (cfg: AppConfigShape, fio: FioApiShape) =>
   Layer.mergeAll(
-    Layer.effect(Accounts, Effect.map(makeAccounts(cfg.accounts), Accounts.of)),
-    Redactor.layerFrom(cfg.secrets.map(Redacted.value)),
+    Accounts.Default,
+    Redactor.Default,
     Layer.succeed(FioApi, fio),
-  ).pipe(Layer.provideMerge(AppConfig.layerFrom(cfg)));
+  ).pipe(Layer.provideMerge(seededConfig(cfg)));
 
 export const cacheLayer = (cfg: AppConfigShape, fio: FioApiShape) =>
   TransactionCacheFromSql.pipe(
