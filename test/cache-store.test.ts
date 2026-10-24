@@ -14,7 +14,6 @@ import {
   cacheLayer,
   config,
   enabledCache,
-  fakeFio,
   NOW,
   serveFrom,
   setNow,
@@ -23,6 +22,7 @@ import {
   TOKEN_B,
   tx,
 } from "./support/cache.js";
+import { fakeFio } from "./support/fio-api.js";
 
 const tempDir = () => mkdtempSync(join(tmpdir(), "fio-cache-"));
 const mode = (path: string) => statSync(path).mode & 0o777;
@@ -138,7 +138,7 @@ describe("cache database", () => {
         assert.isAbove(result.bytes, 0);
         const again = yield* Effect.flip(backupDatabase(destination));
         assert.instanceOf(again, InvalidInput);
-      }).pipe(Effect.provide(Layer.merge(cacheLayer(config({ cache: { dbPath: path } }), fio.api), NodeFileSystem.layer)));
+      }).pipe(Effect.provide(Layer.merge(cacheLayer(config({ cache: { dbPath: path } }), fio.layer), NodeFileSystem.layer)));
       assert.strictEqual(mode(destination), 0o600);
       yield* Effect.gen(function* () {
         const sql = yield* SqlClient.SqlClient;
@@ -195,7 +195,7 @@ describe("cache store", () => {
         yield* cache.record(acc, statement("2025-01-01", "2025-01-31", [tx(9, "2025-01-15", 1)]));
         assert.strictEqual((yield* cache.store.stats(key)).rowCount, 4);
         assert.deepStrictEqual(yield* cache.store.coveredRanges(key), [range]);
-      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+      }).pipe(Effect.provide(cacheLayer(config(), fio.layer)));
     }),
   );
 
@@ -212,7 +212,7 @@ describe("cache store", () => {
         // Days after today are never recorded.
         yield* cache.writeThrough(acc, statement("2026-10-21", "2026-12-31", []), { from: "2026-10-21", to: "2026-12-31" });
         assert.deepStrictEqual(yield* cache.store.coveredRanges(key), [{ from: "2026-10-15", to: TODAY }]);
-      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+      }).pipe(Effect.provide(cacheLayer(config(), fio.layer)));
     }),
   );
 
@@ -228,7 +228,7 @@ describe("cache store", () => {
         const acc = yield* account();
         yield* cache.writeThrough(acc, statement(range.from, range.to, [tx(1, "2026-10-21", -10)]), range);
         assert.strictEqual(yield* cache.boundAccount(acc), "2000000001/2010");
-      }).pipe(Effect.provide(cacheLayer(config({ cache: { dbPath: path } }), fio.api)));
+      }).pipe(Effect.provide(cacheLayer(config({ cache: { dbPath: path } }), fio.layer)));
 
       // "main" now uses token B, which belongs to account 3000000002.
       const repointed = config({
@@ -248,7 +248,7 @@ describe("cache store", () => {
           [7],
         );
         assert.strictEqual(read.info.accountId, "3000000002");
-      }).pipe(Effect.provide(cacheLayer(repointed, fio.api)));
+      }).pipe(Effect.provide(cacheLayer(repointed, fio.layer)));
     }),
   );
 
@@ -271,7 +271,7 @@ describe("cache store", () => {
         );
         assert.strictEqual(result._tag, "FioResponseError");
         assert.instanceOf(yield* Effect.flip(cache.boundAccount(acc)), InvalidInput);
-      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+      }).pipe(Effect.provide(cacheLayer(config(), fio.layer)));
     }),
   );
 
@@ -306,7 +306,7 @@ describe("cache store", () => {
         );
         assert.isFalse(read.freshness.complete);
         assert.isFalse(yield* cache.servable(key, range));
-      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+      }).pipe(Effect.provide(cacheLayer(config(), fio.layer)));
     }),
   );
 });

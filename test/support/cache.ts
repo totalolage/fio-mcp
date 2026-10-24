@@ -1,21 +1,15 @@
 import { NodeFileSystem } from "@effect/platform-node";
-import { Effect, Layer, Redacted, Ref } from "effect";
+import { Effect, Layer, Redacted } from "effect";
 import { TestClock } from "effect/testing";
 import { type Account, Accounts } from "../../src/accounts.js";
 import { databaseLayer } from "../../src/cache/db.js";
 import { TransactionCache, TransactionCacheFromSql } from "../../src/cache/service.js";
-import {
-  type AppConfigShape,
-  type CacheConfig,
-  DEFAULT_BACKFILL_FROM,
-  DEFAULT_CACHE_MAX_AGE_MINUTES,
-  DEFAULT_OVERLAP_DAYS,
-} from "../../src/config.js";
-import type { FioRequestError } from "../../src/errors.js";
-import { FioApi, type FioApiShape } from "../../src/fio-api.js";
+import { type AppConfigShape, type CacheConfig, DEFAULT_BACKFILL_FROM, DEFAULT_CACHE_MAX_AGE_MINUTES, DEFAULT_OVERLAP_DAYS, MAX_RESPONSE_BYTES } from "../../src/config.js";
+import type { FioApi } from "../../src/fio-api.js";
 import { Redactor } from "../../src/redaction.js";
 import type { NormalizedStatement, Transaction } from "../../src/statement.js";
 import { seededConfig } from "./config.js";
+import type { PeriodsScript } from "./fio-api.js";
 
 export const TOKEN_A = "a".repeat(64);
 export const TOKEN_B = "b".repeat(64);
@@ -39,6 +33,7 @@ export function config(
     rateLimitIntervalMs: 30_000,
     maxWaitMs: 25_000,
     requestTimeoutMs: 20_000,
+    maxResponseBytes: MAX_RESPONSE_BYTES,
     transport: { kind: "stdio" },
     cache: {
       enabled: true,
@@ -107,44 +102,6 @@ export function statement(
   };
 }
 
-export interface PeriodCall {
-  readonly token: string;
-  readonly from: string;
-  readonly to: string;
-  readonly priority: string | undefined;
-}
-
-/** Answers /periods from `respond`; every other endpoint dies. Records each call. */
-export type PeriodsScript = (
-  call: PeriodCall,
-  n: number,
-) => Effect.Effect<NormalizedStatement, FioRequestError>;
-
-export const fakeFio = Effect.fnUntraced(function* (initial: PeriodsScript) {
-  const calls = yield* Ref.make<ReadonlyArray<PeriodCall>>([]);
-  const script = yield* Ref.make(initial);
-  const periods: FioApiShape["periods"] = (account, from, to, priority) =>
-    Effect.gen(function* () {
-      const call = { token: Redacted.value(account.token), from, to, priority };
-      const n = (yield* Ref.getAndUpdate(calls, (c) => [...c, call])).length;
-      return yield* (yield* Ref.get(script))(call, n);
-    });
-  const unused = () => Effect.die("not scripted");
-  const api: FioApiShape = {
-    periods,
-    periodsRaw: unused,
-    statement: unused,
-    statementRaw: unused,
-    last: unused,
-    setLastId: unused,
-    setLastDate: unused,
-    lastStatement: unused,
-    merchantRaw: unused,
-    importXml: unused,
-  };
-  return { api, calls, setScript: (next: PeriodsScript) => Ref.set(script, next) };
-});
-
 /** Every range succeeds with the movements dated inside it. */
 export const serveFrom =
   (movements: ReadonlyArray<Transaction>, accountId?: string): PeriodsScript =>
@@ -159,21 +116,17 @@ export const serveFrom =
     );
 
 /** Base services for cache tests: config, accounts, redactor, the DB at cache.dbPath (":memory:" by default), and the cache. */
-const baseLayer = (cfg: AppConfigShape, fio: FioApiShape) =>
-  Layer.mergeAll(
-    Accounts.Default,
-    Redactor.Default,
-    Layer.succeed(FioApi, fio),
-  ).pipe(Layer.provideMerge(seededConfig(cfg)));
+const baseLayer = (cfg: AppConfigShape, fio: Layer.Layer<FioApi>) =>
+  Layer.mergeAll(Accounts.Default, Redactor.Default, fio).pipe(Layer.provideMerge(seededConfig(cfg)));
 
-export const cacheLayer = (cfg: AppConfigShape, fio: FioApiShape) =>
+export const cacheLayer = (cfg: AppConfigShape, fio: Layer.Layer<FioApi>) =>
   TransactionCacheFromSql.pipe(
     Layer.provideMerge(databaseLayer(cfg.cache.dbPath).pipe(Layer.provide(NodeFileSystem.layer))),
     Layer.provideMerge(baseLayer(cfg, fio)),
   );
 
 /** The same services with FIO_CACHE_ENABLED=false: no database at all. */
-export const disabledCacheLayer = (cfg: AppConfigShape, fio: FioApiShape) =>
+export const disabledCacheLayer = (cfg: AppConfigShape, fio: Layer.Layer<FioApi>) =>
   TransactionCache.disabled.pipe(Layer.provideMerge(baseLayer({ ...cfg, cache: { ...cfg.cache, enabled: false } }, fio)));
 
 export const enabledCache = Effect.gen(function* () {

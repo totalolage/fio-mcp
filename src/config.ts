@@ -83,6 +83,8 @@ export interface AppConfigShape {
   readonly maxWaitMs: number;
   /** Per-request HTTP timeout. */
   readonly requestTimeoutMs: number;
+  /** Largest response body FioApi reads. Fixed in production (MAX_RESPONSE_BYTES); tests lower it. */
+  readonly maxResponseBytes: number;
   readonly transport: TransportConfig;
   readonly cache: CacheConfig;
 }
@@ -93,6 +95,8 @@ export const DEFAULT_RATE_LIMIT_INTERVAL_MS = 30_000;
 export const MIN_RATE_LIMIT_INTERVAL_MS = 30_000;
 export const DEFAULT_MAX_WAIT_MS = 25_000;
 export const DEFAULT_REQUEST_TIMEOUT_MS = 20_000;
+/** Largest response body FioApi reads. Not read from the environment. */
+export const MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
 export const DEFAULT_ACCOUNT_NAME = "default";
 export const MIN_TOKEN_LENGTH = 32;
 export const DEFAULT_HTTP_HOST = "0.0.0.0";
@@ -411,6 +415,7 @@ export const loadConfig = Effect.fn("config.load")(function* () {
     ),
     maxWaitMs: yield* intVar("FIO_MAX_WAIT_MS", DEFAULT_MAX_WAIT_MS, 0),
     requestTimeoutMs: yield* intVar("FIO_REQUEST_TIMEOUT_MS", DEFAULT_REQUEST_TIMEOUT_MS, 1),
+    maxResponseBytes: MAX_RESPONSE_BYTES,
     transport,
     cache,
   };

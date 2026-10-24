@@ -490,7 +490,7 @@ FIO's REST API is described in [openapi/fio-api.yaml](openapi/fio-api.yaml) (Ope
 2. Run `npm run generate` (`scripts/generate-fio-client.ts`, run by Node's TypeScript type stripping).
 3. Commit the spec and the regenerated file together. `npm run generate:check` regenerates and fails on any difference.
 
-The generator only decodes JSON success bodies. Operations that FioApi reads as raw text (CSV, XML, OFX, raw JSON, the import response) carry `x-raw-body: true`; the script turns their success bodies into binary in a temporary copy of the spec before generating, and refuses unmarked non-JSON success bodies. `src/fio-api-live.ts` wraps the generated `make()` in the `FioApi` service: base URL, the token (unwrapped from `Redacted` only to build the request), the rate limiter, the request timeout including the body, a 64 MiB response limit, no redirects, no tracing of FIO URLs, and the mapping of every HTTP status and client failure to the tagged errors above.
+The generator only decodes JSON success bodies. Operations that FioApi reads as raw text (CSV, XML, OFX, raw JSON, the import response) carry `x-raw-body: true`; the script turns their success bodies into binary in a temporary copy of the spec before generating, and refuses unmarked non-JSON success bodies. `src/fio-api.ts` wraps the generated `make()` in the `FioApi` service: base URL, the token (unwrapped from `Redacted` only to build the request), the rate limiter, the request timeout including the body, a 64 MiB response limit, no redirects, no tracing of FIO URLs, and the mapping of every HTTP status and client failure to the tagged errors above.
 
 ### Layout
 
@@ -503,8 +503,7 @@ src/
   redaction.ts          Redactor service and the redacting stderr logger
   rate-limiter.ts       per-token dispatcher with interactive and background queues
   accounts.ts           configured accounts, token fingerprints, learned payer details
-  fio-api.ts            FioApi service interface
-  fio-api-live.ts       FioApi on the generated client
+  fio-api.ts            FioApi service: interface and adapter on the generated client
   generated/            generated OpenAPI client (do not edit)
   statement.ts          JSON statement normalisation
   payments.ts           payment order Schemas and the import XML builder

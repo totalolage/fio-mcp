@@ -14,7 +14,7 @@ import { Accounts } from "../../src/accounts.js";
 import { SERVER_INFO, ToolsLive } from "../../src/app.js";
 import { CacheLive } from "../../src/cache/service.js";
 import type { AppConfigShape } from "../../src/config.js";
-import { FioApiLayer } from "../../src/fio-api-live.js";
+import { FioApi } from "../../src/fio-api.js";
 import { RateLimiter } from "../../src/rate-limiter.js";
 import { Redactor } from "../../src/redaction.js";
 import { Auth } from "../../src/transport/auth.js";
@@ -44,7 +44,7 @@ export async function connect(config: AppConfigShape, route: FioHttpHandler | Fi
     ).pipe(Effect.scoped),
   );
   const ServicesLive = CacheLive.pipe(
-    Layer.provideMerge(FioApiLayer),
+    Layer.provideMerge(FioApi.Default),
     Layer.provideMerge(Layer.mergeAll(Redactor.Default, Accounts.Default, RateLimiter.Default)),
     Layer.provideMerge(seededConfig(config)),
     Layer.provide(Layer.mergeAll(Layer.succeedContext(fioHttp), NodeFileSystem.layer)),

@@ -1,6 +1,6 @@
 import { NodeFileSystem } from "@effect/platform-node";
 import { ConfigProvider, Effect, Layer, Redacted } from "effect";
-import { type AccountConfig, type AppConfigShape, loadConfig } from "../src/config.js";
+import { type AccountConfig, type AppConfigShape, loadConfig, MAX_RESPONSE_BYTES } from "../src/config.js";
 
 export const READ_TOKEN = "rEaDtOkEnAbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcdefghijklmnopqr";
 export const PAY_TOKEN = "pAyToKeNAbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcdefghijklmnopqrs";
@@ -161,6 +161,7 @@ export function testConfig(accounts: ReadonlyArray<TestAccount>, overrides: Part
     rateLimitIntervalMs: 0,
     maxWaitMs: 25_000,
     requestTimeoutMs: 5_000,
+    maxResponseBytes: MAX_RESPONSE_BYTES,
     transport: { kind: "stdio" },
     cache: {
       enabled: false,

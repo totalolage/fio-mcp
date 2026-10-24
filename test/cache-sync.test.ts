@@ -23,9 +23,7 @@ import {
   cacheLayer,
   config,
   enabledCache,
-  fakeFio,
   NOW,
-  type PeriodsScript,
   serveFrom,
   setNow,
   settle,
@@ -34,6 +32,7 @@ import {
   TOKEN_A,
   tx,
 } from "./support/cache.js";
+import { fakeFio, type PeriodsScript } from "./support/fio-api.js";
 
 const RECENT_START = addDays(TODAY, -89);
 const DAY_MS = 86_400_000;
@@ -75,7 +74,7 @@ describe("cache sync", () => {
         assert.strictEqual(key, "2000000001/2010");
         assert.deepStrictEqual(yield* cache.store.coveredRanges(key), [{ from: "2000-01-01", to: TODAY }]);
         assert.strictEqual((yield* cache.store.stats(key)).rowCount, 4);
-      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+      }).pipe(Effect.provide(cacheLayer(config(), fio.layer)));
     }),
   );
 
@@ -117,7 +116,7 @@ describe("cache sync", () => {
         const before = calls.length;
         yield* runToEnd({ kind: "backfill" });
         assert.strictEqual((yield* Ref.get(fio.calls)).length, before);
-      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+      }).pipe(Effect.provide(cacheLayer(config(), fio.layer)));
     }),
   );
 
@@ -161,7 +160,7 @@ describe("cache sync", () => {
         assert.deepStrictEqual(yield* cache.store.coveredRanges(key), [{ from: "2000-01-01", to: TODAY }]);
         assert.strictEqual((yield* cache.store.stats(key)).rowCount, 4);
         assert.isFalse((yield* cache.store.syncState(TOKEN_FP)).historyLimited);
-      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+      }).pipe(Effect.provide(cacheLayer(config(), fio.layer)));
     }),
   );
 
@@ -187,7 +186,7 @@ describe("cache sync", () => {
           ]);
           assert.isTrue(job.historyLimited);
         }).pipe(Effect.provide(CacheSyncLive));
-      }).pipe(Effect.provide(cacheLayer(cfg, fio.api)));
+      }).pipe(Effect.provide(cacheLayer(cfg, fio.layer)));
     }),
   );
 
@@ -203,7 +202,7 @@ describe("cache sync", () => {
         assert.strictEqual(job.status, "completed");
         // A fresh cache: one backfill request covers today, so no incremental follows.
         assert.deepStrictEqual(ranges(yield* Ref.get(fio.calls)), [`2000-01-01..${TODAY}`]);
-      }).pipe(Effect.provide(CacheSyncLive.pipe(Layer.provideMerge(cacheLayer(cfg, fio.api)))));
+      }).pipe(Effect.provide(CacheSyncLive.pipe(Layer.provideMerge(cacheLayer(cfg, fio.layer)))));
     }),
   );
 
@@ -228,7 +227,7 @@ describe("cache sync", () => {
         assert.isAbove(state.pending.length, 0);
         assert.strictEqual(state.mode, "backfill");
         return state.pending;
-      }).pipe(Effect.provide(cacheLayer(config({ cache: { dbPath } }), first.api)));
+      }).pipe(Effect.provide(cacheLayer(config({ cache: { dbPath } }), first.layer)));
 
       // Second run on the same file: startup (syncOnStartup=false) resumes exactly the pending ranges.
       const second = yield* fakeFio(tooBig);
@@ -242,7 +241,7 @@ describe("cache sync", () => {
         const key = yield* cache.boundAccount(yield* account());
         assert.deepStrictEqual(yield* cache.store.coveredRanges(key), [{ from: "2000-01-01", to: TODAY }]);
         assert.deepStrictEqual((yield* cache.store.syncState(TOKEN_FP)).pending, []);
-      }).pipe(Effect.provide(CacheSyncLive.pipe(Layer.provideMerge(cacheLayer(config({ cache: { dbPath } }), second.api)))));
+      }).pipe(Effect.provide(CacheSyncLive.pipe(Layer.provideMerge(cacheLayer(config({ cache: { dbPath } }), second.layer)))));
     }),
   );
 
@@ -267,7 +266,7 @@ describe("cache sync", () => {
           found.map((t) => t.id),
           [5],
         );
-      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+      }).pipe(Effect.provide(cacheLayer(config(), fio.layer)));
     }),
   );
 
@@ -284,13 +283,13 @@ describe("cache sync", () => {
         });
         yield* runToEnd({ kind: "incremental" });
         assert.deepStrictEqual(ranges(yield* Ref.get(fio.calls)), [`2026-10-20..${TODAY}`]);
-      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+      }).pipe(Effect.provide(cacheLayer(config(), fio.layer)));
       yield* Ref.set(fio.calls, []);
       yield* Effect.gen(function* () {
         const job = yield* runToEnd({ kind: "incremental" });
         assert.strictEqual(job.status, "completed");
         assert.deepStrictEqual(ranges(yield* Ref.get(fio.calls)), [`2000-01-01..${TODAY}`]);
-      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+      }).pipe(Effect.provide(cacheLayer(config(), fio.layer)));
     }),
   );
 
@@ -324,7 +323,7 @@ describe("cache sync", () => {
         assert.strictEqual((yield* Ref.get(fio.calls)).length, 1);
         // Finished: the next request starts a new job.
         assert.isFalse((yield* cache.sync.start(alias, { kind: "incremental" })).joined);
-      }).pipe(Effect.provide(cacheLayer(cfg, fio.api)));
+      }).pipe(Effect.provide(cacheLayer(cfg, fio.layer)));
     }),
   );
 
@@ -343,7 +342,7 @@ describe("cache sync", () => {
         const job = yield* Fiber.join(fiber);
         assert.strictEqual(job.status, "completed");
         assert.strictEqual((yield* Ref.get(fio.calls)).length, 9);
-      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+      }).pipe(Effect.provide(cacheLayer(config(), fio.layer)));
     }),
   );
 
@@ -367,7 +366,7 @@ describe("cache sync", () => {
         // An explicit retry of failed days asks for it again.
         yield* runToEnd({ kind: "backfill", retryFailed: true });
         assert.deepStrictEqual(ranges(yield* Ref.get(fio.calls)), [`${bigDay}..${bigDay}`]);
-      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+      }).pipe(Effect.provide(cacheLayer(config(), fio.layer)));
     }),
   );
 
@@ -389,7 +388,7 @@ describe("cache sync", () => {
         yield* Ref.set(fio.calls, []);
         yield* runToEnd({ kind: "backfill" });
         assert.deepStrictEqual(ranges(yield* Ref.get(fio.calls)), ["2000-01-01..2004-12-31"]);
-      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+      }).pipe(Effect.provide(cacheLayer(config(), fio.layer)));
     }),
   );
 
@@ -421,7 +420,7 @@ describe("cache sync", () => {
         assert.deepStrictEqual((yield* cache.store.syncState(TOKEN_FP)).pending, [
           { from: "2026-10-12", to: "2026-10-25", replace: false },
         ]);
-      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+      }).pipe(Effect.provide(cacheLayer(config(), fio.layer)));
     }),
   );
 
@@ -463,7 +462,7 @@ describe("cache sync", () => {
         assert.strictEqual((yield* cache.store.stats(key)).rowCount, 4);
         assert.deepStrictEqual(yield* cache.store.coveredRanges(key), [{ from: "2000-01-01", to: TODAY }]);
         assert.deepStrictEqual((yield* cache.store.syncState(TOKEN_FP)).pending, []);
-      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+      }).pipe(Effect.provide(cacheLayer(config(), fio.layer)));
     }),
   );
 
@@ -495,7 +494,7 @@ describe("cache sync", () => {
           ],
         );
         assert.deepStrictEqual(yield* cache.store.coveredRanges(key), [{ from: "2000-01-01", to: TODAY }]);
-      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+      }).pipe(Effect.provide(cacheLayer(config(), fio.layer)));
     }),
   );
 
@@ -519,7 +518,7 @@ describe("cache sync", () => {
         const state = yield* cache.store.syncState(TOKEN_FP);
         assert.deepStrictEqual(state.pending, []);
         assert.strictEqual(state.mode, null);
-      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+      }).pipe(Effect.provide(cacheLayer(config(), fio.layer)));
     }),
   );
 
@@ -538,7 +537,7 @@ describe("cache sync", () => {
         const state = yield* (yield* enabledCache).store.syncState(TOKEN_FP);
         assert.strictEqual(state.mode, "refresh");
         assert.deepStrictEqual(state.pending, [{ from: "2025-03-01", to: "2025-03-31", replace: true }]);
-      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+      }).pipe(Effect.provide(cacheLayer(config(), fio.layer)));
     }),
   );
 
@@ -555,7 +554,7 @@ describe("cache sync", () => {
         const state = yield* (yield* enabledCache).store.syncState(TOKEN_FP);
         assert.strictEqual(state.mode, "refresh");
         assert.deepStrictEqual(state.pending, [{ from: "2026-10-15", to: TODAY, replace: true }]);
-      }).pipe(Effect.provide(cacheLayer(config({ cache: { dbPath } }), first.api)));
+      }).pipe(Effect.provide(cacheLayer(config({ cache: { dbPath } }), first.layer)));
 
       // Movement 4 was cancelled meanwhile; the resumed job still deletes it.
       const second = yield* fakeFio(serveFrom(movements.filter((m) => m.id !== 4)));
@@ -572,7 +571,7 @@ describe("cache sync", () => {
           rows.map((t) => t.id),
           [3],
         );
-      }).pipe(Effect.provide(CacheSyncLive.pipe(Layer.provideMerge(cacheLayer(config({ cache: { dbPath } }), second.api)))));
+      }).pipe(Effect.provide(CacheSyncLive.pipe(Layer.provideMerge(cacheLayer(config({ cache: { dbPath } }), second.layer)))));
     }),
   );
 
@@ -603,7 +602,7 @@ describe("cache sync", () => {
           [1, 2],
         );
         assert.deepStrictEqual((yield* cache.store.syncState(TOKEN_FP)).pending, []);
-      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+      }).pipe(Effect.provide(cacheLayer(config(), fio.layer)));
     }),
   );
 
@@ -636,7 +635,7 @@ describe("cache sync", () => {
           rows.map((t) => t.id),
           [1, 2, 4],
         );
-      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+      }).pipe(Effect.provide(cacheLayer(config(), fio.layer)));
     }),
   );
 
@@ -664,7 +663,7 @@ describe("cache sync", () => {
           { ...b, replace: true },
           { ...a, replace: false },
         ]);
-      }).pipe(Effect.provide(cacheLayer(config({ cache: { dbPath } }), first.api)));
+      }).pipe(Effect.provide(cacheLayer(config({ cache: { dbPath } }), first.layer)));
 
       // After a restart FIO lists movement 2 only: B drops movement 3, A keeps movement 1.
       const second = yield* fakeFio(serveFrom([tx(2, b.from, 2)]));
@@ -683,7 +682,7 @@ describe("cache sync", () => {
         const state = yield* cache.store.syncState(TOKEN_FP);
         assert.deepStrictEqual(state.pending, []);
         assert.strictEqual(state.mode, null);
-      }).pipe(Effect.provide(CacheSyncLive.pipe(Layer.provideMerge(cacheLayer(config({ cache: { dbPath } }), second.api)))));
+      }).pipe(Effect.provide(CacheSyncLive.pipe(Layer.provideMerge(cacheLayer(config({ cache: { dbPath } }), second.layer)))));
     }),
   );
 
@@ -734,7 +733,7 @@ describe("cache sync", () => {
           rows.map((row) => row.id),
           [1, 2],
         );
-      }).pipe(Effect.provide(CacheSyncLive.pipe(Layer.provideMerge(cacheLayer(config({ cache: { dbPath } }), fio.api)))));
+      }).pipe(Effect.provide(CacheSyncLive.pipe(Layer.provideMerge(cacheLayer(config({ cache: { dbPath } }), fio.layer)))));
     }),
   );
 
@@ -758,7 +757,7 @@ describe("cache sync", () => {
             `${addDays(TODAY, -10)}..${TODAY}`,
           ]);
         }).pipe(Effect.provide(CacheSyncLive));
-      }).pipe(Effect.provide(cacheLayer(cfg, fio.api)));
+      }).pipe(Effect.provide(cacheLayer(cfg, fio.layer)));
     }),
   );
 });

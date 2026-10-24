@@ -5,7 +5,7 @@
  * Usage:
  *
  *   const layer = FioHttp.layer({ tokens: [TOKEN] }); // Layer<FioHttp | HttpClient.HttpClient>
- *   // provide it under FioApiLayer (src/fio-api-live.ts), then in the test:
+ *   // provide it under FioApi.Default (src/fio-api.ts), then in the test:
  *   yield* FioHttp.enqueue(json(statement), { status: 409 }, { transportError: "socket hang up" });
  *   yield* FioHttp.handle((request) => (request.path.startsWith("/last/") ? text("ok") : { status: 404 }));
  *   const [first] = yield* FioHttp.requests;

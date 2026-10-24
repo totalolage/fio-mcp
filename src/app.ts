@@ -5,7 +5,7 @@ import { Accounts } from "./accounts.js";
 import { backupDatabase, DatabaseLive } from "./cache/db.js";
 import { CacheLive, CacheSyncLive } from "./cache/service.js";
 import { AppConfig, type HttpAuthConfig } from "./config.js";
-import { FioApiLive } from "./fio-api-live.js";
+import { FioApi } from "./fio-api.js";
 import { CACHE_INSTRUCTIONS, CacheToolsLive } from "./mcp/cache-tools.js";
 import { FioToolsLive, SERVER_INSTRUCTIONS } from "./mcp/fio-tools.js";
 import { listClientsCommand, revokeAllTokensCommand, revokeClientCommand } from "./oauth/cli.js";
@@ -44,7 +44,7 @@ export const BaseLive = Layer.mergeAll(AppConfig.Live, Redactor.Live, Accounts.L
  * SQLite cache. With FIO_CACHE_ENABLED=false the cache opens no database.
  */
 export const ServicesLive = CacheLive.pipe(
-  Layer.provideMerge(FioApiLive.pipe(Layer.provideMerge(BaseLive))),
+  Layer.provideMerge(Layer.mergeAll(BaseLive, FioApi.Live)),
   Layer.provide(NodeFileSystem.layer),
 );
 
