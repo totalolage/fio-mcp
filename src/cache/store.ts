@@ -416,7 +416,10 @@ export const makeCacheStore = Effect.fn("CacheStore.make")(function* () {
 
   const putSyncState = (tokenFingerprint: string, state: SyncState) =>
     sql
-      .withTransaction(retired.has(tokenFingerprint) ? Effect.void : Effect.asVoid(writeSyncState(tokenFingerprint, state)))
+      // Checked when the transaction runs, not when the effect is built.
+      .withTransaction(
+        Effect.suspend(() => (retired.has(tokenFingerprint) ? Effect.void : Effect.asVoid(writeSyncState(tokenFingerprint, state)))),
+      )
       .pipe(cacheFailure("save the sync state"));
 
   /**

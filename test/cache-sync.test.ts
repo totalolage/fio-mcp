@@ -798,6 +798,8 @@ describe("retiring a token removed at /admin", () => {
         const fp = acc.tokenFingerprint;
         yield* cache.sync.start(acc, { kind: "backfill" });
         yield* settle;
+        // Built before the retirement, run after it and the purge.
+        const lateState = cache.store.putSyncState(fp, yield* cache.store.syncState(fp));
         yield* cache.retire(fp);
         assert.isTrue(Option.isNone(yield* cache.sync.progress(acc)));
         // A pass that read the accounts before the removal starts nothing.
@@ -809,7 +811,7 @@ describe("retiring a token removed at /admin", () => {
         const late = { accountName: acc.name, tokenFingerprint: fp, statement: statement(TODAY, TODAY, [tx(1, TODAY, 5)]), fetchedAt: NOW };
         yield* cache.store.purgeToken(fp);
         assert.strictEqual((yield* cache.store.commit(late)).rowsWritten, 0);
-        yield* cache.store.putSyncState(fp, yield* cache.store.syncState(fp));
+        yield* lateState;
         assert.isTrue(Option.isNone(yield* cache.store.binding(fp)));
         const sql = yield* SqlClient.SqlClient;
         const [rows] = yield* sql<{ n: number }>`SELECT (SELECT COUNT(*) FROM transactions) + (SELECT COUNT(*) FROM sync_state) AS n`;
