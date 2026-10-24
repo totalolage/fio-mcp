@@ -75,6 +75,7 @@ describe("URL rules", () => {
 
   it("escapes account names in consent checkbox labels and values", () => {
     const html = consentPage({
+      formId: "form-1",
       clientId: "fio_client_test",
       clientName: null,
       redirectUri: "http://127.0.0.1:45678/callback",

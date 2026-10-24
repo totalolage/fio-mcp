@@ -78,6 +78,8 @@ export interface ConsentPage {
   readonly clientName: string | null;
   readonly redirectUri: string;
   readonly csrf: string;
+  /** Identifies what this form showed (see AuthSession.consentForms). */
+  readonly formId: string;
   readonly paymentsRequested: boolean;
   readonly accounts: ReadonlyArray<string>;
   readonly error: string | undefined;
@@ -102,6 +104,7 @@ ${loopback}
 ${page.error === undefined ? "" : `<p class="error" role="alert">${escapeHtml(page.error)}</p>`}
 <form method="post" action="/consent">
 <input type="hidden" name="csrf" value="${escapeHtml(page.csrf)}">
+<input type="hidden" name="form" value="${escapeHtml(page.formId)}">
 <fieldset><legend>Permissions</legend>
 <label><input type="checkbox" checked disabled> Read accounts, transactions, statements and the local cache; sync; move the download marker (<code>fio:read</code>, required)</label>
 <label><input type="checkbox" name="scope" value="fio:payments"${page.paymentsRequested ? " checked" : ""}> Preview payment orders and submit them to FIO for signing in Internetbanking (<code>fio:payments</code>)</label>

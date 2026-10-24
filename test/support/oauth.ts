@@ -216,6 +216,15 @@ export class Browser {
   }
 }
 
+/** The consent form's CSRF token and form id. */
+export const consentFormOf = async (response: Response) => {
+  const html = await response.text();
+  const csrf = /name="csrf" value="([^"]+)"/.exec(html)?.[1];
+  const form = /name="form" value="([^"]+)"/.exec(html)?.[1];
+  if (csrf === undefined || form === undefined) throw new Error(`no consent form in the page (status ${response.status})`);
+  return { csrf, form };
+};
+
 export const csrfOf = async (response: Response) => {
   const match = /name="csrf" value="([^"]+)"/.exec(await response.text());
   if (match?.[1] === undefined) throw new Error(`no CSRF token in the page (status ${response.status})`);
@@ -238,9 +247,9 @@ export async function authorizeInBrowser(harness: OAuthHarness, authorizationUrl
   const csrf = await csrfOf(await browser.get("/login"));
   const login = await browser.post("/login", { csrf, password: PASSWORD });
   if (login.status !== 303) throw new Error(`login answered ${login.status}`);
-  const consentCsrf = await csrfOf(await browser.get("/consent"));
+  const consentForm = await consentFormOf(await browser.get("/consent"));
   const done = await browser.post("/consent", {
-    csrf: consentCsrf,
+    ...consentForm,
     decision: consent.decision ?? "approve",
     account: consent.accounts ?? ["main", "savings"],
     scope: consent.payments === true ? ["fio:payments"] : [],

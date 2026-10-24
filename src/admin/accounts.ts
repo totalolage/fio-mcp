@@ -60,16 +60,32 @@ export interface AccountInput {
 
 export const makeAccountAdmin = Effect.fn("AccountAdmin.make")(function* (key: Redacted.Redacted<Uint8Array>) {
   const store = yield* makeAccountStore(key);
-  const cacheStore = yield* makeCacheStore();
   const accounts = yield* Accounts;
   const fio = yield* FioApi;
   const cache = yield* TransactionCache;
+  // The cache's own store when it runs: its retired-token gate must be the one writes check.
+  const cacheStore = cache.enabled ? cache.store : yield* makeCacheStore();
   const lock = yield* Semaphore.make(1);
 
   /** Accounts as stored, with created and token-replaced times. */
   const records = store.load;
 
-  const reload = Effect.flatMap(store.load, (loaded) => accounts.replace(loaded.map((record) => record.account)));
+  /**
+   * Publishes the stored accounts. First, tokens no account uses any more are
+   * retired in the cache (no write, no sync job from now on; a running job is
+   * stopped) and returning ones reinstated, so nothing that read the old list
+   * can write for a removed token afterwards.
+   */
+  const reload = Effect.gen(function* () {
+    const next = (yield* store.load).map((record) => record.account);
+    const before = new Set((yield* accounts.list).map((account) => account.tokenFingerprint));
+    const after = new Set(next.map((account) => account.tokenFingerprint));
+    if (cache.enabled) {
+      for (const fingerprint of after) if (!before.has(fingerprint)) yield* cache.reinstate(fingerprint);
+      for (const fingerprint of before) if (!after.has(fingerprint)) yield* cache.retire(fingerprint);
+    }
+    yield* accounts.replace(next);
+  });
 
   /**
    * One change at a time, and never cut short (a closed browser
@@ -138,11 +154,8 @@ export const makeAccountAdmin = Effect.fn("AccountAdmin.make")(function* (key: R
         yield* reload;
         const shared = (yield* accounts.list).some((other) => other.tokenFingerprint === account.tokenFingerprint);
         const purged = purge && !shared;
-        if (purged) {
-          // The token's sync job would write again after the purge: stop it first and wait for it.
-          if (cache.enabled) yield* cache.sync.cancel(account.tokenFingerprint);
-          yield* cacheStore.purgeToken(account.tokenFingerprint);
-        }
+        // Retired by the reload: nothing writes for the token any more, so the purge stays.
+        if (purged) yield* cacheStore.purgeToken(account.tokenFingerprint);
         yield* Effect.logInfo(`admin: account ${accountId} removed${purged ? " with its cached data" : ""}`);
         return { name: account.name, purged, shared };
       }),

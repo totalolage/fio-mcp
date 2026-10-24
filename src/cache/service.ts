@@ -53,6 +53,13 @@ export interface EnabledCache {
   readonly writeThrough: (account: Account, statement: NormalizedStatement, range: DayRange) => Effect.Effect<void>;
   /** Stores movements from a response that is not a full date range (no coverage); failures are logged. */
   readonly record: (account: Account, statement: NormalizedStatement) => Effect.Effect<void>;
+  /**
+   * A token no account uses any more: from now on nothing is written for
+   * it and no sync job starts, and its running job is stopped (awaited).
+   */
+  readonly retire: (tokenFingerprint: string) => Effect.Effect<void>;
+  /** A token configured again (re-added): writes and sync are accepted again. */
+  readonly reinstate: (tokenFingerprint: string) => Effect.Effect<void>;
 }
 
 export type TransactionCacheShape = { readonly enabled: false } | EnabledCache;
@@ -194,10 +201,14 @@ export const makeTransactionCache = Effect.fn("TransactionCache.make")(function*
     );
   });
 
+  const retire = (tokenFingerprint: string) => Effect.andThen(store.retire(tokenFingerprint), sync.cancel(tokenFingerprint));
+
   return {
     enabled: true,
     store,
     sync,
+    retire,
+    reinstate: store.reinstate,
     boundAccount,
     freshness,
     servable,

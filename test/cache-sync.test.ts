@@ -786,3 +786,40 @@ describe("cancelling a removed token's sync", () => {
     }),
   );
 });
+
+describe("retiring a token removed at /admin", () => {
+  it.effect("stops its job, refuses new jobs, and drops its writes until it is reinstated", () =>
+    Effect.gen(function* () {
+      yield* setNow();
+      const fio = yield* fakeFio(() => Effect.never);
+      yield* Effect.gen(function* () {
+        const cache = yield* enabledCache;
+        const acc = yield* account();
+        const fp = acc.tokenFingerprint;
+        yield* cache.sync.start(acc, { kind: "backfill" });
+        yield* settle;
+        yield* cache.retire(fp);
+        assert.isTrue(Option.isNone(yield* cache.sync.progress(acc)));
+        // A pass that read the accounts before the removal starts nothing.
+        const refused = yield* cache.sync.start(acc, { kind: "incremental" });
+        assert.strictEqual(refused.progress.status, "failed");
+        assert.include(refused.progress.lastError ?? "", "removed");
+        assert.isTrue(Option.isNone(yield* cache.sync.progress(acc)));
+        // A write admitted before the removal, landing after it (and after a purge), stores nothing.
+        const late = { accountName: acc.name, tokenFingerprint: fp, statement: statement(TODAY, TODAY, [tx(1, TODAY, 5)]), fetchedAt: NOW };
+        yield* cache.store.purgeToken(fp);
+        assert.strictEqual((yield* cache.store.commit(late)).rowsWritten, 0);
+        yield* cache.store.putSyncState(fp, yield* cache.store.syncState(fp));
+        assert.isTrue(Option.isNone(yield* cache.store.binding(fp)));
+        const sql = yield* SqlClient.SqlClient;
+        const [rows] = yield* sql<{ n: number }>`SELECT (SELECT COUNT(*) FROM transactions) + (SELECT COUNT(*) FROM sync_state) AS n`;
+        assert.strictEqual(rows?.n, 0);
+        // Added again: accepted again.
+        yield* cache.reinstate(fp);
+        assert.strictEqual((yield* cache.store.commit(late)).rowsWritten, 1);
+        const started = yield* cache.sync.start(acc, { kind: "incremental" });
+        assert.strictEqual(started.progress.status, "running");
+      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+    }),
+  );
+});

@@ -295,6 +295,13 @@ const escapeLike = (text: string) => `%${text.replace(/[\\%_]/g, (c) => `\\${c}`
 
 export const makeCacheStore = Effect.fn("CacheStore.make")(function* () {
   const sql = yield* SqlClient.SqlClient;
+  /**
+   * Tokens no account uses any more (removed or replaced at /admin). Writes
+   * for them are dropped; the check runs inside each write's transaction,
+   * so a write admitted before the retirement either commits before a purge
+   * transaction (which then deletes it) or sees the token retired.
+   */
+  const retired = new Set<string>();
 
   const where = (accountKey: string, f: TransactionFilters) => {
     const clauses = [sql`account_key = ${accountKey}`];
@@ -408,7 +415,9 @@ export const makeCacheStore = Effect.fn("CacheStore.make")(function* () {
     `;
 
   const putSyncState = (tokenFingerprint: string, state: SyncState) =>
-    writeSyncState(tokenFingerprint, state).pipe(Effect.asVoid, cacheFailure("save the sync state"));
+    sql
+      .withTransaction(retired.has(tokenFingerprint) ? Effect.void : Effect.asVoid(writeSyncState(tokenFingerprint, state)))
+      .pipe(cacheFailure("save the sync state"));
 
   /**
    * Rows, coverage, binding, account header and sync state of one response, in
@@ -438,6 +447,9 @@ export const makeCacheStore = Effect.fn("CacheStore.make")(function* () {
       const info = statement.info;
       return yield* sql.withTransaction(
         Effect.gen(function* () {
+          if (retired.has(input.tokenFingerprint)) {
+            return { accountKey, rowsWritten: 0, rowsDeleted: 0, coverage: undefined } satisfies CommitResult;
+          }
           yield* sql`
             INSERT INTO accounts ${sql.insert({
               account_key: accountKey,
@@ -664,10 +676,19 @@ export const makeCacheStore = Effect.fn("CacheStore.make")(function* () {
       )
       .pipe(cacheFailure("delete the cached data"));
 
+  /** Stops every later write for the token (see `retired`). */
+  const retire = (tokenFingerprint: string) => Effect.sync(() => void retired.add(tokenFingerprint));
+  /** The token is configured again: its writes are accepted again. */
+  const reinstate = (tokenFingerprint: string) => Effect.sync(() => void retired.delete(tokenFingerprint));
+  const isRetired = (tokenFingerprint: string) => retired.has(tokenFingerprint);
+
   return {
     binding,
     renameBinding,
     purgeToken,
+    retire,
+    reinstate,
+    isRetired,
     account,
     syncState,
     putSyncState,

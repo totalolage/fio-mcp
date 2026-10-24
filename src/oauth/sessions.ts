@@ -21,6 +21,8 @@ export const SESSION_TTL_MS = 10 * 60_000;
  * displaces its own sign-ins first.
  */
 export const MAX_SESSIONS = { pending: 100, signedIn: 20 } as const;
+/** Consent forms (tabs) remembered per session. */
+export const MAX_CONSENT_FORMS = 8;
 
 /** A validated /authorize request, waiting for login and consent. */
 export interface PendingAuthorization {
@@ -42,11 +44,12 @@ export interface AuthSession {
   readonly passwordStamp: string | undefined;
   readonly expiresAt: number;
   /**
-   * The accounts the consent page last showed: name → token fingerprint. A
-   * consent is accepted only for these, unchanged (an account renamed or
-   * given a new token in between is shown again instead).
+   * What each rendered consent form showed, by its form id: account name →
+   * token fingerprint. A submit is accepted only for its own form's accounts,
+   * unchanged (an account renamed or given a new token in between is shown
+   * again instead). The newest MAX_CONSENT_FORMS forms are kept.
    */
-  consentShown: ReadonlyMap<string, string> | undefined;
+  readonly consentForms: Map<string, ReadonlyMap<string, string>>;
 }
 
 export interface IssuedSession {
@@ -104,7 +107,7 @@ export const makeSessions = Effect.fn("AuthSessions.make")(function* () {
       loggedIn,
       passwordStamp,
       expiresAt: expiresAt ?? now + SESSION_TTL_MS,
-      consentShown: undefined,
+      consentForms: new Map(),
     };
     sessions.set(session.key, session);
     return { session, cookie: Redacted.make(`${id}.${sign(key, id)}`) } satisfies IssuedSession;

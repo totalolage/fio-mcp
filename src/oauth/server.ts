@@ -28,7 +28,14 @@ import {
 } from "./errors.js";
 import { consentPage, errorPage, loginPage, pageHeaders, redirectFormTarget } from "./pages.js";
 import { makeWindowLimiter } from "./rate-limit.js";
-import { type AuthSession, makeSessions, type PendingAuthorization, SESSION_COOKIE, SESSION_TTL_MS } from "./sessions.js";
+import {
+  type AuthSession,
+  MAX_CONSENT_FORMS,
+  makeSessions,
+  type PendingAuthorization,
+  SESSION_COOKIE,
+  SESSION_TTL_MS,
+} from "./sessions.js";
 import { type Client, type Grant, makeOAuthStore, type OAuthStore } from "./store.js";
 import { isResource, MCP_RESOURCE_PATH, redirectUriMatches, redirectUriProblem, withParams } from "./urls.js";
 
@@ -521,11 +528,21 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
       extra,
     );
 
-  /** The consent page for the accounts configured now, remembered in the session for the submit. */
-  const renderConsent = (session: AuthSession, configured: ReadonlyArray<Account>, status = 200, error?: string) => {
-    session.consentShown = new Map(configured.map((account) => [account.name, account.tokenFingerprint]));
+  /** The consent page for the accounts configured now; the session remembers what this form showed. */
+  const renderConsent = Effect.fnUntraced(function* (
+    session: AuthSession,
+    configured: ReadonlyArray<Account>,
+    status = 200,
+    error?: string,
+  ) {
+    const formId = yield* randomId("");
+    session.consentForms.set(formId, new Map(configured.map((account) => [account.name, account.tokenFingerprint])));
+    for (const old of [...session.consentForms.keys()].slice(0, Math.max(0, session.consentForms.size - MAX_CONSENT_FORMS))) {
+      session.consentForms.delete(old);
+    }
     return html(
       consentPage({
+        formId,
         clientId: session.request.clientId,
         clientName: session.request.clientName,
         redirectUri: session.request.redirectUri,
@@ -537,7 +554,7 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
       status,
       redirectFormTarget(session.request.redirectUri),
     );
-  };
+  });
 
   const showLogin = Effect.fnUntraced(function* (request: HttpServerRequest.HttpServerRequest) {
     const session = yield* currentSession(request);
@@ -574,7 +591,8 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
 
   const showConsent = Effect.fnUntraced(function* (request: HttpServerRequest.HttpServerRequest) {
     const session = yield* currentSession(request);
-    return session.loggedIn ? renderConsent(session, yield* accounts.list) : redirect("/login");
+    if (!session.loggedIn) return redirect("/login");
+    return yield* renderConsent(session, yield* accounts.list);
   });
 
   const submitConsent = Effect.fnUntraced(function* (request: HttpServerRequest.HttpServerRequest) {
@@ -598,17 +616,22 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
     const configured = yield* accounts.list;
     // Only what the page showed, still behind the same token: a token
     // replaced (or a name reused) at /admin since then is shown again.
-    const shown = session.consentShown;
-    const changed = chosen.some((name) => {
+    const shown = session.consentForms.get(Result.getOrUndefined(single(form, "form")) ?? "");
+    const changed = shown === undefined || chosen.some((name) => {
       const current = configured.find((account) => account.name === name);
       return current === undefined || shown?.get(name) !== current.tokenFingerprint;
     });
     if (changed) {
-      return renderConsent(session, configured, 409, "The accounts changed while this page was open. Review the selection and approve again.");
+      return yield* renderConsent(
+        session,
+        configured,
+        409,
+        "The accounts changed while this page was open. Review the selection and approve again.",
+      );
     }
     const chosenAccounts = configured.filter((account) => chosen.includes(account.name));
     if (chosenAccounts.length === 0) {
-      return renderConsent(
+      return yield* renderConsent(
         session,
         configured,
         400,

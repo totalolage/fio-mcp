@@ -8,6 +8,7 @@ import { resetAdminPasswordCommand } from "../src/oauth/cli.js";
 import {
   authorizationUrl,
   Browser,
+  consentFormOf,
   csrfOf,
   LOOPBACK_REDIRECT,
   type OAuthHarness,
@@ -205,6 +206,25 @@ describe("admin sign-in and sessions", () => {
     expect((await admin.act("/admin/accounts/add", form)).message).toContain("Added “third”");
   });
 
+  it("creates no session for sign-in posts without a sign-in form", async () => {
+    const legit = new Admin();
+    await legit.page("/admin/login");
+    for (let i = 0; i < 150; i++) {
+      const response = await harness.fetch(`${PUBLIC_URL}/admin/login`, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded", origin: PUBLIC_URL },
+        body: new URLSearchParams({ password: "guess" }),
+      });
+      expect(response.status).toBe(303);
+      expect(response.headers.get("location")).toBe("/admin/login");
+      expect(response.headers.getSetCookie()).toEqual([]);
+    }
+    // The pool of sign-in forms (100) was not churned: the open form still signs in.
+    const right = await legit.post("/admin/login", { password: PASSWORD });
+    expect(right.status).toBe(303);
+    expect(right.headers.get("location")).toBe("/admin");
+  });
+
   it("ends a session after 15 minutes without a request", async () => {
     const admin = await signedIn();
     harness.clock.advance(10 * 60_000);
@@ -360,12 +380,20 @@ describe("accounts at /admin", () => {
     );
     const csrf = await csrfOf(await browser.get("/login"));
     await browser.post("/login", { csrf, password: PASSWORD });
-    const consentCsrf = await csrfOf(await browser.get("/consent"));
+    // Tab A shows main's old token; then the token changes and tab B shows the new one.
+    const tabA = await consentFormOf(await browser.get("/consent"));
     const admin = await signedIn();
     await admin.act("/admin/accounts/rotate", { id: idOf((await admin.page("/admin")).html, "main"), token: NEW_MAIN_TOKEN });
-    const changed = await browser.post("/consent", { csrf: consentCsrf, decision: "approve", account: "main" });
+    const tabB = await consentFormOf(await browser.get("/consent"));
+    // Tab A cannot approve the token it never showed, even after tab B rendered it.
+    const changed = await browser.post("/consent", { ...tabA, decision: "approve", account: "main" });
     expect(changed.status).toBe(409);
     expect(await changed.text()).toContain("The accounts changed while this page was open");
+    // Neither can a form id that was never issued.
+    expect((await browser.post("/consent", { ...tabB, form: "made-up", decision: "approve", account: "main" })).status).toBe(409);
+    const approved = await browser.post("/consent", { ...tabB, decision: "approve", account: "main" });
+    expect(approved.status).toBe(303);
+    expect(approved.headers.get("location")).toContain("code=");
   });
 });
 

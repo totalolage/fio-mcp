@@ -421,6 +421,17 @@ export const makeCacheSync = Effect.fn("CacheSync.make")(function* (
     account: Account,
     request: SyncRequest,
   ): Effect.fn.Return<readonly [StartResult, Map<string, RunningJob>]> {
+    if (store.isRetired(account.tokenFingerprint)) {
+      // A pass that read the accounts before this token was removed at /admin.
+      const startedAt = yield* Clock.currentTimeMillis;
+      const refused: JobProgress = {
+        ...initialProgress(account, request, startedAt),
+        status: "failed",
+        finishedAt: startedAt,
+        lastError: "Not started: the account was removed or its token replaced.",
+      };
+      return [{ progress: refused, joined: false } satisfies StartResult, map] as const;
+    }
     const existing = map.get(account.tokenFingerprint);
     if (existing !== undefined) {
       const current = yield* Ref.get(existing.progress);

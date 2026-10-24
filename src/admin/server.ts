@@ -161,18 +161,9 @@ export const makeAdminServer = Effect.fn("AdminServer.make")(function* (settings
 
   const submitLogin = Effect.fnUntraced(function* (request: Request) {
     const found = yield* sessions.find(request.cookies[ADMIN_COOKIE]);
+    // Expired or never started: back to the form, whose sessions are limited per address.
+    if (Option.isNone(found) || found.value.signedIn) return redirect(`${ADMIN_PATH}/login`);
     const form = yield* readForm(request);
-    if (Option.isNone(found) || found.value.signedIn) {
-      // Expired or never started: a fresh form.
-      const started = yield* sessions.start();
-      return renderLogin(
-        started.session.csrf,
-        400,
-        "The sign-in form expired. Enter the password again.",
-        {},
-        sessionCookie(Redacted.value(started.cookie), ADMIN_PRELOGIN_MS),
-      );
-    }
     const session = found.value;
     if (form._tag === "Invalid" || !verified(request, session, form.params)) return refused;
     const entered = Redacted.make(field(form.params, "password") ?? "");
