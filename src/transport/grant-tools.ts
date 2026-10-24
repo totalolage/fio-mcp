@@ -43,9 +43,11 @@ export function grantedTools(tools: ToolList, principal: Principal, accounts: Re
     if (!holdsScopes(principal, toolScopes(tool.name))) return [];
     if (ACCOUNTLESS_TOOLS.has(tool.name)) return [tool];
     if (granted.size === 0) return [];
-    // With one configured account there is no `account` parameter to narrow.
     const account = tool.inputSchema.properties?.account;
-    if (!Predicate.isObject(account) || !Array.isArray(account.enum)) return [tool];
+    // With one configured account there is no `account` parameter to narrow.
+    if (account === undefined) return [tool];
+    // Some other shape (a schema-generation change) could list ungranted names.
+    if (!Predicate.isObject(account) || !Array.isArray(account.enum)) return [];
     const names = account.enum.filter((name) => granted.has(name));
     if (names.length === 0) return [];
     const properties = { ...tool.inputSchema.properties, account: { ...account, enum: names } };
@@ -71,10 +73,10 @@ const handlersOf = (adapter: McpProtocol.ProtocolAdapter) => adapter as McpProto
 const grantAdapter = (adapter: McpProtocol.ProtocolAdapter, accounts: ReadonlyArray<Account>): McpProtocol.ProtocolAdapter => ({
   ...adapter,
   installHandlers: (core, lifecycle, target) => {
-    // Stateless revisions resolve `tools/call` through `tools.list`, which
-    // would turn a hidden tool into "unknown tool".
+    // Only the stateful revisions are offered and tested. Stateless ones read
+    // `tools.list` inside `tools/call` too (header validation).
     if (adapter.runtime._tag !== "Stateful") {
-      return Effect.die(`grant-tools: MCP ${adapter.protocolVersion} is stateless; grant filtering supports stateful revisions only`);
+      return Effect.die(`grant-tools: MCP ${adapter.protocolVersion} is stateless; grant filtering is tested on stateful revisions only`);
     }
     if (!isToolsCore(core)) {
       return Effect.die(`grant-tools: the MCP core for ${adapter.protocolVersion} no longer has tools.list; update src/transport/grant-tools.ts`);

@@ -109,7 +109,20 @@ const call = (client: Client, name: string, args: Record<string, unknown>) =>
   );
 
 const ALL_TOOLS = [...Object.keys(makeFioToolkit(ACCOUNT_NAMES).tools), ...Object.keys(makeCacheToolkit(ACCOUNT_NAMES).tools)].sort();
-const READ_TOOLS = ALL_TOOLS.filter((name) => !PAYMENT_TOOLS.has(name));
+// Spelled out, not derived from PAYMENT_TOOLS: a new tool must be classified here.
+const READ_TOOLS = [
+  "export_transactions",
+  "get_cache_status",
+  "get_last_statement",
+  "get_new_transactions",
+  "get_server_status",
+  "get_statement",
+  "get_transactions",
+  "search_transactions",
+  "set_download_marker",
+  "summarize_transactions",
+  "sync_transactions",
+];
 const DENIED = /^You don't have permissions to do that\./;
 const ORDER = { type: "domestic", amount: 100, accountTo: "2212-2000000699", bankCode: "0300", date: "2025-11-03" };
 
@@ -212,6 +225,17 @@ describe("grantedTools", () => {
     toAccount({ name: "main", token: Redacted.make(FIO_TOKEN), accountNumber: undefined, currency: undefined }),
   ];
 
+  it("lists exactly the configured tools as read tools or payment tools", () => {
+    assert.deepStrictEqual([...PAYMENT_TOOLS].sort(), ["preview_payment_orders", "submit_payment_orders"]);
+    assert.deepStrictEqual([...READ_TOOLS, ...PAYMENT_TOOLS].sort(), ALL_TOOLS);
+  });
+
+  it("hides a tool whose account parameter has no enum to narrow", () => {
+    const granted: Principal = { subject: "x", scopes: [SCOPE_READ], accountFingerprints: [MAIN] };
+    const tools = [tool("get_last_statement", { account: { anyOf: [{ const: "main" }, { const: "savings" }] } })];
+    assert.deepStrictEqual(grantedTools(tools, granted, accounts), []);
+  });
+
   it("hides account tools without an account parameter when the only account is not granted", () => {
     const tools = [tool("get_last_statement"), tool("get_server_status")];
     const rotated: Principal = { subject: "x", scopes: [SCOPE_READ], accountFingerprints: [SAVINGS] };
@@ -238,7 +262,7 @@ describe("grantProtocols", () => {
     }),
   );
 
-  it.effect("refuses stateless revisions, which resolve calls through tools.list", () =>
+  it.effect("refuses stateless revisions, which are not offered or tested", () =>
     Effect.gen(function* () {
       const exit = yield* install(McpProtocol.v2026_07_28, { tools: { list: () => Effect.succeed([]) } });
       assert.isTrue(Exit.isFailure(exit) && Cause.hasDies(exit.cause));
