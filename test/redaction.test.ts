@@ -1,7 +1,5 @@
-import { NodeFileSystem } from "@effect/platform-node";
 import { assert, describe, it } from "@effect/vitest";
 import { ConfigProvider, Effect, Layer, Logger } from "effect";
-import { AppConfig } from "../src/config.js";
 import { makeRedactor, Redactor, stderrLogger } from "../src/redaction.js";
 import { PAY_TOKEN, READ_TOKEN } from "./fixtures.js";
 
@@ -104,9 +102,8 @@ describe("tokens added at runtime", () => {
       const env = ConfigProvider.layer(ConfigProvider.fromEnv({ env: { HOME: "/home/test", FIO_TOKEN: READ_TOKEN } }));
       const grab = (set: (redactor: Redactor["Service"]) => void) =>
         Layer.effectDiscard(Effect.map(Effect.service(Redactor), set)).pipe(
-          Layer.provide(Redactor.layer),
-          Layer.provide(AppConfig.layer),
-          Layer.provide(Layer.mergeAll(NodeFileSystem.layer, env)),
+          Layer.provide(Redactor.Live),
+          Layer.provide(env),
         );
       const innerBuild = Effect.scoped(
         Layer.build(

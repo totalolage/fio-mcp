@@ -1,9 +1,14 @@
 import { createHash } from "node:crypto";
 import { Context, Effect, Layer, Redacted, Ref, type Stream, SubscriptionRef } from "effect";
-import { type AccountConfig, AppConfig } from "./config.js";
-import { InvalidInput } from "./errors.js";
+import type { SqlClient } from "effect/sql";
+import { type AccountStoreError, loadStoredAccounts, makeAccountStore } from "./account-store.js";
+import { Database } from "./cache/db.js";
+import { type AccountConfig, type AccountSeed, AppConfig } from "./config.js";
+import { type ConfigError, InvalidInput } from "./errors.js";
 import type { Payer } from "./payments.js";
+import { Redactor } from "./redaction.js";
 import type { StatementInfo } from "./statement.js";
+import type { DataKeyMismatch, TokenDecryptionFailed } from "./token-crypto.js";
 
 export interface Account {
   /**
@@ -133,12 +138,8 @@ export const makeAccounts = Effect.fn("Accounts.make")(function* (
 });
 
 export class Accounts extends Context.Service<Accounts, AccountsShape>()("fio-mcp/Accounts") {
-  /**
-   * The accounts from FIO_TOKEN / FIO_ACCOUNTS. In HTTP mode with OAuth
-   * `AccountStoreLive` (src/account-store.ts) loads them from the database
-   * instead.
-   */
-  static readonly layer = Layer.effect(
+  /** The accounts from FIO_TOKEN / FIO_ACCOUNTS. */
+  static readonly Default = Layer.effect(
     Accounts,
     // Fixed for the process; their tokens are in AppConfig.secrets, which the Redactor starts with.
     Effect.gen(function* () {
@@ -146,4 +147,40 @@ export class Accounts extends Context.Service<Accounts, AccountsShape>()("fio-mc
       return Accounts.of(yield* makeAccounts(accountsFromConfig(config.accounts)));
     }),
   );
+
+  /**
+   * The accounts from the database (HTTP mode with OAuth), managed at
+   * /admin. Needs the database and the data key; fails startup on a wrong
+   * key, a row that does not decrypt, or a seed that is needed but invalid.
+   * New tokens are registered with the Redactor.
+   */
+  static readonly stored = (
+    key: Redacted.Redacted<Uint8Array>,
+    accountSeed: AccountSeed,
+  ): Layer.Layer<Accounts, DataKeyMismatch | TokenDecryptionFailed | AccountStoreError | ConfigError, SqlClient.SqlClient | Redactor> =>
+    Layer.effect(
+      Accounts,
+      Effect.gen(function* () {
+        const redactor = yield* Redactor;
+        const store = yield* makeAccountStore(key);
+        const records = yield* loadStoredAccounts(store, accountSeed);
+        yield* Effect.logInfo(`accounts: ${records.length} accounts loaded from the database`);
+        return Accounts.of(yield* makeAccounts(records.map((record) => record.account), redactor.register));
+      }),
+    );
+
+  /**
+   * The accounts from configuration: `stored` on the server's database in
+   * HTTP mode with OAuth, otherwise `Default`.
+   */
+  static readonly Live = Layer.unwrap(
+    Effect.gen(function* () {
+      const { transport } = yield* AppConfig;
+      return transport.kind === "http" && transport.auth.kind === "oauth"
+        ? Accounts.stored(transport.auth.dataKey, transport.auth.accountSeed).pipe(
+            Layer.provide(Layer.mergeAll(Database.Live, Redactor.Live)),
+          )
+        : Accounts.Default;
+    }),
+  ).pipe(Layer.provide(AppConfig.Live));
 }

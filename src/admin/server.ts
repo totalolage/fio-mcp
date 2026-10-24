@@ -3,7 +3,7 @@ import { Cookies, HttpRouter, HttpServerRequest, HttpServerResponse } from "effe
 import type { IpNetwork } from "effect/net";
 import type { SqlClient } from "effect/sql";
 import { Accounts, tokenHint } from "../accounts.js";
-import type { TransactionCache } from "../cache/service.js";
+import type { Transactions } from "../cache/service.js";
 import type { FioApi } from "../fio-api.js";
 import { safeEqual } from "../oauth/crypto.js";
 import { pageHeaders } from "../oauth/pages.js";
@@ -449,7 +449,7 @@ export const makeAdminServer = Effect.fn("AdminServer.make")(function* (settings
 /** Registers the admin routes on the router (HTTP mode with OAuth). */
 export const AdminLive = (
   settings: AdminSettings,
-): Layer.Layer<never, never, HttpRouter.HttpRouter | SqlClient.SqlClient | Accounts | AdminPassword | FioApi | TransactionCache> =>
+): Layer.Layer<never, never, HttpRouter.HttpRouter | SqlClient.SqlClient | Accounts | AdminPassword | FioApi | Transactions> =>
   Layer.effectDiscard(
     Effect.gen(function* () {
       const server = yield* makeAdminServer(settings);

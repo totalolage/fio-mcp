@@ -3,7 +3,7 @@ import { createServer } from "node:http";
 import { NodeHttpServer } from "@effect/platform-node";
 import { ByteSize, Clock, Context, Effect, Exit, Fiber, Layer, Predicate, Result, Schema, type Scope, Stream, type Types } from "effect";
 import { McpServer } from "effect/ai";
-import { Headers, HttpBody, HttpEffect, HttpMiddleware, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
+import { Headers, HttpBody, HttpEffect, HttpMiddleware, HttpRouter, type HttpServerError, HttpServerRequest, HttpServerResponse } from "effect/http";
 import { Accounts } from "../accounts.js";
 import type { TransportConfig } from "../config.js";
 import { Redactor } from "../redaction.js";
@@ -258,6 +258,13 @@ type BodyRead =
   | { readonly _tag: "Unreadable" };
 
 /**
+ * Whether the Node server stopped reading at MaxBodySize. Effect 4.0.5 has no
+ * tag for it: the reader fails with this plain Error as the cause.
+ */
+const isBodyTooLarge = (reason: HttpServerError.HttpServerErrorReason): boolean =>
+  reason._tag === "RequestParseError" && reason.cause instanceof Error && reason.cause.message === "maxBytes exceeded";
+
+/**
  * Reads the body once, at most MAX_BODY_BYTES: a larger declared length is
  * refused unread, a longer body stops being read at the limit. McpServer
  * later reads the same cached body.
@@ -273,11 +280,7 @@ const readBody = (request: HttpServerRequest.HttpServerRequest): Effect.Effect<B
       return bytes > MAX_BODY_BYTES ? { _tag: "TooLarge" } : { _tag: "Read", text, bytes };
     }),
     Effect.catch((error) =>
-      Effect.succeed<BodyRead>(
-        error.reason._tag === "RequestParseError" && error.reason.reason === "BodyTooLarge"
-          ? { _tag: "TooLarge" }
-          : { _tag: "Unreadable" },
-      ),
+      Effect.succeed<BodyRead>(isBodyTooLarge(error.reason) ? { _tag: "TooLarge" } : { _tag: "Unreadable" }),
     ),
   );
 };

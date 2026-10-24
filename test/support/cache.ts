@@ -1,21 +1,17 @@
-import { NodeFileSystem } from "@effect/platform-node";
-import { Effect, Layer, Redacted, Ref } from "effect";
+
+import { Clock, Effect, Layer, Redacted } from "effect";
 import { TestClock } from "effect/testing";
-import { type Account, Accounts, accountsFromConfig, makeAccounts } from "../../src/accounts.js";
-import { databaseLayer } from "../../src/cache/db.js";
-import { TransactionCache, TransactionCacheFromSql } from "../../src/cache/service.js";
-import {
-  AppConfig,
-  type AppConfigShape,
-  type CacheConfig,
-  DEFAULT_BACKFILL_FROM,
-  DEFAULT_CACHE_MAX_AGE_MINUTES,
-  DEFAULT_OVERLAP_DAYS,
-} from "../../src/config.js";
-import type { FioRequestError } from "../../src/errors.js";
-import { FioApi, type FioApiShape } from "../../src/fio-api.js";
+import { type Account, Accounts } from "../../src/accounts.js";
+import type { DayRange } from "../../src/cache/dates.js";
+import { Transactions } from "../../src/cache/service.js";
+import { makeCacheStore, type PendingRange, type SyncMode } from "../../src/cache/store.js";
+import { type AppConfigShape, type CacheConfig, DEFAULT_BACKFILL_FROM, DEFAULT_CACHE_MAX_AGE_MINUTES, DEFAULT_OVERLAP_DAYS, MAX_RESPONSE_BYTES } from "../../src/config.js";
+import type { FioApi } from "../../src/fio-api.js";
 import { Redactor } from "../../src/redaction.js";
 import type { NormalizedStatement, Transaction } from "../../src/statement.js";
+import { seededConfig } from "./config.js";
+import { testDatabase } from "./database.js";
+import type { PeriodsScript } from "./fio-api.js";
 
 export const TOKEN_A = "a".repeat(64);
 export const TOKEN_B = "b".repeat(64);
@@ -39,6 +35,7 @@ export function config(
     rateLimitIntervalMs: 30_000,
     maxWaitMs: 25_000,
     requestTimeoutMs: 20_000,
+    maxResponseBytes: MAX_RESPONSE_BYTES,
     transport: { kind: "stdio" },
     cache: {
       enabled: true,
@@ -107,44 +104,6 @@ export function statement(
   };
 }
 
-export interface PeriodCall {
-  readonly token: string;
-  readonly from: string;
-  readonly to: string;
-  readonly priority: string | undefined;
-}
-
-/** Answers /periods from `respond`; every other endpoint dies. Records each call. */
-export type PeriodsScript = (
-  call: PeriodCall,
-  n: number,
-) => Effect.Effect<NormalizedStatement, FioRequestError>;
-
-export const fakeFio = Effect.fnUntraced(function* (initial: PeriodsScript) {
-  const calls = yield* Ref.make<ReadonlyArray<PeriodCall>>([]);
-  const script = yield* Ref.make(initial);
-  const periods: FioApiShape["periods"] = (account, from, to, priority) =>
-    Effect.gen(function* () {
-      const call = { token: Redacted.value(account.token), from, to, priority };
-      const n = (yield* Ref.getAndUpdate(calls, (c) => [...c, call])).length;
-      return yield* (yield* Ref.get(script))(call, n);
-    });
-  const unused = () => Effect.die("not scripted");
-  const api: FioApiShape = {
-    periods,
-    periodsRaw: unused,
-    statement: unused,
-    statementRaw: unused,
-    last: unused,
-    setLastId: unused,
-    setLastDate: unused,
-    lastStatement: unused,
-    merchantRaw: unused,
-    importXml: unused,
-  };
-  return { api, calls, setScript: (next: PeriodsScript) => Ref.set(script, next) };
-});
-
 /** Every range succeeds with the movements dated inside it. */
 export const serveFrom =
   (movements: ReadonlyArray<Transaction>, accountId?: string): PeriodsScript =>
@@ -159,27 +118,50 @@ export const serveFrom =
     );
 
 /** Base services for cache tests: config, accounts, redactor, the DB at cache.dbPath (":memory:" by default), and the cache. */
-const baseLayer = (cfg: AppConfigShape, fio: FioApiShape) =>
-  Layer.mergeAll(
-    Layer.effect(Accounts, Effect.map(makeAccounts(accountsFromConfig(cfg.accounts)), Accounts.of)),
-    Redactor.layerFrom(cfg.secrets.map(Redacted.value)),
-    Layer.succeed(FioApi, fio),
-  ).pipe(Layer.provideMerge(AppConfig.layerFrom(cfg)));
+const baseLayer = (cfg: AppConfigShape, fio: Layer.Layer<FioApi>) =>
+  Layer.mergeAll(Accounts.Default, Redactor.Default, fio).pipe(Layer.provideMerge(seededConfig(cfg)));
 
-export const cacheLayer = (cfg: AppConfigShape, fio: FioApiShape) =>
-  TransactionCacheFromSql.pipe(
-    Layer.provideMerge(databaseLayer(cfg.cache.dbPath).pipe(Layer.provide(NodeFileSystem.layer))),
+export const cacheLayer = (cfg: AppConfigShape, fio: Layer.Layer<FioApi>) =>
+  Transactions.Default.pipe(
+    Layer.provideMerge(testDatabase(cfg.cache.dbPath)),
     Layer.provideMerge(baseLayer(cfg, fio)),
   );
 
 /** The same services with FIO_CACHE_ENABLED=false: no database at all. */
-export const disabledCacheLayer = (cfg: AppConfigShape, fio: FioApiShape) =>
-  TransactionCache.disabled.pipe(Layer.provideMerge(baseLayer({ ...cfg, cache: { ...cfg.cache, enabled: false } }, fio)));
+export const disabledCacheLayer = (cfg: AppConfigShape, fio: Layer.Layer<FioApi>) =>
+  Transactions.Disabled.pipe(Layer.provideMerge(baseLayer({ ...cfg, cache: { ...cfg.cache, enabled: false } }, fio)));
 
-export const enabledCache = Effect.gen(function* () {
-  const cache = yield* TransactionCache;
-  if (!cache.enabled) return yield* Effect.die("cache disabled");
-  return cache;
+/** The account's cache status; dies unless the token is verified. */
+export const verifiedStatus = Effect.fnUntraced(function* (acc: Account) {
+  const [status] = yield* (yield* Transactions).status([acc]);
+  if (status === undefined || !status.verified) return yield* Effect.die("cache not verified");
+  return status;
+});
+
+/*
+ * Setup through the cache's internal store, on the test's SqlClient, for
+ * states the scripted FIO cannot produce. Assertions go through
+ * Transactions.
+ */
+
+/** Stores `statement` as FIO's answer for `range`, as a write-through does. */
+export const seedRange = Effect.fnUntraced(function* (acc: Account, statement: NormalizedStatement, range: DayRange) {
+  const store = yield* makeCacheStore();
+  const fetchedAt = yield* Clock.currentTimeMillis;
+  yield* Effect.orDie(
+    store.commit({ accountName: acc.name, tokenFingerprint: acc.tokenFingerprint, statement, coverage: range, fetchedAt }),
+  );
+});
+
+/** Persists an interrupted job: its mode and pending ranges. */
+export const seedPending = Effect.fnUntraced(function* (
+  acc: Account,
+  mode: SyncMode,
+  pending: ReadonlyArray<PendingRange>,
+) {
+  const store = yield* makeCacheStore();
+  const state = yield* Effect.orDie(store.syncState(acc.tokenFingerprint));
+  yield* Effect.orDie(store.putSyncState(acc.tokenFingerprint, { ...state, mode, pending }));
 });
 
 export const account = Effect.fnUntraced(function* (name = "main") {

@@ -44,7 +44,9 @@ export const clientAddress = (
   request: HttpServerRequest.HttpServerRequest,
   trustedProxies: ReadonlyArray<IpNetwork.IpNetwork>,
 ): string => {
-  const peer = Option.getOrUndefined(Option.map(request.peerAddress, parseAddress));
+  // The socket peer: nothing in this server overrides remoteAddress (no
+  // HttpMiddleware.xForwardedHeaders), so it is not taken from a header.
+  const peer = Option.getOrUndefined(Option.map(request.remoteAddress, parseAddress));
   if (peer === undefined) return UNKNOWN_ADDRESS;
   const isTrusted = (address: NetAddress.IpAddress) => trustedProxies.some((network) => IpNetwork.contains(network, address));
   if (!isTrusted(peer)) return NetAddress.formatIp(peer);

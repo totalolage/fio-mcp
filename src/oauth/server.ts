@@ -1,11 +1,10 @@
-import { ByteSize, Clock, Effect, Layer, Option, Redacted, Result, Schedule, Schema } from "effect";
-import { Cookies, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
+import { ByteSize, Clock, Effect, Option, Redacted, Result, Schema } from "effect";
+import { Cookies, HttpServerRequest, HttpServerResponse } from "effect/http";
 import type { IpNetwork } from "effect/net";
-import type { SqlClient } from "effect/sql";
 import { type Account, Accounts } from "../accounts.js";
 import { AdminPassword } from "../admin/password.js";
 import { SCOPE_PAYMENTS, SCOPE_READ, SCOPES } from "../mcp/permissions.js";
-import { Auth, AuthUnavailable, Unauthorized } from "../transport/auth.js";
+import { AuthUnavailable, Unauthorized } from "../transport/auth-errors.js";
 import { clientAddress } from "../transport/client-address.js";
 import type { Principal } from "../transport/principal.js";
 import { CODE_CHALLENGE, hashSecret, pkceMatches, randomId, randomSecret, safeEqual } from "./crypto.js";
@@ -860,23 +859,3 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
 
   return { authenticate, routes, purge, store, resource, resourceMetadataUrl };
 });
-
-/**
- * `Auth` backed by the authorization server, which also registers its
- * routes on the router and purges expired state hourly.
- */
-export const OAuthLive = (
-  settings: OAuthSettings,
-): Layer.Layer<Auth, never, HttpRouter.HttpRouter | SqlClient.SqlClient | Accounts | AdminPassword> =>
-  Layer.effect(
-    Auth,
-    Effect.gen(function* () {
-      const server = yield* makeOAuthServer(settings);
-      const router = yield* HttpRouter.HttpRouter;
-      for (const route of server.routes) yield* router.add(route.method, route.path, route.handler);
-      yield* Effect.forkScoped(
-        server.purge.pipe(Effect.ignore, Effect.repeat(Schedule.spaced("1 hour"))),
-      );
-      return Auth.of({ authenticate: server.authenticate });
-    }),
-  );

@@ -2,8 +2,7 @@ import { Effect, Redacted, Schema, Semaphore } from "effect";
 import { SqlClient } from "effect/sql";
 import { AccountNotFound, AccountStoreError, makeAccountStore, type NewAccount } from "../account-store.js";
 import { type Account, Accounts } from "../accounts.js";
-import { TransactionCache } from "../cache/service.js";
-import { makeCacheStore } from "../cache/store.js";
+import { makeCachedData, Transactions } from "../cache/service.js";
 import { ACCOUNT_NUMBER, CURRENCY, FIELD_RULES, TOKEN, validAccountName } from "../config.js";
 import type { CacheError, FioRequestError } from "../errors.js";
 import { FioApi } from "../fio-api.js";
@@ -81,9 +80,10 @@ export const makeAccountAdmin = Effect.fn("AccountAdmin.make")(function* (key: R
   const store = yield* makeAccountStore(key);
   const accounts = yield* Accounts;
   const fio = yield* FioApi;
-  const cache = yield* TransactionCache;
-  // The cache's own store when it runs: its retired-token gate must be the one writes check.
-  const cacheStore = cache.enabled ? cache.store : yield* makeCacheStore();
+  // Retiring goes through the running cache (its gate is the one writes check); the
+  // cached data is renamed and purged on the database even while the cache is disabled.
+  const cache = yield* Transactions;
+  const cacheStore = yield* makeCachedData();
   const lock = yield* Semaphore.make(1);
 
   /** Accounts as stored, with created and token-replaced times. */
@@ -99,10 +99,8 @@ export const makeAccountAdmin = Effect.fn("AccountAdmin.make")(function* (key: R
     const next = (yield* store.load).map((record) => record.account);
     const before = new Set((yield* accounts.list).map((account) => account.tokenFingerprint));
     const after = new Set(next.map((account) => account.tokenFingerprint));
-    if (cache.enabled) {
-      for (const fingerprint of after) if (!before.has(fingerprint)) yield* cache.reinstate(fingerprint);
-      for (const fingerprint of before) if (!after.has(fingerprint)) yield* cache.retire(fingerprint);
-    }
+    for (const fingerprint of after) if (!before.has(fingerprint)) yield* cache.reinstate(fingerprint);
+    for (const fingerprint of before) if (!after.has(fingerprint)) yield* cache.retire(fingerprint);
     yield* accounts.replace(next);
   });
 
@@ -185,7 +183,7 @@ export const makeAccountAdmin = Effect.fn("AccountAdmin.make")(function* (key: R
           // inside each write's transaction, and a running job is stopped and awaited.
           // The tokens it replaced were retired when replaced, but only in this
           // process's memory.
-          if (cache.enabled) for (const fingerprint of tokensOf(account)) if (!current.has(fingerprint)) yield* cache.retire(fingerprint);
+          for (const fingerprint of tokensOf(account)) if (!current.has(fingerprint)) yield* cache.retire(fingerprint);
           // One transaction: if the purge fails, the account and its token history stay
           // and its token writes again (a job the retirement stopped stays stopped; its
           // pending ranges are saved for the next sync).
@@ -197,7 +195,7 @@ export const makeAccountAdmin = Effect.fn("AccountAdmin.make")(function* (key: R
                   Effect.andThen(Effect.fail(new AccountStoreError({ operation: "remove the account" }))),
                 ),
               ),
-              Effect.tapError(() => (cache.enabled ? cache.reinstate(account.tokenFingerprint) : Effect.void)),
+              Effect.tapError(() => cache.reinstate(account.tokenFingerprint)),
             );
           yield* reload;
           removed = {

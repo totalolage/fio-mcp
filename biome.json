@@ -7,7 +7,7 @@
   },
   "files": {
     "ignoreUnknown": false,
-    "includes": ["**/*.ts", "**/*.json", "!**/generated", "!package-lock.json", "!dist", "!openapi"]
+    "includes": ["**/*.ts", "**/*.json", "!**/generated", "!dist", "!openapi"]
   },
   "formatter": {
     "enabled": false
@@ -17,7 +17,8 @@
     "./lint/no-direct-process-env.grit",
     "./lint/no-throw-in-effect-modules.grit",
     "./lint/no-promise-in-effect-modules.grit",
-    "./lint/prefer-effect-fn.grit"
+    "./lint/prefer-effect-fn.grit",
+    "./lint/no-standalone-capability-layers.grit"
   ],
   "linter": {
     "rules": {

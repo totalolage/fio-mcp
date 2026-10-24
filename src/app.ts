@@ -2,19 +2,15 @@ import { NodeFileSystem, NodeStdio, NodeTerminal } from "@effect/platform-node";
 import { Effect, Layer } from "effect";
 import { McpProtocol } from "effect/ai";
 import { AccountChangesLive } from "./account-runtime.js";
-import { StoredAccountsLive } from "./account-store.js";
 import { Accounts } from "./accounts.js";
-import { AdminPassword } from "./admin/password.js";
-import { AdminLive } from "./admin/server.js";
-import { backupDatabase, DatabaseLive } from "./cache/db.js";
-import { CacheLive, CacheSyncLive } from "./cache/service.js";
-import { AppConfig, type HttpAuthConfig } from "./config.js";
-import { FioApiLive } from "./fio-api-live.js";
+import { backupDatabase, Database } from "./cache/db.js";
+import { CacheSyncLive, Transactions } from "./cache/service.js";
+import { AppConfig } from "./config.js";
+import { FioApi } from "./fio-api.js";
 import { CACHE_INSTRUCTIONS, CacheToolsLive } from "./mcp/cache-tools.js";
 import { FioToolsLive, SERVER_INSTRUCTIONS } from "./mcp/fio-tools.js";
 import { ToolListChangesLive } from "./mcp/registration.js";
 import { listClientsCommand, resetAdminPasswordCommand, revokeAllTokensCommand, revokeClientCommand } from "./oauth/cli.js";
-import { OAuthLive } from "./oauth/server.js";
 import { RateLimiter } from "./rate-limiter.js";
 import { LoggerLive, Redactor } from "./redaction.js";
 import { Auth } from "./transport/auth.js";
@@ -38,36 +34,25 @@ export const SERVER_INFO: ServerInfo = {
   protocols: MCP_PROTOCOLS,
 };
 
-/**
- * The accounts: from the database (encrypted, managed at /admin) in HTTP
- * mode with OAuth, otherwise from FIO_TOKEN / FIO_ACCOUNTS.
- */
-export const AccountsLive = Layer.unwrap(
-  Effect.gen(function* () {
-    const { transport } = yield* AppConfig;
-    return transport.kind === "http" && transport.auth.kind === "oauth"
-      ? StoredAccountsLive(transport.auth.dataKey, transport.auth.accountSeed).pipe(Layer.provide(DatabaseLive))
-      : Accounts.layer;
-  }),
-);
-
-/** Configuration, redaction and logging. Everything else builds on this. */
-export const BaseLive = Layer.mergeAll(AccountsLive, RateLimiter.layer).pipe(
-  Layer.provideMerge(Redactor.layer),
-  Layer.provideMerge(AppConfig.layer),
-  Layer.provide(NodeFileSystem.layer),
-);
-
 // Composition points. Each layer below is built once per process and shared by
 // every MCP session (stdio has one; HTTP has one per client).
 
 /**
  * One instance per process: one rate limiter per token, one FIO client, one
- * SQLite cache. With FIO_CACHE_ENABLED=false the cache opens no database.
+ * SQLite cache. With FIO_CACHE_ENABLED=false the cache opens no database
+ * (in HTTP mode with OAuth the accounts and Auth.Live still open it).
+ * Every member closes its own requirements (mergeAll feeds no member from
+ * another); they, and Auth.Live's OAuth server and admin UI, share one
+ * AppConfig, Accounts, RateLimiter, Transactions and database because one
+ * build memoizes each layer by reference.
  */
-export const ServicesLive = CacheLive.pipe(
-  Layer.provideMerge(FioApiLive.pipe(Layer.provideMerge(BaseLive))),
-  Layer.provide(NodeFileSystem.layer),
+export const ServicesLive = Layer.mergeAll(
+  AppConfig.Live,
+  Redactor.Live,
+  Accounts.Live,
+  RateLimiter.Live,
+  FioApi.Live,
+  Transactions.Live,
 );
 
 /** Tool registrations, re-registered (with `tools/list_changed`) when the accounts change. */
@@ -94,27 +79,8 @@ export const StdioAppLive = withServices(
   ),
 );
 
-const UNAUTHENTICATED_WARNING =
-  "SECURITY WARNING: FIO_MCP_ALLOW_UNAUTHENTICATED=true. /mcp accepts every request without authentication and gives it full access to every account, including payment orders. Anyone who can reach this port can use your bank tools. Set FIO_MCP_PUBLIC_URL and FIO_MCP_ADMIN_PASSWORD_HASH_FILE to require OAuth.";
-
-/**
- * /mcp authentication: the embedded OAuth server with the admin UI, or
- * (escape hatch) none, without an admin UI.
- */
-export const httpAuthLive = (auth: HttpAuthConfig, trustedProxies: HttpTransportConfig["trustedProxies"]) =>
-  auth.kind === "oauth"
-    ? Layer.mergeAll(
-        OAuthLive({ publicUrl: auth.publicUrl, trustedProxies }),
-        AdminLive({ publicUrl: auth.publicUrl, dataKey: auth.dataKey, trustedProxies }),
-      ).pipe(
-        Layer.provide(AdminPassword.layer(auth.passwordHash)),
-        Layer.provide(DatabaseLive),
-        Layer.provide(NodeFileSystem.layer),
-      )
-    : Layer.merge(Auth.layerOpen, Layer.effectDiscard(Effect.logWarning(UNAUTHENTICATED_WARNING)));
-
 export const HttpAppLive = (config: HttpTransportConfig) =>
-  withServices(serveHttp(ToolsLive, httpAuthLive(config.auth, config.trustedProxies), SERVER_INFO, config));
+  withServices(serveHttp(ToolsLive, Auth.Live, SERVER_INFO, config));
 
 /** The transport selected by FIO_MCP_TRANSPORT. */
 export const AppLive = Layer.unwrap(
@@ -122,28 +88,17 @@ export const AppLive = Layer.unwrap(
     const { transport } = yield* AppConfig;
     return transport.kind === "http" ? HttpAppLive(transport) : StdioAppLive;
   }),
-).pipe(Layer.provide(AppConfig.layer), Layer.provide(NodeFileSystem.layer));
+).pipe(Layer.provide(AppConfig.Live));
 
 /**
  * `fio-mcp backup <dest>`: writes a consistent copy of the live cache
  * database to `dest` with `VACUUM INTO` (safe while the server runs).
  */
 export const backup = (dest: string) =>
-  backupDatabase(dest).pipe(
-    Effect.provide(
-      DatabaseLive.pipe(Layer.provideMerge(AppConfig.layer), Layer.provideMerge(NodeFileSystem.layer)),
-    ),
-  );
+  backupDatabase(dest).pipe(Effect.provide(Layer.mergeAll(Database.Live, NodeFileSystem.layer)));
 
 const withDatabase = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-  effect.pipe(
-    Effect.provide(
-      Layer.mergeAll(
-        DatabaseLive.pipe(Layer.provideMerge(AppConfig.layer), Layer.provideMerge(NodeFileSystem.layer)),
-        NodeStdio.layer,
-      ),
-    ),
-  );
+  effect.pipe(Effect.provide(Layer.mergeAll(Database.Live, NodeStdio.layer)));
 
 /** `fio-mcp clients list` / `clients revoke <id>` / `tokens revoke-all` on the server's database. */
 export const listClients = withDatabase(listClientsCommand());
@@ -154,8 +109,4 @@ export const resetAdminPassword = (set: boolean) =>
   withDatabase(resetAdminPasswordCommand(set)).pipe(Effect.provide(NodeTerminal.layer));
 
 /** The redacting stderr logger, for everything the app layers fork. */
-export const AppLoggerLive = LoggerLive.pipe(
-  Layer.provide(Redactor.layer),
-  Layer.provide(AppConfig.layer),
-  Layer.provide(NodeFileSystem.layer),
-);
+export const AppLoggerLive = LoggerLive.pipe(Layer.provide(Redactor.Live));

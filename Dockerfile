@@ -3,29 +3,40 @@
 # HTTP mode requires FIO_MCP_PUBLIC_URL (the https origin clients use) and
 # FIO_MCP_ADMIN_PASSWORD_HASH_FILE (from `docker run --rm -it <image> hash-password`);
 # it refuses to start without them unless FIO_MCP_ALLOW_UNAUTHENTICATED=true.
-# The base image is pinned by digest; bump NODE_IMAGE deliberately.
+# The base images are pinned by digest; bump NODE_IMAGE and BUN_IMAGE
+# deliberately. Bun only installs dependencies and builds; the server runs on
+# Node and the final image has no Bun.
 
 ARG NODE_IMAGE=node:24.22.1-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205
+ARG BUN_IMAGE=oven/bun:1.4.2-slim@sha256:cb3bbbb08e13a4a2ff400f24c7a2a1d5efa83f6ef8544d52d95a519631e2fc61
+
+FROM ${BUN_IMAGE} AS bun
 
 FROM ${NODE_IMAGE} AS build
+COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
 WORKDIR /app
-COPY package.json package-lock.json ./
-RUN npm ci --ignore-scripts
+COPY package.json bun.lock bunfig.toml ./
+RUN bun install --frozen-lockfile --ignore-scripts
 COPY tsconfig.json tsconfig.build.json ./
 COPY src ./src
 # Patches TypeScript with the Effect language service, then builds dist/.
-RUN npm run prepare
+RUN bun run prepare
+
+FROM ${NODE_IMAGE} AS deps
+COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
+WORKDIR /app
+COPY package.json bun.lock bunfig.toml ./
+RUN bun install --frozen-lockfile --production --ignore-scripts
 
 FROM ${NODE_IMAGE}
 ENV NODE_ENV=production \
     FIO_MCP_TRANSPORT=http \
     FIO_DB_PATH=/data/fio.sqlite
 WORKDIR /app
-COPY package.json package-lock.json ./
-RUN npm ci --omit=dev --ignore-scripts \
- && rm -rf /root/.npm /tmp/* \
- && mkdir /data \
+RUN mkdir /data \
  && chmod 1777 /data
+COPY package.json ./
+COPY --from=deps /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 # Runs as any UID (Compose `user:`); nothing is written outside /data, so the
 # root filesystem can be read-only.

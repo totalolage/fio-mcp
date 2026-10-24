@@ -1,6 +1,6 @@
 import { Effect, Layer, Stream } from "effect";
 import { type Account, Accounts } from "./accounts.js";
-import { startupRequest, syncAll, TransactionCache } from "./cache/service.js";
+import { startupRequest, syncAll, Transactions } from "./cache/service.js";
 import { AppConfig } from "./config.js";
 import { RateLimiter } from "./rate-limiter.js";
 
@@ -21,11 +21,11 @@ import { RateLimiter } from "./rate-limiter.js";
 
 const fingerprints = (list: ReadonlyArray<Account>) => new Set(list.map((account) => account.tokenFingerprint));
 
-export const AccountChangesLive: Layer.Layer<never, never, Accounts | TransactionCache | RateLimiter | AppConfig> =
+export const AccountChangesLive: Layer.Layer<never, never, Accounts | Transactions | RateLimiter | AppConfig> =
   Layer.effectDiscard(
     Effect.gen(function* () {
       const accounts = yield* Accounts;
-      const cache = yield* TransactionCache;
+      const cache = yield* Transactions;
       const limiter = yield* RateLimiter;
       const config = yield* AppConfig;
       let previous = yield* accounts.list;
@@ -35,11 +35,11 @@ export const AccountChangesLive: Layer.Layer<never, never, Accounts | Transactio
         previous = list;
         for (const fingerprint of before) {
           if (now.has(fingerprint)) continue;
-          if (cache.enabled) yield* cache.sync.cancel(fingerprint);
+          yield* cache.cancelSync(fingerprint);
           yield* limiter.forget(fingerprint);
         }
         const added = list.filter((account) => !before.has(account.tokenFingerprint));
-        if (cache.enabled && added.length > 0) yield* syncAll(cache, added, startupRequest(cache, config));
+        if (config.cache.enabled && added.length > 0) yield* syncAll(cache, added, startupRequest(config));
       });
       yield* Effect.forkScoped(Stream.runForEach(accounts.changes, apply));
     }),

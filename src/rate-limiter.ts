@@ -344,7 +344,7 @@ export const makeRateLimiter = Effect.fn("RateLimiter.make")(function* (options:
 });
 
 export class RateLimiter extends Context.Service<RateLimiter, RateLimiterShape>()("fio-mcp/RateLimiter") {
-  static readonly layer = Layer.effect(
+  static readonly Default = Layer.effect(
     RateLimiter,
     Effect.gen(function* () {
       const config = yield* AppConfig;
@@ -354,7 +354,6 @@ export class RateLimiter extends Context.Service<RateLimiter, RateLimiterShape>(
     }),
   );
 
-  static readonly layerFrom = (options: RateLimiterOptions) =>
-    Layer.effect(RateLimiter, Effect.map(makeRateLimiter(options), RateLimiter.of));
+  static readonly Live = RateLimiter.Default.pipe(Layer.provide(AppConfig.Live));
 }
 

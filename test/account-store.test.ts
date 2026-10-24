@@ -1,20 +1,20 @@
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { NodeFileSystem } from "@effect/platform-node";
 import { assert, describe, it } from "@effect/vitest";
 import { Cause, Context, Effect, Exit, Layer, Logger, Option, Redacted } from "effect";
 import { SqlClient, type SqlError } from "effect/sql";
-import { makeAccountStore, SETTING, StoredAccountsLive } from "../src/account-store.js";
+import { makeAccountStore, SETTING } from "../src/account-store.js";
 import { Accounts, tokenFingerprint } from "../src/accounts.js";
-import { databaseLayer, migrate, SERVER_MIGRATIONS } from "../src/cache/db.js";
+import { migrate, SERVER_MIGRATIONS } from "../src/cache/db.js";
 import { type CacheStore, makeCacheStore } from "../src/cache/store.js";
 import { type AccountConfig, type AccountSeed, accountSeedOf } from "../src/config.js";
 import { ConfigError } from "../src/errors.js";
 import { hashPassword } from "../src/oauth/crypto.js";
-import { Redactor } from "../src/redaction.js";
+import { makeRedactor, Redactor } from "../src/redaction.js";
 import { DataKeyMismatch, TokenDecryptionFailed } from "../src/token-crypto.js";
 import { loadConfigFrom } from "./fixtures.js";
+import { testDatabase } from "./support/database.js";
 import { FIO_TOKEN, SAVINGS_TOKEN } from "./support/transport.js";
 
 const KEY = Redacted.make(new Uint8Array(32).fill(3));
@@ -25,7 +25,7 @@ const SAVINGS: AccountConfig = { name: "savings", token: Redacted.make(SAVINGS_T
 
 const tempDb = () => join(mkdtempSync(join(tmpdir(), "fio-accounts-")), "fio.sqlite");
 
-const database = (path: string) => databaseLayer(path, SERVER_MIGRATIONS).pipe(Layer.provide(NodeFileSystem.layer));
+const database = (path: string) => testDatabase(path, SERVER_MIGRATIONS);
 
 /** One server start: the accounts it loads (or why it failed) and what it logged. */
 const start = (path: string, key: Redacted.Redacted<Uint8Array>, configured: ReadonlyArray<AccountConfig> | AccountSeed) =>
@@ -33,7 +33,10 @@ const start = (path: string, key: Redacted.Redacted<Uint8Array>, configured: Rea
     const logs: Array<string> = [];
     const capture = Logger.make<unknown, void>((entry) => void logs.push(Logger.formatLogFmt.log(entry)));
     const seed = "load" in configured ? configured : accountSeedOf(configured);
-    const layer = StoredAccountsLive(key, seed).pipe(Layer.provide(database(path)), Layer.provide(Redactor.layerFrom([])));
+    const layer = Accounts.stored(key, seed).pipe(
+      Layer.provide(database(path)),
+      Layer.provide(Layer.succeed(Redactor, Redactor.of(makeRedactor([])))),
+    );
     const exit = yield* Effect.exit(
       Effect.scoped(Effect.flatMap(Layer.build(layer), (context) => Context.get(context, Accounts).list)),
     ).pipe(Effect.provide(Logger.layer([capture])));
@@ -274,7 +277,7 @@ describe("account token history", () => {
     Effect.gen(function* () {
       const path = tempDb();
       const before = Object.fromEntries(Object.entries(SERVER_MIGRATIONS).filter(([id]) => id < "0007"));
-      const at0006 = databaseLayer(path, before).pipe(Layer.provide(NodeFileSystem.layer));
+      const at0006 = testDatabase(path, before);
       yield* Effect.scoped(
         Effect.flatMap(Layer.build(at0006), (context) =>
           Effect.provideContext(

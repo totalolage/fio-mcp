@@ -1,11 +1,8 @@
 import { randomBytes } from "node:crypto";
-import { Clock, Effect, Layer, Option, Redacted, Result, Schema } from "effect";
+import { Clock, Effect, Option, Redacted, Result, Schema } from "effect";
 import { SqlClient } from "effect/sql";
-import { type Account, Accounts, makeAccounts, tokenFingerprint } from "./accounts.js";
-import type { Migrations } from "./cache/db.js";
+import { type Account, tokenFingerprint } from "./accounts.js";
 import { type AccountSeed, accountNameKey } from "./config.js";
-import type { ConfigError } from "./errors.js";
-import { Redactor } from "./redaction.js";
 import {
   accountTokenAad,
   DataKeyMismatch,
@@ -32,56 +29,6 @@ import {
  * sealed under the key, so a wrong key file fails startup even without
  * accounts) and the admin password hash once it is changed at /admin.
  */
-
-/** Ids continue the shared sequence (src/cache/db.ts); 0004 and 0006 are src/oauth/store.ts's. */
-export const ACCOUNT_MIGRATIONS: Migrations = {
-  "0005_create_accounts": Effect.gen(function* () {
-    const sql = yield* SqlClient.SqlClient;
-    yield* sql`
-      CREATE TABLE fio_accounts (
-        account_id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        name_key TEXT NOT NULL UNIQUE,
-        token_sealed TEXT NOT NULL,
-        token_fingerprint TEXT NOT NULL,
-        account_number TEXT,
-        currency TEXT,
-        position INTEGER NOT NULL,
-        created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL,
-        token_updated_at INTEGER NOT NULL
-      )
-    `;
-    yield* sql`
-      CREATE TABLE server_settings (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL,
-        updated_at INTEGER NOT NULL
-      )
-    `;
-  }),
-  /**
-   * Every token each account has had (its current one included), so a purge
-   * finds what earlier tokens cached. Bindings made before this migration
-   * by tokens that are no account's current token cannot be attributed and
-   * are left out.
-   */
-  "0007_account_token_history": Effect.gen(function* () {
-    const sql = yield* SqlClient.SqlClient;
-    yield* sql`
-      CREATE TABLE fio_account_tokens (
-        account_id TEXT NOT NULL,
-        token_fingerprint TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        PRIMARY KEY (account_id, token_fingerprint)
-      ) WITHOUT ROWID
-    `;
-    yield* sql`
-      INSERT INTO fio_account_tokens (account_id, token_fingerprint, created_at)
-      SELECT account_id, token_fingerprint, token_updated_at FROM fio_accounts
-    `;
-  }),
-};
 
 export const SETTING = {
   dataKeyCheck: "data_key_check",
@@ -449,23 +396,3 @@ export const loadStoredAccounts = Effect.fn("AccountStore.loadAtStartup")(functi
   }
   return yield* store.load;
 });
-
-/**
- * `Accounts` from the database (HTTP mode with OAuth). Needs the database
- * and the data key; fails startup on a wrong key, a row that does not
- * decrypt, or a seed that is needed but invalid.
- */
-export const StoredAccountsLive = (
-  key: Redacted.Redacted<Uint8Array>,
-  accountSeed: AccountSeed,
-): Layer.Layer<Accounts, DataKeyMismatch | TokenDecryptionFailed | AccountStoreError | ConfigError, SqlClient.SqlClient | Redactor> =>
-  Layer.effect(
-    Accounts,
-    Effect.gen(function* () {
-      const redactor = yield* Redactor;
-      const store = yield* makeAccountStore(key);
-      const records = yield* loadStoredAccounts(store, accountSeed);
-      yield* Effect.logInfo(`accounts: ${records.length} accounts loaded from the database`);
-      return Accounts.of(yield* makeAccounts(records.map((record) => record.account), redactor.register));
-    }),
-  );

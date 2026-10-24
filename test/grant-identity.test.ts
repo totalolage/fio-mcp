@@ -1,13 +1,14 @@
-import { NodeFileSystem } from "@effect/platform-node";
+
 import { assert, describe, it } from "@effect/vitest";
-import { Clock, Effect, Exit, Layer, Option, Redacted } from "effect";
+import { Clock, Effect, Exit, Option, Redacted } from "effect";
 import { SqlClient } from "effect/sql";
 import { type Account, toAccount } from "../src/accounts.js";
-import { databaseLayer, migrate, SERVER_MIGRATIONS } from "../src/cache/db.js";
+import { migrate, SERVER_MIGRATIONS } from "../src/cache/db.js";
 import { requireAccount, visibleAccounts } from "../src/mcp/permissions.js";
 import { makeOAuthStore } from "../src/oauth/store.js";
 import { CurrentPrincipal, type Principal } from "../src/transport/principal.js";
 import { PAY_TOKEN, READ_TOKEN } from "./fixtures.js";
+import { memoryDatabase } from "./support/database.js";
 
 /**
  * Grants bind the accounts behind the consented tokens, not their names: a
@@ -65,7 +66,7 @@ const visibleNames = (principal: Principal, list: ReadonlyArray<Account>) =>
   );
 
 describe("grant account identity", () => {
-  const db = databaseLayer(":memory:", SERVER_MIGRATIONS).pipe(Layer.provide(NodeFileSystem.layer));
+  const db = memoryDatabase(SERVER_MIGRATIONS);
 
   it.effect("stores token fingerprints, not names", () =>
     Effect.gen(function* () {
@@ -146,7 +147,7 @@ describe("grant account identity", () => {
       assert.strictEqual(row?.account_fingerprints_json, '["legacy"]');
     }).pipe(
       Effect.provide(
-        databaseLayer(":memory:", BEFORE_FINGERPRINTS).pipe(Layer.provide(NodeFileSystem.layer)),
+        memoryDatabase(BEFORE_FINGERPRINTS),
       ),
     ),
   );

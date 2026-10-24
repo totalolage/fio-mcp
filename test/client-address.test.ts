@@ -11,7 +11,7 @@ const request = (peer: string | undefined, forwardedFor?: string) => {
       headers: forwardedFor === undefined ? {} : { "x-forwarded-for": forwardedFor },
     }),
   );
-  return peer === undefined ? web : web.modify({ remoteAddress: Option.some(peer), peerAddress: Option.some(peer) });
+  return peer === undefined ? web : web.modify({ remoteAddress: Option.some(peer) });
 };
 
 describe("clientAddress", () => {

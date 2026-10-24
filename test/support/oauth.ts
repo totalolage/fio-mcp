@@ -8,7 +8,6 @@
  */
 
 import { createHash, randomBytes } from "node:crypto";
-import { NodeFileSystem } from "@effect/platform-node";
 import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 import type {
   OAuthClientInformationMixed,
@@ -19,19 +18,19 @@ import { Clock, type Context, Deferred, Duration, Effect, Exit, Layer, Logger, O
 import { HttpRouter, HttpServer, HttpServerRequest } from "effect/http";
 import type { SqlClient } from "effect/sql";
 import { AccountChangesLive } from "../../src/account-runtime.js";
-import { StoredAccountsLive } from "../../src/account-store.js";
 import { Accounts, type AccountsShape } from "../../src/accounts.js";
 import { AdminPassword } from "../../src/admin/password.js";
 import { AdminLive } from "../../src/admin/server.js";
 import { SERVER_INFO, ToolsLive } from "../../src/app.js";
-import { databaseLayer, SERVER_MIGRATIONS } from "../../src/cache/db.js";
+import { SERVER_MIGRATIONS } from "../../src/cache/db.js";
 import { type AppConfigShape, accountSeedOf, type HttpAuthConfig } from "../../src/config.js";
 import { hashPassword, type PasswordHash, parsePasswordHash } from "../../src/oauth/crypto.js";
 import type { ThrottlePolicy } from "../../src/oauth/login.js";
-import { OAuthLive } from "../../src/oauth/server.js";
 import { makeOAuthStore, type OAuthStore } from "../../src/oauth/store.js";
+import { Auth } from "../../src/transport/auth.js";
 import { parseTrustedProxy } from "../../src/transport/client-address.js";
 import { type HttpTransportConfig, httpRouterApp } from "../../src/transport/http.js";
+import { testDatabase } from "./database.js";
 import { testConfig, testServices } from "./transport.js";
 
 export const PUBLIC_URL = "https://fio.example.test";
@@ -118,7 +117,7 @@ export async function startOAuth(
   const config = testConfig(transport);
   const scope = await Effect.runPromise(Scope.make());
   const db: Context.Context<SqlClient.SqlClient> = await Effect.runPromise(
-    Layer.buildWithScope(databaseLayer(options.dbPath ?? ":memory:", SERVER_MIGRATIONS).pipe(Layer.provide(NodeFileSystem.layer)), scope),
+    Layer.buildWithScope(testDatabase(options.dbPath ?? ":memory:", SERVER_MIGRATIONS), scope),
   );
   const release = await Effect.runPromise(Deferred.make<void>());
   const clock = new SkewedClock();
@@ -126,8 +125,9 @@ export async function startOAuth(
   const capture = Logger.make<unknown, void>((entry) => {
     logs.push(Logger.formatLogFmt.log(entry));
   });
+  // As Auth.Live builds it, with the test's throttling and scrypt parameters.
   const oauth = Layer.mergeAll(
-    OAuthLive({ publicUrl: PUBLIC_URL, trustedProxies }),
+    Auth.oauth({ publicUrl: PUBLIC_URL, trustedProxies }),
     AdminLive({ publicUrl: PUBLIC_URL, dataKey: DATA_KEY, trustedProxies }),
   ).pipe(Layer.provide(AdminPassword.layer(Redacted.make(hash), options.throttle, FAST_SCRYPT)));
   let accounts: AccountsShape | undefined;
@@ -143,7 +143,7 @@ export async function startOAuth(
       httpEffect.pipe(
         Effect.updateService(HttpServerRequest.HttpServerRequest, (request) => {
           const peer = request.headers[PEER_HEADER];
-          return peer === undefined ? request : request.modify({ remoteAddress: Option.some(peer), peerAddress: Option.some(peer) });
+          return peer === undefined ? request : request.modify({ remoteAddress: Option.some(peer) });
         }),
         Effect.provideService(Clock.Clock, clock),
         Effect.provide(captureLayer),
@@ -151,7 +151,7 @@ export async function startOAuth(
     { global: true },
   );
   const app = httpRouterApp(Layer.mergeAll(ToolsLive, withClock, AccountChangesLive, captureAccounts), oauth, SERVER_INFO, transport).pipe(
-    Layer.provide(testServices(config, release, StoredAccountsLive(DATA_KEY, accountSeed))),
+    Layer.provide(testServices(config, release, Accounts.stored(DATA_KEY, accountSeed))),
     Layer.provide(Layer.succeedContext(db)),
     Layer.provide(HttpServer.layerServices),
     Layer.provide(Logger.layer([capture])),

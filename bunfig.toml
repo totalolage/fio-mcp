@@ -1,0 +1,12 @@
+# Package manager settings for `bun install`. Dependency lifecycle scripts
+# never run: package.json has an empty `trustedDependencies`, which also
+# turns off Bun's built-in allowlist. The project's own `prepare` still runs.
+
+[install]
+# Resolve only versions published at least 7 days ago (seconds).
+minimumReleaseAge = 604800
+# `bun add` writes exact versions instead of ^ranges.
+exact = true
+# Text bun.lock, never the binary bun.lockb.
+saveTextLockfile = true
+linker = "hoisted"

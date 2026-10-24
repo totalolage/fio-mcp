@@ -2,7 +2,7 @@
 # Tests scripts/ship-image.sh against shim docker, ssh and gzip commands on
 # PATH. Nothing is built and the real ssh client is never run.
 #
-# Usage: npm run test:scripts
+# Usage: bun run test:scripts
 #    or: SHIP_SH="bash --posix" sh test/ship-image.test.sh (the shell that
 #        runs the script; default sh)
 set -eu

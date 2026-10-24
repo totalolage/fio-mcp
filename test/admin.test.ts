@@ -8,6 +8,7 @@ import { tokenFingerprint } from "../src/accounts.js";
 import { makeCacheStore } from "../src/cache/store.js";
 import { resetAdminPasswordCommand } from "../src/oauth/cli.js";
 import { NOW, statement, TODAY, tx } from "./support/cache.js";
+import { LAST_STATEMENT } from "./support/fio-api.js";
 import {
   authorizationUrl,
   Browser,
@@ -24,7 +25,7 @@ import {
   startOAuth,
   tokensFor,
 } from "./support/oauth.js";
-import { FIO_TOKEN, LAST_STATEMENT, SAVINGS_TOKEN } from "./support/transport.js";
+import { FIO_TOKEN, SAVINGS_TOKEN } from "./support/transport.js";
 
 const ADMIN_COOKIE = "__Secure-fio-mcp-admin";
 const NEW_MAIN_TOKEN = "rotatedT0ken-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMN";
@@ -502,8 +503,8 @@ describe("accounts at /admin", () => {
     // A replaced token has a limiter of its own.
     await admin.act("/admin/accounts/rotate", { id: main, token: NEW_MAIN_TOKEN });
     expect((await admin.act("/admin/accounts/test", { id: main })).message).toContain("FIO accepted the token");
-    // The fake FioApi dies on last/set-last-*: nothing moved the download marker.
-    expect(harness.logs.join("\n")).not.toMatch(/not used by transport tests/);
+    // The fake FioApi implements no last/set-last-*: nothing moved the download marker.
+    expect(harness.logs.join("\n")).not.toMatch(/Unimplemented method/);
   });
 
   it("checks names and tokens without echoing them", async () => {
