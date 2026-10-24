@@ -56,15 +56,21 @@ const runToEnd = Effect.fnUntraced(function* (request: SyncRequest) {
   return outcome.job;
 });
 
-/** The background layer's job: joins it while it runs, then reads the token's latest job. */
+/**
+ * The job the background layer started: joins it while it runs. Never
+ * starts one, so a test fails if the background layer started nothing.
+ */
 const backgroundJob = Effect.gen(function* () {
   yield* settle;
   const cache = yield* Transactions;
   const acc = yield* account();
-  yield* Effect.orDie(cache.sync(acc, { kind: "resume" }, 3_600_000));
   const [status] = yield* Effect.orDie(cache.status([acc]));
-  if (status?.job == null) return yield* Effect.die("no job");
-  return status.job;
+  if (status?.job == null) return yield* Effect.die("the background layer started no job");
+  if (status.job.status !== "running") return status.job;
+  // A running job: resume joins it instead of starting another.
+  const outcome = yield* Effect.orDie(cache.sync(acc, { kind: "resume" }, 3_600_000));
+  if (!outcome.started || !outcome.joined) return yield* Effect.die("did not join the background job");
+  return outcome.job;
 });
 
 /** Cached movements in `range`, from the cache only. */

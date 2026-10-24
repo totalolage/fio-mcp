@@ -170,6 +170,9 @@ describe("cache disabled", () => {
           assert.instanceOf(error, InvalidInput);
           assert.strictEqual(error.message, CACHE_DISABLED);
         }
+        // sync_transactions checks its arguments before it reaches the cache.
+        const malformed = yield* Effect.flip(cache.sync_transactions({ from: "2026-01-01" }));
+        assert.strictEqual(malformed.message, "`from` applies to mode=backfill only.");
       }).pipe(Effect.provide(Layer.mergeAll(disabledCacheLayer(config(), fio.layer), LocalPrincipalLive)));
     }),
   );
