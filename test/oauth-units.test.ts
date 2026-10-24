@@ -12,6 +12,7 @@ import { CommandFailed, hashPasswordCommand, listClientsCommand, revokeAllTokens
 import {
   hashPassword,
   hashSecret,
+  type PasswordHash,
   PasswordHashError,
   parsePasswordHash,
   pkceMatches,
@@ -242,15 +243,30 @@ describe("login throttling", () => {
     assert.deepStrictEqual(delays, [0, 0, 0, 0, 0, 1000, 2000, 4000, 8000, 900_000, 900_000]);
   });
 
+  /**
+   * Compares plain text and counts the checks instead of running scrypt:
+   * these tests are about counting failures, not hashing.
+   */
+  const plainCheck = () => {
+    const checks = { count: 0 };
+    const verify = (password: Redacted.Redacted<string>) =>
+      Effect.sync(() => {
+        checks.count++;
+        return Redacted.value(password) === "the right password";
+      });
+    const unused = Redacted.make<PasswordHash>({ params: FAST, salt: new Uint8Array(16), hash: new Uint8Array(32) });
+    return { checks, verify, expected: Effect.succeed(unused) };
+  };
+
   it.effect("rejects attempts during backoff without checking the password, per address (TestClock)", () =>
     Effect.gen(function* () {
-      const parsed = parsePasswordHash(yield* hashPassword(Redacted.make("the right password"), FAST));
-      if (parsed instanceof PasswordHashError) return assert.fail("hash did not parse");
-      const guard = yield* makeLoginGuard(Effect.succeed(Redacted.make(parsed)));
+      const { checks, verify, expected } = plainCheck();
+      const guard = yield* makeLoginGuard(expected, DEFAULT_THROTTLE, verify);
       const wrong = Redacted.make("the wrong password");
       const right = Redacted.make("the right password");
       for (let i = 0; i < 6; i++) assert.strictEqual((yield* guard.attempt("10.0.0.1", wrong))._tag, "Rejected");
       assert.deepStrictEqual(yield* guard.attempt("10.0.0.1", right), { _tag: "Throttled", retryAfterSeconds: 1 });
+      assert.strictEqual(checks.count, 6);
       // Another address is unaffected.
       assert.strictEqual((yield* guard.attempt("10.0.0.2", right))._tag, "Accepted");
       yield* TestClock.adjust("1 second");
@@ -263,6 +279,7 @@ describe("login throttling", () => {
 
   it.effect("keeps the permit and counts the failure when the caller is interrupted mid-check", () =>
     Effect.gen(function* () {
+      // A real (FAST) scrypt check: it must still be running when the second attempt arrives.
       const parsed = parsePasswordHash(yield* hashPassword(Redacted.make("the right password"), FAST));
       if (parsed instanceof PasswordHashError) return assert.fail("hash did not parse");
       const guard = yield* makeLoginGuard(Effect.succeed(Redacted.make(parsed)));
@@ -280,10 +297,10 @@ describe("login throttling", () => {
 
   it.effect("locks an address out for 15 minutes after 10 failures", () =>
     Effect.gen(function* () {
-      const parsed = parsePasswordHash(yield* hashPassword(Redacted.make("the right password"), FAST));
-      if (parsed instanceof PasswordHashError) return assert.fail("hash did not parse");
-      const guard = yield* makeLoginGuard(Effect.succeed(Redacted.make(parsed)), { ...DEFAULT_THROTTLE, freeFailures: 0, baseDelayMs: 0 });
+      const { checks, verify, expected } = plainCheck();
+      const guard = yield* makeLoginGuard(expected, { ...DEFAULT_THROTTLE, freeFailures: 0, baseDelayMs: 0 }, verify);
       for (let i = 0; i < 10; i++) yield* guard.attempt("a", Redacted.make("nope"));
+      assert.strictEqual(checks.count, 10);
       const right = Redacted.make("the right password");
       assert.deepStrictEqual(yield* guard.attempt("a", right), { _tag: "Throttled", retryAfterSeconds: 900 });
       yield* TestClock.adjust("14 minutes");
