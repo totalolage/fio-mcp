@@ -882,35 +882,67 @@ describe("retiring a token removed at /admin", () => {
     }),
   );
 
-  it.effect("removing an account with purge keeps accepting writes for a token another account uses", () =>
+  it.effect("removing an account with purge fences only the tokens no other account uses, also when the purge fails", () =>
     Effect.gen(function* () {
       yield* setNow();
       const fio = yield* fakeFio(() => Effect.never);
       yield* Effect.gen(function* () {
         const cache = yield* enabledCache;
         const admin = yield* makeAccountAdmin(ADMIN_KEY);
+        const sql = yield* SqlClient.SqlClient;
         const before = yield* account();
-        const old = before.tokenFingerprint;
-        const shared = tokenFingerprint(Redacted.make(TOKEN_B));
-        const write = (accountName: string, tokenFingerprint: string, rowId: number, accountId: string) => ({
-          accountName,
-          tokenFingerprint,
-          statement: statement(TODAY, TODAY, [tx(rowId, TODAY, 5)], accountId),
-          fetchedAt: NOW,
-        });
-        assert.strictEqual((yield* cache.store.commit(write("main", old, 1, "2000000001"))).rowsWritten, 1);
+        const TOKEN_C = "c".repeat(64);
+        const [onlyMain = "", gammas = "", shared = ""] = [TOKEN_A, TOKEN_B, TOKEN_C].map((token) => tokenFingerprint(Redacted.make(token)));
+        let rowId = 0;
+        const write = (tokenFingerprint: string, accountId: string) =>
+          cache.store.commit({
+            accountName: "main",
+            tokenFingerprint,
+            statement: statement(TODAY, TODAY, [tx(++rowId, TODAY, 5)], accountId),
+            fetchedAt: NOW,
+          });
+        // main caches X with its first token and Z with its second; gamma now uses the second, beta the third (main's current).
+        yield* write(onlyMain, "2000000001");
         yield* admin.rotate(before.id, TOKEN_B);
-        yield* admin.add({ name: "beta", token: TOKEN_B, accountNumber: undefined, currency: undefined });
-        assert.strictEqual((yield* cache.store.commit(write("beta", shared, 2, "2000000002"))).rowsWritten, 1);
+        yield* write(gammas, "2000000003");
+        yield* admin.rotate(before.id, TOKEN_C);
+        yield* admin.add({ name: "gamma", token: TOKEN_B, accountNumber: undefined, currency: undefined });
+        yield* admin.add({ name: "beta", token: TOKEN_C, accountNumber: undefined, currency: undefined });
+        yield* write(shared, "2000000002");
+        const beta = (yield* (yield* Accounts).list).find((some) => some.name === "beta");
+        if (beta === undefined) return assert.fail("beta was not added");
+        // A process that did not see the first token replaced still runs a job for it; beta's job runs too.
+        yield* cache.reinstate(onlyMain);
+        yield* cache.sync.start(before, { kind: "backfill" });
+        yield* cache.sync.start(beta, { kind: "backfill" });
+        yield* settle;
+        assert.strictEqual(Option.getOrUndefined(yield* cache.sync.progress(before))?.status, "running");
 
+        // The purge fails: main stays, the token only it had stays fenced, the tokens others use still write.
+        yield* sql`DROP TABLE accounts`;
+        assert.strictEqual((yield* Effect.flip(admin.remove(before.id, true)))._tag, "CacheError");
+        yield* sql`CREATE TABLE accounts (account_key TEXT PRIMARY KEY, account_id TEXT NOT NULL, bank_id TEXT NOT NULL, iban TEXT, bic TEXT, currency TEXT, balance REAL, balance_date TEXT, updated_at INTEGER NOT NULL)`;
+        assert.deepStrictEqual((yield* (yield* Accounts).list).map((some) => some.name).sort(), ["beta", "gamma", "main"]);
+        assert.isTrue(Option.isNone(yield* cache.sync.progress(before)));
+        assert.strictEqual((yield* write(onlyMain, "2000000001")).rowsWritten, 0);
+        assert.strictEqual((yield* write(gammas, "2000000003")).rowsWritten, 1);
+        assert.strictEqual((yield* write(shared, "2000000002")).rowsWritten, 1);
+        assert.strictEqual(Option.getOrUndefined(yield* cache.sync.progress(beta))?.status, "running");
+
+        // Removing again: X, which only main's first token reached, goes; Z and Y stay for gamma and beta.
         const removed = yield* admin.remove(before.id, true);
-        assert.deepStrictEqual(removed.cache, { kind: "purged", deleted: 1, accounts: ["beta"], unattributed: 0 });
-        // Only main had the old token: its writes stop. beta's token still writes.
-        assert.strictEqual((yield* cache.store.commit(write("main", old, 3, "2000000001"))).rowsWritten, 0);
-        assert.strictEqual((yield* cache.store.commit(write("beta", shared, 4, "2000000002"))).rowsWritten, 1);
-        const beta = (yield* (yield* Accounts).list).find((candidate) => candidate.name === "beta");
-        if (beta === undefined) return assert.fail("beta is gone");
-        assert.strictEqual((yield* cache.sync.start(beta, { kind: "incremental" })).progress.status, "running");
+        if (removed.cache.kind !== "purged") return assert.fail(`not purged: ${removed.cache.kind}`);
+        assert.deepStrictEqual(
+          { ...removed.cache, accounts: [...removed.cache.accounts].sort() },
+          { kind: "purged", deleted: 1, accounts: ["beta", "gamma"], unattributed: 0 },
+        );
+        const kept = yield* sql<{ account_key: string }>`SELECT DISTINCT account_key FROM transactions ORDER BY account_key`;
+        assert.notInclude(kept.map((row) => row.account_key).join(" "), "2000000001");
+        assert.strictEqual(kept.length, 2);
+        assert.strictEqual((yield* write(onlyMain, "2000000001")).rowsWritten, 0);
+        assert.strictEqual((yield* write(gammas, "2000000003")).rowsWritten, 1);
+        assert.strictEqual((yield* write(shared, "2000000002")).rowsWritten, 1);
+        assert.strictEqual(Option.getOrUndefined(yield* cache.sync.progress(beta))?.status, "running");
       }).pipe(Effect.provide(adminLayer(fio.api)));
     }),
   );
