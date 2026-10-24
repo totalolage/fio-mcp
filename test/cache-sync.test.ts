@@ -6,11 +6,14 @@ import { assert, describe, it } from "@effect/vitest";
 import { Deferred, Effect, Fiber, Layer, Option, Redacted, Ref } from "effect";
 import { SqlClient } from "effect/sql";
 import { TestClock } from "effect/testing";
-import { tokenFingerprint } from "../src/accounts.js";
+import { StoredAccountsLive } from "../src/account-store.js";
+import { Accounts, tokenFingerprint } from "../src/accounts.js";
+import { makeAccountAdmin } from "../src/admin/accounts.js";
 import { addDays } from "../src/cache/dates.js";
 import { databaseLayer, SERVER_MIGRATIONS } from "../src/cache/db.js";
-import { CacheSyncLive } from "../src/cache/service.js";
+import { CacheSyncLive, TransactionCacheFromSql } from "../src/cache/service.js";
 import { historyUnlockMessage, type SyncRequest } from "../src/cache/sync.js";
+import { AppConfig, accountSeedOf } from "../src/config.js";
 import {
   FioServerError,
   HISTORY_UNLOCK_STEPS,
@@ -18,6 +21,8 @@ import {
   RateLimited,
   TooManyItems,
 } from "../src/errors.js";
+import { FioApi, type FioApiShape } from "../src/fio-api.js";
+import { Redactor } from "../src/redaction.js";
 import {
   account,
   cacheLayer,
@@ -32,6 +37,7 @@ import {
   statement,
   TODAY,
   TOKEN_A,
+  TOKEN_B,
   tx,
 } from "./support/cache.js";
 
@@ -809,7 +815,7 @@ describe("retiring a token removed at /admin", () => {
         assert.isTrue(Option.isNone(yield* cache.sync.progress(acc)));
         // A write admitted before the removal, landing after it (and after a purge), stores nothing.
         const late = { accountName: acc.name, tokenFingerprint: fp, statement: statement(TODAY, TODAY, [tx(1, TODAY, 5)]), fetchedAt: NOW };
-        yield* cache.store.purgeToken(fp, new Set());
+        yield* cache.store.purgeTokens([fp], new Set());
         assert.strictEqual((yield* cache.store.commit(late)).rowsWritten, 0);
         yield* lateState;
         assert.isTrue(Option.isNone(yield* cache.store.binding(fp)));
@@ -822,6 +828,93 @@ describe("retiring a token removed at /admin", () => {
         const started = yield* cache.sync.start(acc, { kind: "incremental" });
         assert.strictEqual(started.progress.status, "running");
       }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+    }),
+  );
+
+  const ADMIN_KEY = Redacted.make(new Uint8Array(32).fill(5));
+  /** The cache on the server's database, with the accounts stored in it (as in HTTP mode with OAuth). */
+  const adminLayer = (api: FioApiShape) => {
+    const cfg = config();
+    return TransactionCacheFromSql.pipe(
+      Layer.provideMerge(StoredAccountsLive(ADMIN_KEY, accountSeedOf(cfg.accounts))),
+      Layer.provideMerge(databaseLayer(":memory:", SERVER_MIGRATIONS).pipe(Layer.provide(NodeFileSystem.layer))),
+      Layer.provideMerge(Layer.mergeAll(Redactor.layerFrom([]), Layer.succeed(FioApi, api), AppConfig.layerFrom(cfg))),
+    );
+  };
+
+  it.effect("removing an account with purge stops writes for every token it had, not only the current one", () =>
+    Effect.gen(function* () {
+      yield* setNow();
+      const fio = yield* fakeFio(() => Effect.never);
+      yield* Effect.gen(function* () {
+        const cache = yield* enabledCache;
+        const admin = yield* makeAccountAdmin(ADMIN_KEY);
+        const sql = yield* SqlClient.SqlClient;
+        const before = yield* account();
+        const old = before.tokenFingerprint;
+        const write = (rowId: number) => ({
+          accountName: before.name,
+          tokenFingerprint: old,
+          statement: statement(TODAY, TODAY, [tx(rowId, TODAY, 5)]),
+          fetchedAt: NOW,
+        });
+        assert.strictEqual((yield* cache.store.commit(write(1))).rowsWritten, 1);
+        yield* admin.rotate(before.id, TOKEN_B);
+        // A process that did not see the token replaced (the retired set is in memory) still runs a job for it.
+        yield* cache.reinstate(old);
+        yield* cache.sync.start(before, { kind: "backfill" });
+        yield* settle;
+        assert.strictEqual(Option.getOrUndefined(yield* cache.sync.progress(before))?.status, "running");
+        const lateState = cache.store.putSyncState(old, yield* cache.store.syncState(old));
+
+        const removed = yield* admin.remove(before.id, true);
+        assert.deepStrictEqual(removed.cache, { kind: "purged", deleted: 1, accounts: [], unattributed: 0 });
+        // The old token's job was stopped and its late writes store nothing.
+        assert.isTrue(Option.isNone(yield* cache.sync.progress(before)));
+        assert.strictEqual((yield* cache.store.commit(write(2))).rowsWritten, 0);
+        yield* lateState;
+        const [left] = yield* sql<{ n: number }>`
+          SELECT (SELECT COUNT(*) FROM transactions) + (SELECT COUNT(*) FROM bindings) + (SELECT COUNT(*) FROM sync_state) AS n
+        `;
+        assert.strictEqual(left?.n, 0);
+        assert.deepStrictEqual(yield* (yield* Accounts).list, []);
+      }).pipe(Effect.provide(adminLayer(fio.api)));
+    }),
+  );
+
+  it.effect("a purge that fails removes nothing: the account, its token history and its writes stay", () =>
+    Effect.gen(function* () {
+      yield* setNow();
+      const fio = yield* fakeFio(() => Effect.never);
+      yield* Effect.gen(function* () {
+        const cache = yield* enabledCache;
+        const admin = yield* makeAccountAdmin(ADMIN_KEY);
+        const sql = yield* SqlClient.SqlClient;
+        const main = yield* account();
+        const write = (rowId: number) => ({
+          accountName: main.name,
+          tokenFingerprint: main.tokenFingerprint,
+          statement: statement(TODAY, TODAY, [tx(rowId, TODAY, 5)]),
+          fetchedAt: NOW,
+        });
+        yield* cache.store.commit(write(1));
+        yield* admin.rotate(main.id, TOKEN_B);
+        // The purge's last statement for a bank account fails.
+        yield* sql`DROP TABLE accounts`;
+        const failed = yield* Effect.flip(admin.remove(main.id, true));
+        assert.strictEqual(failed._tag, "CacheError");
+        yield* sql`CREATE TABLE accounts (account_key TEXT PRIMARY KEY, account_id TEXT NOT NULL, bank_id TEXT NOT NULL, iban TEXT, bic TEXT, currency TEXT, balance REAL, balance_date TEXT, updated_at INTEGER NOT NULL)`;
+        assert.deepStrictEqual((yield* (yield* Accounts).list).map((some) => some.name), ["main"]);
+        const [left] = yield* sql<{ n: number }>`SELECT COUNT(*) AS n FROM transactions`;
+        assert.strictEqual(left?.n, 1);
+        // The current token writes again; removing again (now succeeding) still reaches the replaced token's data.
+        const current = { ...write(2), tokenFingerprint: tokenFingerprint(Redacted.make(TOKEN_B)) };
+        assert.strictEqual((yield* cache.store.commit(current)).rowsWritten, 1);
+        const removed = yield* admin.remove(main.id, true);
+        assert.deepStrictEqual(removed.cache, { kind: "purged", deleted: 1, accounts: [], unattributed: 0 });
+        const [after] = yield* sql<{ n: number }>`SELECT (SELECT COUNT(*) FROM transactions) + (SELECT COUNT(*) FROM bindings) AS n`;
+        assert.strictEqual(after?.n, 0);
+      }).pipe(Effect.provide(adminLayer(fio.api)));
     }),
   );
 });

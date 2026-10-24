@@ -98,18 +98,28 @@ const refused = html(adminRefusedPage(), 403);
 
 const quoted = (names: ReadonlyArray<string>) => names.map((name) => `“${name}”`).join(", ");
 
+/** `accounts` kept data because a token they have, or had, is bound to the same bank account. */
+const purgedText = (deleted: number, accounts: ReadonlyArray<string>): string => {
+  const holders = `${quoted(accounts)} ${accounts.length === 1 ? "has or had a token" : "have or had tokens"} for the same bank account`;
+  if (deleted > 0 && accounts.length > 0) return `Its cached transactions were deleted, except where ${holders}.`;
+  if (deleted > 0) return "Its cached transactions were deleted.";
+  if (accounts.length > 0) return `Its cached transactions were kept: ${holders}.`;
+  return "Nothing was cached under its tokens, so nothing was deleted.";
+};
+
 const removedCacheText = (cache: RemovedCache): string => {
   switch (cache.kind) {
     case "kept":
       return "Its cached transactions were kept.";
-    case "deleted":
-      return "Its cached transactions were deleted.";
-    case "nothing-cached":
-      return "Nothing was cached under its current token, so nothing was deleted.";
     case "shared-token":
       return `Its cached transactions were kept: ${quoted(cache.accounts)} ${cache.accounts.length === 1 ? "uses" : "use"} the same token.`;
-    case "shared-account":
-      return `Its cached transactions were kept: ${quoted(cache.accounts)} ${cache.accounts.length === 1 ? "reads" : "read"} the same bank account.`;
+    case "purged": {
+      const text = purgedText(cache.deleted, cache.accounts);
+      if (cache.unattributed === 0) return text;
+      const one = cache.unattributed === 1;
+      const which = one ? "1 cached bank account" : `${cache.unattributed} cached bank accounts`;
+      return `${text} ${which} cannot be linked to a configured account (cached before this version recorded which tokens an account had, or kept when an account was removed) and ${one ? "was" : "were"} not touched.`;
+    }
   }
 };
 

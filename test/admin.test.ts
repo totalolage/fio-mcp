@@ -362,23 +362,49 @@ describe("accounts at /admin", () => {
     await admin.act("/admin/accounts/add", { name: "third", token: THIRD_TOKEN });
     await commit(SAVINGS_TOKEN, "savings", [303], "2000000009");
     await commit(THIRD_TOKEN, "third", [404], "2000000009");
-    expect(await remove("savings")).toContain("Removed “savings”. Its cached transactions were kept: “third” reads the same bank account.");
+    // Replaced since: the token it had still links it to the bank account.
+    await admin.act("/admin/accounts/rotate", { id: idOf((await admin.page("/admin")).html, "third"), token: NEW_MAIN_TOKEN });
+    expect(await remove("savings")).toContain(
+      "Removed “savings”. Its cached transactions were kept: “third” has or had a token for the same bank account.",
+    );
     expect(await cached()).toEqual({ movements: [303, 404], bindings: 1 });
     expect(await remove("third")).toContain("Removed “third”. Its cached transactions were deleted.");
     expect(await cached()).toEqual({ movements: [], bindings: 0 });
 
     // A token that never cached anything deletes nothing and says so.
     await admin.act("/admin/accounts/add", { name: "fourth", token: NEW_MAIN_TOKEN });
-    expect(await remove("fourth")).toContain("Nothing was cached under its current token, so nothing was deleted.");
+    expect(await remove("fourth")).toContain("Removed “fourth”. Nothing was cached under its tokens, so nothing was deleted.");
+
+    // Its tokens reached two bank accounts: one only it had goes, the other stays for the account that reads it too.
+    await admin.act("/admin/accounts/add", { name: "alpha", token: FIO_TOKEN });
+    await commit(FIO_TOKEN, "alpha", [707]);
+    await admin.act("/admin/accounts/rotate", { id: idOf((await admin.page("/admin")).html, "alpha"), token: SAVINGS_TOKEN });
+    await admin.act("/admin/accounts/add", { name: "beta", token: THIRD_TOKEN });
+    await commit(SAVINGS_TOKEN, "alpha", [808], "2000000009");
+    await commit(THIRD_TOKEN, "beta", [909], "2000000009");
+    expect(await remove("alpha")).toContain(
+      "Removed “alpha”. Its cached transactions were deleted, except where “beta” has or had a token for the same bank account.",
+    );
+    expect(await cached()).toEqual({ movements: [808, 909], bindings: 1 });
   });
 
-  it("keeps what an earlier token cached when the current one cached nothing, and data another account's token reads", async () => {
+  it("deletes what an earlier token cached when the current one cached nothing, and keeps data another account's token reads", async () => {
     const admin = await signedIn();
     const movements = () =>
       harness.sql(
         Effect.flatMap(SqlClient.SqlClient, (sql) =>
           Effect.map(sql<{ id: number }>`SELECT movement_id AS id FROM transactions ORDER BY movement_id`, (rows) => rows.map((row) => row.id)),
         ),
+      );
+    const leftFor = (token: string) =>
+      harness.sql(
+        Effect.flatMap(SqlClient.SqlClient, (sql) => {
+          const fingerprint = tokenFingerprint(Redacted.make(token));
+          return Effect.map(
+            sql<{ n: number }>`SELECT (SELECT COUNT(*) FROM bindings WHERE token_fingerprint = ${fingerprint}) + (SELECT COUNT(*) FROM sync_state WHERE token_fingerprint = ${fingerprint}) AS n`,
+            ([row]) => row?.n,
+          );
+        }),
       );
     const cache = (token: string, accountName: string, id: number, accountId?: string) =>
       harness.sql(
@@ -394,18 +420,30 @@ describe("accounts at /admin", () => {
     const remove = async (name: string) =>
       (await admin.act("/admin/accounts/remove", { id: idOf((await admin.page("/admin")).html, name), cache: "purge", confirm: "yes" })).message;
 
-    // Replaced before the new token downloaded anything: the old token's data cannot be told apart, so it stays.
+    // Replaced before the new token downloaded anything: the old token's data is the account's, and goes.
     await cache(SAVINGS_TOKEN, "savings", 505, "2000000009");
+    expect(await leftFor(SAVINGS_TOKEN)).toBeGreaterThan(0);
     await admin.act("/admin/accounts/rotate", { id: idOf((await admin.page("/admin")).html, "savings"), token: THIRD_TOKEN });
-    expect(await remove("savings")).toContain("Removed “savings”. Nothing was cached under its current token, so nothing was deleted.");
-    expect(await movements()).toEqual([505]);
+    expect(await remove("savings")).toContain("Removed “savings”. Its cached transactions were deleted.");
+    expect(await movements()).toEqual([]);
+    expect(await leftFor(SAVINGS_TOKEN)).toBe(0);
 
     // Accounts with the same token keep it, all named; nothing is deleted.
     await cache(FIO_TOKEN, "main", 606);
     await admin.act("/admin/accounts/add", { name: "twin", token: FIO_TOKEN });
     await admin.act("/admin/accounts/add", { name: "triplet", token: FIO_TOKEN });
     expect(await remove("main")).toContain("Removed “main”. Its cached transactions were kept: “twin”, “triplet” use the same token.");
-    expect(await movements()).toEqual([505, 606]);
+    expect(await movements()).toEqual([606]);
+
+    // Kept at a removal, the data belongs to no configured account: a later purge leaves it and says so.
+    for (const name of ["twin", "triplet"]) {
+      await admin.act("/admin/accounts/remove", { id: idOf((await admin.page("/admin")).html, name), cache: "keep", confirm: "yes" });
+    }
+    await admin.act("/admin/accounts/add", { name: "fifth", token: NEW_MAIN_TOKEN });
+    expect(await remove("fifth")).toContain(
+      "Removed “fifth”. Nothing was cached under its tokens, so nothing was deleted. 1 cached bank account cannot be linked to a configured account (cached before this version recorded which tokens an account had, or kept when an account was removed) and was not touched.",
+    );
+    expect(await movements()).toEqual([606]);
   });
 
   it("tests a token with one read-only call through its rate limiter, which follows a replaced token", async () => {

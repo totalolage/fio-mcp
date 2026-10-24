@@ -74,6 +74,7 @@ describe("cache database", () => {
           [4, "grant_account_fingerprints"],
           [5, "create_accounts"],
           [6, "grant_last_used"],
+          [7, "account_token_history"],
         ]);
         const store = yield* makeCacheStore();
         const pending = (fp: string) => Effect.map(store.syncState(fp), (state) => state.pending);

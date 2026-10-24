@@ -1,5 +1,6 @@
 import { Effect, Redacted, Schema, Semaphore } from "effect";
-import { AccountNotFound, type AccountStoreError, makeAccountStore, type NewAccount } from "../account-store.js";
+import { SqlClient } from "effect/sql";
+import { AccountNotFound, AccountStoreError, makeAccountStore, type NewAccount } from "../account-store.js";
 import { type Account, Accounts } from "../accounts.js";
 import { TransactionCache } from "../cache/service.js";
 import { makeCacheStore } from "../cache/store.js";
@@ -60,14 +61,24 @@ export interface AccountInput {
 
 /**
  * What a removal did with the account's cached data: `kept` (keep chosen),
- * `deleted`, `nothing-cached` under its current token, or kept because
- * `accounts` use the same token or read the same bank account.
+ * kept because `accounts` use the same token, or `purged`: the number of
+ * bank accounts whose data was deleted, the `accounts` that kept one (a
+ * token they have or had is bound to it), and how many cached bank
+ * accounts cannot be linked to a configured account (left alone; see
+ * `CacheStore.purgeTokens`).
  */
 export type RemovedCache =
-  | { readonly kind: "kept" | "deleted" | "nothing-cached" }
-  | { readonly kind: "shared-token" | "shared-account"; readonly accounts: ReadonlyArray<string> };
+  | { readonly kind: "kept" }
+  | { readonly kind: "shared-token"; readonly accounts: ReadonlyArray<string> }
+  | {
+      readonly kind: "purged";
+      readonly deleted: number;
+      readonly accounts: ReadonlyArray<string>;
+      readonly unattributed: number;
+    };
 
 export const makeAccountAdmin = Effect.fn("AccountAdmin.make")(function* (key: Redacted.Redacted<Uint8Array>) {
+  const sql = yield* SqlClient.SqlClient;
   const store = yield* makeAccountStore(key);
   const accounts = yield* Accounts;
   const fio = yield* FioApi;
@@ -152,29 +163,53 @@ export const makeAccountAdmin = Effect.fn("AccountAdmin.make")(function* (key: R
 
   /**
    * Removes the account. With `purge`, also deletes what the cache holds for
-   * its token, unless another account still uses that token or reads the
-   * same bank account. Returns what happened to the cached data, naming the
-   * accounts that kept it.
+   * every token it had (the current one and those it replaced), unless
+   * another account uses its current token, or a token another account has
+   * or had is bound to the same bank account. Returns what happened to the
+   * cached data, naming the accounts that kept it.
    */
   const remove = (accountId: string, purge: boolean) =>
     exclusive(
       Effect.gen(function* () {
         const account = yield* find(accountId);
-        yield* store.remove(accountId);
-        yield* reload;
-        const remaining = yield* accounts.list;
-        const namesOf = (fingerprints: ReadonlyArray<string>) =>
-          remaining.filter((other) => fingerprints.includes(other.tokenFingerprint)).map((other) => other.name);
-        const sameToken = namesOf([account.tokenFingerprint]);
-        let cache: RemovedCache = { kind: "kept" };
-        if (purge && sameToken.length > 0) cache = { kind: "shared-token", accounts: sameToken };
-        else if (purge) {
-          // Retired by the reload: nothing writes for the token any more, so the purge stays.
-          const outcome = yield* cacheStore.purgeToken(account.tokenFingerprint, new Set(remaining.map((other) => other.tokenFingerprint)));
-          cache = outcome.kind === "shared" ? { kind: "shared-account", accounts: namesOf(outcome.tokenFingerprints) } : outcome;
+        const others = (yield* accounts.list).filter((other) => other.id !== accountId);
+        const sameToken = others.filter((other) => other.tokenFingerprint === account.tokenFingerprint).map((other) => other.name);
+        let removed: RemovedCache;
+        if (!purge || sameToken.length > 0) {
+          yield* store.remove(accountId);
+          yield* reload;
+          removed = purge ? { kind: "shared-token", accounts: sameToken } : { kind: "kept" };
+        } else {
+          const history = yield* store.tokenHistory;
+          const tokensOf = (some: Account) => [some.tokenFingerprint, ...(history.get(some.id) ?? [])];
+          const current = new Set(others.map((other) => other.tokenFingerprint));
+          // First stop every write for its tokens: the check runs inside each write's
+          // transaction, and a running job is stopped and awaited. The tokens it
+          // replaced were retired when replaced, but only in this process's memory.
+          if (cache.enabled) for (const fingerprint of tokensOf(account)) if (!current.has(fingerprint)) yield* cache.retire(fingerprint);
+          // One transaction: if the purge fails, the account and its token history stay
+          // and its token writes again (a job the retirement stopped stays stopped; its
+          // pending ranges are saved for the next sync).
+          const outcome = yield* sql
+            .withTransaction(Effect.flatMap(store.remove(accountId), (fingerprints) => cacheStore.purgeTokens(fingerprints, new Set(others.flatMap(tokensOf)))))
+            .pipe(
+              Effect.catchTag("SqlError", (cause) =>
+                Effect.logError("accounts: failed to remove the account", cause).pipe(
+                  Effect.andThen(Effect.fail(new AccountStoreError({ operation: "remove the account" }))),
+                ),
+              ),
+              Effect.tapError(() => (cache.enabled ? cache.reinstate(account.tokenFingerprint) : Effect.void)),
+            );
+          yield* reload;
+          removed = {
+            kind: "purged",
+            deleted: outcome.deleted,
+            accounts: others.filter((other) => tokensOf(other).some((fp) => outcome.sharedWith.includes(fp))).map((other) => other.name),
+            unattributed: outcome.unattributed,
+          };
         }
-        yield* Effect.logInfo(`admin: account ${accountId} removed; cached data: ${cache.kind}`);
-        return { name: account.name, cache };
+        yield* Effect.logInfo(`admin: account ${accountId} removed; cached data: ${removed.kind}`);
+        return { name: account.name, cache: removed };
       }),
     );
 

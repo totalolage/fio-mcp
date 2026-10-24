@@ -33,7 +33,7 @@ import {
  * accounts) and the admin password hash once it is changed at /admin.
  */
 
-/** Ids continue the shared sequence (src/cache/db.ts): 0004 is the last before these. */
+/** Ids continue the shared sequence (src/cache/db.ts); 0004 and 0006 are src/oauth/store.ts's. */
 export const ACCOUNT_MIGRATIONS: Migrations = {
   "0005_create_accounts": Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
@@ -58,6 +58,27 @@ export const ACCOUNT_MIGRATIONS: Migrations = {
         value TEXT NOT NULL,
         updated_at INTEGER NOT NULL
       )
+    `;
+  }),
+  /**
+   * Every token each account has had (its current one included), so a purge
+   * finds what earlier tokens cached. Bindings made before this migration
+   * by tokens that are no account's current token cannot be attributed and
+   * are left out.
+   */
+  "0007_account_token_history": Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`
+      CREATE TABLE fio_account_tokens (
+        account_id TEXT NOT NULL,
+        token_fingerprint TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (account_id, token_fingerprint)
+      ) WITHOUT ROWID
+    `;
+    yield* sql`
+      INSERT INTO fio_account_tokens (account_id, token_fingerprint, created_at)
+      SELECT account_id, token_fingerprint, token_updated_at FROM fio_accounts
     `;
   }),
 };
@@ -242,6 +263,13 @@ export const makeAccountStore = Effect.fn("AccountStore.make")(function* (key: R
   const sealToken = (accountId: string, token: Redacted.Redacted<string>) =>
     Effect.map(seal(key, Redacted.value(token), accountTokenAad(accountId)), encodeSealed);
 
+  /** Records that the account has (had) this token; a token it had before keeps its first time. */
+  const recordToken = (accountId: string, fingerprint: string, now: number) =>
+    sql`
+      INSERT INTO fio_account_tokens ${sql.insert({ account_id: accountId, token_fingerprint: fingerprint, created_at: now })}
+      ON CONFLICT (account_id, token_fingerprint) DO NOTHING
+    `;
+
   const nameTaken = (name: string, except: string | undefined) =>
     sql<{ account_id: string }>`SELECT account_id FROM fio_accounts WHERE name_key = ${accountNameKey(name)}`.pipe(
       Effect.map((rows) => rows.some((row) => row.account_id !== except)),
@@ -265,6 +293,7 @@ export const makeAccountStore = Effect.fn("AccountStore.make")(function* (key: R
         token_updated_at: now,
       })}
     `;
+    yield* recordToken(accountId, tokenFingerprint(input.token), now);
     return accountId;
   });
 
@@ -318,20 +347,45 @@ export const makeAccountStore = Effect.fn("AccountStore.make")(function* (key: R
               token_updated_at = ${now}
             WHERE account_id = ${accountId}
           `;
+          yield* recordToken(accountId, tokenFingerprint(token), now);
           return Result.succeed(undefined);
         }),
       )
       .pipe(storeFailure("replace the token"), Effect.flatMap(Effect.fromResult));
 
+  /** Each account's token fingerprints, its current one included, oldest first. */
+  const tokenHistory = sql<{ account_id: string; token_fingerprint: string }>`
+    SELECT account_id, token_fingerprint FROM fio_account_tokens ORDER BY account_id, created_at, token_fingerprint
+  `.pipe(
+    Effect.map((rows) => {
+      const history = new Map<string, Array<string>>();
+      for (const row of rows) history.set(row.account_id, [...(history.get(row.account_id) ?? []), row.token_fingerprint]);
+      return history as ReadonlyMap<string, ReadonlyArray<string>>;
+    }),
+    storeFailure("read the token history"),
+  );
+
+  /**
+   * Removes the account with its token history (nothing else needs it: grants
+   * name tokens). Returns the fingerprints of every token it had.
+   */
   const remove = (accountId: string) =>
     sql
       .withTransaction(
         Effect.gen(function* () {
-          if (!(yield* exists(accountId))) return Result.fail(new AccountNotFound());
+          const [row] = yield* sql<{ token_fingerprint: string }>`
+            SELECT token_fingerprint FROM fio_accounts WHERE account_id = ${accountId}
+          `;
+          if (row === undefined) return Result.fail(new AccountNotFound());
+          const history = yield* sql<{ token_fingerprint: string }>`
+            SELECT token_fingerprint FROM fio_account_tokens WHERE account_id = ${accountId} ORDER BY created_at, token_fingerprint
+          `;
           const now = yield* Clock.currentTimeMillis;
+          yield* sql`DELETE FROM fio_account_tokens WHERE account_id = ${accountId}`;
           yield* sql`DELETE FROM fio_accounts WHERE account_id = ${accountId}`;
           yield* putSettingNow(SETTING.accountsSeeded, String(now), now);
-          return Result.succeed(undefined);
+          const fingerprints = history.map((entry) => entry.token_fingerprint);
+          return Result.succeed(fingerprints.includes(row.token_fingerprint) ? fingerprints : [...fingerprints, row.token_fingerprint]);
         }),
       )
       .pipe(storeFailure("remove the account"), Effect.flatMap(Effect.fromResult));
@@ -366,7 +420,7 @@ export const makeAccountStore = Effect.fn("AccountStore.make")(function* (key: R
       )
       .pipe(storeFailure("import the configured accounts"), Effect.flatMap(Effect.fromResult));
 
-  return { checkKey, load, insert, rename, rotate, remove, seed };
+  return { checkKey, load, insert, rename, rotate, remove, seed, tokenHistory };
 });
 
 export type AccountStore = Effect.Success<ReturnType<typeof makeAccountStore>>;

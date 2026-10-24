@@ -5,9 +5,9 @@ import { NodeFileSystem } from "@effect/platform-node";
 import { assert, describe, it } from "@effect/vitest";
 import { Cause, Context, Effect, Exit, Layer, Logger, Option, Redacted } from "effect";
 import { SqlClient, type SqlError } from "effect/sql";
-import { SETTING, StoredAccountsLive } from "../src/account-store.js";
+import { makeAccountStore, SETTING, StoredAccountsLive } from "../src/account-store.js";
 import { Accounts, tokenFingerprint } from "../src/accounts.js";
-import { databaseLayer, SERVER_MIGRATIONS } from "../src/cache/db.js";
+import { databaseLayer, migrate, SERVER_MIGRATIONS } from "../src/cache/db.js";
 import { type CacheStore, makeCacheStore } from "../src/cache/store.js";
 import { type AccountConfig, type AccountSeed, accountSeedOf } from "../src/config.js";
 import { ConfigError } from "../src/errors.js";
@@ -240,6 +240,90 @@ describe("encrypted account store", () => {
   );
 });
 
+describe("account token history", () => {
+  const fp = (token: string) => tokenFingerprint(Redacted.make(token));
+  const OTHER_TOKEN = "otherT0ken-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQ";
+
+  it.effect("records each account's tokens when imported, added and replaced, and forgets them with the account", () =>
+    withSql(
+      tempDb(),
+      Effect.gen(function* () {
+        const store = yield* makeAccountStore(KEY);
+        assert.deepStrictEqual(yield* store.seed(accountSeedOf([MAIN])), Option.some(1));
+        const savings = yield* store.insert({ name: "savings", token: Redacted.make(SAVINGS_TOKEN), accountNumber: undefined, currency: undefined });
+        const [main] = (yield* store.load).map((record) => record.account);
+        assert.strictEqual(main?.name, "main");
+        const mainId = main?.id ?? "";
+        yield* store.rotate(mainId, Redacted.make(OTHER_TOKEN));
+        // Back to a token it had: still one entry for it.
+        yield* store.rotate(mainId, Redacted.make(FIO_TOKEN));
+        const history = yield* store.tokenHistory;
+        assert.deepStrictEqual(history.get(mainId), [fp(FIO_TOKEN), fp(OTHER_TOKEN)]);
+        assert.deepStrictEqual(history.get(savings), [fp(SAVINGS_TOKEN)]);
+        assert.deepStrictEqual(yield* store.remove(mainId), [fp(FIO_TOKEN), fp(OTHER_TOKEN)]);
+        assert.deepStrictEqual([...(yield* store.tokenHistory).keys()], [savings]);
+      }),
+    ),
+  );
+
+  it.effect("backfills every account's current token when migrating, and leaves the cache as it is", () =>
+    Effect.gen(function* () {
+      const path = tempDb();
+      const before = Object.fromEntries(Object.entries(SERVER_MIGRATIONS).filter(([id]) => id < "0007"));
+      const at0006 = databaseLayer(path, before).pipe(Layer.provide(NodeFileSystem.layer));
+      yield* Effect.scoped(
+        Effect.flatMap(Layer.build(at0006), (context) =>
+          Effect.provideContext(
+            Effect.gen(function* () {
+              const sql = yield* SqlClient.SqlClient;
+              const row = (id: string, name: string, fingerprint: string, position: number) => ({
+                account_id: id,
+                name,
+                name_key: name,
+                token_sealed: "v1.sealed",
+                token_fingerprint: fingerprint,
+                account_number: null,
+                currency: null,
+                position,
+                created_at: 1,
+                updated_at: 2,
+                token_updated_at: 3 + position,
+              });
+              yield* sql`INSERT INTO fio_accounts ${sql.insert([row("acct_a", "a", "fp-a", 1), row("acct_b", "b", "fp-b", 2)])}`;
+              // fp-a-old: a's token before a rotation made before the history existed.
+              yield* sql`INSERT INTO bindings ${sql.insert([
+                { token_fingerprint: "fp-a", account_key: "k1", account_name: "a", verified_at: 1 },
+                { token_fingerprint: "fp-a-old", account_key: "k1", account_name: "a", verified_at: 1 },
+              ])}`;
+            }),
+            context,
+          ),
+        ),
+      );
+      yield* withSql(
+        path,
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          assert.deepStrictEqual(yield* migrate(SERVER_MIGRATIONS), []);
+          const [applied] = yield* sql<{ id: number }>`SELECT MAX(migration_id) AS id FROM fio_mcp_migrations`;
+          assert.strictEqual(applied?.id, 7);
+          assert.deepStrictEqual(
+            yield* sql<{ account_id: string; token_fingerprint: string; created_at: number }>`
+              SELECT account_id, token_fingerprint, created_at FROM fio_account_tokens ORDER BY account_id
+            `,
+            [
+              { account_id: "acct_a", token_fingerprint: "fp-a", created_at: 4 },
+              { account_id: "acct_b", token_fingerprint: "fp-b", created_at: 5 },
+            ],
+          );
+          const [bindings] = yield* sql<{ n: number }>`SELECT COUNT(*) AS n FROM bindings`;
+          assert.strictEqual(bindings?.n, 2);
+        }),
+      );
+    }),
+  );
+});
+
 describe("cache purge for a removed token", () => {
   const purgeFixture = <A, E>(body: (helpers: {
     readonly store: CacheStore;
@@ -269,12 +353,12 @@ describe("cache purge for a removed token", () => {
       Effect.gen(function* () {
         yield* bind("fp-a", "k1");
         yield* bind("fp-b", "k1");
-        assert.deepStrictEqual(yield* store.purgeToken("fp-a", new Set(["fp-b"])), { kind: "shared", tokenFingerprints: ["fp-b"] });
+        assert.deepStrictEqual(yield* store.purgeTokens(["fp-a"], new Set(["fp-b"])), { deleted: 0, sharedWith: ["fp-b"], unattributed: 0 });
         // fp-b still reads k1: only fp-a's binding and sync state go.
         assert.strictEqual(yield* count("transactions"), 1);
         assert.strictEqual(yield* count("bindings"), 1);
         assert.strictEqual(yield* count("sync_state"), 1);
-        assert.deepStrictEqual(yield* store.purgeToken("fp-b", new Set()), { kind: "deleted" });
+        assert.deepStrictEqual(yield* store.purgeTokens(["fp-b"], new Set()), { deleted: 1, sharedWith: [], unattributed: 0 });
         assert.strictEqual(yield* count("transactions"), 0);
         assert.strictEqual(yield* count("accounts"), 0);
         assert.strictEqual(yield* count("bindings"), 0);
@@ -291,9 +375,10 @@ describe("cache purge for a removed token", () => {
         yield* bind("fp-old", "k1");
         yield* bind("fp-active", "k1");
         yield* bind("fp-removed", "k1");
-        assert.deepStrictEqual(yield* store.purgeToken("fp-removed", new Set(["fp-active"])), {
-          kind: "shared",
-          tokenFingerprints: ["fp-active"],
+        assert.deepStrictEqual(yield* store.purgeTokens(["fp-removed"], new Set(["fp-active"])), {
+          deleted: 0,
+          sharedWith: ["fp-active"],
+          unattributed: 0,
         });
         assert.strictEqual(yield* count("transactions"), 1);
         assert.strictEqual(yield* count("coverage_days"), 1);
@@ -314,7 +399,7 @@ describe("cache purge for a removed token", () => {
         yield* bind("fp-old", "k1");
         yield* bind("fp-new", "k1");
         yield* bind("fp-other", "k2");
-        assert.deepStrictEqual(yield* store.purgeToken("fp-new", new Set(["fp-other"])), { kind: "deleted" });
+        assert.deepStrictEqual(yield* store.purgeTokens(["fp-new"], new Set(["fp-other"])), { deleted: 1, sharedWith: [], unattributed: 0 });
         assert.strictEqual(yield* count("transactions"), 0);
         assert.strictEqual(yield* count("accounts"), 0);
         // Nothing left that could bind k1 again; fp-other's binding stays.
@@ -322,7 +407,112 @@ describe("cache purge for a removed token", () => {
         assert.strictEqual(yield* count("sync_state"), 1);
         assert.isTrue(Option.isSome(yield* store.binding("fp-other")));
         // A token without a binding has nothing to delete.
-        assert.deepStrictEqual(yield* store.purgeToken("fp-new", new Set(["fp-other"])), { kind: "nothing-cached" });
+        assert.deepStrictEqual(yield* store.purgeTokens(["fp-new"], new Set(["fp-other"])), { deleted: 0, sharedWith: [], unattributed: 0 });
+      }),
+    ),
+  );
+
+  it.effect("deletes what an earlier token cached when the current one cached nothing", () =>
+    purgeFixture(({ store, bind, count }) =>
+      Effect.gen(function* () {
+        // fp-old: the account's token before a rotation; fp-new (current) never downloaded.
+        yield* bind("fp-old", "k1");
+        yield* bind("fp-other", "k2");
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`INSERT INTO sync_state ${sql.insert({ token_fingerprint: "fp-new" })}`;
+        assert.deepStrictEqual(yield* store.purgeTokens(["fp-old", "fp-new"], new Set(["fp-other"])), {
+          deleted: 1,
+          sharedWith: [],
+          unattributed: 0,
+        });
+        assert.strictEqual(yield* count("transactions"), 0);
+        assert.strictEqual(yield* count("accounts"), 0);
+        assert.deepStrictEqual(
+          yield* sql<{ fp: string }>`SELECT token_fingerprint AS fp FROM bindings UNION ALL SELECT token_fingerprint FROM sync_state`,
+          [{ fp: "fp-other" }, { fp: "fp-other" }],
+        );
+      }),
+    ),
+  );
+
+  it.effect("keeps a bank account an earlier token of a configured account is bound to, and that token's binding", () =>
+    purgeFixture(({ store, bind, count }) =>
+      Effect.gen(function* () {
+        // fp-mine: the removed account's; fp-theirs-old: a configured account's token before its rotation.
+        yield* bind("fp-mine", "k1");
+        yield* bind("fp-theirs-old", "k1");
+        assert.deepStrictEqual(yield* store.purgeTokens(["fp-mine"], new Set(["fp-theirs", "fp-theirs-old"])), {
+          deleted: 0,
+          sharedWith: ["fp-theirs-old"],
+          unattributed: 0,
+        });
+        assert.strictEqual(yield* count("transactions"), 1);
+        assert.isTrue(Option.isNone(yield* store.binding("fp-mine")));
+        assert.isTrue(Option.isSome(yield* store.binding("fp-theirs-old")));
+      }),
+    ),
+  );
+
+  it.effect("leaves and counts cached bank accounts no configured account's token is bound to", () =>
+    purgeFixture(({ store, bind, count }) =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        // k1: bound only to a token no account is known to have had (cached before token history, or kept at a removal).
+        yield* bind("fp-unknown", "k1");
+        yield* sql`INSERT INTO accounts ${sql.insert({ account_key: "k2", account_id: "2", bank_id: "2010", updated_at: 1 })}`;
+        yield* bind("fp-mine", "k2");
+        yield* sql`INSERT INTO accounts ${sql.insert({ account_key: "k3", account_id: "3", bank_id: "2010", updated_at: 1 })}`;
+        yield* bind("fp-other", "k3");
+        assert.deepStrictEqual(yield* store.purgeTokens(["fp-mine"], new Set(["fp-other"])), {
+          deleted: 1,
+          sharedWith: [],
+          unattributed: 1,
+        });
+        assert.strictEqual(yield* count("transactions"), 1);
+        assert.strictEqual(yield* count("accounts"), 2);
+        assert.isTrue(Option.isSome(yield* store.binding("fp-unknown")));
+      }),
+    ),
+  );
+
+  it.effect("leaves a removed account's token that another account uses or used, with its binding, sync state and data", () =>
+    purgeFixture(({ store, bind, count }) =>
+      Effect.gen(function* () {
+        // fp-both: the removed account's earlier token, which another account has now (or had).
+        yield* bind("fp-both", "k1");
+        yield* bind("fp-mine", "k1");
+        assert.deepStrictEqual(yield* store.purgeTokens(["fp-both", "fp-mine"], new Set(["fp-both"])), {
+          deleted: 0,
+          sharedWith: ["fp-both"],
+          unattributed: 0,
+        });
+        assert.strictEqual(yield* count("transactions"), 1);
+        const sql = yield* SqlClient.SqlClient;
+        assert.deepStrictEqual(
+          yield* sql<{ fp: string }>`SELECT token_fingerprint AS fp FROM bindings UNION ALL SELECT token_fingerprint FROM sync_state`,
+          [{ fp: "fp-both" }, { fp: "fp-both" }],
+        );
+      }),
+    ),
+  );
+
+  it.effect("deletes one bank account and keeps another a configured account's token is bound to", () =>
+    purgeFixture(({ store, bind, count }) =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`INSERT INTO accounts ${sql.insert({ account_key: "k2", account_id: "2", bank_id: "2010", updated_at: 1 })}`;
+        yield* sql`INSERT INTO transactions ${sql.insert({ account_key: "k2", movement_id: 2, date: "2026-01-01", raw_json: "{}", first_seen_at: 1, updated_at: 1 })}`;
+        // The removed account's tokens: fp-old for k1, fp-new (after its binding moved) for k2, which fp-other reads too.
+        yield* bind("fp-old", "k1");
+        yield* bind("fp-new", "k2");
+        yield* bind("fp-other", "k2");
+        assert.deepStrictEqual(yield* store.purgeTokens(["fp-old", "fp-new"], new Set(["fp-other"])), {
+          deleted: 1,
+          sharedWith: ["fp-other"],
+          unattributed: 0,
+        });
+        assert.deepStrictEqual(yield* sql<{ key: string }>`SELECT DISTINCT account_key AS key FROM transactions`, [{ key: "k2" }]);
+        assert.strictEqual(yield* count("bindings"), 1);
       }),
     ),
   );
