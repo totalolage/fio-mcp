@@ -46,7 +46,7 @@ export const AccountsLive = Layer.unwrap(
   Effect.gen(function* () {
     const { transport } = yield* AppConfig;
     return transport.kind === "http" && transport.auth.kind === "oauth"
-      ? StoredAccountsLive(transport.auth.dataKey).pipe(Layer.provide(DatabaseLive))
+      ? StoredAccountsLive(transport.auth.dataKey, transport.auth.accountSeed).pipe(Layer.provide(DatabaseLive))
       : Accounts.layer;
   }),
 );

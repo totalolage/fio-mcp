@@ -3,7 +3,8 @@ import { Clock, Effect, Layer, Option, Redacted, Result, Schema } from "effect";
 import { SqlClient } from "effect/sql";
 import { type Account, Accounts, makeAccounts, tokenFingerprint } from "./accounts.js";
 import type { Migrations } from "./cache/db.js";
-import { type AccountConfig, AppConfig, accountNameKey } from "./config.js";
+import { type AccountSeed, accountNameKey } from "./config.js";
+import type { ConfigError } from "./errors.js";
 import { Redactor } from "./redaction.js";
 import {
   accountTokenAad,
@@ -336,18 +337,22 @@ export const makeAccountStore = Effect.fn("AccountStore.make")(function* (key: R
       .pipe(storeFailure("remove the account"), Effect.flatMap(Effect.fromResult));
 
   /**
-   * Imports `configs` when the database has no accounts and was never
-   * seeded or edited. Returns how many were imported, or None when the
+   * Imports the seed's accounts when the database has no accounts and was
+   * never seeded or edited; only then is the seed read (and its errors
+   * fail the import). Returns how many were imported, or None when the
    * database already decides.
    */
-  const seed = (configs: ReadonlyArray<AccountConfig>) =>
+  const seed = (accountSeed: AccountSeed) =>
     sql
       .withTransaction(
         Effect.gen(function* () {
           const [row] = yield* sql<{ total: number }>`SELECT COUNT(*) AS total FROM fio_accounts`;
           const [seeded] = yield* sql<{ value: string }>`SELECT value FROM server_settings WHERE key = ${SETTING.accountsSeeded}`;
-          if ((row?.total ?? 0) > 0 || seeded !== undefined) return Option.none<number>();
-          if (configs.length === 0) return Option.some(0);
+          if ((row?.total ?? 0) > 0 || seeded !== undefined) return Result.succeed(Option.none<number>());
+          const loaded = yield* Effect.result(accountSeed.load);
+          if (Result.isFailure(loaded)) return Result.fail(loaded.failure);
+          const configs = loaded.success;
+          if (configs.length === 0) return Result.succeed(Option.some(0));
           const now = yield* Clock.currentTimeMillis;
           for (const config of configs) {
             yield* insertNow(
@@ -356,10 +361,10 @@ export const makeAccountStore = Effect.fn("AccountStore.make")(function* (key: R
             );
           }
           yield* putSettingNow(SETTING.accountsSeeded, String(now), now);
-          return Option.some(configs.length);
+          return Result.succeed(Option.some(configs.length));
         }),
       )
-      .pipe(storeFailure("import the configured accounts"));
+      .pipe(storeFailure("import the configured accounts"), Effect.flatMap(Effect.fromResult));
 
   return { checkKey, load, insert, rename, rotate, remove, seed };
 });
@@ -377,15 +382,15 @@ const IGNORED_ENV_WARNING =
  */
 export const loadStoredAccounts = Effect.fn("AccountStore.loadAtStartup")(function* (
   store: AccountStore,
-  configured: ReadonlyArray<AccountConfig>,
+  accountSeed: AccountSeed,
 ) {
   yield* store.checkKey;
-  const seeded = yield* store.seed(configured);
+  const seeded = yield* store.seed(accountSeed);
   if (Option.isSome(seeded) && seeded.value > 0) {
     yield* Effect.logWarning(
       `accounts: imported ${seeded.value} accounts from FIO_TOKEN / FIO_ACCOUNTS into the database (encrypted). Remove those variables and delete the accounts file: from now on the accounts are managed at /admin.`,
     );
-  } else if (Option.isNone(seeded) && configured.length > 0) {
+  } else if (Option.isNone(seeded) && accountSeed.configured) {
     yield* Effect.logWarning(IGNORED_ENV_WARNING);
   }
   return yield* store.load;
@@ -393,21 +398,20 @@ export const loadStoredAccounts = Effect.fn("AccountStore.loadAtStartup")(functi
 
 /**
  * `Accounts` from the database (HTTP mode with OAuth). Needs the database
- * and the data key; fails startup on a wrong key or a row that does not
- * decrypt.
+ * and the data key; fails startup on a wrong key, a row that does not
+ * decrypt, or a seed that is needed but invalid.
  */
 export const StoredAccountsLive = (
   key: Redacted.Redacted<Uint8Array>,
-): Layer.Layer<Accounts, DataKeyMismatch | TokenDecryptionFailed | AccountStoreError, SqlClient.SqlClient | AppConfig | Redactor> =>
+  accountSeed: AccountSeed,
+): Layer.Layer<Accounts, DataKeyMismatch | TokenDecryptionFailed | AccountStoreError | ConfigError, SqlClient.SqlClient | Redactor> =>
   Layer.effect(
     Accounts,
     Effect.gen(function* () {
-      const config = yield* AppConfig;
       const redactor = yield* Redactor;
       const store = yield* makeAccountStore(key);
-      const records = yield* loadStoredAccounts(store, config.accounts);
+      const records = yield* loadStoredAccounts(store, accountSeed);
       yield* Effect.logInfo(`accounts: ${records.length} accounts loaded from the database`);
       return Accounts.of(yield* makeAccounts(records.map((record) => record.account), redactor.register));
     }),
   );
-

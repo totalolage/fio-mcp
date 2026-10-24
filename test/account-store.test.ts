@@ -1,18 +1,21 @@
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { NodeFileSystem } from "@effect/platform-node";
 import { assert, describe, it } from "@effect/vitest";
-import { Context, Effect, Exit, Layer, Logger, Redacted } from "effect";
+import { Cause, Context, Effect, Exit, Layer, Logger, Redacted } from "effect";
 import { SqlClient } from "effect/sql";
 import { SETTING, StoredAccountsLive } from "../src/account-store.js";
 import { Accounts, tokenFingerprint } from "../src/accounts.js";
 import { databaseLayer, SERVER_MIGRATIONS } from "../src/cache/db.js";
 import { makeCacheStore } from "../src/cache/store.js";
-import { type AccountConfig, AppConfig } from "../src/config.js";
+import { type AccountConfig, type AccountSeed, accountSeedOf } from "../src/config.js";
+import { ConfigError } from "../src/errors.js";
+import { hashPassword } from "../src/oauth/crypto.js";
 import { Redactor } from "../src/redaction.js";
 import { DataKeyMismatch, TokenDecryptionFailed } from "../src/token-crypto.js";
-import { FIO_TOKEN, SAVINGS_TOKEN, testConfig } from "./support/transport.js";
+import { loadConfigFrom } from "./fixtures.js";
+import { FIO_TOKEN, SAVINGS_TOKEN } from "./support/transport.js";
 
 const KEY = Redacted.make(new Uint8Array(32).fill(3));
 const WRONG_KEY = Redacted.make(new Uint8Array(32).fill(4));
@@ -25,15 +28,12 @@ const tempDb = () => join(mkdtempSync(join(tmpdir(), "fio-accounts-")), "fio.sql
 const database = (path: string) => databaseLayer(path, SERVER_MIGRATIONS).pipe(Layer.provide(NodeFileSystem.layer));
 
 /** One server start: the accounts it loads (or why it failed) and what it logged. */
-const start = (path: string, key: Redacted.Redacted<Uint8Array>, configured: ReadonlyArray<AccountConfig>) =>
+const start = (path: string, key: Redacted.Redacted<Uint8Array>, configured: ReadonlyArray<AccountConfig> | AccountSeed) =>
   Effect.gen(function* () {
     const logs: Array<string> = [];
     const capture = Logger.make<unknown, void>((entry) => void logs.push(Logger.formatLogFmt.log(entry)));
-    const layer = StoredAccountsLive(key).pipe(
-      Layer.provide(database(path)),
-      Layer.provide(Redactor.layerFrom([])),
-      Layer.provide(AppConfig.layerFrom({ ...testConfig(), accounts: configured })),
-    );
+    const seed = "load" in configured ? configured : accountSeedOf(configured);
+    const layer = StoredAccountsLive(key, seed).pipe(Layer.provide(database(path)), Layer.provide(Redactor.layerFrom([])));
     const exit = yield* Effect.exit(
       Effect.scoped(Effect.flatMap(Layer.build(layer), (context) => Context.get(context, Accounts).list)),
     ).pipe(Effect.provide(Logger.layer([capture])));
@@ -42,6 +42,31 @@ const start = (path: string, key: Redacted.Redacted<Uint8Array>, configured: Rea
 
 const withSql = <A, E>(path: string, effect: Effect.Effect<A, E, SqlClient.SqlClient>) =>
   Effect.scoped(Effect.flatMap(Layer.build(database(path)), (context) => Effect.provideContext(effect, context)));
+
+const tempFile = (content: string) => {
+  const path = join(mkdtempSync(join(tmpdir(), "fio-accounts-")), "file");
+  writeFileSync(path, content, { mode: 0o440 });
+  return path;
+};
+
+/** The seed `loadConfig` builds for HTTP mode with OAuth from `env`. */
+const oauthSeed = (env: Record<string, string>) =>
+  Effect.gen(function* () {
+    const hash = yield* hashPassword(Redacted.make("test-admin-password"), { ln: 14, r: 8, p: 1 });
+    const config = yield* loadConfigFrom({
+      FIO_MCP_TRANSPORT: "http",
+      FIO_MCP_PUBLIC_URL: "https://fio.example.test",
+      FIO_MCP_ADMIN_PASSWORD_HASH_FILE: tempFile(`${hash}\n`),
+      FIO_MCP_DATA_KEY_FILE: tempFile(`${"03".repeat(32)}\n`),
+      ...env,
+    });
+    if (config.transport.kind !== "http" || config.transport.auth.kind !== "oauth") return assert.fail("expected OAuth");
+    assert.deepStrictEqual(config.accounts, []);
+    return config.transport.auth.accountSeed;
+  });
+
+// Not JSON, and holds a token: it must never be echoed.
+const MALFORMED_ACCOUNTS = `[{"name":"main","token":"${FIO_TOKEN}"`;
 
 const names = (exit: Exit.Exit<ReadonlyArray<{ readonly name: string }>, unknown>) =>
   Exit.isSuccess(exit) ? exit.value.map((account) => account.name) : `failed: ${String(exit.cause)}`;
@@ -84,6 +109,55 @@ describe("encrypted account store", () => {
       const fresh = tempDb();
       assert.deepStrictEqual(names((yield* start(fresh, KEY, [])).exit), []);
       assert.deepStrictEqual(names((yield* start(fresh, KEY, [SAVINGS])).exit), ["savings"]);
+    }),
+  );
+
+  it.effect("starts from a seeded database whatever the ignored FIO_ACCOUNTS holds", () =>
+    Effect.gen(function* () {
+      const path = tempDb();
+      yield* start(path, KEY, [MAIN]);
+      const missing = join(mkdtempSync(join(tmpdir(), "fio-accounts-")), "gone.json");
+      const ignored: ReadonlyArray<Record<string, string>> = [
+        { FIO_ACCOUNTS: MALFORMED_ACCOUNTS },
+        { FIO_ACCOUNTS_FILE: missing },
+        { FIO_ACCOUNTS: "[]", FIO_TOKEN },
+      ];
+      for (const env of ignored) {
+        const restarted = yield* start(path, KEY, yield* oauthSeed(env));
+        assert.deepStrictEqual(names(restarted.exit), ["main"]);
+        assert.isTrue(restarted.logs.some((line) => line.includes("are set but ignored")));
+        for (const line of restarted.logs) {
+          assert.notInclude(line, FIO_TOKEN);
+          assert.notInclude(line, missing);
+        }
+      }
+    }),
+  );
+
+  it.effect("validates the seed strictly when the database needs it, without echoing it", () =>
+    Effect.gen(function* () {
+      const path = tempDb();
+      const failed = yield* start(path, KEY, yield* oauthSeed({ FIO_ACCOUNTS: MALFORMED_ACCOUNTS }));
+      assert.isTrue(Exit.isFailure(failed.exit));
+      if (Exit.isFailure(failed.exit)) {
+        const error = Cause.squash(failed.exit.cause);
+        assert.instanceOf(error, ConfigError);
+        assert.strictEqual((error as ConfigError).message, "FIO_ACCOUNTS is not valid JSON");
+        assert.notInclude(String(failed.exit.cause), FIO_TOKEN);
+      }
+      const missing = join(mkdtempSync(join(tmpdir(), "fio-accounts-")), "gone.json");
+      const unreadable = yield* start(path, KEY, yield* oauthSeed({ FIO_ACCOUNTS_FILE: missing }));
+      assert.isTrue(Exit.isFailure(unreadable.exit));
+      if (Exit.isFailure(unreadable.exit)) {
+        const error = Cause.squash(unreadable.exit.cause);
+        assert.instanceOf(error, ConfigError);
+        assert.strictEqual((error as ConfigError).message, "FIO_ACCOUNTS_FILE: file not readable");
+        assert.notInclude(String(unreadable.exit.cause), missing);
+      }
+      for (const line of [...failed.logs, ...unreadable.logs]) assert.notInclude(line, FIO_TOKEN);
+      // Nothing was imported or marked: a fixed seed still imports.
+      const fixed = yield* start(path, KEY, yield* oauthSeed({ FIO_ACCOUNTS_FILE: tempFile(JSON.stringify([{ name: "main", token: FIO_TOKEN }])) }));
+      assert.deepStrictEqual(names(fixed.exit), ["main"]);
     }),
   );
 

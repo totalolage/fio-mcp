@@ -320,6 +320,45 @@ describe("loadConfig", () => {
     }),
   );
 
+  it.effect("defers the account seed with OAuth; stdio still validates it at load", () =>
+    Effect.gen(function* () {
+      const hash = yield* hashPassword(Redacted.make("test-admin-password"), { ln: 14, r: 8, p: 1 });
+      const oauth = {
+        FIO_MCP_TRANSPORT: "http",
+        FIO_MCP_PUBLIC_URL: "https://fio.example.test",
+        FIO_MCP_ADMIN_PASSWORD_HASH_FILE: secretFile(`${hash}\n`),
+        FIO_MCP_DATA_KEY_FILE: secretFile(`${"ab".repeat(32)}\n`),
+      };
+      const malformed = `[{"name":"main","token":"${READ_TOKEN}"`;
+      const missing = join(mkdtempSync(join(tmpdir(), "fio-mcp-config-")), "gone.json");
+      const cases: ReadonlyArray<readonly [Record<string, string>, string]> = [
+        [{ FIO_ACCOUNTS: malformed }, "FIO_ACCOUNTS is not valid JSON"],
+        [{ FIO_ACCOUNTS_FILE: missing }, "FIO_ACCOUNTS_FILE: file not readable"],
+        [{ FIO_TOKEN: READ_TOKEN, FIO_ACCOUNTS: "[]" }, "Set either FIO_TOKEN or FIO_ACCOUNTS (or their _FILE variants), not both"],
+      ];
+      for (const [env, expected] of cases) {
+        assert.strictEqual(yield* configError(env), expected);
+        const config = yield* loadConfigFrom({ ...oauth, ...env });
+        assert.deepStrictEqual(config.accounts, []);
+        assert.deepStrictEqual(config.secrets, []);
+        if (config.transport.kind !== "http" || config.transport.auth.kind !== "oauth") return assert.fail("expected OAuth");
+        assert.isTrue(config.transport.auth.accountSeed.configured);
+        // Reading it later fails the same way, without the value or the path.
+        const error = yield* Effect.flip(config.transport.auth.accountSeed.load);
+        assert.instanceOf(error, ConfigError);
+        assert.strictEqual(error.message, expected);
+      }
+      const unset = yield* loadConfigFrom(oauth);
+      if (unset.transport.kind !== "http" || unset.transport.auth.kind !== "oauth") return assert.fail("expected OAuth");
+      assert.isFalse(unset.transport.auth.accountSeed.configured);
+      assert.deepStrictEqual(yield* unset.transport.auth.accountSeed.load, []);
+      const valid = yield* loadConfigFrom({ ...oauth, FIO_TOKEN: READ_TOKEN });
+      if (valid.transport.kind !== "http" || valid.transport.auth.kind !== "oauth") return assert.fail("expected OAuth");
+      const [seeded] = yield* valid.transport.auth.accountSeed.load;
+      assert.strictEqual(seeded && Redacted.value(seeded.token), READ_TOKEN);
+    }),
+  );
+
   it.effect("requires OAuth settings unless unauthenticated HTTP is explicitly allowed", () =>
     Effect.gen(function* () {
       const env = { FIO_TOKEN: READ_TOKEN, FIO_MCP_TRANSPORT: "http" };

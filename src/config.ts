@@ -15,7 +15,8 @@ import { parseTrustedProxy } from "./transport/client-address.js";
  *
  * With OAuth over HTTP the FIO accounts live in the database (encrypted
  * with the data key, managed at /admin); FIO_TOKEN / FIO_ACCOUNTS are then
- * optional and only seed an empty database once (src/account-store.ts).
+ * optional and only seed an empty database once (src/account-store.ts),
+ * which reads them only then.
  * Diagnostics name the variable, field, or path, never a value: a misplaced
  * token must not reach stderr.
  */
@@ -62,8 +63,30 @@ export type HttpAuthConfig =
       readonly passwordHash: Redacted.Redacted<PasswordHash>;
       /** AES-256-GCM key (FIO_MCP_DATA_KEY_FILE) for the FIO tokens in the database. */
       readonly dataKey: Redacted.Redacted<Uint8Array>;
+      /** FIO_TOKEN / FIO_ACCOUNTS, read only if the database needs them. */
+      readonly accountSeed: AccountSeed;
     }
   | { readonly kind: "unauthenticated" };
+
+/**
+ * The accounts FIO_TOKEN / FIO_ACCOUNTS (or their _FILE variants) would
+ * import in HTTP mode with OAuth. They are read and validated only when the
+ * database has no accounts and was never edited (src/account-store.ts), so
+ * once it holds the accounts, a stale, broken or deleted seed cannot stop
+ * startup.
+ */
+export interface AccountSeed {
+  /** Whether a seed variable is set; says nothing about its value. */
+  readonly configured: boolean;
+  /** Reads and validates the seed with the stdio rules. */
+  readonly load: Effect.Effect<ReadonlyArray<AccountConfig>, ConfigError>;
+}
+
+/** A seed that is already read (tests). */
+export const accountSeedOf = (accounts: ReadonlyArray<AccountConfig>): AccountSeed => ({
+  configured: accounts.length > 0,
+  load: Effect.succeed(accounts),
+});
 
 export interface CacheConfig {
   readonly enabled: boolean;
@@ -82,8 +105,8 @@ export interface CacheConfig {
 export interface AppConfigShape {
   /**
    * Accounts from FIO_TOKEN / FIO_ACCOUNTS. Never empty for stdio and
-   * unauthenticated HTTP; may be empty with OAuth, where the database is
-   * authoritative and these only seed it.
+   * unauthenticated HTTP; empty with OAuth, where the database is
+   * authoritative and these only seed it (`auth.accountSeed`).
    */
   readonly accounts: ReadonlyArray<AccountConfig>;
   /** Every configured secret that must never leave the process: the FIO tokens. */
@@ -348,7 +371,18 @@ const loadHttpAuth = Effect.fn("config.loadHttpAuth")(function* () {
     publicUrl: parsedUrl.origin,
     passwordHash: Redacted.make(hash),
     dataKey,
+    accountSeed: yield* loadAccountSeed(),
   } satisfies HttpAuthConfig;
+});
+
+const SEED_VARS = ["FIO_TOKEN", "FIO_TOKEN_FILE", "FIO_ACCOUNTS", "FIO_ACCOUNTS_FILE"];
+
+/** Notes which seed variables are set; reading them waits for `load`, with this environment and file system. */
+const loadAccountSeed = Effect.fn("config.loadAccountSeed")(function* () {
+  let configured = false;
+  for (const key of SEED_VARS) if (Option.isSome(yield* optionalVar(key))) configured = true;
+  const services = yield* Effect.context<FileSystem.FileSystem>();
+  return { configured, load: Effect.provideContext(loadAccounts(true), services) } satisfies AccountSeed;
 });
 
 const DATA_KEY_HELP = "create one with `openssl rand -hex 32 > fio_mcp_data_key` and keep a copy outside the database backups";
@@ -436,7 +470,7 @@ const loadCache = Effect.fn("config.loadCache")(function* () {
 /** Reads and validates the whole configuration. */
 export const loadConfig = Effect.fn("config.load")(function* () {
   const transport = yield* loadTransport();
-  const accounts = yield* loadAccounts(transport.kind === "http" && transport.auth.kind === "oauth");
+  const accounts = transport.kind === "http" && transport.auth.kind === "oauth" ? [] : yield* loadAccounts(false);
   const baseUrl = Option.getOrElse(yield* optionalVar("FIO_API_BASE_URL"), () => DEFAULT_BASE_URL).replace(/\/+$/, "");
   const cache = yield* loadCache();
   if (transport.kind === "http" && transport.auth.kind === "oauth" && cache.dbPath === "") {

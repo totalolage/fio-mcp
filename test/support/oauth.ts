@@ -25,7 +25,7 @@ import { AdminPassword } from "../../src/admin/password.js";
 import { AdminLive } from "../../src/admin/server.js";
 import { SERVER_INFO, ToolsLive } from "../../src/app.js";
 import { databaseLayer, SERVER_MIGRATIONS } from "../../src/cache/db.js";
-import type { AppConfigShape, HttpAuthConfig } from "../../src/config.js";
+import { type AppConfigShape, accountSeedOf, type HttpAuthConfig } from "../../src/config.js";
 import { hashPassword, type PasswordHash, parsePasswordHash } from "../../src/oauth/crypto.js";
 import type { ThrottlePolicy } from "../../src/oauth/login.js";
 import { OAuthLive } from "../../src/oauth/server.js";
@@ -101,7 +101,8 @@ export async function startOAuth(
 ): Promise<OAuthHarness> {
   const hash = await passwordHash();
   const trustedProxies = (options.trustedProxies ?? []).flatMap((entry) => parseTrustedProxy(entry) ?? []);
-  const auth: HttpAuthConfig = { kind: "oauth", publicUrl: PUBLIC_URL, passwordHash: Redacted.make(hash), dataKey: DATA_KEY };
+  const accountSeed = accountSeedOf(options.configured ?? testConfig().accounts);
+  const auth: HttpAuthConfig = { kind: "oauth", publicUrl: PUBLIC_URL, passwordHash: Redacted.make(hash), dataKey: DATA_KEY, accountSeed };
   const transport: HttpTransportConfig = {
     kind: "http",
     host: "127.0.0.1",
@@ -111,8 +112,7 @@ export async function startOAuth(
     allowedHosts: [],
     trustedProxies,
   };
-  const base = testConfig(transport);
-  const config = options.configured === undefined ? base : { ...base, accounts: options.configured };
+  const config = testConfig(transport);
   const scope = await Effect.runPromise(Scope.make());
   const db: Context.Context<SqlClient.SqlClient> = await Effect.runPromise(
     Layer.buildWithScope(databaseLayer(options.dbPath ?? ":memory:", SERVER_MIGRATIONS).pipe(Layer.provide(NodeFileSystem.layer)), scope),
@@ -148,7 +148,7 @@ export async function startOAuth(
     { global: true },
   );
   const app = httpRouterApp(Layer.mergeAll(ToolsLive, withClock, AccountChangesLive, captureAccounts), oauth, SERVER_INFO, transport).pipe(
-    Layer.provide(testServices(config, release, StoredAccountsLive(DATA_KEY))),
+    Layer.provide(testServices(config, release, StoredAccountsLive(DATA_KEY, accountSeed))),
     Layer.provide(Layer.succeedContext(db)),
     Layer.provide(HttpServer.layerServices),
     Layer.provide(Logger.layer([capture])),
