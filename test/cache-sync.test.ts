@@ -809,7 +809,7 @@ describe("retiring a token removed at /admin", () => {
         assert.isTrue(Option.isNone(yield* cache.sync.progress(acc)));
         // A write admitted before the removal, landing after it (and after a purge), stores nothing.
         const late = { accountName: acc.name, tokenFingerprint: fp, statement: statement(TODAY, TODAY, [tx(1, TODAY, 5)]), fetchedAt: NOW };
-        yield* cache.store.purgeToken(fp);
+        yield* cache.store.purgeToken(fp, new Set());
         assert.strictEqual((yield* cache.store.commit(late)).rowsWritten, 0);
         yield* lateState;
         assert.isTrue(Option.isNone(yield* cache.store.binding(fp)));

@@ -10,7 +10,7 @@ import { pageHeaders } from "../oauth/pages.js";
 import { makeWindowLimiter } from "../oauth/rate-limit.js";
 import { makeOAuthStore } from "../oauth/store.js";
 import { clientAddress } from "../transport/client-address.js";
-import { makeAccountAdmin } from "./accounts.js";
+import { makeAccountAdmin, type RemovedCache } from "./accounts.js";
 import {
   ADMIN_STYLE_HASH,
   accountsPage,
@@ -95,6 +95,23 @@ const field = (form: URLSearchParams, name: string) => {
 };
 
 const refused = html(adminRefusedPage(), 403);
+
+const quoted = (names: ReadonlyArray<string>) => names.map((name) => `“${name}”`).join(", ");
+
+const removedCacheText = (cache: RemovedCache): string => {
+  switch (cache.kind) {
+    case "kept":
+      return "Its cached transactions were kept.";
+    case "deleted":
+      return "Its cached transactions were deleted.";
+    case "nothing-cached":
+      return "Nothing was cached under its current token, so nothing was deleted.";
+    case "shared-token":
+      return `Its cached transactions were kept: ${quoted(cache.accounts)} ${cache.accounts.length === 1 ? "uses" : "use"} the same token.`;
+    case "shared-account":
+      return `Its cached transactions were kept: ${quoted(cache.accounts)} ${cache.accounts.length === 1 ? "reads" : "read"} the same bank account.`;
+  }
+};
 
 export const makeAdminServer = Effect.fn("AdminServer.make")(function* (settings: AdminSettings) {
   const password = yield* AdminPassword;
@@ -272,12 +289,7 @@ export const makeAdminServer = Effect.fn("AdminServer.make")(function* (settings
   const removeAccount = action(ADMIN_PATH, (form) => {
     if (field(form, "confirm") !== "yes") return Effect.succeed<Flash>({ kind: "error", text: "Tick the box to confirm the removal." });
     return admin.remove(idOf(form), field(form, "cache") === "purge").pipe(
-      Effect.map(({ name, purged, shared }): Flash => {
-        let cache = " Its cached transactions were kept.";
-        if (purged) cache = " Its cached transactions were deleted.";
-        else if (shared) cache = " Its cached transactions were kept: another account uses the same token.";
-        return { kind: "ok", text: `Removed “${name}”.${cache}` };
-      }),
+      Effect.map(({ name, cache }): Flash => ({ kind: "ok", text: `Removed “${name}”. ${removedCacheText(cache)}` })),
     );
   });
 

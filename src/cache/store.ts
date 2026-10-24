@@ -293,6 +293,16 @@ const cents = (value: number | null) => (value ?? 0) / 100;
 
 const escapeLike = (text: string) => `%${text.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
 
+/**
+ * What `purgeToken` did with the bound bank account's data: deleted it,
+ * kept it for the configured tokens still bound to it, or found nothing
+ * cached under the token.
+ */
+export type PurgeOutcome =
+  | { readonly kind: "deleted" }
+  | { readonly kind: "shared"; readonly tokenFingerprints: ReadonlyArray<string> }
+  | { readonly kind: "nothing-cached" };
+
 export const makeCacheStore = Effect.fn("CacheStore.make")(function* () {
   const sql = yield* SqlClient.SqlClient;
   /**
@@ -655,10 +665,13 @@ export const makeCacheStore = Effect.fn("CacheStore.make")(function* () {
 
   /**
    * Deletes what the cache holds for a token: its binding and sync state,
-   * and the bound bank account's movements, coverage and balance unless
-   * another token is still bound to that bank account.
+   * and the bound bank account's movements, coverage and balance unless a
+   * token in `active` (the configured ones) is still bound to that bank
+   * account. Bindings of tokens no account uses any more (replaced or
+   * removed earlier) do not keep the data; they are deleted with their
+   * sync state, so re-adding such a token verifies it with FIO again.
    */
-  const purgeToken = (tokenFingerprint: string) =>
+  const purgeToken = (tokenFingerprint: string, active: ReadonlySet<string>) =>
     sql
       .withTransaction(
         Effect.gen(function* () {
@@ -667,14 +680,24 @@ export const makeCacheStore = Effect.fn("CacheStore.make")(function* () {
           `;
           yield* sql`DELETE FROM bindings WHERE token_fingerprint = ${tokenFingerprint}`;
           yield* sql`DELETE FROM sync_state WHERE token_fingerprint = ${tokenFingerprint}`;
-          if (bound === undefined) return;
-          const [shared] = yield* sql<{ total: number }>`
-            SELECT COUNT(*) AS total FROM bindings WHERE account_key = ${bound.account_key}
+          if (bound === undefined) return { kind: "nothing-cached" } satisfies PurgeOutcome;
+          const others = yield* sql<{ token_fingerprint: string }>`
+            SELECT token_fingerprint FROM bindings WHERE account_key = ${bound.account_key} ORDER BY token_fingerprint
           `;
-          if ((shared?.total ?? 0) > 0) return;
+          const sharing: Array<string> = [];
+          for (const { token_fingerprint: other } of others) {
+            if (active.has(other)) {
+              sharing.push(other);
+              continue;
+            }
+            yield* sql`DELETE FROM bindings WHERE token_fingerprint = ${other}`;
+            yield* sql`DELETE FROM sync_state WHERE token_fingerprint = ${other}`;
+          }
+          if (sharing.length > 0) return { kind: "shared", tokenFingerprints: sharing } satisfies PurgeOutcome;
           yield* sql`DELETE FROM transactions WHERE account_key = ${bound.account_key}`;
           yield* sql`DELETE FROM coverage_days WHERE account_key = ${bound.account_key}`;
           yield* sql`DELETE FROM accounts WHERE account_key = ${bound.account_key}`;
+          return { kind: "deleted" } satisfies PurgeOutcome;
         }),
       )
       .pipe(cacheFailure("delete the cached data"));

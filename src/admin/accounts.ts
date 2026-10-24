@@ -58,6 +58,15 @@ export interface AccountInput {
   readonly currency: string | undefined;
 }
 
+/**
+ * What a removal did with the account's cached data: `kept` (keep chosen),
+ * `deleted`, `nothing-cached` under its current token, or kept because
+ * `accounts` use the same token or read the same bank account.
+ */
+export type RemovedCache =
+  | { readonly kind: "kept" | "deleted" | "nothing-cached" }
+  | { readonly kind: "shared-token" | "shared-account"; readonly accounts: ReadonlyArray<string> };
+
 export const makeAccountAdmin = Effect.fn("AccountAdmin.make")(function* (key: Redacted.Redacted<Uint8Array>) {
   const store = yield* makeAccountStore(key);
   const accounts = yield* Accounts;
@@ -143,8 +152,9 @@ export const makeAccountAdmin = Effect.fn("AccountAdmin.make")(function* (key: R
 
   /**
    * Removes the account. With `purge`, also deletes what the cache holds for
-   * its token, unless another account still uses that token. Returns
-   * whether cached data was deleted.
+   * its token, unless another account still uses that token or reads the
+   * same bank account. Returns what happened to the cached data, naming the
+   * accounts that kept it.
    */
   const remove = (accountId: string, purge: boolean) =>
     exclusive(
@@ -152,12 +162,19 @@ export const makeAccountAdmin = Effect.fn("AccountAdmin.make")(function* (key: R
         const account = yield* find(accountId);
         yield* store.remove(accountId);
         yield* reload;
-        const shared = (yield* accounts.list).some((other) => other.tokenFingerprint === account.tokenFingerprint);
-        const purged = purge && !shared;
-        // Retired by the reload: nothing writes for the token any more, so the purge stays.
-        if (purged) yield* cacheStore.purgeToken(account.tokenFingerprint);
-        yield* Effect.logInfo(`admin: account ${accountId} removed${purged ? " with its cached data" : ""}`);
-        return { name: account.name, purged, shared };
+        const remaining = yield* accounts.list;
+        const namesOf = (fingerprints: ReadonlyArray<string>) =>
+          remaining.filter((other) => fingerprints.includes(other.tokenFingerprint)).map((other) => other.name);
+        const sameToken = namesOf([account.tokenFingerprint]);
+        let cache: RemovedCache = { kind: "kept" };
+        if (purge && sameToken.length > 0) cache = { kind: "shared-token", accounts: sameToken };
+        else if (purge) {
+          // Retired by the reload: nothing writes for the token any more, so the purge stays.
+          const outcome = yield* cacheStore.purgeToken(account.tokenFingerprint, new Set(remaining.map((other) => other.tokenFingerprint)));
+          cache = outcome.kind === "shared" ? { kind: "shared-account", accounts: namesOf(outcome.tokenFingerprints) } : outcome;
+        }
+        yield* Effect.logInfo(`admin: account ${accountId} removed; cached data: ${cache.kind}`);
+        return { name: account.name, cache };
       }),
     );
 

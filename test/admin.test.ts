@@ -1,10 +1,13 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { type CallToolResult, ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
-import { Effect, Layer, Sink, Stdio, Stream, Terminal } from "effect";
+import { Effect, Layer, Redacted, Sink, Stdio, Stream, Terminal } from "effect";
 import { SqlClient } from "effect/sql";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { tokenFingerprint } from "../src/accounts.js";
+import { makeCacheStore } from "../src/cache/store.js";
 import { resetAdminPasswordCommand } from "../src/oauth/cli.js";
+import { NOW, statement, TODAY, tx } from "./support/cache.js";
 import {
   authorizationUrl,
   Browser,
@@ -318,6 +321,55 @@ describe("accounts at /admin", () => {
     for (const token of [FIO_TOKEN, SAVINGS_TOKEN, NEW_MAIN_TOKEN, THIRD_TOKEN]) expect(final.html).not.toContain(token);
     expect(session.changes()).toBeGreaterThan(1);
     await session.client.close();
+  });
+
+  it("purges a removed account's cached data unless an account still reads that bank account, and says which", async () => {
+    const admin = await signedIn();
+    const commit = (token: string, accountName: string, ids: ReadonlyArray<number>, accountId?: string) =>
+      harness.sql(
+        Effect.flatMap(makeCacheStore(), (store) =>
+          store.commit({
+            accountName,
+            tokenFingerprint: tokenFingerprint(Redacted.make(token)),
+            statement: statement(TODAY, TODAY, ids.map((id) => tx(id, TODAY, 5)), accountId),
+            fetchedAt: NOW,
+          }),
+        ),
+      );
+    const cached = () =>
+      harness.sql(
+        Effect.flatMap(SqlClient.SqlClient, (sql) =>
+          Effect.all({
+            movements: Effect.map(sql<{ id: number }>`SELECT movement_id AS id FROM transactions ORDER BY movement_id`, (rows) =>
+              rows.map((row) => row.id),
+            ),
+            bindings: Effect.map(sql<{ n: number }>`SELECT COUNT(*) AS n FROM bindings`, ([row]) => row?.n),
+          }),
+        ),
+      );
+    const remove = async (name: string) =>
+      (await admin.act("/admin/accounts/remove", { id: idOf((await admin.page("/admin")).html, name), cache: "purge", confirm: "yes" })).message;
+
+    // Cached under the first token, then under the replacing one: the old token's binding must not keep the data.
+    await commit(FIO_TOKEN, "main", [101]);
+    await admin.act("/admin/accounts/rotate", { id: idOf((await admin.page("/admin")).html, "main"), token: NEW_MAIN_TOKEN });
+    await commit(NEW_MAIN_TOKEN, "main", [202]);
+    expect(await cached()).toEqual({ movements: [101, 202], bindings: 2 });
+    expect(await remove("main")).toContain("Removed “main”. Its cached transactions were deleted.");
+    expect(await cached()).toEqual({ movements: [], bindings: 0 });
+
+    // Another configured account reading the same bank account keeps it, and is named.
+    await admin.act("/admin/accounts/add", { name: "third", token: THIRD_TOKEN });
+    await commit(SAVINGS_TOKEN, "savings", [303], "2000000009");
+    await commit(THIRD_TOKEN, "third", [404], "2000000009");
+    expect(await remove("savings")).toContain("Removed “savings”. Its cached transactions were kept: “third” reads the same bank account.");
+    expect(await cached()).toEqual({ movements: [303, 404], bindings: 1 });
+    expect(await remove("third")).toContain("Removed “third”. Its cached transactions were deleted.");
+    expect(await cached()).toEqual({ movements: [], bindings: 0 });
+
+    // A token that never cached anything deletes nothing and says so.
+    await admin.act("/admin/accounts/add", { name: "fourth", token: NEW_MAIN_TOKEN });
+    expect(await remove("fourth")).toContain("Nothing was cached under its current token, so nothing was deleted.");
   });
 
   it("tests a token with one read-only call through its rate limiter, which follows a replaced token", async () => {
