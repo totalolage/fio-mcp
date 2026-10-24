@@ -1,7 +1,7 @@
 import { dirname } from "node:path";
 import { SqliteClient, SqliteMigrator } from "@effect/sql-sqlite-node";
 import { Effect, FileSystem, Layer } from "effect";
-import { SqlClient, type SqlError } from "effect/sql";
+import { Migrator, SqlClient, type SqlError } from "effect/sql";
 import { AppConfig } from "../config.js";
 import { CacheError, InvalidInput } from "../errors.js";
 import { OAUTH_MIGRATIONS } from "../oauth/store.js";
@@ -132,9 +132,16 @@ export const CACHE_MIGRATIONS: Migrations = {
 
 const MIGRATIONS_TABLE = "fio_mcp_migrations";
 
-/** Runs pending migrations; a no-op on an up-to-date database. */
+/**
+ * Runs pending migrations; a no-op on an up-to-date database. Effect 4.0.5's
+ * migrator dies with a MigrationError when a migration fails (after rolling
+ * back), so that defect becomes a failure like the migrator's other errors.
+ */
 export const migrate = (migrations: Migrations = CACHE_MIGRATIONS) =>
   SqliteMigrator.run({ loader: SqliteMigrator.fromRecord(migrations), table: MIGRATIONS_TABLE }).pipe(
+    Effect.catchDefect((defect) =>
+      defect instanceof Migrator.MigrationError ? Effect.fail(defect) : Effect.die(defect),
+    ),
     cacheFailure("migrate the database"),
   );
 

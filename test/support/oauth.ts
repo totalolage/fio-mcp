@@ -110,7 +110,7 @@ export async function startOAuth(
       httpEffect.pipe(
         Effect.updateService(HttpServerRequest.HttpServerRequest, (request) => {
           const peer = request.headers[PEER_HEADER];
-          return peer === undefined ? request : request.modify({ remoteAddress: Option.some(peer), peerAddress: Option.some(peer) });
+          return peer === undefined ? request : request.modify({ remoteAddress: Option.some(peer) });
         }),
         Effect.provideService(Clock.Clock, clock),
         Effect.provide(captureLayer),

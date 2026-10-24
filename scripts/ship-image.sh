@@ -5,7 +5,7 @@
 # load). No registry is involved. It then checks that the remote image ID
 # matches the local one.
 #
-# Usage: npm run ship:image -- [--dry-run] [--no-compress]
+# Usage: bun run ship:image -- [--dry-run] [--no-compress]
 #
 # FIO_MCP_SSH_HOST       ssh destination, usually a host alias from
 #                        ~/.ssh/config (default: nas). ssh runs with

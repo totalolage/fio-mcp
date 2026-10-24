@@ -14,6 +14,7 @@
   "engines": {
     "node": ">=22.13"
   },
+  "packageManager": "bun@1.4.2",
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
@@ -21,27 +22,28 @@
     "lint:fix": "biome check --write .",
     "test": "vitest run",
     "generate": "node scripts/generate-fio-client.ts",
-    "generate:check": "npm run generate && git diff --exit-code -- src/generated",
-    "check": "npm run typecheck && npm run lint && npm test",
+    "generate:check": "bun run generate && git diff --exit-code -- src/generated",
+    "check": "bun run typecheck && bun run lint && bun run test",
     "start": "node dist/main.js",
     "ship:image": "sh scripts/ship-image.sh",
     "test:scripts": "sh test/ship-image.test.sh",
-    "prepare": "effect-tsgo patch --typescript --no-oxlint && npm run build"
+    "prepare": "effect-tsgo patch --typescript --no-oxlint && bun run build"
   },
   "dependencies": {
-    "@effect/platform-node": "^4.0.6",
-    "@effect/sql-sqlite-node": "^4.0.6",
-    "effect": "^4.0.6",
-    "fast-xml-parser": "^5.11.2"
+    "@effect/platform-node": "4.0.5",
+    "@effect/sql-sqlite-node": "4.0.5",
+    "effect": "4.0.5",
+    "fast-xml-parser": "5.11.2"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.6.2",
-    "@effect/openapi-generator": "^4.0.6",
-    "@effect/tsgo": "^0.56.0",
-    "@effect/vitest": "^4.0.6",
-    "@modelcontextprotocol/sdk": "^1.32.1",
-    "@types/node": "^26.6.5",
-    "typescript": "^7.0.2",
-    "vitest": "^5.0.5"
-  }
+    "@biomejs/biome": "2.5.15",
+    "@effect/openapi-generator": "4.0.5",
+    "@effect/tsgo": "0.53.3",
+    "@effect/vitest": "4.0.5",
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "@types/node": "26.6.5",
+    "typescript": "7.0.2",
+    "vitest": "5.0.5"
+  },
+  "trustedDependencies": []
 }
