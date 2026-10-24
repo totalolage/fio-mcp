@@ -40,7 +40,12 @@ export interface AccountsShape {
   readonly list: Effect.Effect<ReadonlyArray<Account>>;
   /** The current list, then every new one. */
   readonly changes: Stream.Stream<ReadonlyArray<Account>>;
-  /** Replaces the list (after the database changed); hands new tokens to `register` (the Redactor) first. */
+  /**
+   * Replaces the list (after the database changed); hands new tokens to
+   * `register` (the Redactor) first. Retire the tokens it drops in
+   * `Transactions` before calling it (src/admin/accounts.ts does): the
+   * cache drops a token's writes only once it is retired.
+   */
   readonly replace: (accounts: ReadonlyArray<Account>) => Effect.Effect<void>;
   /** The named account, or the only one when `name` is omitted. */
   readonly resolve: (name: string | undefined) => Effect.Effect<Account, InvalidInput>;
