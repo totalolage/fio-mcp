@@ -9,7 +9,7 @@ import { coveredBy } from "./store.js";
 
 /*
  * Where a date-range read comes from: the cache or FIO. Private to the
- * TransactionCache module, which exposes the choice as `transactions`.
+ * Transactions module, which exposes the choice as `transactions`.
  */
 
 /** auto: the cache when every day is servable, else FIO; cache: the cache only; fio: always FIO. */
@@ -77,7 +77,7 @@ export const selectSource = (fio: FioApiShape, cache: CacheReadPath) => {
     return yield* cache.servable(accountKey.value, range).pipe(Effect.orElseSucceed(() => false));
   });
 
-  return Effect.fn("TransactionCache.transactions")(function* (
+  return Effect.fn("Transactions.transactions")(function* (
     account: Account,
     range: DayRange,
     source: Source,

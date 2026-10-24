@@ -5,7 +5,7 @@ import { assert, describe, it } from "@effect/vitest";
 import { Effect, Redacted, Ref } from "effect";
 import { TestClock } from "effect/testing";
 import type { Account } from "../src/accounts.js";
-import { CACHE_DISABLED, NOT_VERIFIED, type SearchQuery, TransactionCache } from "../src/cache/service.js";
+import { CACHE_DISABLED, NOT_VERIFIED, type SearchQuery, Transactions } from "../src/cache/service.js";
 import { InvalidInput } from "../src/errors.js";
 import {
   account,
@@ -58,13 +58,13 @@ const answer =
   () =>
     Effect.succeed(fixed);
 
-describe("TransactionCache.transactions", () => {
+describe("Transactions.transactions", () => {
   it.effect("auto asks FIO when the range is not cached, writes through, then answers from the cache", () =>
     Effect.gen(function* () {
       yield* setNow();
       const fio = yield* fakeFio(serveFrom(fixture));
       yield* Effect.gen(function* () {
-        const cache = yield* TransactionCache;
+        const cache = yield* Transactions;
         const acct = yield* account();
         const range = { from: "2026-10-01", to: TODAY };
         const first = yield* cache.transactions(acct, range, "auto");
@@ -107,7 +107,7 @@ describe("TransactionCache.transactions", () => {
         Effect.succeed(statement(call.from, call.to, [tx(1, "2026-10-05", -10), tx(2, "2026-10-06", 20, { id: null })]));
       const fio = yield* fakeFio(malformed);
       yield* Effect.gen(function* () {
-        const cache = yield* TransactionCache;
+        const cache = yield* Transactions;
         const acct = yield* account();
         const range = { from: "2026-10-01", to: TODAY };
         assert.strictEqual((yield* cache.transactions(acct, range, "auto")).source, "fio");
@@ -124,7 +124,7 @@ describe("TransactionCache.transactions", () => {
       yield* setNow();
       const fio = yield* fakeFio(serveFrom(fixture));
       yield* Effect.gen(function* () {
-        const cache = yield* TransactionCache;
+        const cache = yield* Transactions;
         const acct = yield* account();
         const unverified = yield* Effect.flip(cache.transactions(acct, COVERED, "cache"));
         assert.instanceOf(unverified, InvalidInput);
@@ -146,7 +146,7 @@ describe("TransactionCache.transactions", () => {
         Effect.map(serveFrom(fixture)(call, n), (s) => ({ ...s, info: { ...s.info, dateStart: "2026-02-01" } })),
       );
       yield* Effect.gen(function* () {
-        const cache = yield* TransactionCache;
+        const cache = yield* Transactions;
         const acct = yield* account();
         const result = yield* cache.transactions(acct, { from: "2026-01-01", to: "2026-12-31" }, "fio");
         assert.isFalse(result.freshness.complete);
@@ -170,7 +170,7 @@ describe("TransactionCache.transactions", () => {
       yield* setNow();
       const fio = yield* fakeFio(serveFrom([tx(1, "2026-10-20", -10), tx(2, "2026-10-21", 20)]));
       yield* Effect.gen(function* () {
-        const cache = yield* TransactionCache;
+        const cache = yield* Transactions;
         const acc = yield* account();
         const range = { from: "2026-10-20", to: TODAY };
         yield* cache.transactions(acc, range, "fio");
@@ -197,7 +197,7 @@ describe("TransactionCache.transactions", () => {
       yield* setNow();
       const fio = yield* fakeFio(answer(statement("2026-10-15", "2026-10-20", [])));
       yield* Effect.gen(function* () {
-        const cache = yield* TransactionCache;
+        const cache = yield* Transactions;
         const acc = yield* account();
         yield* cache.transactions(acc, { from: "2026-10-10", to: TODAY }, "fio");
         assert.deepStrictEqual((yield* verifiedStatus(acc)).coveredRanges, [{ from: "2026-10-15", to: "2026-10-20" }]);
@@ -217,7 +217,7 @@ describe("TransactionCache.transactions", () => {
       const first = yield* fakeFio(serveFrom([tx(1, "2026-10-21", -10)]));
       yield* Effect.gen(function* () {
         const acc = yield* account();
-        yield* (yield* TransactionCache).transactions(acc, range, "fio");
+        yield* (yield* Transactions).transactions(acc, range, "fio");
         assert.strictEqual((yield* verifiedStatus(acc)).bankAccount, "2000000001/2010");
       }).pipe(Effect.provide(cacheLayer(config({ cache: { dbPath: path } }), first.layer)));
 
@@ -228,7 +228,7 @@ describe("TransactionCache.transactions", () => {
       });
       const second = yield* fakeFio(serveFrom([tx(7, TODAY, 70)], "3000000002"));
       yield* Effect.gen(function* () {
-        const cache = yield* TransactionCache;
+        const cache = yield* Transactions;
         const acc = yield* account();
         const unverified = yield* Effect.flip(cache.transactions(acc, range, "cache"));
         assert.instanceOf(unverified, InvalidInput);
@@ -247,7 +247,7 @@ describe("TransactionCache.transactions", () => {
       const anonymous = statement("2026-10-20", TODAY, [tx(1, TODAY, 1)]);
       const fio = yield* fakeFio(answer({ ...anonymous, info: { ...anonymous.info, accountId: null } }));
       yield* Effect.gen(function* () {
-        const cache = yield* TransactionCache;
+        const cache = yield* Transactions;
         const acc = yield* account();
         const result = yield* cache.transactions(acc, { from: "2026-10-20", to: TODAY }, "fio");
         assert.strictEqual(result.transactionCount, 1);
@@ -263,7 +263,7 @@ describe("TransactionCache.transactions", () => {
       const earlier = { from: "2026-10-20", to: "2026-10-20" };
       const fio = yield* fakeFio(serveFrom([tx(1, "2026-10-20", -10)]));
       yield* Effect.gen(function* () {
-        const cache = yield* TransactionCache;
+        const cache = yield* Transactions;
         const acc = yield* account();
         yield* cache.transactions(acc, earlier, "fio");
         const range = { from: "2026-10-20", to: TODAY };
@@ -287,13 +287,13 @@ describe("TransactionCache.transactions", () => {
   );
 });
 
-describe("TransactionCache.record", () => {
+describe("Transactions.record", () => {
   it.effect("stores statement and new-movement results without coverage", () =>
     Effect.gen(function* () {
       yield* setNow();
       const fio = yield* fakeFio(serveFrom([]));
       yield* Effect.gen(function* () {
-        const cache = yield* TransactionCache;
+        const cache = yield* Transactions;
         const acct = yield* account();
         yield* cache.record(acct, statement("2026-01-01", "2026-01-31", [fixture[0]!, fixture[1]!]));
         yield* cache.record(acct, statement("2026-10-01", TODAY, [tx(42, TODAY, 5)]));
@@ -311,14 +311,14 @@ describe("TransactionCache.record", () => {
   );
 });
 
-describe("TransactionCache.search and summarize", () => {
+describe("Transactions.search and summarize", () => {
   it.effect("search filters, pages and orders cached movements", () =>
     Effect.gen(function* () {
       yield* setNow();
       const fio = yield* fakeFio(serveFrom([]));
       yield* Effect.gen(function* () {
         yield* seed;
-        const cache = yield* TransactionCache;
+        const cache = yield* Transactions;
         const acc = yield* account();
         const search = (query: Partial<SearchQuery>) => cache.search(acc, { ...PAGE, ...query });
         assert.deepStrictEqual(ids((yield* search({ direction: "out", minAmount: 100 })).transactions), [7, 1]);
@@ -353,7 +353,7 @@ describe("TransactionCache.search and summarize", () => {
       const fio = yield* fakeFio(serveFrom([]));
       yield* Effect.gen(function* () {
         yield* seed;
-        const cache = yield* TransactionCache;
+        const cache = yield* Transactions;
         const result = yield* cache.search(yield* account(), { ...PAGE, dateFrom: "2025-12-01", dateTo: "2026-12-31" });
         assert.deepStrictEqual(result.freshness, {
           lastSyncAt: null,
@@ -374,7 +374,7 @@ describe("TransactionCache.search and summarize", () => {
       const fio = yield* fakeFio(serveFrom([]));
       yield* Effect.gen(function* () {
         yield* seed;
-        const cache = yield* TransactionCache;
+        const cache = yield* Transactions;
         const acc = yield* account();
         const page = { limit: 100, offset: 0 };
         const byMonth = yield* cache.summarize(acc, { groupBy: "month", ...page });
@@ -407,13 +407,13 @@ describe("TransactionCache.search and summarize", () => {
   );
 });
 
-describe("TransactionCache.status and sync", () => {
+describe("Transactions.status and sync", () => {
   it.effect("a backfill verifies the token and status reports what it stored", () =>
     Effect.gen(function* () {
       yield* setNow();
       const fio = yield* fakeFio(serveFrom(fixture));
       yield* Effect.gen(function* () {
-        const cache = yield* TransactionCache;
+        const cache = yield* Transactions;
         const acc = yield* account();
         const [before] = yield* cache.status([acc]);
         assert.isFalse(before?.verified);
@@ -447,7 +447,7 @@ describe("TransactionCache.status and sync", () => {
       yield* setNow();
       const fio = yield* fakeFio(serveFrom(fixture));
       yield* Effect.gen(function* () {
-        const cache = yield* TransactionCache;
+        const cache = yield* Transactions;
         const acc: Account = yield* account();
         assert.deepStrictEqual(yield* cache.sync(acc, { kind: "resume" }, 25_000), { started: false });
         assert.deepStrictEqual(yield* Ref.get(fio.calls), []);
@@ -467,13 +467,13 @@ describe("TransactionCache.status and sync", () => {
   );
 });
 
-describe("TransactionCache.Disabled", () => {
+describe("Transactions.Disabled", () => {
   it.effect("reads date ranges from FIO every time, stores nothing, and refuses cache-only calls", () =>
     Effect.gen(function* () {
       yield* setNow();
       const fio = yield* fakeFio(serveFrom(fixture));
       yield* Effect.gen(function* () {
-        const cache = yield* TransactionCache;
+        const cache = yield* Transactions;
         const acct = yield* account();
         const range = { from: "2026-01-01", to: TODAY };
         const first = yield* cache.transactions(acct, range, "auto");

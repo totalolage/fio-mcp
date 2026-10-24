@@ -44,7 +44,7 @@ const seed = Effect.gen(function* () {
 
 const ids = (rows: unknown) => (rows as ReadonlyArray<{ id: number }>).map((r) => r.id);
 
-// Query semantics are tested on TransactionCache (test/transaction-cache.test.ts);
+// Query semantics are tested on Transactions (test/transactions.test.ts);
 // these cases cover argument defaults, validation and the result envelope.
 describe("cache query tools", () => {
   it.effect("search_transactions pages with defaults and reports the cache as its source", () =>

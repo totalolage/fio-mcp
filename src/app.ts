@@ -3,7 +3,7 @@ import { Effect, Layer } from "effect";
 import { McpProtocol } from "effect/ai";
 import { Accounts } from "./accounts.js";
 import { backupDatabase, Database } from "./cache/db.js";
-import { CacheSyncLive, TransactionCache } from "./cache/service.js";
+import { CacheSyncLive, Transactions } from "./cache/service.js";
 import { AppConfig, type HttpAuthConfig } from "./config.js";
 import { FioApi } from "./fio-api.js";
 import { CACHE_INSTRUCTIONS, CacheToolsLive } from "./mcp/cache-tools.js";
@@ -49,7 +49,7 @@ export const ServicesLive = Layer.mergeAll(
   Accounts.Live,
   RateLimiter.Live,
   FioApi.Live,
-  TransactionCache.Live,
+  Transactions.Live,
 );
 
 /** Tool registrations (`McpServer.toolkit(...)` layers). */

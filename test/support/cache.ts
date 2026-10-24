@@ -3,7 +3,7 @@ import { Clock, Effect, Layer, Redacted } from "effect";
 import { TestClock } from "effect/testing";
 import { type Account, Accounts } from "../../src/accounts.js";
 import type { DayRange } from "../../src/cache/dates.js";
-import { TransactionCache } from "../../src/cache/service.js";
+import { Transactions } from "../../src/cache/service.js";
 import { makeCacheStore, type PendingRange, type SyncMode } from "../../src/cache/store.js";
 import { type AppConfigShape, type CacheConfig, DEFAULT_BACKFILL_FROM, DEFAULT_CACHE_MAX_AGE_MINUTES, DEFAULT_OVERLAP_DAYS, MAX_RESPONSE_BYTES } from "../../src/config.js";
 import type { FioApi } from "../../src/fio-api.js";
@@ -122,18 +122,18 @@ const baseLayer = (cfg: AppConfigShape, fio: Layer.Layer<FioApi>) =>
   Layer.mergeAll(Accounts.Default, Redactor.Default, fio).pipe(Layer.provideMerge(seededConfig(cfg)));
 
 export const cacheLayer = (cfg: AppConfigShape, fio: Layer.Layer<FioApi>) =>
-  TransactionCache.Default.pipe(
+  Transactions.Default.pipe(
     Layer.provideMerge(testDatabase(cfg.cache.dbPath)),
     Layer.provideMerge(baseLayer(cfg, fio)),
   );
 
 /** The same services with FIO_CACHE_ENABLED=false: no database at all. */
 export const disabledCacheLayer = (cfg: AppConfigShape, fio: Layer.Layer<FioApi>) =>
-  TransactionCache.Disabled.pipe(Layer.provideMerge(baseLayer({ ...cfg, cache: { ...cfg.cache, enabled: false } }, fio)));
+  Transactions.Disabled.pipe(Layer.provideMerge(baseLayer({ ...cfg, cache: { ...cfg.cache, enabled: false } }, fio)));
 
 /** The account's cache status; dies unless the token is verified. */
 export const verifiedStatus = Effect.fnUntraced(function* (acc: Account) {
-  const [status] = yield* (yield* TransactionCache).status([acc]);
+  const [status] = yield* (yield* Transactions).status([acc]);
   if (status === undefined || !status.verified) return yield* Effect.die("cache not verified");
   return status;
 });
@@ -141,7 +141,7 @@ export const verifiedStatus = Effect.fnUntraced(function* (acc: Account) {
 /*
  * Setup through the cache's internal store, on the test's SqlClient, for
  * states the scripted FIO cannot produce. Assertions go through
- * TransactionCache.
+ * Transactions.
  */
 
 /** Stores `statement` as FIO's answer for `range`, as a write-through does. */

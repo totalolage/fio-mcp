@@ -8,7 +8,7 @@ import { TestClock } from "effect/testing";
 import { tokenFingerprint } from "../src/accounts.js";
 import { addDays, type DayRange } from "../src/cache/dates.js";
 import { SERVER_MIGRATIONS } from "../src/cache/db.js";
-import { CacheSyncLive, historyUnlockMessage, type SyncRequest, TransactionCache } from "../src/cache/service.js";
+import { CacheSyncLive, historyUnlockMessage, type SyncRequest, Transactions } from "../src/cache/service.js";
 import {
   FioServerError,
   HISTORY_UNLOCK_STEPS,
@@ -50,7 +50,7 @@ const TOKEN_FP = tokenFingerprint(Redacted.make(TOKEN_A));
 
 /** Starts (or joins) a job and waits for it to finish. */
 const runToEnd = Effect.fnUntraced(function* (request: SyncRequest) {
-  const cache = yield* TransactionCache;
+  const cache = yield* Transactions;
   const outcome = yield* Effect.orDie(cache.sync(yield* account(), request, 3_600_000));
   if (!outcome.started) return yield* Effect.die("no job started");
   return outcome.job;
@@ -59,7 +59,7 @@ const runToEnd = Effect.fnUntraced(function* (request: SyncRequest) {
 /** The background layer's job: joins it while it runs, then reads the token's latest job. */
 const backgroundJob = Effect.gen(function* () {
   yield* settle;
-  const cache = yield* TransactionCache;
+  const cache = yield* Transactions;
   const acc = yield* account();
   yield* Effect.orDie(cache.sync(acc, { kind: "resume" }, 3_600_000));
   const [status] = yield* Effect.orDie(cache.status([acc]));
@@ -70,13 +70,13 @@ const backgroundJob = Effect.gen(function* () {
 /** Cached movements in `range`, from the cache only. */
 const cachedIn = (range: DayRange) =>
   Effect.gen(function* () {
-    const cache = yield* TransactionCache;
+    const cache = yield* Transactions;
     return (yield* Effect.orDie(cache.transactions(yield* account(), range, "cache"))).transactions;
   });
 
 /** The token's persisted sync state as get_cache_status reports it. */
 const syncStatus = Effect.gen(function* () {
-  const [status] = yield* Effect.orDie((yield* TransactionCache).status([yield* account()]));
+  const [status] = yield* Effect.orDie((yield* Transactions).status([yield* account()]));
   if (status === undefined) return yield* Effect.die("no status");
   return status.sync;
 });
@@ -317,7 +317,7 @@ describe("cache sync", () => {
         ],
       });
       yield* Effect.gen(function* () {
-        const cache = yield* TransactionCache;
+        const cache = yield* Transactions;
         const main = yield* account("main");
         const alias = yield* account("alias");
         const start = (acc: typeof main, request: SyncRequest, waitMs?: number) =>

@@ -1,6 +1,6 @@
 import { type Deferred, Layer, Redacted } from "effect";
 import { Accounts } from "../../src/accounts.js";
-import { TransactionCache } from "../../src/cache/service.js";
+import { Transactions } from "../../src/cache/service.js";
 import { type AppConfigShape, MAX_RESPONSE_BYTES, type TransportConfig } from "../../src/config.js";
 import { RateLimiter } from "../../src/rate-limiter.js";
 import { Redactor } from "../../src/redaction.js";
@@ -46,7 +46,7 @@ export function testConfig(transport: TransportConfig = { kind: "stdio" }): AppC
 
 /** The app's services with a fake FioApi; one instance shared by every session. */
 export const testServices = (config: AppConfigShape, release: Deferred.Deferred<void>) =>
-  TransactionCache.Disabled.pipe(
+  Transactions.Disabled.pipe(
     Layer.provideMerge(slotHoldingFio(release)),
     Layer.provideMerge(Layer.mergeAll(Redactor.Default, Accounts.Default, RateLimiter.Default)),
     Layer.provideMerge(seededConfig(config)),

@@ -1,7 +1,7 @@
 import { Effect, Layer, Schema } from "effect";
 import { McpServer, Tool, Toolkit } from "effect/ai";
 import { type Account, Accounts } from "../accounts.js";
-import { TransactionCache } from "../cache/service.js";
+import { Transactions } from "../cache/service.js";
 import { AppConfig } from "../config.js";
 import { InvalidInput, PAYMENT_TOKEN_HINT, PermissionDenied, UploadOutcomeUnknown } from "../errors.js";
 import { FioApi, MERCHANT_FORMATS, MOVEMENT_FORMATS, STATEMENT_FORMATS } from "../fio-api.js";
@@ -180,7 +180,7 @@ export const makeFioHandlers = Effect.fn("FioTools.handlers")(function* (toolkit
   const limiter = yield* RateLimiter;
   const redactor = yield* Redactor;
   const config = yield* AppConfig;
-  const cache = yield* TransactionCache;
+  const cache = yield* Transactions;
   const out = <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.map(effect, redactor.redactDeep);
 
   const accountStatus = Effect.fnUntraced(function* (acc: Account) {

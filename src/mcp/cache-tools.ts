@@ -6,8 +6,8 @@ import {
   type GroupBy,
   historyUnlockMessage,
   type SyncRequest,
-  TransactionCache,
   type TransactionFilters,
+  Transactions,
 } from "../cache/service.js";
 import { AppConfig } from "../config.js";
 import { InvalidInput } from "../errors.js";
@@ -143,7 +143,7 @@ const toFilters = (args: FilterArgs): TransactionFilters => ({
 
 export const makeCacheHandlers = Effect.fn("CacheTools.handlers")(function* (toolkit: CacheToolkit) {
   const accounts = yield* Accounts;
-  const cache = yield* TransactionCache;
+  const cache = yield* Transactions;
   const redactor = yield* Redactor;
   const config = yield* AppConfig;
   const unlockMessage = historyUnlockMessage(config.rateLimitIntervalMs);

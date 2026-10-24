@@ -509,7 +509,7 @@ src/
   payments.ts           payment order Schemas and the import XML builder
   fio-countries.ts      country codes from the XSD's country_type enumeration
   import-response.ts    import response parser
-  cache/                SQLite database, migrations, store, sync engine, TransactionCache service
+  cache/                SQLite database, migrations, store, sync engine, Transactions service
   mcp/                  tool definitions and handlers (FIO tools, cache tools)
   transport/            stdio and HTTP transports, auth seam, frame redaction, grant-filtered tools/list
 openapi/fio-api.yaml    FIO REST API spec
