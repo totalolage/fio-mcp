@@ -648,7 +648,7 @@ describe("admin password", () => {
         return yield* sql<{ value: string }>`SELECT value FROM server_settings WHERE key = 'admin_password_hash'`;
       }),
     );
-    expect(stored[0]?.value).toMatch(/^\$scrypt\$ln=17,r=8,p=1\$/);
+    expect(stored[0]?.value).toMatch(/^\$scrypt\$ln=14,r=8,p=1\$/);
     expect(JSON.stringify(stored)).not.toContain(NEW_PASSWORD);
 
     // Recovery: `fio-mcp reset-admin-password` drops it; the hash file applies again and sessions end.

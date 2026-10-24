@@ -4,8 +4,9 @@ import { type Cause, Clock, Deferred, Effect, Fiber, Layer, Option, Queue, Redac
 import { HttpServerRequest } from "effect/http";
 import { SqlClient } from "effect/sql";
 import { TestClock } from "effect/testing";
+import { makeSettingsStore, SETTING } from "../src/account-store.js";
 import { Accounts, makeAccounts } from "../src/accounts.js";
-import { AdminPassword } from "../src/admin/password.js";
+import { AdminPassword, makeAdminPassword } from "../src/admin/password.js";
 import { databaseLayer, SERVER_MIGRATIONS } from "../src/cache/db.js";
 import { CommandFailed, hashPasswordCommand, listClientsCommand, revokeAllTokensCommand, revokeClientCommand } from "../src/oauth/cli.js";
 import {
@@ -120,6 +121,24 @@ describe("secrets", () => {
     assert.isFalse(pkceMatches(`${verifier}x`, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"));
     assert.isFalse(pkceMatches("short", "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"));
   });
+
+  // The only test with the production parameters (128 MiB, slow on a loaded machine); the rest use FAST.
+  it.effect(
+    "stores a password changed at /admin with the production scrypt parameters",
+    () =>
+      Effect.gen(function* () {
+        const bootstrap = parsePasswordHash(yield* hashPassword(Redacted.make("the bootstrap password"), FAST));
+        if (bootstrap instanceof PasswordHashError) return assert.fail("hash did not parse");
+        const password = yield* makeAdminPassword(Redacted.make(bootstrap));
+        const next = Redacted.make("the production password");
+        const changed = yield* password.change("192.0.2.1", Redacted.make("the bootstrap password"), next);
+        assert.strictEqual(changed._tag, "Accepted");
+        const stored = yield* (yield* makeSettingsStore()).get(SETTING.adminPasswordHash);
+        assert.match(Option.getOrElse(stored, () => ""), /^\$scrypt\$ln=17,r=8,p=1\$/);
+        assert.strictEqual((yield* password.signIn("192.0.2.1", next))._tag, "Accepted");
+      }).pipe(Effect.provide(databaseLayer(":memory:", SERVER_MIGRATIONS).pipe(Layer.provide(NodeFileSystem.layer)))),
+    60_000,
+  );
 
   it.effect("hashes and verifies the admin password with scrypt", () =>
     Effect.gen(function* () {

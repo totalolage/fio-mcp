@@ -3,7 +3,15 @@ import { Context, Effect, Layer, Option, Redacted, Schema } from "effect";
 import type { SqlClient } from "effect/sql";
 import { makeSettingsStore, SETTING } from "../account-store.js";
 import { MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH } from "../oauth/cli.js";
-import { formatPasswordHash, hashPassword, type PasswordHash, PasswordHashError, parsePasswordHash } from "../oauth/crypto.js";
+import {
+  DEFAULT_SCRYPT,
+  formatPasswordHash,
+  hashPassword,
+  type PasswordHash,
+  PasswordHashError,
+  parsePasswordHash,
+  type ScryptParams,
+} from "../oauth/crypto.js";
 import { DEFAULT_THROTTLE, type LoginResult, makeLoginGuard, PasswordUnavailable, type ThrottlePolicy } from "../oauth/login.js";
 
 /**
@@ -67,9 +75,11 @@ export const checkNewPassword = (next: string, confirm: string): InvalidNewPassw
 const stampOfLine = (line: string) => createHash("sha256").update(line).digest("hex").slice(0, 32);
 const stampOf = (hash: PasswordHash) => stampOfLine(formatPasswordHash(hash));
 
+/** `scrypt` hashes a changed password; tests pass cheaper parameters. */
 export const makeAdminPassword = Effect.fn("AdminPassword.make")(function* (
   bootstrap: Redacted.Redacted<PasswordHash>,
   throttle: ThrottlePolicy = DEFAULT_THROTTLE,
+  scrypt: ScryptParams = DEFAULT_SCRYPT,
 ) {
   const settings = yield* makeSettingsStore();
 
@@ -95,7 +105,7 @@ export const makeAdminPassword = Effect.fn("AdminPassword.make")(function* (
 
   /** Hashes and stores `next`; returns its stamp. */
   const store = (next: Redacted.Redacted<string>) =>
-    hashPassword(next).pipe(
+    hashPassword(next, scrypt).pipe(
       Effect.tap((line) => settings.put(SETTING.adminPasswordHash, line)),
       Effect.map(stampOfLine),
       Effect.tapError((error) => Effect.logError(`admin password: the change failed: ${error.message}`)),
@@ -114,6 +124,7 @@ export class AdminPassword extends Context.Service<AdminPassword, AdminPasswordS
   static readonly layer = (
     bootstrap: Redacted.Redacted<PasswordHash>,
     throttle?: ThrottlePolicy,
+    scrypt?: ScryptParams,
   ): Layer.Layer<AdminPassword, never, SqlClient.SqlClient> =>
-    Layer.effect(AdminPassword, Effect.map(makeAdminPassword(bootstrap, throttle), AdminPassword.of));
+    Layer.effect(AdminPassword, Effect.map(makeAdminPassword(bootstrap, throttle, scrypt), AdminPassword.of));
 }

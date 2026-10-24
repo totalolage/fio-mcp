@@ -40,12 +40,15 @@ export const PASSWORD = "correct horse battery staple";
 /** The test data key (FIO_MCP_DATA_KEY_FILE). */
 export const DATA_KEY = Redacted.make(new Uint8Array(32).fill(7));
 
+/** Cheap scrypt parameters (ln=14, 16 MiB) for every hash the tests make; one test in oauth-units uses the real ones. */
+export const FAST_SCRYPT = { ln: 14, r: 8, p: 1 } as const;
+
 let cachedHash: PasswordHash | undefined;
 
-/** A fast (ln=14) hash of PASSWORD, made once per test file. */
+/** A fast hash of PASSWORD, made once per test file. */
 export async function passwordHash(): Promise<PasswordHash> {
   if (cachedHash === undefined) {
-    const line = await Effect.runPromise(hashPassword(Redacted.make(PASSWORD), { ln: 14, r: 8, p: 1 }));
+    const line = await Effect.runPromise(hashPassword(Redacted.make(PASSWORD), FAST_SCRYPT));
     const parsed = parsePasswordHash(line);
     if (!("hash" in parsed)) throw new Error("hash did not parse");
     cachedHash = parsed;
@@ -126,7 +129,7 @@ export async function startOAuth(
   const oauth = Layer.mergeAll(
     OAuthLive({ publicUrl: PUBLIC_URL, trustedProxies }),
     AdminLive({ publicUrl: PUBLIC_URL, dataKey: DATA_KEY, trustedProxies }),
-  ).pipe(Layer.provide(AdminPassword.layer(Redacted.make(hash), options.throttle)));
+  ).pipe(Layer.provide(AdminPassword.layer(Redacted.make(hash), options.throttle, FAST_SCRYPT)));
   let accounts: AccountsShape | undefined;
   const captureAccounts = Layer.effectDiscard(
     Effect.map(Effect.service(Accounts), (service) => {
