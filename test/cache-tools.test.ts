@@ -1,7 +1,7 @@
 import { assert, describe, it } from "@effect/vitest";
 import { Effect, Layer, Redacted, Ref } from "effect";
 import { TestClock } from "effect/testing";
-import { Accounts, makeAccounts } from "../src/accounts.js";
+import { Accounts, accountsFromConfig, makeAccounts } from "../src/accounts.js";
 import { CACHE_DISABLED, NOT_VERIFIED } from "../src/cache/service.js";
 import { AppConfig } from "../src/config.js";
 import { type CacheError, InvalidInput, type PermissionDenied } from "../src/errors.js";
@@ -380,7 +380,7 @@ describe("cache disabled", () => {
       const fio = yield* fakeFio(serveFrom(fixture));
       const cfg = config();
       const layer = Layer.mergeAll(
-        Layer.effect(Accounts, Effect.map(makeAccounts(cfg.accounts), Accounts.of)),
+        Layer.effect(Accounts, Effect.map(makeAccounts(accountsFromConfig(cfg.accounts)), Accounts.of)),
         Redactor.layerFrom(cfg.secrets.map(Redacted.value)),
         Layer.succeed(FioApi, fio.api),
       ).pipe(Layer.provideMerge(AppConfig.layerFrom(cfg)));

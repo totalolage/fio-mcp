@@ -1,14 +1,19 @@
-import { NodeFileSystem, NodeStdio } from "@effect/platform-node";
+import { NodeFileSystem, NodeStdio, NodeTerminal } from "@effect/platform-node";
 import { Effect, Layer } from "effect";
 import { McpProtocol } from "effect/ai";
+import { AccountChangesLive } from "./account-runtime.js";
+import { StoredAccountsLive } from "./account-store.js";
 import { Accounts } from "./accounts.js";
+import { AdminPassword } from "./admin/password.js";
+import { AdminLive } from "./admin/server.js";
 import { backupDatabase, DatabaseLive } from "./cache/db.js";
 import { CacheLive, CacheSyncLive } from "./cache/service.js";
 import { AppConfig, type HttpAuthConfig } from "./config.js";
 import { FioApiLive } from "./fio-api-live.js";
 import { CACHE_INSTRUCTIONS, CacheToolsLive } from "./mcp/cache-tools.js";
 import { FioToolsLive, SERVER_INSTRUCTIONS } from "./mcp/fio-tools.js";
-import { listClientsCommand, revokeAllTokensCommand, revokeClientCommand } from "./oauth/cli.js";
+import { ToolListChangesLive } from "./mcp/registration.js";
+import { listClientsCommand, resetAdminPasswordCommand, revokeAllTokensCommand, revokeClientCommand } from "./oauth/cli.js";
 import { OAuthLive } from "./oauth/server.js";
 import { RateLimiter } from "./rate-limiter.js";
 import { LoggerLive, Redactor } from "./redaction.js";
@@ -33,8 +38,22 @@ export const SERVER_INFO: ServerInfo = {
   protocols: MCP_PROTOCOLS,
 };
 
+/**
+ * The accounts: from the database (encrypted, managed at /admin) in HTTP
+ * mode with OAuth, otherwise from FIO_TOKEN / FIO_ACCOUNTS.
+ */
+export const AccountsLive = Layer.unwrap(
+  Effect.gen(function* () {
+    const { transport } = yield* AppConfig;
+    return transport.kind === "http" && transport.auth.kind === "oauth"
+      ? StoredAccountsLive(transport.auth.dataKey).pipe(Layer.provide(DatabaseLive))
+      : Accounts.layer;
+  }),
+);
+
 /** Configuration, redaction and logging. Everything else builds on this. */
-export const BaseLive = Layer.mergeAll(Redactor.layer, Accounts.layer, RateLimiter.layer).pipe(
+export const BaseLive = Layer.mergeAll(AccountsLive, RateLimiter.layer).pipe(
+  Layer.provideMerge(Redactor.layer),
   Layer.provideMerge(AppConfig.layer),
   Layer.provide(NodeFileSystem.layer),
 );
@@ -51,15 +70,16 @@ export const ServicesLive = CacheLive.pipe(
   Layer.provide(NodeFileSystem.layer),
 );
 
-/** Tool registrations (`McpServer.toolkit(...)` layers). */
-export const ToolsLive = Layer.mergeAll(FioToolsLive, CacheToolsLive);
+/** Tool registrations, re-registered (with `tools/list_changed`) when the accounts change. */
+export const ToolsLive = Layer.mergeAll(FioToolsLive, CacheToolsLive, ToolListChangesLive);
 
 /**
- * Long-running background work: startup and periodic cache sync. Layers here
- * fork instead of running inline, so the transport answers `initialize`
- * without waiting for FIO.
+ * Long-running background work: startup and periodic cache sync, and
+ * following account changes made at /admin. Layers here fork instead of
+ * running inline, so the transport answers `initialize` without waiting
+ * for FIO.
  */
-export const BackgroundLive = CacheSyncLive;
+export const BackgroundLive = Layer.mergeAll(CacheSyncLive, AccountChangesLive);
 
 /** Tools and background work on a shared services graph, behind a transport. */
 const withServices = <A, E, R>(transport: Layer.Layer<A, E, R>) =>
@@ -77,10 +97,17 @@ export const StdioAppLive = withServices(
 const UNAUTHENTICATED_WARNING =
   "SECURITY WARNING: FIO_MCP_ALLOW_UNAUTHENTICATED=true. /mcp accepts every request without authentication and gives it full access to every account, including payment orders. Anyone who can reach this port can use your bank tools. Set FIO_MCP_PUBLIC_URL and FIO_MCP_ADMIN_PASSWORD_HASH_FILE to require OAuth.";
 
-/** /mcp authentication: the embedded OAuth server, or (escape hatch) none. */
+/**
+ * /mcp authentication: the embedded OAuth server with the admin UI, or
+ * (escape hatch) none, without an admin UI.
+ */
 export const httpAuthLive = (auth: HttpAuthConfig, trustedProxies: HttpTransportConfig["trustedProxies"]) =>
   auth.kind === "oauth"
-    ? OAuthLive({ publicUrl: auth.publicUrl, passwordHash: auth.passwordHash, trustedProxies }).pipe(
+    ? Layer.mergeAll(
+        OAuthLive({ publicUrl: auth.publicUrl, trustedProxies }),
+        AdminLive({ publicUrl: auth.publicUrl, dataKey: auth.dataKey, trustedProxies }),
+      ).pipe(
+        Layer.provide(AdminPassword.layer(auth.passwordHash)),
         Layer.provide(DatabaseLive),
         Layer.provide(NodeFileSystem.layer),
       )
@@ -122,6 +149,9 @@ const withDatabase = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
 export const listClients = withDatabase(listClientsCommand());
 export const revokeClient = (clientId: string) => withDatabase(revokeClientCommand(clientId));
 export const revokeAllTokens = withDatabase(revokeAllTokensCommand());
+/** `fio-mcp reset-admin-password [--set]`: back to the hash file, or a new password from the terminal or stdin. */
+export const resetAdminPassword = (set: boolean) =>
+  withDatabase(resetAdminPasswordCommand(set)).pipe(Effect.provide(NodeTerminal.layer));
 
 /** The redacting stderr logger, for everything the app layers fork. */
 export const AppLoggerLive = LoggerLive.pipe(

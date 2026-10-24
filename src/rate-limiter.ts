@@ -1,4 +1,4 @@
-import { Clock, Context, DateTime, Deferred, Effect, Layer, Predicate, Queue, Ref, Result, SynchronizedRef } from "effect";
+import { Clock, Context, DateTime, Deferred, Effect, Fiber, Layer, Predicate, Queue, Ref, Result, SynchronizedRef } from "effect";
 import { AppConfig } from "./config.js";
 import { RateLimited, type TokenBusy } from "./errors.js";
 
@@ -87,6 +87,7 @@ interface TokenLimiter {
   readonly state: Ref.Ref<TokenState>;
   /** Wakes the dispatcher after arrivals, cancellations, and 409 blocks. */
   readonly wake: Queue.Queue<void>;
+  readonly dispatcher: Fiber.Fiber<never>;
 }
 
 const CONFLICT_REASON = "FIO returned HTTP 409 (the token was used elsewhere within the last 30 s).";
@@ -104,6 +105,12 @@ export interface RateLimiterShape {
     request: Effect.Effect<A, E | TokenBusy, R>,
   ) => Effect.Effect<A, Exclude<E, TokenBusy> | RateLimited, R>;
   readonly state: (key: string) => Effect.Effect<RateLimitState>;
+  /**
+   * Drops the state of a token no account uses any more (removed or
+   * replaced at /admin). A token with calls in flight or waiting keeps it,
+   * so its spacing still holds. Using the key again starts afresh.
+   */
+  readonly forget: (key: string) => Effect.Effect<void>;
 }
 
 const initialState: TokenState = {
@@ -212,7 +219,7 @@ export const makeRateLimiter = Effect.fn("RateLimiter.make")(function* (options:
     };
 
   /** Hands out slots; fails interactive waiters a 409 pushed past their budget. */
-  const dispatch = (limiter: TokenLimiter): Effect.Effect<never> =>
+  const dispatch = (limiter: Omit<TokenLimiter, "dispatcher">): Effect.Effect<never> =>
     Effect.gen(function* () {
       const now = yield* Clock.currentTimeMillis;
       const { rejected, grant, waitMs } = yield* Ref.modify(limiter.state, step(now));
@@ -232,11 +239,9 @@ export const makeRateLimiter = Effect.fn("RateLimiter.make")(function* (options:
       const existing = map.get(key);
       if (existing !== undefined) return Effect.succeed([existing, map] as const);
       return Effect.gen(function* () {
-        const limiter: TokenLimiter = {
-          state: yield* Ref.make(initialState),
-          wake: yield* Queue.sliding<void>(1),
-        };
-        yield* Effect.forkIn(dispatch(limiter), scope);
+        const state = yield* Ref.make(initialState);
+        const wake = yield* Queue.sliding<void>(1);
+        const limiter: TokenLimiter = { state, wake, dispatcher: yield* Effect.forkIn(dispatch({ state, wake }), scope) };
         return [limiter, new Map(map).set(key, limiter)] as const;
       });
     });
@@ -319,7 +324,23 @@ export const makeRateLimiter = Effect.fn("RateLimiter.make")(function* (options:
       } satisfies RateLimitState;
   });
 
-  return { run, state } satisfies RateLimiterShape;
+  const forget = (key: string) =>
+    SynchronizedRef.updateEffect(limiters, (map) => {
+      const limiter = map.get(key);
+      if (limiter === undefined) return Effect.succeed(map);
+      return Effect.gen(function* () {
+        const s = yield* Ref.get(limiter.state);
+        const now = yield* Clock.currentTimeMillis;
+        // Busy: someone is waiting, or a request may still be running in its slot.
+        if (s.interactive.length > 0 || s.background.length > 0 || readyAt(s) > now) return map;
+        yield* Fiber.interrupt(limiter.dispatcher);
+        const next = new Map(map);
+        next.delete(key);
+        return next;
+      });
+    });
+
+  return { run, state, forget } satisfies RateLimiterShape;
 });
 
 export class RateLimiter extends Context.Service<RateLimiter, RateLimiterShape>()("fio-mcp/RateLimiter") {

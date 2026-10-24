@@ -1,4 +1,4 @@
-import { DateTime, Effect, Layer, Option, Schema } from "effect";
+import { DateTime, Effect, Option, Schema } from "effect";
 import { McpServer, Tool, Toolkit } from "effect/ai";
 import { type Account, Accounts } from "../accounts.js";
 import { type DayRange, minDate, pragueToday } from "../cache/dates.js";
@@ -14,6 +14,7 @@ import { Redactor } from "../redaction.js";
 import { parseLastStatement, type StatementInfo } from "../statement.js";
 import { annotateTool, DateParam, JsonObject, ToolFailure, withAccount } from "./common.js";
 import { PAYMENTS, permittedAccount, READ, requireScopes, visibleAccounts } from "./permissions.js";
+import { toolsForAccounts } from "./registration.js";
 
 export const SERVER_INSTRUCTIONS =
   "Tools for FIO Bank accounts (Czech Republic). Tools are listed regardless of what the configured FIO API tokens may do; if a token lacks the permission, the tool answers \"You don't have permissions to do that.\" Over HTTP, the list follows this client's authorization: tools and accounts it was not granted are left out. FIO allows one request per token every 30 seconds, so batch questions into as few calls as possible. Call get_server_status to see accounts and rate-limit state.";
@@ -187,6 +188,13 @@ export const makeFioHandlers = Effect.fn("FioTools.handlers")(function* (toolkit
   const cache = cacheService?.enabled ? cacheService : undefined;
   const out = <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.map(effect, redactor.redactDeep);
 
+  /**
+   * Cache writes only for a token still configured: the account may have
+   * been removed (and its cache purged) at /admin during the FIO call.
+   */
+  const storable = (acc: Account) =>
+    Effect.map(accounts.list, (list) => cache !== undefined && list.some((other) => other.tokenFingerprint === acc.tokenFingerprint));
+
   /** Whether auto may answer from the cache; cache trouble means "ask FIO". */
   const cacheCanServe = Effect.fnUntraced(function* (enabled: EnabledCache, acc: Account, range: DayRange) {
     const accountKey = yield* Effect.option(enabled.boundAccount(acc));
@@ -247,7 +255,7 @@ export const makeFioHandlers = Effect.fn("FioTools.handlers")(function* (toolkit
             if (Option.isSome(cached)) return { account: acc.name, source: "cache", ...cached.value };
           }
           const statement = yield* fio.periods(acc, dateFrom, dateTo);
-          if (cache !== undefined) yield* cache.writeThrough(acc, statement, range);
+          if (cache !== undefined && (yield* storable(acc))) yield* cache.writeThrough(acc, statement, range);
           return { account: acc.name, source: "fio", ...statement, freshness: yield* liveFreshness(range, statement.info) };
         }),
       ),
@@ -257,7 +265,7 @@ export const makeFioHandlers = Effect.fn("FioTools.handlers")(function* (toolkit
         Effect.gen(function* () {
           const acc = yield* permittedAccount(accounts, account);
           const statement = yield* fio.statement(acc, year, number);
-          if (cache !== undefined) yield* cache.record(acc, statement);
+          if (cache !== undefined && (yield* storable(acc))) yield* cache.record(acc, statement);
           return { account: acc.name, ...statement };
         }),
       ),
@@ -267,7 +275,7 @@ export const makeFioHandlers = Effect.fn("FioTools.handlers")(function* (toolkit
         Effect.gen(function* () {
           const acc = yield* permittedAccount(accounts, account);
           const statement = yield* fio.last(acc);
-          if (cache !== undefined) yield* cache.record(acc, statement);
+          if (cache !== undefined && (yield* storable(acc))) yield* cache.record(acc, statement);
           return { account: acc.name, markerAdvanced: statement.transactionCount > 0, ...statement };
         }),
       ),
@@ -383,7 +391,7 @@ export const makeFioHandlers = Effect.fn("FioTools.handlers")(function* (toolkit
       out(
         Effect.gen(function* () {
           yield* requireScopes(READ);
-          const listed = yield* Effect.forEach(yield* visibleAccounts(accounts.list), accountStatus);
+          const listed = yield* Effect.forEach(yield* visibleAccounts(yield* accounts.list), accountStatus);
           return {
             accounts: listed,
             rateLimit: {
@@ -396,11 +404,8 @@ export const makeFioHandlers = Effect.fn("FioTools.handlers")(function* (toolkit
   });
 });
 
-/** Registers the FIO toolkit with the MCP server. */
-export const FioToolsLive = Layer.unwrap(
-  Effect.gen(function* () {
-    const config = yield* AppConfig;
-    const toolkit = makeFioToolkit(config.accounts.map((a) => a.name));
-    return McpServer.toolkit(toolkit).pipe(Layer.provide(toolkit.toLayer(makeFioHandlers(toolkit))));
-  }),
-);
+/** Registers the FIO toolkit with the MCP server, again whenever the account names change. */
+export const FioToolsLive = toolsForAccounts((names) => {
+  const toolkit = makeFioToolkit(names);
+  return McpServer.registerToolkit(toolkit).pipe(Effect.provide(toolkit.toLayer(makeFioHandlers(toolkit))));
+});

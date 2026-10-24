@@ -64,10 +64,14 @@ export function testConfig(transport: TransportConfig = { kind: "stdio" }): AppC
   };
 }
 
+/** What a FioApi fake answers for `lastStatement` (the token test at /admin). */
+export const LAST_STATEMENT = '{"year":2026,"id":7}';
+
 /**
  * A FioApi whose `periods` goes through the real RateLimiter and holds its
- * slot until `release` completes. Every other call dies: tests must not
- * reach them.
+ * slot until `release` completes, and whose `lastStatement` answers
+ * LAST_STATEMENT through the rate limiter. Every other call dies: tests
+ * must not reach them (in particular nothing that moves the `last` marker).
  */
 export const fakeFioApi = (release: Deferred.Deferred<void>) =>
   Layer.effect(
@@ -84,16 +88,25 @@ export const fakeFioApi = (release: Deferred.Deferred<void>) =>
         last: () => unused,
         setLastId: () => unused,
         setLastDate: () => unused,
-        lastStatement: () => unused,
+        lastStatement: (account) => limiter.run(account.tokenFingerprint, "interactive", Effect.succeed(LAST_STATEMENT)),
         merchantRaw: () => unused,
         importXml: () => unused,
       });
     }),
   );
 
-/** The app's services with a fake FioApi; one instance shared by every session. */
-export const testServices = (config: AppConfigShape, release: Deferred.Deferred<void>) =>
+/**
+ * The app's services with a fake FioApi; one instance shared by every
+ * session. `accounts` defaults to the configured ones (FIO_TOKEN /
+ * FIO_ACCOUNTS); the OAuth harness passes the database-backed layer.
+ */
+export const testServices = <E = never, R = never>(
+  config: AppConfigShape,
+  release: Deferred.Deferred<void>,
+  accounts: Layer.Layer<Accounts, E, R | Redactor | AppConfig> = Accounts.layer as Layer.Layer<Accounts, E, R | Redactor | AppConfig>,
+) =>
   Layer.mergeAll(fakeFioApi(release), Layer.succeed(TransactionCache, { enabled: false })).pipe(
-    Layer.provideMerge(Layer.mergeAll(Redactor.layer, Accounts.layer, RateLimiter.layer)),
+    Layer.provideMerge(Layer.mergeAll(accounts, RateLimiter.layer)),
+    Layer.provideMerge(Redactor.layer),
     Layer.provideMerge(AppConfig.layerFrom(config)),
   );

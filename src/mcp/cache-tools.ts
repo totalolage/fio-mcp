@@ -1,4 +1,4 @@
-import { DateTime, Effect, Layer, Option, Schema } from "effect";
+import { DateTime, Effect, Option, Schema } from "effect";
 import { McpServer, Tool, Toolkit } from "effect/ai";
 import { type Account, Accounts } from "../accounts.js";
 import { type DayRange, minDate, pragueToday } from "../cache/dates.js";
@@ -10,6 +10,7 @@ import { InvalidInput } from "../errors.js";
 import { Redactor } from "../redaction.js";
 import { annotateTool, DateParam, JsonObject, ToolFailure, withAccount } from "./common.js";
 import { permittedAccount, READ, requireScopes, visibleAccounts } from "./permissions.js";
+import { toolsForAccounts } from "./registration.js";
 
 /**
  * Tools answered from the local cache only. They never call FIO, so they
@@ -282,7 +283,7 @@ export const makeCacheHandlers = Effect.fn("CacheTools.handlers")(function* (too
               overlapDays: config.cache.overlapDays,
               maxAgeMinutes: config.cache.maxAgeMinutes,
             },
-            accounts: yield* Effect.forEach(yield* visibleAccounts(accounts.list), (account) => accountStatus(cache, account)),
+            accounts: yield* Effect.forEach(yield* visibleAccounts(yield* accounts.list), (account) => accountStatus(cache, account)),
           };
         }),
       ),
@@ -332,11 +333,8 @@ export const makeCacheHandlers = Effect.fn("CacheTools.handlers")(function* (too
   });
 });
 
-/** Registers the cache toolkit with the MCP server. */
-export const CacheToolsLive = Layer.unwrap(
-  Effect.gen(function* () {
-    const config = yield* AppConfig;
-    const toolkit = makeCacheToolkit(config.accounts.map((a) => a.name));
-    return McpServer.toolkit(toolkit).pipe(Layer.provide(toolkit.toLayer(makeCacheHandlers(toolkit))));
-  }),
-);
+/** Registers the cache toolkit with the MCP server, again whenever the account names change. */
+export const CacheToolsLive = toolsForAccounts((names) => {
+  const toolkit = makeCacheToolkit(names);
+  return McpServer.registerToolkit(toolkit).pipe(Effect.provide(toolkit.toLayer(makeCacheHandlers(toolkit))));
+});

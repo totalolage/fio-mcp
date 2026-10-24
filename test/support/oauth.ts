@@ -1,8 +1,10 @@
 /**
- * In-process harness for the OAuth authorization server: the production
- * router app (guards, OAuth routes, McpServer behind Auth) on an in-memory
- * SQLite database, served through a web handler; a cookie-keeping
- * "browser"; an SDK OAuth client provider; and a clock the test can move.
+ * In-process harness for the OAuth authorization server and the admin UI:
+ * the production router app (guards, OAuth and /admin routes, McpServer
+ * behind Auth) with the accounts in an in-memory SQLite database (seeded
+ * from the test config's main and savings accounts, encrypted with
+ * DATA_KEY), served through a web handler; a cookie-keeping "browser"; an
+ * SDK OAuth client provider; and a clock the test can move.
  */
 
 import { createHash, randomBytes } from "node:crypto";
@@ -16,9 +18,14 @@ import type {
 import { Clock, type Context, Deferred, Duration, Effect, Exit, Layer, Logger, Option, Redacted, Scope } from "effect";
 import { HttpRouter, HttpServer, HttpServerRequest } from "effect/http";
 import type { SqlClient } from "effect/sql";
+import { AccountChangesLive } from "../../src/account-runtime.js";
+import { StoredAccountsLive } from "../../src/account-store.js";
+import { Accounts, type AccountsShape } from "../../src/accounts.js";
+import { AdminPassword } from "../../src/admin/password.js";
+import { AdminLive } from "../../src/admin/server.js";
 import { SERVER_INFO, ToolsLive } from "../../src/app.js";
 import { databaseLayer, SERVER_MIGRATIONS } from "../../src/cache/db.js";
-import type { HttpAuthConfig } from "../../src/config.js";
+import type { AppConfigShape, HttpAuthConfig } from "../../src/config.js";
 import { hashPassword, type PasswordHash, parsePasswordHash } from "../../src/oauth/crypto.js";
 import type { ThrottlePolicy } from "../../src/oauth/login.js";
 import { OAuthLive } from "../../src/oauth/server.js";
@@ -30,6 +37,8 @@ import { testConfig, testServices } from "./transport.js";
 export const PUBLIC_URL = "https://fio.example.test";
 export const RESOURCE = `${PUBLIC_URL}/mcp`;
 export const PASSWORD = "correct horse battery staple";
+/** The test data key (FIO_MCP_DATA_KEY_FILE). */
+export const DATA_KEY = Redacted.make(new Uint8Array(32).fill(7));
 
 let cachedHash: PasswordHash | undefined;
 
@@ -70,6 +79,10 @@ export interface OAuthHarness {
   readonly logs: Array<string>;
   /** Runs a store operation against the server's database. */
   readonly store: <A, E>(f: (store: OAuthStore) => Effect.Effect<A, E>) => Promise<A>;
+  /** Runs an effect against the server's database. */
+  readonly sql: <A, E>(effect: Effect.Effect<A, E, SqlClient.SqlClient>) => Promise<A>;
+  /** The server's accounts (as /admin changes them). */
+  readonly accounts: () => AccountsShape;
   readonly close: () => Promise<void>;
 }
 
@@ -77,11 +90,18 @@ export interface OAuthHarness {
 export const PEER_HEADER = "x-test-peer";
 
 export async function startOAuth(
-  options: { throttle?: ThrottlePolicy; trustedProxies?: ReadonlyArray<string> } = {},
+  options: {
+    throttle?: ThrottlePolicy;
+    trustedProxies?: ReadonlyArray<string>;
+    /** A database file instead of memory (survives `close`, for restart tests). */
+    dbPath?: string;
+    /** The accounts FIO_TOKEN / FIO_ACCOUNTS would configure (default: main and savings). */
+    configured?: AppConfigShape["accounts"];
+  } = {},
 ): Promise<OAuthHarness> {
   const hash = await passwordHash();
   const trustedProxies = (options.trustedProxies ?? []).flatMap((entry) => parseTrustedProxy(entry) ?? []);
-  const auth: HttpAuthConfig = { kind: "oauth", publicUrl: PUBLIC_URL, passwordHash: Redacted.make(hash) };
+  const auth: HttpAuthConfig = { kind: "oauth", publicUrl: PUBLIC_URL, passwordHash: Redacted.make(hash), dataKey: DATA_KEY };
   const transport: HttpTransportConfig = {
     kind: "http",
     host: "127.0.0.1",
@@ -91,10 +111,11 @@ export async function startOAuth(
     allowedHosts: [],
     trustedProxies,
   };
-  const config = testConfig(transport);
+  const base = testConfig(transport);
+  const config = options.configured === undefined ? base : { ...base, accounts: options.configured };
   const scope = await Effect.runPromise(Scope.make());
   const db: Context.Context<SqlClient.SqlClient> = await Effect.runPromise(
-    Layer.buildWithScope(databaseLayer(":memory:", SERVER_MIGRATIONS).pipe(Layer.provide(NodeFileSystem.layer)), scope),
+    Layer.buildWithScope(databaseLayer(options.dbPath ?? ":memory:", SERVER_MIGRATIONS).pipe(Layer.provide(NodeFileSystem.layer)), scope),
   );
   const release = await Effect.runPromise(Deferred.make<void>());
   const clock = new SkewedClock();
@@ -102,7 +123,16 @@ export async function startOAuth(
   const capture = Logger.make<unknown, void>((entry) => {
     logs.push(Logger.formatLogFmt.log(entry));
   });
-  const oauth = OAuthLive({ publicUrl: PUBLIC_URL, passwordHash: Redacted.make(hash), throttle: options.throttle, trustedProxies });
+  const oauth = Layer.mergeAll(
+    OAuthLive({ publicUrl: PUBLIC_URL, trustedProxies }),
+    AdminLive({ publicUrl: PUBLIC_URL, dataKey: DATA_KEY, trustedProxies }),
+  ).pipe(Layer.provide(AdminPassword.layer(Redacted.make(hash), options.throttle)));
+  let accounts: AccountsShape | undefined;
+  const captureAccounts = Layer.effectDiscard(
+    Effect.map(Effect.service(Accounts), (service) => {
+      accounts = service;
+    }),
+  );
   // Request handlers run with the router's context, not the layer's: clock and logger are provided per request.
   const captureLayer = Logger.layer([capture]);
   const withClock = HttpRouter.middleware(
@@ -117,8 +147,8 @@ export async function startOAuth(
       ),
     { global: true },
   );
-  const app = httpRouterApp(Layer.mergeAll(ToolsLive, withClock), oauth, SERVER_INFO, transport).pipe(
-    Layer.provide(testServices(config, release)),
+  const app = httpRouterApp(Layer.mergeAll(ToolsLive, withClock, AccountChangesLive, captureAccounts), oauth, SERVER_INFO, transport).pipe(
+    Layer.provide(testServices(config, release, StoredAccountsLive(DATA_KEY))),
     Layer.provide(Layer.succeedContext(db)),
     Layer.provide(HttpServer.layerServices),
     Layer.provide(Logger.layer([capture])),
@@ -133,6 +163,11 @@ export async function startOAuth(
       Effect.runPromise(
         Effect.flatMap(makeOAuthStore(), f).pipe(Effect.provide(Layer.succeedContext(db)), Effect.provideService(Clock.Clock, clock)),
       ),
+    sql: (effect) => Effect.runPromise(effect.pipe(Effect.provide(Layer.succeedContext(db)), Effect.provideService(Clock.Clock, clock))),
+    accounts: () => {
+      if (accounts === undefined) throw new Error("the app has not started yet (make a request first)");
+      return accounts;
+    },
     close: async () => {
       await web.dispose();
       await Effect.runPromise(Deferred.succeed(release, undefined));

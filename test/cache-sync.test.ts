@@ -762,3 +762,27 @@ describe("cache sync", () => {
     }),
   );
 });
+
+describe("cancelling a removed token's sync", () => {
+  it.effect("stops the running job and wakes whoever waits for it", () =>
+    Effect.gen(function* () {
+      yield* setNow();
+      const fio = yield* fakeFio(() => Effect.never);
+      yield* Effect.gen(function* () {
+        const cache = yield* enabledCache;
+        const acc = yield* account();
+        yield* cache.sync.start(acc, { kind: "backfill" });
+        yield* settle;
+        const waiting = yield* Effect.forkChild(cache.sync.awaitJob(acc, 3_600_000), { startImmediately: true });
+        yield* settle;
+        yield* cache.sync.cancel(acc.tokenFingerprint);
+        const job = Option.getOrThrow(yield* Fiber.join(waiting));
+        assert.strictEqual(job.status, "failed");
+        assert.include(job.lastError ?? "", "removed");
+        // Forgotten: nothing runs for it any more, and a later start begins anew.
+        assert.isTrue(Option.isNone(yield* cache.sync.progress(acc)));
+        yield* cache.sync.cancel(acc.tokenFingerprint);
+      }).pipe(Effect.provide(cacheLayer(config(), fio.api)));
+    }),
+  );
+});

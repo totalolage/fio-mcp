@@ -38,7 +38,15 @@ export interface AuthSession {
   readonly csrf: Redacted.Redacted<string>;
   readonly request: PendingAuthorization;
   readonly loggedIn: boolean;
+  /** The admin password's stamp at login (src/admin/password.ts); a signed-in session ends when it changes. */
+  readonly passwordStamp: string | undefined;
   readonly expiresAt: number;
+  /**
+   * The accounts the consent page last showed: name → token fingerprint. A
+   * consent is accepted only for these, unchanged (an account renamed or
+   * given a new token in between is shown again instead).
+   */
+  consentShown: ReadonlyMap<string, string> | undefined;
 }
 
 export interface IssuedSession {
@@ -80,7 +88,12 @@ export const makeSessions = Effect.fn("AuthSessions.make")(function* () {
     }
   };
 
-  const issue = Effect.fnUntraced(function* (request: PendingAuthorization, loggedIn: boolean, expiresAt?: number) {
+  const issue = Effect.fnUntraced(function* (
+    request: PendingAuthorization,
+    loggedIn: boolean,
+    passwordStamp?: string,
+    expiresAt?: number,
+  ) {
     const now = yield* Clock.currentTimeMillis;
     prune(now, loggedIn, request.clientId);
     const id = Redacted.value(yield* randomSecret(""));
@@ -89,7 +102,9 @@ export const makeSessions = Effect.fn("AuthSessions.make")(function* () {
       csrf: yield* randomSecret(""),
       request,
       loggedIn,
+      passwordStamp,
       expiresAt: expiresAt ?? now + SESSION_TTL_MS,
+      consentShown: undefined,
     };
     sessions.set(session.key, session);
     return { session, cookie: Redacted.make(`${id}.${sign(key, id)}`) } satisfies IssuedSession;
@@ -112,9 +127,9 @@ export const makeSessions = Effect.fn("AuthSessions.make")(function* () {
   });
 
   /** After a correct password: the same request under a fresh id and CSRF token (no fixation). */
-  const login = Effect.fnUntraced(function* (session: AuthSession) {
+  const login = Effect.fnUntraced(function* (session: AuthSession, passwordStamp: string) {
     sessions.delete(session.key);
-    return yield* issue(session.request, true, session.expiresAt);
+    return yield* issue(session.request, true, passwordStamp, session.expiresAt);
   });
 
   const end = (session: AuthSession) => Effect.sync(() => void sessions.delete(session.key));

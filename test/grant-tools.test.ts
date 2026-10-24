@@ -222,7 +222,7 @@ describe("grantedTools", () => {
   const tool = (name: string, properties: Record<string, object> = {}) =>
     McpSchema.Tool.make({ name, inputSchema: { type: "object", properties } });
   const accounts = [
-    toAccount({ name: "main", token: Redacted.make(FIO_TOKEN), accountNumber: undefined, currency: undefined }),
+    toAccount({ name: "main", token: Redacted.make(FIO_TOKEN), accountNumber: undefined, currency: undefined }, "env:0"),
   ];
 
   it("lists exactly the configured tools as read tools or payment tools", () => {
@@ -250,7 +250,7 @@ describe("grantedTools", () => {
 
 describe("grantProtocols", () => {
   const install = (adapter: McpProtocol.ProtocolAdapter, core: unknown) => {
-    const [granted] = grantProtocols([adapter], []);
+    const [granted] = grantProtocols([adapter], Effect.succeed([]));
     // Only the guards run before the stock handlers would need their services.
     return Effect.exit((granted as McpProtocol.AnyProtocolAdapter<string, never>).installHandlers(core, undefined, undefined));
   };

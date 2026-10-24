@@ -5,6 +5,7 @@ import { HttpServerRequest } from "effect/http";
 import { SqlClient } from "effect/sql";
 import { TestClock } from "effect/testing";
 import { Accounts, makeAccounts } from "../src/accounts.js";
+import { AdminPassword } from "../src/admin/password.js";
 import { databaseLayer, SERVER_MIGRATIONS } from "../src/cache/db.js";
 import { CommandFailed, hashPasswordCommand, listClientsCommand, revokeAllTokensCommand, revokeClientCommand } from "../src/oauth/cli.js";
 import {
@@ -97,7 +98,9 @@ describe("authorization endpoint request target", () => {
     Effect.gen(function* () {
       const parsed = parsePasswordHash(yield* hashPassword(Redacted.make("correct horse battery"), FAST));
       if (!("hash" in parsed)) return assert.fail("hash did not parse");
-      const server = yield* makeOAuthServer({ publicUrl: "https://fio.example.net", passwordHash: Redacted.make(parsed) });
+      const server = yield* makeOAuthServer({ publicUrl: "https://fio.example.net" }).pipe(
+        Effect.provide(AdminPassword.layer(Redacted.make(parsed))),
+      );
       const authorize = server.routes.find((route) => route.method === "GET" && route.path === "/authorize");
       if (authorize === undefined) return assert.fail("no /authorize route");
       // The Node adapter keeps a target it cannot parse as is, and the router still routes `GET http://[/authorize` here.
@@ -159,13 +162,13 @@ describe("authorization sessions", () => {
     Effect.gen(function* () {
       const sessions = yield* makeSessions();
       const first = yield* sessions.start(request);
-      const signedIn = yield* sessions.login((yield* sessions.start(request)).session);
+      const signedIn = yield* sessions.login((yield* sessions.start(request)).session, "stamp");
       for (let i = 0; i < MAX_SESSIONS.pending + 50; i++) yield* sessions.start(request);
       assert.isTrue(Option.isSome(yield* sessions.find(Redacted.value(signedIn.cookie))));
       assert.isTrue(Option.isNone(yield* sessions.find(Redacted.value(first.cookie))));
       // Signed-in sessions make room among themselves.
       const more = [];
-      for (let i = 0; i < MAX_SESSIONS.signedIn; i++) more.push(yield* sessions.login((yield* sessions.start(request)).session));
+      for (let i = 0; i < MAX_SESSIONS.signedIn; i++) more.push(yield* sessions.login((yield* sessions.start(request)).session, "stamp"));
       assert.isTrue(Option.isNone(yield* sessions.find(Redacted.value(signedIn.cookie))));
       assert.isTrue(Option.isSome(yield* sessions.find(Redacted.value(more[0]?.cookie ?? Redacted.make("")))));
     }),
@@ -223,7 +226,7 @@ describe("login throttling", () => {
     Effect.gen(function* () {
       const parsed = parsePasswordHash(yield* hashPassword(Redacted.make("the right password"), FAST));
       if (parsed instanceof PasswordHashError) return assert.fail("hash did not parse");
-      const guard = yield* makeLoginGuard(Redacted.make(parsed));
+      const guard = yield* makeLoginGuard(Effect.succeed(Redacted.make(parsed)));
       const wrong = Redacted.make("the wrong password");
       const right = Redacted.make("the right password");
       for (let i = 0; i < 6; i++) assert.strictEqual((yield* guard.attempt("10.0.0.1", wrong))._tag, "Rejected");
@@ -242,7 +245,7 @@ describe("login throttling", () => {
     Effect.gen(function* () {
       const parsed = parsePasswordHash(yield* hashPassword(Redacted.make("the right password"), FAST));
       if (parsed instanceof PasswordHashError) return assert.fail("hash did not parse");
-      const guard = yield* makeLoginGuard(Redacted.make(parsed));
+      const guard = yield* makeLoginGuard(Effect.succeed(Redacted.make(parsed)));
       const wrong = Redacted.make("the wrong password");
       const fiber = yield* Effect.forkChild(guard.attempt("a", wrong));
       yield* Effect.yieldNow;
@@ -259,7 +262,7 @@ describe("login throttling", () => {
     Effect.gen(function* () {
       const parsed = parsePasswordHash(yield* hashPassword(Redacted.make("the right password"), FAST));
       if (parsed instanceof PasswordHashError) return assert.fail("hash did not parse");
-      const guard = yield* makeLoginGuard(Redacted.make(parsed), { ...DEFAULT_THROTTLE, freeFailures: 0, baseDelayMs: 0 });
+      const guard = yield* makeLoginGuard(Effect.succeed(Redacted.make(parsed)), { ...DEFAULT_THROTTLE, freeFailures: 0, baseDelayMs: 0 });
       for (let i = 0; i < 10; i++) yield* guard.attempt("a", Redacted.make("nope"));
       const right = Redacted.make("the right password");
       assert.deepStrictEqual(yield* guard.attempt("a", right), { _tag: "Throttled", retryAfterSeconds: 900 });
@@ -474,7 +477,7 @@ describe("sign-in scrypt bound", () => {
           yield* Deferred.await(release);
           return false;
         }).pipe(Effect.ensuring(Effect.sync(() => running--)));
-      const guard = yield* makeLoginGuard(Redacted.make(parsed), DEFAULT_THROTTLE, verify);
+      const guard = yield* makeLoginGuard(Effect.succeed(Redacted.make(parsed)), DEFAULT_THROTTLE, verify);
       const wrong = Redacted.make("the wrong password");
       const fibers = yield* Effect.forEach(Array.from({ length: 10 }, (_, i) => `10.0.0.${i}`), (address) =>
         Effect.forkChild(guard.attempt(address, wrong), { startImmediately: true }),

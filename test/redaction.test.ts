@@ -1,6 +1,8 @@
+import { NodeFileSystem } from "@effect/platform-node";
 import { assert, describe, it } from "@effect/vitest";
-import { Effect, Logger } from "effect";
-import { makeRedactor, stderrLogger } from "../src/redaction.js";
+import { ConfigProvider, Effect, Layer, Logger } from "effect";
+import { AppConfig } from "../src/config.js";
+import { makeRedactor, Redactor, stderrLogger } from "../src/redaction.js";
 import { PAY_TOKEN, READ_TOKEN } from "./fixtures.js";
 
 describe("token redaction", () => {
@@ -81,6 +83,47 @@ describe("token redaction", () => {
       assert.notInclude(written[0], PAY_TOKEN);
       assert.include(written[0], "/periods/***/2024-01-01");
       assert.strictEqual(stdoutWrites, 0);
+    }),
+  );
+});
+
+describe("tokens added at runtime", () => {
+  it("are redacted from the moment they are registered", () => {
+    const redactor = makeRedactor([READ_TOKEN]);
+    assert.strictEqual(redactor.redact(`a ${PAY_TOKEN} b`), `a ${PAY_TOKEN} b`);
+    redactor.register([PAY_TOKEN]);
+    assert.strictEqual(redactor.redact(`a ${PAY_TOKEN} ${READ_TOKEN} b`), "a *** *** b");
+  });
+
+  it.effect("reach the logger: main.ts's logger and the app build the same Redactor", () =>
+    Effect.gen(function* () {
+      // main.ts provides the logger's layers around `Layer.launch(AppLive)`;
+      // the inner build reuses the outer one's Redactor from the memo map.
+      let outer: Redactor["Service"] | undefined;
+      let inner: Redactor["Service"] | undefined;
+      const env = ConfigProvider.layer(ConfigProvider.fromEnv({ env: { HOME: "/home/test", FIO_TOKEN: READ_TOKEN } }));
+      const grab = (set: (redactor: Redactor["Service"]) => void) =>
+        Layer.effectDiscard(Effect.map(Effect.service(Redactor), set)).pipe(
+          Layer.provide(Redactor.layer),
+          Layer.provide(AppConfig.layer),
+          Layer.provide(Layer.mergeAll(NodeFileSystem.layer, env)),
+        );
+      const innerBuild = Effect.scoped(
+        Layer.build(
+          grab((r) => {
+            inner = r;
+          }),
+        ),
+      );
+      yield* innerBuild.pipe(
+        Effect.provide(
+          grab((r) => {
+            outer = r;
+          }),
+        ),
+      );
+      assert.isDefined(outer);
+      assert.strictEqual(inner, outer);
     }),
   );
 });

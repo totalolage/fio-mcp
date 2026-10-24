@@ -475,3 +475,20 @@ describe("RateLimiter", () => {
     }).pipe(Effect.scoped),
   );
 });
+
+describe("forgetting a token no account uses", () => {
+  it.effect("keeps a token whose interval is still running and drops it once it passed", () =>
+    Effect.gen(function* () {
+      const rl = yield* limiter({ intervalMs: 30_000, maxWaitMs: 5_000 });
+      assert.strictEqual(yield* rl.run(KEY, "interactive", Effect.succeed(1)), 1);
+      // Removed and re-added within the interval: the spacing still holds.
+      yield* rl.forget(KEY);
+      const early = yield* Effect.exit(rl.run(KEY, "interactive", Effect.succeed(2)));
+      assert.isTrue(Exit.isFailure(early));
+      yield* TestClock.adjust("30 seconds");
+      yield* rl.forget(KEY);
+      assert.strictEqual((yield* rl.state(KEY)).nextSlotInSeconds, 0);
+      assert.strictEqual(yield* rl.run(KEY, "interactive", Effect.succeed(3)), 3);
+    }).pipe(Effect.scoped),
+  );
+});

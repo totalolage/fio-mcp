@@ -239,7 +239,7 @@ export const CacheLive: Layer.Layer<TransactionCache, CacheError, AppConfig | Fi
     }),
   );
 
-const syncAll = Effect.fn("CacheSync.syncAll")(function* (
+export const syncAll = Effect.fn("CacheSync.syncAll")(function* (
   cache: EnabledCache,
   accounts: ReadonlyArray<Account>,
   choose: (account: Account) => Effect.Effect<Option.Option<Parameters<CacheSyncShape["start"]>[1]>, CacheError>,
@@ -266,8 +266,8 @@ const resumeRequest = (mode: SyncMode | null): SyncRequest => {
   }
 };
 
-/** What startup runs for one token: the full startup sync, or only an interrupted job. */
-const startupRequest = (cache: EnabledCache, config: AppConfigShape) => (account: Account) =>
+/** What startup runs for one token (and a token added at runtime): the full startup sync, or only an interrupted job. */
+export const startupRequest = (cache: EnabledCache, config: AppConfigShape) => (account: Account) =>
   config.cache.syncOnStartup
     ? Effect.succeedSome({ kind: "startup" as const })
     : Effect.map(cache.store.syncState(account.tokenFingerprint), (state) =>
@@ -276,8 +276,10 @@ const startupRequest = (cache: EnabledCache, config: AppConfigShape) => (account
 
 /**
  * Background sync: at startup (cache.syncOnStartup, or to resume an
- * interrupted job) and every cache.syncIntervalMinutes when that is above 0.
- * Forked into the layer's scope; MCP initialization never waits for it.
+ * interrupted job) and every cache.syncIntervalMinutes when that is above 0,
+ * for the accounts configured at that moment. Forked into the layer's
+ * scope; MCP initialization never waits for it. Accounts added or removed
+ * at runtime are handled by AccountChangesLive (src/account-runtime.ts).
  */
 export const CacheSyncLive: Layer.Layer<never, never, TransactionCache | Accounts | AppConfig> = Layer.effectDiscard(
   Effect.gen(function* () {
@@ -285,10 +287,12 @@ export const CacheSyncLive: Layer.Layer<never, never, TransactionCache | Account
     if (!cache.enabled) return;
     const accounts = yield* Accounts;
     const config = yield* AppConfig;
-    yield* Effect.forkScoped(syncAll(cache, accounts.list, startupRequest(cache, config)));
+    yield* Effect.forkScoped(syncAll(cache, yield* accounts.list, startupRequest(cache, config)));
     const minutes = config.cache.syncIntervalMinutes;
     if (minutes > 0) {
-      const periodic = syncAll(cache, accounts.list, () => Effect.succeedSome({ kind: "incremental" as const }));
+      const periodic = Effect.flatMap(accounts.list, (list) =>
+        syncAll(cache, list, () => Effect.succeedSome({ kind: "incremental" as const })),
+      );
       yield* Effect.forkScoped(
         Effect.sleep(`${minutes} minutes`).pipe(Effect.andThen(Effect.repeat(periodic, Schedule.spaced(`${minutes} minutes`)))),
       );

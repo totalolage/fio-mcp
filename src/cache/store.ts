@@ -631,8 +631,43 @@ export const makeCacheStore = Effect.fn("CacheStore.make")(function* () {
       cacheFailure("count cached transactions"),
     );
 
+  /** Keeps a renamed account's binding label current (it is otherwise refreshed on the next download). */
+  const renameBinding = (tokenFingerprint: string, accountName: string) =>
+    sql`UPDATE bindings SET account_name = ${accountName} WHERE token_fingerprint = ${tokenFingerprint}`.pipe(
+      Effect.asVoid,
+      cacheFailure("rename the account binding"),
+    );
+
+  /**
+   * Deletes what the cache holds for a token: its binding and sync state,
+   * and the bound bank account's movements, coverage and balance unless
+   * another token is still bound to that bank account.
+   */
+  const purgeToken = (tokenFingerprint: string) =>
+    sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const [bound] = yield* sql<{ account_key: string }>`
+            SELECT account_key FROM bindings WHERE token_fingerprint = ${tokenFingerprint}
+          `;
+          yield* sql`DELETE FROM bindings WHERE token_fingerprint = ${tokenFingerprint}`;
+          yield* sql`DELETE FROM sync_state WHERE token_fingerprint = ${tokenFingerprint}`;
+          if (bound === undefined) return;
+          const [shared] = yield* sql<{ total: number }>`
+            SELECT COUNT(*) AS total FROM bindings WHERE account_key = ${bound.account_key}
+          `;
+          if ((shared?.total ?? 0) > 0) return;
+          yield* sql`DELETE FROM transactions WHERE account_key = ${bound.account_key}`;
+          yield* sql`DELETE FROM coverage_days WHERE account_key = ${bound.account_key}`;
+          yield* sql`DELETE FROM accounts WHERE account_key = ${bound.account_key}`;
+        }),
+      )
+      .pipe(cacheFailure("delete the cached data"));
+
   return {
     binding,
+    renameBinding,
+    purgeToken,
     account,
     syncState,
     putSyncState,

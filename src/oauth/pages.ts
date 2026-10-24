@@ -23,16 +23,20 @@ const STYLE =
   "button{font-size:1rem;padding:.45rem 1.1rem;margin-right:.5rem}.warn{background:#fff4d6;border:1px solid #e0b84c;padding:.5rem .75rem;border-radius:6px}" +
   ".error{color:#a40000}code{word-break:break-all}.muted{color:#555;font-size:.9rem}";
 
-const STYLE_HASH = createHash("sha256").update(STYLE, "utf8").digest("base64");
+/** CSP source hash of an inline style block. */
+export const styleHash = (style: string) => createHash("sha256").update(style, "utf8").digest("base64");
+
+const STYLE_HASH = styleHash(STYLE);
 
 /**
  * Headers for every HTML page. `formTargets` widens form-action for the
  * consent page: browsers apply it to the redirect that follows the POST.
+ * `style` is the hash of the page's one inline style block.
  */
-export function pageHeaders(formTargets: ReadonlyArray<string> = []): Record<string, string> {
+export function pageHeaders(formTargets: ReadonlyArray<string> = [], style: string = STYLE_HASH): Record<string, string> {
   const formAction = ["'self'", ...formTargets].join(" ");
   return {
-    "content-security-policy": `default-src 'none'; style-src 'sha256-${STYLE_HASH}'; form-action ${formAction}; frame-ancestors 'none'; base-uri 'none'`,
+    "content-security-policy": `default-src 'none'; style-src 'sha256-${style}'; form-action ${formAction}; frame-ancestors 'none'; base-uri 'none'`,
     "x-frame-options": "DENY",
     "x-content-type-options": "nosniff",
     // Not no-referrer: browsers then send `Origin: null` on the form posts,

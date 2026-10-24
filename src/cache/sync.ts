@@ -1,4 +1,4 @@
-import { type Cause, Clock, Deferred, Duration, Effect, Option, Ref, Result, Schedule, SynchronizedRef } from "effect";
+import { type Cause, Clock, Deferred, Duration, Effect, Fiber, Option, Ref, Result, Schedule, SynchronizedRef } from "effect";
 import type { Account } from "../accounts.js";
 import type { AppConfigShape } from "../config.js";
 import { type CacheError, type FioRequestError, HISTORY_UNLOCK_STEPS } from "../errors.js";
@@ -90,6 +90,12 @@ export interface CacheSyncShape {
   readonly awaitJob: (account: Account, timeoutMs: number) => Effect.Effect<Option.Option<JobProgress>>;
   /** The running or most recent job of the account's token in this process. */
   readonly progress: (account: Account) => Effect.Effect<Option.Option<JobProgress>>;
+  /**
+   * Stops and forgets the job of a token no account uses any more (removed
+   * or replaced at /admin). Its saved pending ranges stay, so the token
+   * resumes where it stopped if it comes back.
+   */
+  readonly cancel: (tokenFingerprint: string) => Effect.Effect<void>;
 }
 
 /** What to tell the owner when older history is blocked. */
@@ -132,6 +138,7 @@ interface RunningJob {
   readonly account: Account;
   readonly progress: Ref.Ref<JobProgress>;
   readonly done: Deferred.Deferred<JobProgress>;
+  readonly fiber: Fiber.Fiber<boolean>;
 }
 
 export const makeCacheSync = Effect.fn("CacheSync.make")(function* (
@@ -392,7 +399,11 @@ export const makeCacheSync = Effect.fn("CacheSync.make")(function* (
     lastError: null,
   });
 
-  const finishFailed = Effect.fnUntraced(function* (account: Account, job: RunningJob, cause: Cause.Cause<CacheError>) {
+  const finishFailed = Effect.fnUntraced(function* (
+    account: Account,
+    job: Pick<RunningJob, "progress">,
+    cause: Cause.Cause<CacheError>,
+  ) {
     yield* Effect.logError(`cache sync ${account.name}: failed`, cause);
     const finishedAt = yield* Clock.currentTimeMillis;
     yield* Ref.update(job.progress, (p) => ({
@@ -416,7 +427,7 @@ export const makeCacheSync = Effect.fn("CacheSync.make")(function* (
       if (current.status === "running") return [{ progress: current, joined: true } satisfies StartResult, map] as const;
     }
     const startedAt = yield* Clock.currentTimeMillis;
-    const job: RunningJob = {
+    const job = {
       account,
       progress: yield* Ref.make(initialProgress(account, request, startedAt)),
       done: yield* Deferred.make<JobProgress>(),
@@ -431,9 +442,12 @@ export const makeCacheSync = Effect.fn("CacheSync.make")(function* (
       ),
       Effect.flatMap((final) => Deferred.succeed(job.done, final)),
     );
-    yield* Effect.forkIn(body, scope);
+    const fiber = yield* Effect.forkIn(body, scope);
     const progress = yield* Ref.get(job.progress);
-    return [{ progress, joined: false } satisfies StartResult, new Map(map).set(account.tokenFingerprint, job)] as const;
+    return [
+      { progress, joined: false } satisfies StartResult,
+      new Map(map).set(account.tokenFingerprint, { ...job, fiber } satisfies RunningJob),
+    ] as const;
   });
 
   const start = (account: Account, request: SyncRequest) =>
@@ -456,5 +470,24 @@ export const makeCacheSync = Effect.fn("CacheSync.make")(function* (
       );
     });
 
-  return { start, awaitJob, progress } satisfies CacheSyncShape;
+  const cancel = (tokenFingerprint: string) =>
+    SynchronizedRef.updateEffect(jobs, (map) => {
+      const job = map.get(tokenFingerprint);
+      if (job === undefined) return Effect.succeed(map);
+      return Effect.gen(function* () {
+        yield* Fiber.interrupt(job.fiber);
+        const finishedAt = yield* Clock.currentTimeMillis;
+        const final = yield* Ref.updateAndGet(job.progress, (p) =>
+          p.status === "running"
+            ? { ...p, status: "failed" as const, finishedAt, current: null, lastError: "Stopped: the account was removed or its token replaced." }
+            : p,
+        );
+        yield* Deferred.succeed(job.done, final);
+        const next = new Map(map);
+        next.delete(tokenFingerprint);
+        return next;
+      });
+    });
+
+  return { start, awaitJob, progress, cancel } satisfies CacheSyncShape;
 });

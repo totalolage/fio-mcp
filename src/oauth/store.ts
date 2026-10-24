@@ -13,7 +13,7 @@ import { ServerError } from "./errors.js";
 /**
  * Ids share one sequence with the cache's migrations (the migrator skips ids
  * at or below the latest applied one): 0002 follows the cache's 0001, 0004
- * its 0003.
+ * its 0003, 0006 the accounts' 0005.
  */
 export const OAUTH_MIGRATIONS: Migrations = {
   "0002_create_oauth": Effect.gen(function* () {
@@ -70,6 +70,12 @@ export const OAUTH_MIGRATIONS: Migrations = {
     yield* sql`UPDATE oauth_grants SET revoked_at = ${now} WHERE revoked_at IS NULL`;
     yield* sql`ALTER TABLE oauth_grants RENAME COLUMN accounts_json TO account_fingerprints_json`;
   }),
+  // 0005 is the accounts table (src/account-store.ts). When a grant was last
+  // used on /mcp, for the admin page (written at most once a minute).
+  "0006_grant_last_used": Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`ALTER TABLE oauth_grants ADD COLUMN last_used_at INTEGER`;
+  }),
 };
 
 export interface Client {
@@ -92,6 +98,13 @@ export interface Grant {
   /** Token fingerprints (Account.tokenFingerprint) of the consented accounts, never names. */
   readonly accountFingerprints: ReadonlyArray<string>;
   readonly resource: string;
+}
+
+/** A live grant as /admin lists it. */
+export interface GrantSummary extends Grant {
+  readonly createdAt: number;
+  /** Last authenticated /mcp request (to the minute), or null when never used. */
+  readonly lastUsedAt: number | null;
 }
 
 export interface NewCode {
@@ -415,6 +428,22 @@ export const makeOAuthStore = Effect.fn("OAuthStore.make")(function* (maxRotatio
   const revokeGrant = (grantId: string, now: number) =>
     sql.withTransaction(revokeGrantNow(grantId, now)).pipe(failure("revoke the grant"));
 
+  /** Every live grant (not revoked, with a usable token or code), oldest first. */
+  const listGrants = (now: number) =>
+    sql<GrantRow & { created_at: number; last_used_at: number | null }>`
+      SELECT g.grant_id, g.client_id, g.scopes, g.account_fingerprints_json, g.resource, g.created_at, g.last_used_at
+      FROM oauth_grants g WHERE ${liveGrant(now)} ORDER BY g.created_at
+    `.pipe(
+      Effect.map((rows) =>
+        rows.map((row): GrantSummary => ({ ...toGrant(row), createdAt: row.created_at, lastUsedAt: row.last_used_at })),
+      ),
+      failure("list grants"),
+    );
+
+  /** Records a use of the grant on /mcp. */
+  const touchGrant = (grantId: string, now: number) =>
+    sql`UPDATE oauth_grants SET last_used_at = ${now} WHERE grant_id = ${grantId}`.pipe(Effect.asVoid, failure("record the grant's use"));
+
   /** Revokes every grant; returns how many were live. */
   const revokeAll = (now: number) =>
     sql
@@ -467,6 +496,8 @@ export const makeOAuthStore = Effect.fn("OAuthStore.make")(function* (maxRotatio
     tokenOwner,
     revokeGrant,
     revokeAll,
+    listGrants,
+    touchGrant,
     purge,
   };
 });

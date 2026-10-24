@@ -72,6 +72,8 @@ describe("cache database", () => {
         assert.deepStrictEqual(yield* migrate(SERVER_MIGRATIONS), [
           [3, "pending_range_replace"],
           [4, "grant_account_fingerprints"],
+          [5, "create_accounts"],
+          [6, "grant_last_used"],
         ]);
         const store = yield* makeCacheStore();
         const pending = (fp: string) => Effect.map(store.syncState(fp), (state) => state.pending);

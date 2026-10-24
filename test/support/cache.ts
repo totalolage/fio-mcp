@@ -1,7 +1,7 @@
 import { NodeFileSystem } from "@effect/platform-node";
 import { Effect, Layer, Redacted, Ref } from "effect";
 import { TestClock } from "effect/testing";
-import { type Account, Accounts, makeAccounts } from "../../src/accounts.js";
+import { type Account, Accounts, accountsFromConfig, makeAccounts } from "../../src/accounts.js";
 import { databaseLayer } from "../../src/cache/db.js";
 import { TransactionCache, TransactionCacheFromSql } from "../../src/cache/service.js";
 import {
@@ -161,7 +161,7 @@ export const serveFrom =
 /** Base services for cache tests: config, accounts, redactor, the DB at cache.dbPath (":memory:" by default), and the cache. */
 const baseLayer = (cfg: AppConfigShape, fio: FioApiShape) =>
   Layer.mergeAll(
-    Layer.effect(Accounts, Effect.map(makeAccounts(cfg.accounts), Accounts.of)),
+    Layer.effect(Accounts, Effect.map(makeAccounts(accountsFromConfig(cfg.accounts)), Accounts.of)),
     Redactor.layerFrom(cfg.secrets.map(Redacted.value)),
     Layer.succeed(FioApi, fio),
   ).pipe(Layer.provideMerge(AppConfig.layerFrom(cfg)));

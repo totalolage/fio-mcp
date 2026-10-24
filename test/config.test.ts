@@ -300,6 +300,7 @@ describe("loadConfig", () => {
         FIO_MCP_TRANSPORT: "http",
         FIO_MCP_PUBLIC_URL: "https://fio.example.test",
         FIO_MCP_ADMIN_PASSWORD_HASH_FILE: hashFile,
+        FIO_MCP_DATA_KEY_FILE: secretFile(`${"ab".repeat(32)}\n`),
       };
 
       const config = yield* loadConfigFrom(env);
@@ -369,6 +370,7 @@ describe("loadConfig", () => {
         FIO_TOKEN: READ_TOKEN,
         FIO_MCP_TRANSPORT: "http",
         FIO_MCP_ADMIN_PASSWORD_HASH_FILE: secretFile(`${hash}\n`),
+        FIO_MCP_DATA_KEY_FILE: secretFile(`${"ab".repeat(32)}\n`),
       };
 
       const path = yield* configError({ ...common, FIO_MCP_PUBLIC_URL: "https://fio.example.test/base" });
@@ -401,7 +403,12 @@ describe("loadConfig", () => {
   it.effect("accepts a hash file with a trailing LF or CRLF and rejects captured prompts without echoing them", () =>
     Effect.gen(function* () {
       const hash = yield* hashPassword(Redacted.make("test-admin-password"), { ln: 14, r: 8, p: 1 });
-      const env = { FIO_TOKEN: READ_TOKEN, FIO_MCP_TRANSPORT: "http", FIO_MCP_PUBLIC_URL: "https://fio.example.test" };
+      const env = {
+        FIO_TOKEN: READ_TOKEN,
+        FIO_MCP_TRANSPORT: "http",
+        FIO_MCP_PUBLIC_URL: "https://fio.example.test",
+        FIO_MCP_DATA_KEY_FILE: secretFile(`${"ab".repeat(32)}\n`),
+      };
       for (const content of [`${hash}\n`, `${hash}\r\n`]) {
         const config = yield* loadConfigFrom({ ...env, FIO_MCP_ADMIN_PASSWORD_HASH_FILE: secretFile(content) });
         assert.strictEqual(config.transport.kind, "http");
