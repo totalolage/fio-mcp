@@ -481,6 +481,7 @@ Biome runs its recommended rules (with `noExplicitAny` and `noConsole` as errors
 | `no-direct-effect-runs` | `Effect.run*` outside `src/main.ts` |
 | `no-direct-process-env` | `process.env`: read configuration through Effect `Config` |
 | `prefer-effect-fn` | arrow functions that only wrap `Effect.gen`: use `Effect.fn` |
+| `no-standalone-capability-layers` | a standalone `FooDefault`/`FooLive` constant for a `Context.Service` `Foo` (in tests too): use the static `Foo.Default` (requirements open) and `Foo.Live` (fully wired) |
 
 ### OpenAPI spec and the generated client
 

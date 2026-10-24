@@ -1,0 +1,57 @@
+engine biome(1.0)
+language js(typescript)
+
+// A Context.Service capability owns its layers as static members
+// (`Capability.Default`, `Capability.Live`), and a fully wired layer is named
+// `Live`. GritQL cannot see other files, so a standalone
+// `<Capability>Default` or `<Capability>Live` constant is reported when its file
+// declares that capability class, or imports a binding with the capability's name
+// and reads its `Default` or `Live` layer.
+file($name, $body) where {
+  $name <: r".*\.ts$",
+  not $name <: r".*/generated/.*",
+  any {
+    and {
+      $body <: r"(?s).*\b(?:const|let|var)\s+[A-Z][A-Za-z0-9]*(?:Default|Live|LiveWithDependencies)\b.*",
+      $body <: contains bubble JsVariableDeclarator(id = $layer) as $declarator where {
+        $layer <: r"^([A-Z][A-Za-z0-9]*?)(?:Default|Live|LiveWithDependencies)$"($capability),
+        $program <: contains or {
+          JsClassDeclaration(id = $declared) as $class where {
+            $declared <: $capability,
+            $class <: r"(?s)^class\s+\w+\s+extends\s+Context\.Service\b.*"
+          },
+          JsIdentifierBinding() as $imported where {
+            $imported <: $capability,
+            $imported <: within JsImport(),
+            $declarator <: contains JsStaticMemberExpression() as $member where {
+              $member <: r"^([A-Za-z0-9_$]+)\.(?:Default|Live)$"($owner),
+              $owner <: $capability
+            }
+          }
+        },
+        register_diagnostic(
+          span = $layer,
+          message = "Expose a capability's layers as static members (`Capability.Default`, `Capability.Live`) instead of a standalone layer constant.",
+          severity = "error"
+        )
+      }
+    },
+    and {
+      $body <: r"(?s).*\bLiveWithDependencies\b.*",
+      $body <: contains bubble or {
+        JsName() as $obsolete,
+        JsLiteralMemberName() as $obsolete,
+        JsReferenceIdentifier() as $obsolete,
+        JsIdentifierBinding() as $obsolete,
+        TsIdentifierBinding() as $obsolete
+      } where {
+        $obsolete <: r"^LiveWithDependencies$",
+        register_diagnostic(
+          span = $obsolete,
+          message = "Name a capability's fully wired layer `Live`, not `LiveWithDependencies`.",
+          severity = "error"
+        )
+      }
+    }
+  }
+}
