@@ -49,10 +49,14 @@ const tempFile = (content: string) => {
   return path;
 };
 
+/** The admin password hash file's content, hashed once (scrypt is slow on a loaded machine). */
+let adminHash: string | undefined;
+
 /** The seed `loadConfig` builds for HTTP mode with OAuth from `env`. */
 const oauthSeed = (env: Record<string, string>) =>
   Effect.gen(function* () {
-    const hash = yield* hashPassword(Redacted.make("test-admin-password"), { ln: 14, r: 8, p: 1 });
+    adminHash ??= yield* hashPassword(Redacted.make("test-admin-password"), { ln: 14, r: 8, p: 1 });
+    const hash = adminHash;
     const config = yield* loadConfigFrom({
       FIO_MCP_TRANSPORT: "http",
       FIO_MCP_PUBLIC_URL: "https://fio.example.test",
