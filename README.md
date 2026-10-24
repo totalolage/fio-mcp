@@ -363,7 +363,7 @@ docker exec <container> node dist/main.js reset-admin-password
 
 With OAuth over HTTP, `https://<host>/admin` manages the server. It has three pages:
 
-- **Accounts** (`/admin`): add an account (name, FIO token, optionally account number and currency), rename it, replace its token, remove it, and test its token. Tokens go into a write-only password field and are shown only as their last four characters. The token test makes one read-only FIO call (`lastStatement`, the latest statement's number), which never moves the `last` download marker; it goes through the token's rate limiter like a tool call, so a second test within 30 s answers "Rate limited" at once. A passed test shows that FIO accepts the token for reading, not whether it may submit payment orders. Removing asks whether to keep the account's cached transactions (the default; they are used again if the same token or bank account comes back) or delete them (skipped while another account uses the same token).
+- **Accounts** (`/admin`): add an account (name, FIO token, optionally account number and currency), rename it, replace its token, remove it, and test its token. Tokens go into a write-only password field and are shown only as their last four characters. The token test makes one read-only FIO call (`lastStatement`, the latest statement's number), which never moves the `last` download marker; it goes through the token's rate limiter like a tool call, so a second test within 30 s answers "Rate limited" at once. A passed test shows that FIO accepts the token for reading, not whether it may submit payment orders. Removing asks whether to keep the account's cached transactions (the default; they are used again if the same token or bank account comes back) or delete them. Deleting skips data another account still reads (the same token, or another token for the same bank account), and the confirmation names that account. Data cached under a token the account no longer has (replaced earlier) is deleted with it only if the current token has downloaded the same bank account since.
 - **Connected clients** (`/admin/clients`): every registered OAuth client with its redirect URIs, registration and last authorization, and its live authorizations: scopes, accounts by their current name (tokens replaced or removed since are counted, not named), when it was authorized and when it last used `/mcp` (to the minute). Revoke one authorization, remove a client with all its tokens, or revoke everything.
 - **Admin password** (`/admin/password`): see [Admin password](#admin-password).
 
@@ -395,7 +395,7 @@ Changes at `/admin` take effect at once, without a restart:
 
 ### Moving accounts into the database
 
-On the first start in HTTP mode with OAuth, if the database has no accounts and was never edited at `/admin`, the accounts from `FIO_TOKEN` / `FIO_ACCOUNTS` (or their `_FILE` variants) are imported, encrypted, and the server logs how many. From then on the database decides: the variables are ignored with a warning at every start, even after every account was removed at `/admin`. Remove the variables and delete the accounts file, which holds the tokens in plaintext.
+On the first start in HTTP mode with OAuth, if the database has no accounts and was never edited at `/admin`, the accounts from `FIO_TOKEN` / `FIO_ACCOUNTS` (or their `_FILE` variants) are imported, encrypted, and the server logs how many. From then on the database decides: the variables are ignored with a warning at every start, even after every account was removed at `/admin`, and they are not read, so a broken value or a deleted accounts file does not stop the start. When an import is due, they are checked as strictly as in stdio mode and an error stops the start. Remove the variables and delete the accounts file, which holds the tokens in plaintext.
 
 ### Admin password
 
@@ -404,8 +404,15 @@ On the first start in HTTP mode with OAuth, if the database has no accounts and 
 If the password is lost:
 
 ```sh
-docker exec <container> node dist/main.js reset-admin-password          # the hash file applies again
-docker exec -i <container> node dist/main.js reset-admin-password --set  # or store a new password (typed, or piped on stdin)
+docker exec <container> node dist/main.js reset-admin-password           # the hash file applies again
+docker exec -it <container> node dist/main.js reset-admin-password --set  # or store a new password, typed twice at a hidden prompt
+```
+
+`-t` gives the command a terminal, so it prompts and does not echo. To pipe the password in instead (from a script, or without a terminal), use `-i` alone: the command then reads standard input to its end, once, with no prompt. In Bash:
+
+```bash
+IFS= read -rs -p 'New admin password: ' pw && echo
+printf '%s\n' "$pw" | docker exec -i <container> node dist/main.js reset-admin-password --set; unset pw
 ```
 
 The server reads the stored hash at every sign-in, so either takes effect at once and ends every signed-in session.
