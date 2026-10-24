@@ -882,6 +882,39 @@ describe("retiring a token removed at /admin", () => {
     }),
   );
 
+  it.effect("removing an account with purge keeps accepting writes for a token another account uses", () =>
+    Effect.gen(function* () {
+      yield* setNow();
+      const fio = yield* fakeFio(() => Effect.never);
+      yield* Effect.gen(function* () {
+        const cache = yield* enabledCache;
+        const admin = yield* makeAccountAdmin(ADMIN_KEY);
+        const before = yield* account();
+        const old = before.tokenFingerprint;
+        const shared = tokenFingerprint(Redacted.make(TOKEN_B));
+        const write = (accountName: string, tokenFingerprint: string, rowId: number, accountId: string) => ({
+          accountName,
+          tokenFingerprint,
+          statement: statement(TODAY, TODAY, [tx(rowId, TODAY, 5)], accountId),
+          fetchedAt: NOW,
+        });
+        assert.strictEqual((yield* cache.store.commit(write("main", old, 1, "2000000001"))).rowsWritten, 1);
+        yield* admin.rotate(before.id, TOKEN_B);
+        yield* admin.add({ name: "beta", token: TOKEN_B, accountNumber: undefined, currency: undefined });
+        assert.strictEqual((yield* cache.store.commit(write("beta", shared, 2, "2000000002"))).rowsWritten, 1);
+
+        const removed = yield* admin.remove(before.id, true);
+        assert.deepStrictEqual(removed.cache, { kind: "purged", deleted: 1, accounts: ["beta"], unattributed: 0 });
+        // Only main had the old token: its writes stop. beta's token still writes.
+        assert.strictEqual((yield* cache.store.commit(write("main", old, 3, "2000000001"))).rowsWritten, 0);
+        assert.strictEqual((yield* cache.store.commit(write("beta", shared, 4, "2000000002"))).rowsWritten, 1);
+        const beta = (yield* (yield* Accounts).list).find((candidate) => candidate.name === "beta");
+        if (beta === undefined) return assert.fail("beta is gone");
+        assert.strictEqual((yield* cache.sync.start(beta, { kind: "incremental" })).progress.status, "running");
+      }).pipe(Effect.provide(adminLayer(fio.api)));
+    }),
+  );
+
   it.effect("a purge that fails removes nothing: the account, its token history and its writes stay", () =>
     Effect.gen(function* () {
       yield* setNow();

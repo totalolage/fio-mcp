@@ -111,14 +111,12 @@ const removedCacheText = (cache: RemovedCache): string => {
   switch (cache.kind) {
     case "kept":
       return "Its cached transactions were kept.";
-    case "shared-token":
-      return `Its cached transactions were kept: ${quoted(cache.accounts)} ${cache.accounts.length === 1 ? "uses" : "use"} the same token.`;
     case "purged": {
       const text = purgedText(cache.deleted, cache.accounts);
       if (cache.unattributed === 0) return text;
       const one = cache.unattributed === 1;
       const which = one ? "1 cached bank account" : `${cache.unattributed} cached bank accounts`;
-      return `${text} ${which} cannot be linked to a configured account (cached before this version recorded which tokens an account had, or kept when an account was removed) and ${one ? "was" : "were"} not touched.`;
+      return `${text} ${which} could not be linked to any configured account and ${one ? "was" : "were"} not touched.`;
     }
   }
 };

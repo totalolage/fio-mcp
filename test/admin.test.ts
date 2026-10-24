@@ -388,8 +388,8 @@ describe("accounts at /admin", () => {
     expect(await cached()).toEqual({ movements: [808, 909], bindings: 1 });
   });
 
-  it("deletes what an earlier token cached when the current one cached nothing, and keeps data another account's token reads", async () => {
-    const admin = await signedIn();
+  /** What the cache holds, and a removal with purge at /admin. */
+  const purging = (admin: Admin) => {
     const movements = () =>
       harness.sql(
         Effect.flatMap(SqlClient.SqlClient, (sql) =>
@@ -419,6 +419,12 @@ describe("accounts at /admin", () => {
       );
     const remove = async (name: string) =>
       (await admin.act("/admin/accounts/remove", { id: idOf((await admin.page("/admin")).html, name), cache: "purge", confirm: "yes" })).message;
+    return { movements, leftFor, cache, remove };
+  };
+
+  it("deletes what an earlier token cached when the current one cached nothing, and keeps data another account's token reads", async () => {
+    const admin = await signedIn();
+    const { movements, leftFor, cache, remove } = purging(admin);
 
     // Replaced before the new token downloaded anything: the old token's data is the account's, and goes.
     await cache(SAVINGS_TOKEN, "savings", 505, "2000000009");
@@ -428,11 +434,13 @@ describe("accounts at /admin", () => {
     expect(await movements()).toEqual([]);
     expect(await leftFor(SAVINGS_TOKEN)).toBe(0);
 
-    // Accounts with the same token keep it, all named; nothing is deleted.
+    // Accounts with the same token keep what it cached, all named; nothing is deleted.
     await cache(FIO_TOKEN, "main", 606);
     await admin.act("/admin/accounts/add", { name: "twin", token: FIO_TOKEN });
     await admin.act("/admin/accounts/add", { name: "triplet", token: FIO_TOKEN });
-    expect(await remove("main")).toContain("Removed “main”. Its cached transactions were kept: “twin”, “triplet” use the same token.");
+    expect(await remove("main")).toBe(
+      "Removed “main”. Its cached transactions were kept: “twin”, “triplet” have or had tokens for the same bank account.",
+    );
     expect(await movements()).toEqual([606]);
 
     // Kept at a removal, the data belongs to no configured account: a later purge leaves it and says so.
@@ -441,9 +449,44 @@ describe("accounts at /admin", () => {
     }
     await admin.act("/admin/accounts/add", { name: "fifth", token: NEW_MAIN_TOKEN });
     expect(await remove("fifth")).toContain(
-      "Removed “fifth”. Nothing was cached under its tokens, so nothing was deleted. 1 cached bank account cannot be linked to a configured account (cached before this version recorded which tokens an account had, or kept when an account was removed) and was not touched.",
+      "Removed “fifth”. Nothing was cached under its tokens, so nothing was deleted. 1 cached bank account could not be linked to any configured account and was not touched.",
     );
     expect(await movements()).toEqual([606]);
+  });
+
+  it("purges what only the removed account's tokens cached when another account uses its current token", async () => {
+    const admin = await signedIn();
+    const { movements, leftFor, cache, remove } = purging(admin);
+    // main caches bank account X, then gets a new token, which beta also uses and caches bank account Y with.
+    await cache(FIO_TOKEN, "main", 1101, "2000000001");
+    await admin.act("/admin/accounts/rotate", { id: idOf((await admin.page("/admin")).html, "main"), token: NEW_MAIN_TOKEN });
+    await admin.act("/admin/accounts/add", { name: "beta", token: NEW_MAIN_TOKEN });
+    await cache(NEW_MAIN_TOKEN, "beta", 2202, "2000000002");
+
+    // X was only main's: it goes. Y stays with the token beta uses.
+    expect(await remove("main")).toBe(
+      "Removed “main”. Its cached transactions were deleted, except where “beta” has or had a token for the same bank account.",
+    );
+    expect(await movements()).toEqual([2202]);
+    expect(await leftFor(FIO_TOKEN)).toBe(0);
+    expect(await leftFor(NEW_MAIN_TOKEN)).toBeGreaterThan(0);
+
+    // Nothing of X is left behind for beta's purge to leave unlinked.
+    expect(await remove("beta")).toBe("Removed “beta”. Its cached transactions were deleted.");
+    expect(await movements()).toEqual([]);
+    expect(await leftFor(NEW_MAIN_TOKEN)).toBe(0);
+  });
+
+  it("counts cached data it cannot link to an account without naming a cause, as when a token's data moved to another bank account", async () => {
+    const admin = await signedIn();
+    const { movements, cache, remove } = purging(admin);
+    // FIO reports main's token for bank account X, later for Y: the binding moves to Y, and X is no longer linked.
+    await cache(FIO_TOKEN, "main", 3301, "2000000001");
+    await cache(FIO_TOKEN, "main", 3302, "2000000002");
+    expect(await remove("main")).toBe(
+      "Removed “main”. Its cached transactions were deleted. 1 cached bank account could not be linked to any configured account and was not touched.",
+    );
+    expect(await movements()).toEqual([3301]);
   });
 
   it("tests a token with one read-only call through its rate limiter, which follows a replaced token", async () => {

@@ -61,15 +61,14 @@ export interface AccountInput {
 
 /**
  * What a removal did with the account's cached data: `kept` (keep chosen),
- * kept because `accounts` use the same token, or `purged`: the number of
- * bank accounts whose data was deleted, the `accounts` that kept one (a
- * token they have or had is bound to it), and how many cached bank
- * accounts cannot be linked to a configured account (left alone; see
+ * or `purged`: the number of bank accounts whose data was deleted, the
+ * `accounts` that kept one (a token they have or had, the removed
+ * account's current one included, is bound to it), and how many cached
+ * bank accounts cannot be linked to a configured account (left alone; see
  * `CacheStore.purgeTokens`).
  */
 export type RemovedCache =
   | { readonly kind: "kept" }
-  | { readonly kind: "shared-token"; readonly accounts: ReadonlyArray<string> }
   | {
       readonly kind: "purged";
       readonly deleted: number;
@@ -163,29 +162,29 @@ export const makeAccountAdmin = Effect.fn("AccountAdmin.make")(function* (key: R
 
   /**
    * Removes the account. With `purge`, also deletes what the cache holds for
-   * every token it had (the current one and those it replaced), unless
-   * another account uses its current token, or a token another account has
-   * or had is bound to the same bank account. Returns what happened to the
-   * cached data, naming the accounts that kept it.
+   * every token it had (the current one and those it replaced), except each
+   * bank account a token another account has or had is bound to (another
+   * account using the same token keeps what that token cached). Returns what
+   * happened to the cached data, naming the accounts that kept it.
    */
   const remove = (accountId: string, purge: boolean) =>
     exclusive(
       Effect.gen(function* () {
         const account = yield* find(accountId);
         const others = (yield* accounts.list).filter((other) => other.id !== accountId);
-        const sameToken = others.filter((other) => other.tokenFingerprint === account.tokenFingerprint).map((other) => other.name);
         let removed: RemovedCache;
-        if (!purge || sameToken.length > 0) {
+        if (!purge) {
           yield* store.remove(accountId);
           yield* reload;
-          removed = purge ? { kind: "shared-token", accounts: sameToken } : { kind: "kept" };
+          removed = { kind: "kept" };
         } else {
           const history = yield* store.tokenHistory;
           const tokensOf = (some: Account) => [some.tokenFingerprint, ...(history.get(some.id) ?? [])];
           const current = new Set(others.map((other) => other.tokenFingerprint));
-          // First stop every write for its tokens: the check runs inside each write's
-          // transaction, and a running job is stopped and awaited. The tokens it
-          // replaced were retired when replaced, but only in this process's memory.
+          // First stop every write for its tokens no other account uses: the check runs
+          // inside each write's transaction, and a running job is stopped and awaited.
+          // The tokens it replaced were retired when replaced, but only in this
+          // process's memory.
           if (cache.enabled) for (const fingerprint of tokensOf(account)) if (!current.has(fingerprint)) yield* cache.retire(fingerprint);
           // One transaction: if the purge fails, the account and its token history stay
           // and its token writes again (a job the retirement stopped stays stopped; its
