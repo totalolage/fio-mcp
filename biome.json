@@ -1,0 +1,57 @@
+{
+  "$schema": "./node_modules/@biomejs/biome/configuration_schema.json",
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true
+  },
+  "files": {
+    "ignoreUnknown": false,
+    "includes": ["**/*.ts", "**/*.json", "!**/generated", "!package-lock.json", "!dist", "!openapi"]
+  },
+  "formatter": {
+    "enabled": false
+  },
+  "plugins": [
+    "./lint/no-direct-effect-runs.grit",
+    "./lint/no-direct-process-env.grit",
+    "./lint/no-throw-in-effect-modules.grit",
+    "./lint/no-promise-in-effect-modules.grit",
+    "./lint/prefer-effect-fn.grit"
+  ],
+  "linter": {
+    "rules": {
+      "preset": "recommended",
+      "complexity": {
+        "noForEach": "off"
+      },
+      "style": {
+        "noNonNullAssertion": "off",
+        "noNestedTernary": "error"
+      },
+      "suspicious": {
+        "noExplicitAny": "error",
+        "noConsole": "error"
+      }
+    }
+  },
+  "overrides": [
+    {
+      "includes": ["test/**", "scripts/**"],
+      "linter": {
+        "rules": {
+          "suspicious": {
+            "noConsole": "off"
+          }
+        }
+      }
+    }
+  ],
+  "assist": {
+    "actions": {
+      "source": {
+        "organizeImports": "on"
+      }
+    }
+  }
+}

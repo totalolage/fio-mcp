@@ -1,0 +1,17 @@
+engine biome(1.0)
+language js(typescript)
+
+file($name, $body) where {
+  $name <: r".*/src/.*\.ts$",
+  not $name <: r".*/src/generated/.*",
+  $body <: r"(?s).*\bthrow\b.*",
+  $body <: contains bubble {
+    `throw $value` as $statement where {
+      register_diagnostic(
+        span = $statement,
+        message = "Model expected failures as tagged errors in the Effect error channel instead of throwing.",
+        severity = "error"
+      )
+    }
+  }
+}
