@@ -16,7 +16,7 @@ import { annotateTool, DateParam, JsonObject, ToolFailure, withAccount } from ".
 import { PAYMENTS, permittedAccount, READ, requireScopes, visibleAccounts } from "./permissions.js";
 
 export const SERVER_INSTRUCTIONS =
-  "Tools for FIO Bank accounts (Czech Republic). Every tool is listed regardless of what the configured API tokens may do; if a token lacks the permission, the tool answers \"You don't have permissions to do that.\" FIO allows one request per token every 30 seconds, so batch questions into as few calls as possible. Call get_server_status to see accounts and rate-limit state.";
+  "Tools for FIO Bank accounts (Czech Republic). Tools are listed regardless of what the configured FIO API tokens may do; if a token lacks the permission, the tool answers \"You don't have permissions to do that.\" Over HTTP, the list follows this client's authorization: tools and accounts it was not granted are left out. FIO allows one request per token every 30 seconds, so batch questions into as few calls as possible. Call get_server_status to see accounts and rate-limit state.";
 
 const PAYMENT_WARNING =
   "Orders are NOT executed by this call: FIO only queues them as a batch, which an authorized person must then sign in FIO Internetbanking (SMS or Fio signature) before anything is paid. Even so, it creates a real batch in the bank. Only call it after the user has reviewed the exact orders (use preview_payment_orders) and explicitly asked to submit them.";
@@ -332,7 +332,7 @@ export const makeFioHandlers = Effect.fn("FioTools.handlers")(function* (toolkit
     preview_payment_orders: ({ account, orders }) =>
       out(
         Effect.gen(function* () {
-          const acc = yield* permittedAccount(accounts, account);
+          const acc = yield* permittedAccount(accounts, account, PAYMENTS);
           const payer = yield* accounts.payer(acc);
           const xml = yield* buildImportXml(orders, payer);
           return {

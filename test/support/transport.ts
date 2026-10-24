@@ -9,7 +9,7 @@ import type { NormalizedStatement } from "../../src/statement.js";
 
 /** A FIO-shaped read token (64 URL-safe characters). */
 export const FIO_TOKEN = "fioT0ken-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRS";
-const SAVINGS_TOKEN = "savingsT0ken-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMN";
+export const SAVINGS_TOKEN = "savingsT0ken-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMN";
 
 export const STATEMENT: NormalizedStatement = {
   info: {

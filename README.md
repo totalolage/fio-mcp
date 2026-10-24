@@ -2,7 +2,7 @@
 
 # fio-mcp
 
-An [MCP](https://modelcontextprotocol.io) server for [FIO Bank](https://www.fio.cz)'s REST API ("API Bankovnictví"). It exposes every tool: reading transactions and statements, and preparing and uploading payment orders, which still have to be signed in Internetbanking. If a token isn't allowed to do something, the tool answers "You don't have permissions to do that."
+An [MCP](https://modelcontextprotocol.io) server for [FIO Bank](https://www.fio.cz)'s REST API ("API Bankovnictví"). Its tools read transactions and statements, and prepare and upload payment orders, which still have to be signed in Internetbanking. Every tool is listed whatever the FIO tokens may do; if a token isn't allowed to do something, the tool answers "You don't have permissions to do that." Over HTTP with OAuth, a client sees only the tools and accounts it was granted.
 
 FIO allows one request per token every 30 seconds. To keep interactive use fast, the server keeps a local SQLite cache of your transactions and answers searches and summaries from it without calling FIO.
 
@@ -121,7 +121,7 @@ FIO tokens have one of two levels, chosen when the token is created:
 - **Sledování účtu**: read-only account monitoring.
 - **Sledování účtu a zadávání platebních a inkasních příkazů**: monitoring plus entering payment and collection orders.
 
-The API has no endpoint that reports a token's level, so the server doesn't try to find out. Every tool is always listed. When FIO refuses a call because the token may not do it, the tool returns an error that starts with:
+The API has no endpoint that reports a token's level, so the server doesn't try to find out, and a token's level never hides a tool. When FIO refuses a call because the token may not do it, the tool returns an error that starts with:
 
 > You don't have permissions to do that.
 
@@ -133,7 +133,7 @@ It is followed by one line saying what FIO answered and, for payments, which tok
 | HTTP 500 (FIO's code for a missing or inactive token, and the likely answer to a read-only token trying to upload) | payment upload |
 | Upload rejected with a batch-level message that mentions the token or API **and** denies a right (e.g. "Token does not have permission…", "Token nemá oprávnění…") | payment upload |
 
-FIO does not document what a read-only token gets back on upload, so this is a best guess. Other errors keep their own messages. On reads, HTTP 500 is reported as "token does not exist or is inactive". Ordinary validation failures and content restrictions (e.g. "payments to this country are not permitted") come back as a normal rejected result. With several accounts, every tool takes an `account` argument listing all configured account names. Tool inputs are strict: unknown arguments are rejected.
+FIO does not document what a read-only token gets back on upload, so this is a best guess. Other errors keep their own messages. On reads, HTTP 500 is reported as "token does not exist or is inactive". Ordinary validation failures and content restrictions (e.g. "payments to this country are not permitted") come back as a normal rejected result. With several accounts, every tool that acts on an account takes an `account` argument whose enum lists the configured account names (over HTTP, only the granted ones; see [Connecting a client](#connecting-a-client)). Tool inputs are strict: unknown arguments are rejected.
 
 ## Tools
 
@@ -165,7 +165,7 @@ Data older than 90 days is only served after the account owner unlocks full hist
 
 Every answer from the cache includes `freshness`: the covered ranges in the requested period, the last successful sync, the oldest download among the days returned, whether history is limited, and `complete` (every requested day is cached).
 
-### Payments (need a token with the payment-order level)
+### Payments (need a token with the payment-order level; over HTTP, also `fio:payments`)
 
 | Tool | What it does |
 |---|---|
@@ -183,7 +183,7 @@ Orders are sent in the order FIO requires (domestic, euro, foreign), and all tex
 ## Payment safety
 
 - **Uploading does not pay anything by itself.** Per FIO's documentation, an imported batch must be signed by an authorized person in Internetbanking (SMS or Fio signature) before FIO processes it. Treat an upload as real anyway: it creates a pending batch in the bank.
-- Payment tools are always listed, but FIO refuses uploads from a read-only token. Give the server a read-only token unless you need payments.
+- Payment tools are listed whatever the token's level (over HTTP, only to clients granted `fio:payments`), but FIO refuses uploads from a read-only token. Give the server a read-only token unless you need payments.
 - `submit_payment_orders` requires `confirm: true` and is annotated destructive, so MCP clients that ask before destructive actions will ask. Have the model show you `preview_payment_orders` output first.
 - Validation covers formats, lengths, and enums from the PDF and `importIB.xsd`: account and bank-code patterns, symbols, dates, 2-decimal amounts, BIC, IBAN checksum, the XSD's country list (`country_type`), payment-reason codes, and fee codes. FIO's character-set classes (for example "no diacritics" in euro beneficiary names) are described in the tool schema but not enforced locally. FIO rejects such a batch with a validation error instead of creating it.
 - If the outcome is uncertain, the server says so instead of reporting a rejection. That covers a timeout or network failure after the request was sent, an unexpected HTTP status, an unparseable response, or a response with a missing status or an error status alongside a batch ID. Check pending batches in Internetbanking before submitting again, or the orders may be duplicated. A failure before anything was sent (rate limit, invalid input) is reported as certain.
@@ -300,12 +300,12 @@ HTTP mode is protected by OAuth, with fio-mcp as its own authorization server (M
 
 Add `https://<host>/mcp` (for example `https://fio.home.arpa/mcp`) as a remote MCP server in your client. The client opens the sign-in page; enter the admin password, then choose on the consent page, which shows the client's name and redirect URI:
 
-- **Scopes.** `fio:read` covers every reading tool, the cache tools, sync, the download marker, and payment previews. `fio:payments` additionally allows `submit_payment_orders`.
+- **Scopes.** `fio:read` covers every reading tool, the cache tools, sync, and the download marker. `fio:payments` additionally allows `preview_payment_orders` and `submit_payment_orders`.
 - **Accounts** the client may use.
 
 A grant covers the accounts behind the chosen FIO tokens, not their names. Renaming an account keeps its grants; giving an old name to another token does not pass the grant on. Replacing an account's token (FIO tokens expire within 180 days) removes that account from existing grants: its calls are refused until you reconnect the client and select it again. Accounts configured with the same token are the same FIO account, so a grant for one covers them all. Grants made before this rule (by name) were revoked on upgrade; reconnect those clients.
 
-Every tool stays listed. A call outside the grant answers "You don't have permissions to do that."; to widen a grant, remove and re-add the server in the client. `get_server_status` and `get_cache_status` show only granted accounts.
+HTTP sessions list only what the grant allows; stdio lists everything. Without `fio:payments` the payment tools are not listed, the `account` enum names only the granted accounts, and when a grant covers no configured account (for example after its token was replaced) the tools that take an account are not listed either. `get_server_status` and `get_cache_status` show only granted accounts. The list is for discovery: every call is still checked, and a call outside the grant, including one to a tool that is not listed, answers "You don't have permissions to do that." To widen a grant, remove and re-add the server in the client.
 
 ### How it works
 
@@ -512,7 +512,7 @@ src/
   import-response.ts    import response parser
   cache/                SQLite database, migrations, store, sync engine, TransactionCache service
   mcp/                  tool definitions and handlers (FIO tools, cache tools)
-  transport/            stdio and HTTP transports, auth seam, frame redaction
+  transport/            stdio and HTTP transports, auth seam, frame redaction, grant-filtered tools/list
 openapi/fio-api.yaml    FIO REST API spec
 scripts/                client generator, image ship script
 lint/                   Biome Grit rules

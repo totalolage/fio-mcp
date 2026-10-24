@@ -4,10 +4,12 @@ import { NodeHttpServer } from "@effect/platform-node";
 import { ByteSize, Clock, Context, Effect, Exit, Fiber, Layer, Predicate, Result, Schema, type Scope, Stream, type Types } from "effect";
 import { McpServer } from "effect/ai";
 import { Headers, HttpBody, HttpEffect, HttpMiddleware, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
+import { Accounts } from "../accounts.js";
 import type { TransportConfig } from "../config.js";
 import { Redactor } from "../redaction.js";
 import { Auth } from "./auth.js";
 import { type FrameRedactor, makeFrameRedactor } from "./frame-redaction.js";
+import { grantProtocols } from "./grant-tools.js";
 import { CurrentPrincipal, type Principal } from "./principal.js";
 import type { ServerInfo } from "./server-info.js";
 
@@ -488,7 +490,8 @@ const mcpAuth = HttpRouter.middleware(
  * The router app: `app` (tool registrations and anything else that needs
  * `McpServer`) at /mcp, with /healthz and the guards. `auth` is built inside
  * it, so it may add routes of its own (those pass the Host allowlist but not
- * `Auth`). Usable with `HttpRouter.serve` or `HttpRouter.toWebHandler`.
+ * `Auth`). `tools/list` follows each request's grant (grant-tools.ts).
+ * Usable with `HttpRouter.serve` or `HttpRouter.toWebHandler`.
  */
 export const httpRouterApp = <A, E, R, EA, RA>(
   app: Layer.Layer<A, E, R>,
@@ -498,12 +501,18 @@ export const httpRouterApp = <A, E, R, EA, RA>(
 ) =>
   Layer.mergeAll(app, HealthRoute, guard(config.allowedHosts)).pipe(
     Layer.provideMerge(
-      McpServer.layerHttp({
-        ...info,
-        path: MCP_PATH,
-        allowedOrigins: config.allowedOrigins,
-        allowSessionTermination: true,
-      }).pipe(Layer.provide(mcpAuth.layer)),
+      Layer.unwrap(
+        Effect.gen(function* () {
+          const accounts = yield* Accounts;
+          return McpServer.layerHttp({
+            ...info,
+            protocols: grantProtocols(info.protocols, accounts.list),
+            path: MCP_PATH,
+            allowedOrigins: config.allowedOrigins,
+            allowSessionTermination: true,
+          }).pipe(Layer.provide(mcpAuth.layer));
+        }),
+      ),
     ),
     Layer.provide(auth),
   );

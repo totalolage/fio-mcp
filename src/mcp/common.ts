@@ -58,7 +58,8 @@ export function withAccount<F extends Schema.Struct.Fields>(
     accountNames.length > 1
       ? {
           ...fields,
-          account: Schema.Literals(accountNames).annotate({ description: `Account to use: ${accountNames.join(", ")}.` }),
+          // Generic: HTTP narrows the enum to the session's granted accounts.
+          account: Schema.Literals(accountNames).annotate({ description: "Name of the account to use." }),
         }
       : fields;
   // MCP needs an object-rooted JSON Schema; an empty Struct encodes to

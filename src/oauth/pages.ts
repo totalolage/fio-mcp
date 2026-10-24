@@ -99,8 +99,8 @@ ${page.error === undefined ? "" : `<p class="error" role="alert">${escapeHtml(pa
 <form method="post" action="/consent">
 <input type="hidden" name="csrf" value="${escapeHtml(page.csrf)}">
 <fieldset><legend>Permissions</legend>
-<label><input type="checkbox" checked disabled> Read accounts, transactions, statements and the local cache; sync; move the download marker; preview payment orders (<code>fio:read</code>, required)</label>
-<label><input type="checkbox" name="scope" value="fio:payments"${page.paymentsRequested ? " checked" : ""}> Submit payment orders to FIO for signing in Internetbanking (<code>fio:payments</code>)</label>
+<label><input type="checkbox" checked disabled> Read accounts, transactions, statements and the local cache; sync; move the download marker (<code>fio:read</code>, required)</label>
+<label><input type="checkbox" name="scope" value="fio:payments"${page.paymentsRequested ? " checked" : ""}> Preview payment orders and submit them to FIO for signing in Internetbanking (<code>fio:payments</code>)</label>
 </fieldset>
 <fieldset><legend>Accounts</legend>
 ${accounts}

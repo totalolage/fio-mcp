@@ -91,25 +91,29 @@ describe("OAuth end to end with the MCP SDK client", () => {
     expect(provider.saved?.scope).toBe("fio:read");
     expect(provider.saved?.refresh_token).toMatch(/^fio_rt_/);
 
-    // 4. /mcp calls with the token: only the granted account is visible;
-    // other accounts and payments are refused per call, every tool stays listed.
+    // 4. /mcp calls with the token: only the granted account and the
+    // fio:read tools are listed; other accounts and payments are refused per call.
     const { client } = await sdkClient(provider);
-    const tools = (await client.listTools()).tools.map((t) => t.name);
-    expect(tools).toContain("submit_payment_orders");
+    const tools = (await client.listTools()).tools;
+    expect(tools.map((t) => t.name)).not.toContain("submit_payment_orders");
+    expect(tools.map((t) => t.name)).not.toContain("preview_payment_orders");
+    expect(tools.find((t) => t.name === "get_last_statement")?.inputSchema.properties?.account).toMatchObject({ enum: ["main"] });
     const status = JSON.parse(text((await client.callTool({ name: "get_server_status", arguments: {} })) as CallToolResult));
     expect(status.accounts.map((a: { name: string }) => a.name)).toEqual(["main"]);
-    const preview = (await client.callTool({
-      name: "preview_payment_orders",
-      arguments: { account: "main", orders: [ORDER] },
-    })) as CallToolResult;
-    expect(preview.isError).not.toBe(true);
     const otherAccount = (await client.callTool({
-      name: "preview_payment_orders",
-      arguments: { account: "savings", orders: [ORDER] },
+      name: "get_last_statement",
+      arguments: { account: "savings" },
     })) as CallToolResult;
     expect(otherAccount.isError).toBe(true);
     expect(text(otherAccount)).toMatch(/^You don't have permissions to do that\./);
     expect(text(otherAccount)).toContain('"savings"');
+    const preview = (await client.callTool({
+      name: "preview_payment_orders",
+      arguments: { account: "main", orders: [ORDER] },
+    })) as CallToolResult;
+    expect(preview.isError).toBe(true);
+    expect(text(preview)).toMatch(/^You don't have permissions to do that\./);
+    expect(text(preview)).toContain("fio:payments");
     const submit = (await client.callTool({
       name: "submit_payment_orders",
       arguments: { account: "main", orders: [ORDER], confirm: true },
