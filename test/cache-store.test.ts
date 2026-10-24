@@ -5,7 +5,7 @@ import { NodeFileSystem } from "@effect/platform-node";
 import { assert, describe, it } from "@effect/vitest";
 import { Effect, Layer, Redacted } from "effect";
 import { SqlClient } from "effect/sql";
-import { backupDatabase, CACHE_MIGRATIONS, databaseLayer, migrate, SERVER_MIGRATIONS } from "../src/cache/db.js";
+import { backupDatabase, CACHE_MIGRATIONS, migrate, SERVER_MIGRATIONS } from "../src/cache/db.js";
 import { NOT_VERIFIED } from "../src/cache/service.js";
 import { makeCacheStore } from "../src/cache/store.js";
 import { CacheError, InvalidInput } from "../src/errors.js";
@@ -22,12 +22,13 @@ import {
   TOKEN_B,
   tx,
 } from "./support/cache.js";
+import { memoryDatabase, testDatabase } from "./support/database.js";
 import { fakeFio } from "./support/fio-api.js";
 
 const tempDir = () => mkdtempSync(join(tmpdir(), "fio-cache-"));
 const mode = (path: string) => statSync(path).mode & 0o777;
 
-const withDb = (filename: string) => Effect.provide(databaseLayer(filename).pipe(Layer.provide(NodeFileSystem.layer)));
+const withDb = (filename: string) => Effect.provide(testDatabase(filename));
 
 const tables = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
@@ -54,7 +55,7 @@ describe("cache database", () => {
   it.effect("migrating legacy pending ranges makes every range upsert-only", () =>
     Effect.gen(function* () {
       const beforeMigration = Object.fromEntries(Object.entries(SERVER_MIGRATIONS).filter(([id]) => id < "0003"));
-      const oldDatabase = () => databaseLayer(":memory:", beforeMigration).pipe(Layer.provide(NodeFileSystem.layer));
+      const oldDatabase = () => memoryDatabase(beforeMigration);
 
       yield* Effect.gen(function* () {
         const sql = yield* SqlClient.SqlClient;

@@ -2,7 +2,7 @@ import { NodeFileSystem, NodeStdio } from "@effect/platform-node";
 import { Effect, Layer } from "effect";
 import { McpProtocol } from "effect/ai";
 import { Accounts } from "./accounts.js";
-import { backupDatabase, DatabaseLive } from "./cache/db.js";
+import { backupDatabase, Database } from "./cache/db.js";
 import { CacheLive, CacheSyncLive } from "./cache/service.js";
 import { AppConfig, type HttpAuthConfig } from "./config.js";
 import { FioApi } from "./fio-api.js";
@@ -43,10 +43,7 @@ export const BaseLive = Layer.mergeAll(AppConfig.Live, Redactor.Live, Accounts.L
  * One instance per process: one rate limiter per token, one FIO client, one
  * SQLite cache. With FIO_CACHE_ENABLED=false the cache opens no database.
  */
-export const ServicesLive = CacheLive.pipe(
-  Layer.provideMerge(Layer.mergeAll(BaseLive, FioApi.Live)),
-  Layer.provide(NodeFileSystem.layer),
-);
+export const ServicesLive = CacheLive.pipe(Layer.provideMerge(Layer.mergeAll(BaseLive, FioApi.Live)));
 
 /** Tool registrations (`McpServer.toolkit(...)` layers). */
 export const ToolsLive = Layer.mergeAll(FioToolsLive, CacheToolsLive);
@@ -78,8 +75,7 @@ const UNAUTHENTICATED_WARNING =
 export const httpAuthLive = (auth: HttpAuthConfig, trustedProxies: HttpTransportConfig["trustedProxies"]) =>
   auth.kind === "oauth"
     ? OAuthLive({ publicUrl: auth.publicUrl, passwordHash: auth.passwordHash, trustedProxies }).pipe(
-        Layer.provide(DatabaseLive),
-        Layer.provide(NodeFileSystem.layer),
+        Layer.provide(Database.Live),
       )
     : Layer.merge(Auth.layerOpen, Layer.effectDiscard(Effect.logWarning(UNAUTHENTICATED_WARNING)));
 
@@ -99,21 +95,10 @@ export const AppLive = Layer.unwrap(
  * database to `dest` with `VACUUM INTO` (safe while the server runs).
  */
 export const backup = (dest: string) =>
-  backupDatabase(dest).pipe(
-    Effect.provide(
-      DatabaseLive.pipe(Layer.provideMerge(AppConfig.Live), Layer.provideMerge(NodeFileSystem.layer)),
-    ),
-  );
+  backupDatabase(dest).pipe(Effect.provide(Layer.mergeAll(Database.Live, NodeFileSystem.layer)));
 
 const withDatabase = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-  effect.pipe(
-    Effect.provide(
-      Layer.mergeAll(
-        DatabaseLive.pipe(Layer.provideMerge(AppConfig.Live), Layer.provideMerge(NodeFileSystem.layer)),
-        NodeStdio.layer,
-      ),
-    ),
-  );
+  effect.pipe(Effect.provide(Layer.mergeAll(Database.Live, NodeStdio.layer)));
 
 /** `fio-mcp clients list` / `clients revoke <id>` / `tokens revoke-all` on the server's database. */
 export const listClients = withDatabase(listClientsCommand());

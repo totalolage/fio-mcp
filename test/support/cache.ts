@@ -1,14 +1,14 @@
-import { NodeFileSystem } from "@effect/platform-node";
+
 import { Effect, Layer, Redacted } from "effect";
 import { TestClock } from "effect/testing";
 import { type Account, Accounts } from "../../src/accounts.js";
-import { databaseLayer } from "../../src/cache/db.js";
 import { TransactionCache, TransactionCacheFromSql } from "../../src/cache/service.js";
 import { type AppConfigShape, type CacheConfig, DEFAULT_BACKFILL_FROM, DEFAULT_CACHE_MAX_AGE_MINUTES, DEFAULT_OVERLAP_DAYS, MAX_RESPONSE_BYTES } from "../../src/config.js";
 import type { FioApi } from "../../src/fio-api.js";
 import { Redactor } from "../../src/redaction.js";
 import type { NormalizedStatement, Transaction } from "../../src/statement.js";
 import { seededConfig } from "./config.js";
+import { testDatabase } from "./database.js";
 import type { PeriodsScript } from "./fio-api.js";
 
 export const TOKEN_A = "a".repeat(64);
@@ -121,7 +121,7 @@ const baseLayer = (cfg: AppConfigShape, fio: Layer.Layer<FioApi>) =>
 
 export const cacheLayer = (cfg: AppConfigShape, fio: Layer.Layer<FioApi>) =>
   TransactionCacheFromSql.pipe(
-    Layer.provideMerge(databaseLayer(cfg.cache.dbPath).pipe(Layer.provide(NodeFileSystem.layer))),
+    Layer.provideMerge(testDatabase(cfg.cache.dbPath)),
     Layer.provideMerge(baseLayer(cfg, fio)),
   );
 

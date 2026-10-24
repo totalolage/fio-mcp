@@ -1,12 +1,12 @@
-import { Clock, Context, DateTime, Effect, type FileSystem, Layer, Option, Schedule } from "effect";
+import { Clock, Context, DateTime, Effect, Layer, Option, Schedule } from "effect";
 import type { SqlClient } from "effect/sql";
 import { type Account, Accounts } from "../accounts.js";
 import { AppConfig, type AppConfigShape } from "../config.js";
-import { type CacheError, InvalidInput } from "../errors.js";
+import { type CacheError, type ConfigError, InvalidInput } from "../errors.js";
 import { FioApi } from "../fio-api.js";
 import type { NormalizedStatement, StatementInfo, Transaction } from "../statement.js";
 import { addDays, type DayRange, minDate, pragueDateOf, pragueToday, rangeLength } from "./dates.js";
-import { DatabaseLive } from "./db.js";
+import { Database } from "./db.js";
 import { type CachedAccount, type CacheStore, makeCacheStore, type SyncMode } from "./store.js";
 import { type CacheSyncShape, makeCacheSync, type SyncRequest } from "./sync.js";
 
@@ -215,7 +215,7 @@ export const TransactionCacheFromSql: Layer.Layer<
 > = Layer.effect(TransactionCache, Effect.map(makeTransactionCache(), TransactionCache.of));
 
 /**
- * The cache on a database the caller provides (e.g. `DatabaseLive`, shared
+ * The cache on a database the caller provides (e.g. `Database.Live`, shared
  * with other users of the file); `{ enabled: false }` when the cache is off.
  */
 export const CacheOnDatabaseLive: Layer.Layer<TransactionCache, never, SqlClient.SqlClient | AppConfig | FioApi> =
@@ -231,11 +231,11 @@ export const CacheOnDatabaseLive: Layer.Layer<TransactionCache, never, SqlClient
  * FIO_DB_PATH when the cache is enabled, otherwise `{ enabled: false }`
  * without touching disk.
  */
-export const CacheLive: Layer.Layer<TransactionCache, CacheError, AppConfig | FileSystem.FileSystem | FioApi> =
+export const CacheLive: Layer.Layer<TransactionCache, CacheError | ConfigError, AppConfig | FioApi> =
   Layer.unwrap(
     Effect.gen(function* () {
       const config = yield* AppConfig;
-      return config.cache.enabled ? TransactionCacheFromSql.pipe(Layer.provide(DatabaseLive)) : TransactionCache.disabled;
+      return config.cache.enabled ? TransactionCacheFromSql.pipe(Layer.provide(Database.Live)) : TransactionCache.disabled;
     }),
   );
 

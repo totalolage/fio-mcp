@@ -1,4 +1,5 @@
 import { dirname } from "node:path";
+import { NodeFileSystem } from "@effect/platform-node";
 import { SqliteClient, SqliteMigrator } from "@effect/sql-sqlite-node";
 import { Effect, FileSystem, Layer } from "effect";
 import { SqlClient, type SqlError } from "effect/sql";
@@ -156,7 +157,7 @@ const configure = Effect.gen(function* () {
  * SqlClient (and SqliteClient) for `filename`, migrated. ":memory:" skips the
  * file preparation; tests use it.
  */
-export const databaseLayer = (
+const layer = (
   filename: string,
   migrations: Migrations = CACHE_MIGRATIONS,
 ): Layer.Layer<SqlClient.SqlClient | SqliteClient.SqliteClient, CacheError, FileSystem.FileSystem> => {
@@ -175,28 +176,30 @@ export const databaseLayer = (
     : ready.pipe(Layer.provideMerge(Layer.effectDiscard(prepareDatabaseFile(filename))));
 };
 
-/** The database at `AppConfig.cache.dbPath` (FIO_DB_PATH) with `migrations` applied. */
-export const makeDatabaseLive = (
-  migrations: Migrations = CACHE_MIGRATIONS,
-): Layer.Layer<SqlClient.SqlClient | SqliteClient.SqliteClient, CacheError, AppConfig | FileSystem.FileSystem> =>
-  Layer.unwrap(
+/** Every module's migrations, in one id sequence. */
+export const SERVER_MIGRATIONS: Migrations = { ...CACHE_MIGRATIONS, ...OAUTH_MIGRATIONS };
+
+/**
+ * The server's database (`SqlClient`). Not a `Context.Service`: `SqlClient`
+ * is the capability, and this is its only adapter.
+ */
+export const Database = {
+  layer,
+  /**
+   * The database at `AppConfig.cache.dbPath` (FIO_DB_PATH) with all
+   * migrations. Every user provides this same value, so one build (one
+   * connection) is shared: layers are memoized by reference.
+   */
+  Live: Layer.unwrap(
     Effect.gen(function* () {
       const config = yield* AppConfig;
       if (config.cache.dbPath === "") {
         return yield* new CacheError({ operation: "locate the database (set FIO_DB_PATH)" });
       }
-      return databaseLayer(config.cache.dbPath, migrations);
+      return layer(config.cache.dbPath, SERVER_MIGRATIONS);
     }),
-  );
-
-/** Every module's migrations, in one id sequence. */
-export const SERVER_MIGRATIONS: Migrations = { ...CACHE_MIGRATIONS, ...OAUTH_MIGRATIONS };
-
-/**
- * The database with all migrations. Every user provides this same value, so
- * one build (one connection) is shared: layers are memoized by reference.
- */
-export const DatabaseLive = makeDatabaseLive(SERVER_MIGRATIONS);
+  ).pipe(Layer.provide(NodeFileSystem.layer), Layer.provide(AppConfig.Live)),
+};
 
 /**
  * Writes a consistent copy of the live database to `destination` with

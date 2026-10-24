@@ -1,14 +1,13 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { NodeFileSystem } from "@effect/platform-node";
 import { assert, describe, it } from "@effect/vitest";
 import { Deferred, Effect, Fiber, Layer, Option, Redacted, Ref } from "effect";
 import { SqlClient } from "effect/sql";
 import { TestClock } from "effect/testing";
 import { tokenFingerprint } from "../src/accounts.js";
 import { addDays } from "../src/cache/dates.js";
-import { databaseLayer, SERVER_MIGRATIONS } from "../src/cache/db.js";
+import { SERVER_MIGRATIONS } from "../src/cache/db.js";
 import { CacheSyncLive } from "../src/cache/service.js";
 import { historyUnlockMessage, type SyncRequest } from "../src/cache/sync.js";
 import {
@@ -32,6 +31,7 @@ import {
   TOKEN_A,
   tx,
 } from "./support/cache.js";
+import { testDatabase } from "./support/database.js";
 import { fakeFio, type PeriodsScript } from "./support/fio-api.js";
 
 const RECENT_START = addDays(TODAY, -89);
@@ -716,7 +716,7 @@ describe("cache sync", () => {
           INSERT INTO sync_state (token_fingerprint, account_key, mode, pending_json)
           VALUES (${TOKEN_FP}, ${accountKey}, 'refresh', ${JSON.stringify([b, a])})
         `;
-      }).pipe(Effect.provide(databaseLayer(dbPath, beforeMigration).pipe(Layer.provide(NodeFileSystem.layer))));
+      }).pipe(Effect.provide(testDatabase(dbPath, beforeMigration)));
 
       // FIO still lists B's movement, but returns no movement for A.
       const fio = yield* fakeFio(serveFrom([tx(2, b.from, 2)]));

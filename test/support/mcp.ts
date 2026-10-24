@@ -4,7 +4,6 @@
  * nothing listens on a port; FIO is the scripted `FioHttp` client.
  */
 
-import { NodeFileSystem } from "@effect/platform-node";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
@@ -12,7 +11,7 @@ import { Effect, Layer, Redacted } from "effect";
 import { HttpRouter, HttpServer } from "effect/http";
 import { Accounts } from "../../src/accounts.js";
 import { SERVER_INFO, ToolsLive } from "../../src/app.js";
-import { CacheLive } from "../../src/cache/service.js";
+import { TransactionCache, TransactionCacheFromSql } from "../../src/cache/service.js";
 import type { AppConfigShape } from "../../src/config.js";
 import { FioApi } from "../../src/fio-api.js";
 import { RateLimiter } from "../../src/rate-limiter.js";
@@ -20,6 +19,7 @@ import { Redactor } from "../../src/redaction.js";
 import { Auth } from "../../src/transport/auth.js";
 import { httpRouterApp } from "../../src/transport/http.js";
 import { seededConfig } from "./config.js";
+import { testDatabase } from "./database.js";
 import { FioHttp, type FioHttpHandler, type FioHttpReply, type RecordedRequest } from "./fio-http.js";
 
 export interface Harness {
@@ -43,11 +43,14 @@ export async function connect(config: AppConfigShape, route: FioHttpHandler | Fi
       }),
     ).pipe(Effect.scoped),
   );
-  const ServicesLive = CacheLive.pipe(
+  const cache = config.cache.enabled
+    ? TransactionCacheFromSql.pipe(Layer.provide(testDatabase(config.cache.dbPath)))
+    : TransactionCache.disabled;
+  const ServicesLive = cache.pipe(
     Layer.provideMerge(FioApi.Default),
     Layer.provideMerge(Layer.mergeAll(Redactor.Default, Accounts.Default, RateLimiter.Default)),
     Layer.provideMerge(seededConfig(config)),
-    Layer.provide(Layer.mergeAll(Layer.succeedContext(fioHttp), NodeFileSystem.layer)),
+    Layer.provide(Layer.succeedContext(fioHttp)),
   );
   // The production HTTP router app (guards, frame redaction, /healthz), without auth.
   const httpConfig = {
