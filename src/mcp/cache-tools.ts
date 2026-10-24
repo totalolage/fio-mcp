@@ -203,6 +203,8 @@ export const makeCacheHandlers = Effect.fn("CacheTools.handlers")(function* (too
       out(
         Effect.gen(function* () {
           const account = yield* permittedAccount(accounts, name);
+          // A disabled cache is reported before any argument error.
+          yield* cache.requireEnabled;
           if (from !== undefined && mode !== "backfill") {
             return yield* new InvalidInput({ detail: "`from` applies to mode=backfill only." });
           }

@@ -3,6 +3,8 @@ import { Effect, Layer, Ref } from "effect";
 import { CACHE_DISABLED } from "../src/cache/service.js";
 import { type CacheError, InvalidInput, type PermissionDenied } from "../src/errors.js";
 import { makeCacheHandlers, makeCacheToolkit } from "../src/mcp/cache-tools.js";
+import { makeFioHandlers, makeFioToolkit } from "../src/mcp/fio-tools.js";
+import { RateLimiter } from "../src/rate-limiter.js";
 import { LocalPrincipalLive } from "../src/transport/principal.js";
 import {
   account,
@@ -15,10 +17,14 @@ import {
   statement,
   TODAY,
   tx,
+  verifiedStatus,
 } from "./support/cache.js";
 import { fakeFio } from "./support/fio-api.js";
 
 const cacheTools = Effect.suspend(() => makeCacheHandlers(makeCacheToolkit(["main"])));
+const fioTools = Effect.suspend(() => makeFioHandlers(makeFioToolkit(["main"]))).pipe(
+  Effect.provide(RateLimiter.Default),
+);
 
 const fixture = [
   tx(1, "2026-01-05", -100.1, {
@@ -152,6 +158,28 @@ describe("cache query tools", () => {
   );
 });
 
+describe("FIO tools writing to the cache", () => {
+  it.effect("get_statement and get_new_transactions store their movements without coverage", () =>
+    Effect.gen(function* () {
+      yield* setNow();
+      const fio = yield* fakeFio(serveFrom([]), {
+        statement: () => Effect.succeed(statement("2026-01-01", "2026-01-31", [fixture[0]!, fixture[1]!])),
+        last: () => Effect.succeed(statement("2026-10-01", TODAY, [tx(42, TODAY, 5)])),
+      });
+      yield* Effect.gen(function* () {
+        const tools = yield* fioTools;
+        yield* tools.get_statement({ year: 2026, number: 1 });
+        yield* tools.get_new_transactions({});
+        const status = yield* verifiedStatus(yield* account());
+        assert.strictEqual(status.rowCount, 3);
+        assert.deepStrictEqual(status.coveredRanges, []);
+        const found = yield* (yield* cacheTools).search_transactions({});
+        assert.deepStrictEqual(ids(found.transactions), [42, 2, 1]);
+      }).pipe(Effect.provide(Layer.mergeAll(cacheLayer(config(), fio.layer), LocalPrincipalLive)));
+    }),
+  );
+});
+
 describe("cache disabled", () => {
   it.effect("cache tools answer that the cache is disabled", () =>
     Effect.gen(function* () {
@@ -170,9 +198,9 @@ describe("cache disabled", () => {
           assert.instanceOf(error, InvalidInput);
           assert.strictEqual(error.message, CACHE_DISABLED);
         }
-        // sync_transactions checks its arguments before it reaches the cache.
+        // Reported before any argument error.
         const malformed = yield* Effect.flip(cache.sync_transactions({ from: "2026-01-01" }));
-        assert.strictEqual(malformed.message, "`from` applies to mode=backfill only.");
+        assert.strictEqual(malformed.message, CACHE_DISABLED);
       }).pipe(Effect.provide(Layer.mergeAll(disabledCacheLayer(config(), fio.layer), LocalPrincipalLive)));
     }),
   );

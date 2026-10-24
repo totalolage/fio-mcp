@@ -139,6 +139,8 @@ export type SyncOutcome =
     };
 
 export interface TransactionsShape {
+  /** Fails with CACHE_DISABLED when the cache is disabled, so a tool can report that before its argument errors. */
+  readonly requireEnabled: Effect.Effect<void, InvalidInput>;
   /** Date-range movements from the cache or FIO, by `source`; a FIO answer is written through. */
   readonly transactions: (
     account: Account,
@@ -411,6 +413,7 @@ const makeTransactions = Effect.fn("Transactions.make")(function* () {
   });
 
   return {
+    requireEnabled: Effect.void,
     transactions: selectSource(fio, { boundAccount, servable, read, writeThrough }),
     record,
     search,
@@ -433,6 +436,7 @@ export class Transactions extends Context.Service<Transactions, TransactionsShap
       const live = fromFio(yield* FioApi, () => Effect.void);
       const disabled = Effect.fail(new InvalidInput({ detail: CACHE_DISABLED }));
       return {
+        requireEnabled: disabled,
         transactions: (account, range, source) => (source === "cache" ? disabled : live(account, range)),
         record: () => Effect.void,
         search: () => disabled,
