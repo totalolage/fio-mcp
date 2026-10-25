@@ -37,14 +37,14 @@ describe("following account changes made at /admin", () => {
       const [held, release, done] = [yield* Deferred.make<void>(), yield* Deferred.make<void>(), yield* Deferred.make<void>()];
       const limiter = Layer.mock(RateLimiter, {
         forget: (key) =>
-          Effect.andThen(
-            Ref.update(forgotten, (keys) => [...keys, key]),
-            key === FP_B
-              ? Effect.andThen(Deferred.succeed(held, undefined), Deferred.await(release))
-              : key === FP_C
-                ? Deferred.succeed(done, undefined)
-                : Effect.void,
-          ),
+          Effect.gen(function* () {
+            yield* Ref.update(forgotten, (keys) => [...keys, key]);
+            if (key === FP_B) {
+              yield* Deferred.succeed(held, undefined);
+              yield* Deferred.await(release);
+            }
+            if (key === FP_C) yield* Deferred.succeed(done, undefined);
+          }),
       });
       const cfg = config({
         accounts: [
