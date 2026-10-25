@@ -4,12 +4,15 @@ import { type Cause, Clock, Deferred, Effect, Fiber, Layer, Option, Queue, Redac
 import { HttpServerRequest } from "effect/http";
 import { SqlClient } from "effect/sql";
 import { TestClock } from "effect/testing";
+import { makeSettingsStore, SETTING } from "../src/account-store.js";
 import { Accounts } from "../src/accounts.js";
+import { AdminPassword, makeAdminPassword } from "../src/admin/password.js";
 import { SERVER_MIGRATIONS } from "../src/cache/db.js";
 import { CommandFailed, hashPasswordCommand, listClientsCommand, revokeAllTokensCommand, revokeClientCommand } from "../src/oauth/cli.js";
 import {
   hashPassword,
   hashSecret,
+  type PasswordHash,
   PasswordHashError,
   parsePasswordHash,
   pkceMatches,
@@ -27,6 +30,8 @@ import { seededConfig } from "./support/config.js";
 import { memoryDatabase } from "./support/database.js";
 
 const FAST = { ln: 14, r: 8, p: 1 } as const;
+/** A well-formed hash for tests that never check a password against it (or stub the check): no scrypt run. */
+const UNCHECKED_HASH: PasswordHash = { params: FAST, salt: new Uint8Array(16), hash: new Uint8Array(32) };
 
 describe("URL rules", () => {
   it("accepts only https origins (http for loopback) as FIO_MCP_PUBLIC_URL", () => {
@@ -77,6 +82,7 @@ describe("URL rules", () => {
 
   it("escapes account names in consent checkbox labels and values", () => {
     const html = consentPage({
+      formId: "form-1",
       clientId: "fio_client_test",
       clientName: null,
       redirectUri: "http://127.0.0.1:45678/callback",
@@ -98,9 +104,9 @@ describe("authorization endpoint request target", () => {
 
   it.effect("shows an error page for an absolute-form target that is not a URL", () =>
     Effect.gen(function* () {
-      const parsed = parsePasswordHash(yield* hashPassword(Redacted.make("correct horse battery"), FAST));
-      if (!("hash" in parsed)) return assert.fail("hash did not parse");
-      const server = yield* makeOAuthServer({ publicUrl: "https://fio.example.net", passwordHash: Redacted.make(parsed) });
+      const server = yield* makeOAuthServer({ publicUrl: "https://fio.example.net" }).pipe(
+        Effect.provide(AdminPassword.layer(Redacted.make(UNCHECKED_HASH))),
+      );
       const authorize = server.routes.find((route) => route.method === "GET" && route.path === "/authorize");
       if (authorize === undefined) return assert.fail("no /authorize route");
       // The Node adapter keeps a target it cannot parse as is, and the router still routes `GET http://[/authorize` here.
@@ -119,6 +125,24 @@ describe("secrets", () => {
     assert.isFalse(pkceMatches(`${verifier}x`, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"));
     assert.isFalse(pkceMatches("short", "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"));
   });
+
+  // The only test with the production parameters (128 MiB, slow on a loaded machine); the rest use FAST.
+  it.effect(
+    "stores a password changed at /admin with the production scrypt parameters",
+    () =>
+      Effect.gen(function* () {
+        const bootstrap = parsePasswordHash(yield* hashPassword(Redacted.make("the bootstrap password"), FAST));
+        if (bootstrap instanceof PasswordHashError) return assert.fail("hash did not parse");
+        const password = yield* makeAdminPassword(Redacted.make(bootstrap));
+        const next = Redacted.make("the production password");
+        const changed = yield* password.change("192.0.2.1", Redacted.make("the bootstrap password"), next);
+        assert.strictEqual(changed._tag, "Accepted");
+        const stored = yield* (yield* makeSettingsStore()).get(SETTING.adminPasswordHash);
+        assert.match(Option.getOrElse(stored, () => ""), /^\$scrypt\$ln=17,r=8,p=1\$/);
+        assert.strictEqual((yield* password.signIn("192.0.2.1", next))._tag, "Accepted");
+      }).pipe(Effect.provide(memoryDatabase(SERVER_MIGRATIONS))),
+    60_000,
+  );
 
   it.effect("hashes and verifies the admin password with scrypt", () =>
     Effect.gen(function* () {
@@ -162,13 +186,13 @@ describe("authorization sessions", () => {
     Effect.gen(function* () {
       const sessions = yield* makeSessions();
       const first = yield* sessions.start(request);
-      const signedIn = yield* sessions.login((yield* sessions.start(request)).session);
+      const signedIn = yield* sessions.login((yield* sessions.start(request)).session, "stamp");
       for (let i = 0; i < MAX_SESSIONS.pending + 50; i++) yield* sessions.start(request);
       assert.isTrue(Option.isSome(yield* sessions.find(Redacted.value(signedIn.cookie))));
       assert.isTrue(Option.isNone(yield* sessions.find(Redacted.value(first.cookie))));
       // Signed-in sessions make room among themselves.
       const more = [];
-      for (let i = 0; i < MAX_SESSIONS.signedIn; i++) more.push(yield* sessions.login((yield* sessions.start(request)).session));
+      for (let i = 0; i < MAX_SESSIONS.signedIn; i++) more.push(yield* sessions.login((yield* sessions.start(request)).session, "stamp"));
       assert.isTrue(Option.isNone(yield* sessions.find(Redacted.value(signedIn.cookie))));
       assert.isTrue(Option.isSome(yield* sessions.find(Redacted.value(more[0]?.cookie ?? Redacted.make("")))));
     }),
@@ -222,15 +246,29 @@ describe("login throttling", () => {
     assert.deepStrictEqual(delays, [0, 0, 0, 0, 0, 1000, 2000, 4000, 8000, 900_000, 900_000]);
   });
 
+  /**
+   * Compares plain text and counts the checks instead of running scrypt:
+   * these tests are about counting failures, not hashing.
+   */
+  const plainCheck = () => {
+    const checks = { count: 0 };
+    const verify = (password: Redacted.Redacted<string>) =>
+      Effect.sync(() => {
+        checks.count++;
+        return Redacted.value(password) === "the right password";
+      });
+    return { checks, verify, expected: Effect.succeed(Redacted.make(UNCHECKED_HASH)) };
+  };
+
   it.effect("rejects attempts during backoff without checking the password, per address (TestClock)", () =>
     Effect.gen(function* () {
-      const parsed = parsePasswordHash(yield* hashPassword(Redacted.make("the right password"), FAST));
-      if (parsed instanceof PasswordHashError) return assert.fail("hash did not parse");
-      const guard = yield* makeLoginGuard(Redacted.make(parsed));
+      const { checks, verify, expected } = plainCheck();
+      const guard = yield* makeLoginGuard(expected, DEFAULT_THROTTLE, verify);
       const wrong = Redacted.make("the wrong password");
       const right = Redacted.make("the right password");
       for (let i = 0; i < 6; i++) assert.strictEqual((yield* guard.attempt("10.0.0.1", wrong))._tag, "Rejected");
       assert.deepStrictEqual(yield* guard.attempt("10.0.0.1", right), { _tag: "Throttled", retryAfterSeconds: 1 });
+      assert.strictEqual(checks.count, 6);
       // Another address is unaffected.
       assert.strictEqual((yield* guard.attempt("10.0.0.2", right))._tag, "Accepted");
       yield* TestClock.adjust("1 second");
@@ -243,16 +281,32 @@ describe("login throttling", () => {
 
   it.effect("keeps the permit and counts the failure when the caller is interrupted mid-check", () =>
     Effect.gen(function* () {
-      const parsed = parsePasswordHash(yield* hashPassword(Redacted.make("the right password"), FAST));
-      if (parsed instanceof PasswordHashError) return assert.fail("hash did not parse");
-      const guard = yield* makeLoginGuard(Redacted.make(parsed));
+      // The first check holds until released, as a scrypt run still going when the second attempt arrives.
+      const { checks, verify, expected } = plainCheck();
+      const started = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let first = true;
+      const held = (password: Redacted.Redacted<string>) => {
+        if (!first) return verify(password);
+        first = false;
+        return Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(release)), Effect.andThen(verify(password)));
+      };
+      const guard = yield* makeLoginGuard(expected, DEFAULT_THROTTLE, held);
       const wrong = Redacted.make("the wrong password");
       const fiber = yield* Effect.forkChild(guard.attempt("a", wrong));
-      yield* Effect.yieldNow;
-      // While the first check runs, others are turned away rather than run in parallel.
-      assert.strictEqual((yield* guard.attempt("b", wrong))._tag, "Throttled");
-      // Interruption waits for the admitted check, which still counts as a failure.
-      yield* Fiber.interrupt(fiber);
+      yield* Deferred.await(started);
+      // Released even if an assertion fails: the admitted check is uninterruptible.
+      const interrupting = yield* Effect.gen(function* () {
+        // While the first check runs, others are turned away rather than run in parallel.
+        assert.strictEqual((yield* guard.attempt("b", wrong))._tag, "Throttled");
+        // Interruption waits for the admitted check (the permit stays held meanwhile), which still counts as a failure.
+        const interruption = yield* Effect.forkChild(Fiber.interrupt(fiber), { startImmediately: true });
+        yield* Effect.yieldNow;
+        assert.strictEqual((yield* guard.attempt("b", wrong))._tag, "Throttled");
+        return interruption;
+      }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+      yield* Fiber.join(interrupting);
+      assert.strictEqual(checks.count, 1);
       for (let i = 0; i < 5; i++) assert.strictEqual((yield* guard.attempt("a", wrong))._tag, "Rejected");
       assert.strictEqual((yield* guard.attempt("a", Redacted.make("the right password")))._tag, "Throttled");
     }),
@@ -260,10 +314,10 @@ describe("login throttling", () => {
 
   it.effect("locks an address out for 15 minutes after 10 failures", () =>
     Effect.gen(function* () {
-      const parsed = parsePasswordHash(yield* hashPassword(Redacted.make("the right password"), FAST));
-      if (parsed instanceof PasswordHashError) return assert.fail("hash did not parse");
-      const guard = yield* makeLoginGuard(Redacted.make(parsed), { ...DEFAULT_THROTTLE, freeFailures: 0, baseDelayMs: 0 });
+      const { checks, verify, expected } = plainCheck();
+      const guard = yield* makeLoginGuard(expected, { ...DEFAULT_THROTTLE, freeFailures: 0, baseDelayMs: 0 }, verify);
       for (let i = 0; i < 10; i++) yield* guard.attempt("a", Redacted.make("nope"));
+      assert.strictEqual(checks.count, 10);
       const right = Redacted.make("the right password");
       assert.deepStrictEqual(yield* guard.attempt("a", right), { _tag: "Throttled", retryAfterSeconds: 900 });
       yield* TestClock.adjust("14 minutes");
@@ -463,8 +517,6 @@ describe("hash-password output", () => {
 describe("sign-in scrypt bound", () => {
   it.effect("runs at most one password check at a time across all addresses", () =>
     Effect.gen(function* () {
-      const parsed = parsePasswordHash(yield* hashPassword(Redacted.make("the right password"), FAST));
-      if (parsed instanceof PasswordHashError) return assert.fail("hash did not parse");
       const entered = yield* Deferred.make<void>();
       const release = yield* Deferred.make<void>();
       let running = 0;
@@ -477,7 +529,7 @@ describe("sign-in scrypt bound", () => {
           yield* Deferred.await(release);
           return false;
         }).pipe(Effect.ensuring(Effect.sync(() => running--)));
-      const guard = yield* makeLoginGuard(Redacted.make(parsed), DEFAULT_THROTTLE, verify);
+      const guard = yield* makeLoginGuard(Effect.succeed(Redacted.make(UNCHECKED_HASH)), DEFAULT_THROTTLE, verify);
       const wrong = Redacted.make("the wrong password");
       const fibers = yield* Effect.forEach(Array.from({ length: 10 }, (_, i) => `10.0.0.${i}`), (address) =>
         Effect.forkChild(guard.attempt(address, wrong), { startImmediately: true }),

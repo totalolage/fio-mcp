@@ -1,6 +1,6 @@
 import { Clock, Context, DateTime, Effect, Layer, Option, Schedule } from "effect";
 import { type Account, Accounts } from "../accounts.js";
-import { AppConfig } from "../config.js";
+import { AppConfig, type AppConfigShape } from "../config.js";
 import { type CacheError, type FioRequestError, InvalidInput } from "../errors.js";
 import { FioApi } from "../fio-api.js";
 import type { NormalizedStatement, StatementInfo, Transaction } from "../statement.js";
@@ -18,7 +18,7 @@ import {
 import { historyUnlockMessage, type JobProgress, makeCacheSync, type StartRequest } from "./sync.js";
 
 export type { Source, TransactionsResult } from "./source.js";
-export type { GroupBy, SummaryGroup, TransactionFilters } from "./store.js";
+export type { GroupBy, PurgeOutcome, SummaryGroup, TransactionFilters } from "./store.js";
 export { historyUnlockMessage, type JobProgress, type StartRequest, type SyncRequest } from "./sync.js";
 
 /**
@@ -162,6 +162,14 @@ export interface TransactionsShape {
    * long and returns the job's progress then; without, returns at once.
    */
   readonly sync: (account: Account, request: StartRequest, waitMs?: number) => Effect.Effect<SyncOutcome, InvalidInput>;
+  /**
+   * A token no account uses any more (removed or replaced at /admin): from
+   * now on nothing is written for it and no sync job starts, and its
+   * running job is stopped (awaited).
+   */
+  readonly retire: (tokenFingerprint: string) => Effect.Effect<void>;
+  /** A token configured again (re-added): writes and sync are accepted again. */
+  readonly reinstate: (tokenFingerprint: string) => Effect.Effect<void>;
 }
 
 export const NOT_VERIFIED =
@@ -420,6 +428,8 @@ const makeTransactions = Effect.fn("Transactions.make")(function* () {
     summarize,
     status,
     sync: startSync,
+    retire: (tokenFingerprint) => Effect.andThen(store.retire(tokenFingerprint), sync.cancel(tokenFingerprint)),
+    reinstate: store.reinstate,
   } satisfies TransactionsShape;
 });
 
@@ -443,6 +453,8 @@ export class Transactions extends Context.Service<Transactions, TransactionsShap
         summarize: () => disabled,
         status: () => disabled,
         sync: () => disabled,
+        retire: () => Effect.void,
+        reinstate: () => Effect.void,
       } satisfies TransactionsShape;
     }),
   );
@@ -461,8 +473,25 @@ export class Transactions extends Context.Service<Transactions, TransactionsShap
   ).pipe(Layer.provide(Layer.mergeAll(FioApi.Live, AppConfig.Live)));
 }
 
+/**
+ * What /admin does to an account's cached data, on the SqlClient in
+ * context: renames its token's binding, or deletes what its tokens cached
+ * (`purgeTokens`, see the store). Not a `Transactions` member: it must also
+ * reach data cached before the cache was disabled, when `Disabled` opens no
+ * database. Fence writers with `Transactions.retire` first.
+ */
+export const makeCachedData = Effect.fn("CachedData.make")(function* () {
+  const store = yield* makeCacheStore();
+  return { renameBinding: store.renameBinding, purgeTokens: store.purgeTokens };
+});
+
+/** What startup runs for each token (and for a token added at runtime): the full startup sync, or only an interrupted job. */
+export const startupRequest = (config: AppConfigShape): StartRequest => ({
+  kind: config.cache.syncOnStartup ? "startup" : "resume",
+});
+
 /** One request per token (accounts may share a token); a failure is logged and the next token goes on. */
-const syncAll = Effect.fn("CacheSync.syncAll")(function* (
+export const syncAll = Effect.fn("CacheSync.syncAll")(function* (
   cache: TransactionsShape,
   accounts: ReadonlyArray<Account>,
   request: StartRequest,
@@ -479,8 +508,10 @@ const syncAll = Effect.fn("CacheSync.syncAll")(function* (
 
 /**
  * Background sync: at startup (cache.syncOnStartup, or to resume an
- * interrupted job) and every cache.syncIntervalMinutes when that is above 0.
- * Forked into the layer's scope; MCP initialization never waits for it.
+ * interrupted job) and every cache.syncIntervalMinutes when that is above 0,
+ * for the accounts configured at that moment. Forked into the layer's
+ * scope; MCP initialization never waits for it. Accounts added or removed
+ * at runtime are handled by AccountChangesLive (src/account-runtime.ts).
  */
 export const CacheSyncLive: Layer.Layer<never, never, Transactions | Accounts | AppConfig> = Layer.effectDiscard(
   Effect.gen(function* () {
@@ -488,10 +519,10 @@ export const CacheSyncLive: Layer.Layer<never, never, Transactions | Accounts | 
     if (!config.cache.enabled) return;
     const cache = yield* Transactions;
     const accounts = yield* Accounts;
-    yield* Effect.forkScoped(syncAll(cache, accounts.list, { kind: config.cache.syncOnStartup ? "startup" : "resume" }));
+    yield* Effect.forkScoped(syncAll(cache, yield* accounts.list, startupRequest(config)));
     const minutes = config.cache.syncIntervalMinutes;
     if (minutes > 0) {
-      const periodic = syncAll(cache, accounts.list, { kind: "incremental" });
+      const periodic = Effect.flatMap(accounts.list, (list) => syncAll(cache, list, { kind: "incremental" }));
       yield* Effect.forkScoped(
         Effect.sleep(`${minutes} minutes`).pipe(Effect.andThen(Effect.repeat(periodic, Schedule.spaced(`${minutes} minutes`)))),
       );

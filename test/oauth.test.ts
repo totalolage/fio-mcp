@@ -2,7 +2,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { Clock, Effect, Option, Redacted } from "effect";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { tokenFingerprint } from "../src/accounts.js";
 import { hashSecret, randomSecret } from "../src/oauth/crypto.js";
 import { DEFAULT_THROTTLE } from "../src/oauth/login.js";
@@ -40,6 +40,12 @@ const readJson = async (response: Response) => (await response.json()) as Record
 const text = (result: CallToolResult) => result.content.map((c) => (c.type === "text" ? c.text : "")).join("\n");
 
 const ORDER = { type: "domestic", amount: 100, accountTo: "2212-2000000699", bankCode: "0300", date: "2025-11-03" };
+
+// End to end: every test builds the whole app (router, SQLite, McpServer) and
+// drives it through the browser flow and the MCP SDK client. A loaded host
+// stalls whole test workers for 10-15 s at times, past the 5 s default; this
+// file allows 30 s.
+vi.setConfig({ testTimeout: 30_000, hookTimeout: 30_000 });
 
 let harness: OAuthHarness;
 

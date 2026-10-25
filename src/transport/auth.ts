@@ -2,8 +2,12 @@ import { Context, Effect, Layer, Schedule } from "effect";
 import { HttpRouter, type HttpServerRequest } from "effect/http";
 import type { SqlClient } from "effect/sql";
 import { Accounts } from "../accounts.js";
+import { AdminPassword } from "../admin/password.js";
+import { AdminLive } from "../admin/server.js";
 import { Database } from "../cache/db.js";
+import { Transactions } from "../cache/service.js";
 import { AppConfig } from "../config.js";
+import { FioApi } from "../fio-api.js";
 import { makeOAuthServer, type OAuthSettings } from "../oauth/server.js";
 import type { AuthUnavailable, Unauthorized } from "./auth-errors.js";
 import { LOCAL_PRINCIPAL, type Principal } from "./principal.js";
@@ -42,7 +46,7 @@ export class Auth extends Context.Service<Auth, AuthShape>()("fio-mcp/transport/
    */
   static readonly oauth = (
     settings: OAuthSettings,
-  ): Layer.Layer<Auth, never, HttpRouter.HttpRouter | SqlClient.SqlClient | Accounts> =>
+  ): Layer.Layer<Auth, never, HttpRouter.HttpRouter | SqlClient.SqlClient | Accounts | AdminPassword> =>
     Layer.effect(
       Auth,
       Effect.gen(function* () {
@@ -55,17 +59,23 @@ export class Auth extends Context.Service<Auth, AuthShape>()("fio-mcp/transport/
     );
 
   /**
-   * /mcp authentication from configuration: the OAuth server on the
-   * server's database, or `Open` with a startup warning. Leaves
-   * `HttpRouter` open, since the HTTP transport provides it.
+   * /mcp authentication from configuration: the OAuth server with the
+   * admin UI (/admin) on the server's database, or `Open` with a startup
+   * warning and no admin UI. Leaves `HttpRouter` open, since the HTTP
+   * transport provides it.
    */
   static readonly Live = Layer.unwrap(
     Effect.gen(function* () {
       const { transport } = yield* AppConfig;
       if (transport.kind === "http" && transport.auth.kind === "oauth") {
-        const { publicUrl, passwordHash } = transport.auth;
-        return Auth.oauth({ publicUrl, passwordHash, trustedProxies: transport.trustedProxies }).pipe(
-          Layer.provide(Layer.mergeAll(Database.Live, Accounts.Live)),
+        const { publicUrl, passwordHash, dataKey } = transport.auth;
+        const { trustedProxies } = transport;
+        return Layer.mergeAll(
+          Auth.oauth({ publicUrl, trustedProxies }),
+          AdminLive({ publicUrl, dataKey, trustedProxies }),
+        ).pipe(
+          Layer.provide(AdminPassword.layer(passwordHash)),
+          Layer.provide(Layer.mergeAll(Database.Live, Accounts.Live, FioApi.Live, Transactions.Live)),
         );
       }
       return Layer.merge(Auth.Open, Layer.effectDiscard(Effect.logWarning(UNAUTHENTICATED_WARNING)));

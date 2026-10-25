@@ -3,13 +3,15 @@ import { NodeFileSystem } from "@effect/platform-node";
 import { SqliteClient, SqliteMigrator } from "@effect/sql-sqlite-node";
 import { Effect, FileSystem, Layer } from "effect";
 import { Migrator, SqlClient, type SqlError } from "effect/sql";
+import { ACCOUNT_MIGRATIONS } from "../account-migrations.js";
 import { AppConfig } from "../config.js";
 import { CacheError, InvalidInput } from "../errors.js";
 import { OAUTH_MIGRATIONS } from "../oauth/store.js";
 
 /**
- * The server's SQLite file (FIO_DB_PATH). It holds the transaction cache and
- * the OAuth state (clients, grants, token hashes), so the layer does not
+ * The server's SQLite file (FIO_DB_PATH). It holds the transaction cache,
+ * the OAuth state (clients, grants, token hashes), and in HTTP mode the
+ * encrypted FIO accounts and server settings, so the layer does not
  * depend on cache.enabled. One connection per process (the
  * HTTP transport serves several MCP sessions from it). The file is
  * private to the user: the directory is created 0700 and the file 0600
@@ -184,7 +186,7 @@ const layer = (
 };
 
 /** Every module's migrations, in one id sequence. */
-export const SERVER_MIGRATIONS: Migrations = { ...CACHE_MIGRATIONS, ...OAUTH_MIGRATIONS };
+export const SERVER_MIGRATIONS: Migrations = { ...CACHE_MIGRATIONS, ...OAUTH_MIGRATIONS, ...ACCOUNT_MIGRATIONS };
 
 /**
  * The server's database (`SqlClient`). Not a `Context.Service`: `SqlClient`

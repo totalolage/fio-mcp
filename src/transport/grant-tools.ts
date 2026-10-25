@@ -55,13 +55,16 @@ export function grantedTools(tools: ToolList, principal: Principal, accounts: Re
   });
 }
 
-const grantCore = (core: ToolsCore, accounts: ReadonlyArray<Account>): ToolsCore => ({
+/** The configured accounts as of this request; they change at runtime in HTTP mode with OAuth. */
+type CurrentAccounts = Effect.Effect<ReadonlyArray<Account>>;
+
+const grantCore = (core: ToolsCore, accounts: CurrentAccounts): ToolsCore => ({
   ...core,
   tools: {
     ...core.tools,
     list: (profile) =>
       Effect.flatMap(core.tools.list(profile), (tools) =>
-        Effect.map(CurrentPrincipal, (principal) => grantedTools(tools, principal, accounts)),
+        Effect.flatMap(CurrentPrincipal, (principal) => Effect.map(accounts, (list) => grantedTools(tools, principal, list))),
       ),
   },
 });
@@ -70,7 +73,7 @@ const grantCore = (core: ToolsCore, accounts: ReadonlyArray<Account>): ToolsCore
 // provides them where it installs the handlers.
 const handlersOf = (adapter: McpProtocol.ProtocolAdapter) => adapter as McpProtocol.AnyProtocolAdapter<string, never>;
 
-const grantAdapter = (adapter: McpProtocol.ProtocolAdapter, accounts: ReadonlyArray<Account>): McpProtocol.ProtocolAdapter => ({
+const grantAdapter = (adapter: McpProtocol.ProtocolAdapter, accounts: CurrentAccounts): McpProtocol.ProtocolAdapter => ({
   ...adapter,
   installHandlers: (core, lifecycle, target) => {
     // Only the stateful revisions are offered and tested. Stateless ones read
@@ -86,7 +89,7 @@ const grantAdapter = (adapter: McpProtocol.ProtocolAdapter, accounts: ReadonlyAr
 });
 
 /** `protocols` with each adapter's `tools/list` following the request's grant. */
-export function grantProtocols(protocols: ServerInfo["protocols"], accounts: ReadonlyArray<Account>): ServerInfo["protocols"] {
+export function grantProtocols(protocols: ServerInfo["protocols"], accounts: CurrentAccounts): ServerInfo["protocols"] {
   const [first, ...rest] = protocols;
   return [grantAdapter(first, accounts), ...rest.map((adapter) => grantAdapter(adapter, accounts))];
 }

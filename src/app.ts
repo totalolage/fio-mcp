@@ -1,6 +1,7 @@
-import { NodeFileSystem, NodeStdio } from "@effect/platform-node";
+import { NodeFileSystem, NodeStdio, NodeTerminal } from "@effect/platform-node";
 import { Effect, Layer } from "effect";
 import { McpProtocol } from "effect/ai";
+import { AccountChangesLive } from "./account-runtime.js";
 import { Accounts } from "./accounts.js";
 import { backupDatabase, Database } from "./cache/db.js";
 import { CacheSyncLive, Transactions } from "./cache/service.js";
@@ -8,7 +9,8 @@ import { AppConfig } from "./config.js";
 import { FioApi } from "./fio-api.js";
 import { CACHE_INSTRUCTIONS, CacheToolsLive } from "./mcp/cache-tools.js";
 import { FioToolsLive, SERVER_INSTRUCTIONS } from "./mcp/fio-tools.js";
-import { listClientsCommand, revokeAllTokensCommand, revokeClientCommand } from "./oauth/cli.js";
+import { ToolListChangesLive } from "./mcp/registration.js";
+import { listClientsCommand, resetAdminPasswordCommand, revokeAllTokensCommand, revokeClientCommand } from "./oauth/cli.js";
 import { RateLimiter } from "./rate-limiter.js";
 import { LoggerLive, Redactor } from "./redaction.js";
 import { Auth } from "./transport/auth.js";
@@ -37,10 +39,12 @@ export const SERVER_INFO: ServerInfo = {
 
 /**
  * One instance per process: one rate limiter per token, one FIO client, one
- * SQLite cache. With FIO_CACHE_ENABLED=false the cache opens no database.
+ * SQLite cache. With FIO_CACHE_ENABLED=false the cache opens no database
+ * (in HTTP mode with OAuth the accounts and Auth.Live still open it).
  * Every member closes its own requirements (mergeAll feeds no member from
- * another); they share one AppConfig, Accounts, RateLimiter and database
- * because one build memoizes each layer by reference.
+ * another); they, and Auth.Live's OAuth server and admin UI, share one
+ * AppConfig, Accounts, RateLimiter, Transactions and database because one
+ * build memoizes each layer by reference.
  */
 export const ServicesLive = Layer.mergeAll(
   AppConfig.Live,
@@ -51,15 +55,16 @@ export const ServicesLive = Layer.mergeAll(
   Transactions.Live,
 );
 
-/** Tool registrations (`McpServer.toolkit(...)` layers). */
-export const ToolsLive = Layer.mergeAll(FioToolsLive, CacheToolsLive);
+/** Tool registrations, re-registered (with `tools/list_changed`) when the accounts change. */
+export const ToolsLive = Layer.mergeAll(FioToolsLive, CacheToolsLive, ToolListChangesLive);
 
 /**
- * Long-running background work: startup and periodic cache sync. Layers here
- * fork instead of running inline, so the transport answers `initialize`
- * without waiting for FIO.
+ * Long-running background work: startup and periodic cache sync, and
+ * following account changes made at /admin. Layers here fork instead of
+ * running inline, so the transport answers `initialize` without waiting
+ * for FIO.
  */
-export const BackgroundLive = CacheSyncLive;
+export const BackgroundLive = Layer.mergeAll(CacheSyncLive, AccountChangesLive);
 
 /** Tools and background work on a shared services graph, behind a transport. */
 const withServices = <A, E, R>(transport: Layer.Layer<A, E, R>) =>
@@ -99,6 +104,9 @@ const withDatabase = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
 export const listClients = withDatabase(listClientsCommand());
 export const revokeClient = (clientId: string) => withDatabase(revokeClientCommand(clientId));
 export const revokeAllTokens = withDatabase(revokeAllTokensCommand());
+/** `fio-mcp reset-admin-password [--set]`: back to the hash file, or a new password from the terminal or stdin. */
+export const resetAdminPassword = (set: boolean) =>
+  withDatabase(resetAdminPasswordCommand(set)).pipe(Effect.provide(NodeTerminal.layer));
 
 /** The redacting stderr logger, for everything the app layers fork. */
 export const AppLoggerLive = LoggerLive.pipe(Layer.provide(Redactor.Live));

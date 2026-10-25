@@ -22,7 +22,7 @@ const RESOURCE = "https://fio.example.test/mcp";
 const BEFORE_FINGERPRINTS = Object.fromEntries(Object.entries(SERVER_MIGRATIONS).filter(([id]) => id < "0004"));
 
 const account = (name: string, token: string): Account =>
-  toAccount({ name, token: Redacted.make(token), accountNumber: undefined, currency: undefined });
+  toAccount({ name, token: Redacted.make(token), accountNumber: undefined, currency: undefined }, `env:${name}`);
 
 /** Stores a grant for `accounts` with a live access token, as consent does. */
 const grantFor = Effect.fnUntraced(function* (accounts: ReadonlyArray<Account>) {

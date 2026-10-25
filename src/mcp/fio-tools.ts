@@ -1,4 +1,4 @@
-import { Effect, Layer, Schema } from "effect";
+import { Effect, Schema } from "effect";
 import { McpServer, Tool, Toolkit } from "effect/ai";
 import { type Account, Accounts } from "../accounts.js";
 import { Transactions } from "../cache/service.js";
@@ -12,6 +12,7 @@ import { Redactor } from "../redaction.js";
 import { parseLastStatement } from "../statement.js";
 import { annotateTool, DateParam, JsonObject, ToolFailure, withAccount } from "./common.js";
 import { PAYMENTS, permittedAccount, READ, requireScopes, visibleAccounts } from "./permissions.js";
+import { toolsForAccounts } from "./registration.js";
 
 export const SERVER_INSTRUCTIONS =
   "Tools for FIO Bank accounts (Czech Republic). Tools are listed regardless of what the configured FIO API tokens may do; if a token lacks the permission, the tool answers \"You don't have permissions to do that.\" Over HTTP, the list follows this client's authorization: tools and accounts it was not granted are left out. FIO allows one request per token every 30 seconds, so batch questions into as few calls as possible. Call get_server_status to see accounts and rate-limit state.";
@@ -334,7 +335,7 @@ export const makeFioHandlers = Effect.fn("FioTools.handlers")(function* (toolkit
       out(
         Effect.gen(function* () {
           yield* requireScopes(READ);
-          const listed = yield* Effect.forEach(yield* visibleAccounts(accounts.list), accountStatus);
+          const listed = yield* Effect.forEach(yield* visibleAccounts(yield* accounts.list), accountStatus);
           return {
             accounts: listed,
             rateLimit: {
@@ -347,11 +348,8 @@ export const makeFioHandlers = Effect.fn("FioTools.handlers")(function* (toolkit
   });
 });
 
-/** Registers the FIO toolkit with the MCP server. */
-export const FioToolsLive = Layer.unwrap(
-  Effect.gen(function* () {
-    const config = yield* AppConfig;
-    const toolkit = makeFioToolkit(config.accounts.map((a) => a.name));
-    return McpServer.toolkit(toolkit).pipe(Layer.provide(toolkit.toLayer(makeFioHandlers(toolkit))));
-  }),
-);
+/** Registers the FIO toolkit with the MCP server, again whenever the account names change. */
+export const FioToolsLive = toolsForAccounts((names) => {
+  const toolkit = makeFioToolkit(names);
+  return McpServer.registerToolkit(toolkit).pipe(Effect.provide(toolkit.toLayer(makeFioHandlers(toolkit))));
+});

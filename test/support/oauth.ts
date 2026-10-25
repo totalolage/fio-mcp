@@ -1,8 +1,10 @@
 /**
- * In-process harness for the OAuth authorization server: the production
- * router app (guards, OAuth routes, McpServer behind Auth) on an in-memory
- * SQLite database, served through a web handler; a cookie-keeping
- * "browser"; an SDK OAuth client provider; and a clock the test can move.
+ * In-process harness for the OAuth authorization server and the admin UI:
+ * the production router app (guards, OAuth and /admin routes, McpServer
+ * behind Auth) with the accounts in an in-memory SQLite database (seeded
+ * from the test config's main and savings accounts, encrypted with
+ * DATA_KEY), served through a web handler; a cookie-keeping "browser"; an
+ * SDK OAuth client provider; and a clock the test can move.
  */
 
 import { createHash, randomBytes } from "node:crypto";
@@ -15,28 +17,37 @@ import type {
 import { Clock, type Context, Deferred, Duration, Effect, Exit, Layer, Logger, Option, Redacted, Scope } from "effect";
 import { HttpRouter, HttpServer, HttpServerRequest } from "effect/http";
 import type { SqlClient } from "effect/sql";
+import { AccountChangesLive } from "../../src/account-runtime.js";
+import { Accounts, type AccountsShape } from "../../src/accounts.js";
+import { AdminPassword } from "../../src/admin/password.js";
+import { AdminLive } from "../../src/admin/server.js";
 import { SERVER_INFO, ToolsLive } from "../../src/app.js";
 import { SERVER_MIGRATIONS } from "../../src/cache/db.js";
-import type { HttpAuthConfig } from "../../src/config.js";
+import { type AppConfigShape, accountSeedOf, type HttpAuthConfig } from "../../src/config.js";
 import { hashPassword, type PasswordHash, parsePasswordHash } from "../../src/oauth/crypto.js";
 import type { ThrottlePolicy } from "../../src/oauth/login.js";
 import { makeOAuthStore, type OAuthStore } from "../../src/oauth/store.js";
 import { Auth } from "../../src/transport/auth.js";
 import { parseTrustedProxy } from "../../src/transport/client-address.js";
 import { type HttpTransportConfig, httpRouterApp } from "../../src/transport/http.js";
-import { memoryDatabase } from "./database.js";
+import { testDatabase } from "./database.js";
 import { testConfig, testServices } from "./transport.js";
 
 export const PUBLIC_URL = "https://fio.example.test";
 export const RESOURCE = `${PUBLIC_URL}/mcp`;
 export const PASSWORD = "correct horse battery staple";
+/** The test data key (FIO_MCP_DATA_KEY_FILE). */
+export const DATA_KEY = Redacted.make(new Uint8Array(32).fill(7));
+
+/** Cheap scrypt parameters (ln=14, 16 MiB) for every hash the tests make; one test in oauth-units uses the real ones. */
+export const FAST_SCRYPT = { ln: 14, r: 8, p: 1 } as const;
 
 let cachedHash: PasswordHash | undefined;
 
-/** A fast (ln=14) hash of PASSWORD, made once per test file. */
+/** A fast hash of PASSWORD, made once per test file. */
 export async function passwordHash(): Promise<PasswordHash> {
   if (cachedHash === undefined) {
-    const line = await Effect.runPromise(hashPassword(Redacted.make(PASSWORD), { ln: 14, r: 8, p: 1 }));
+    const line = await Effect.runPromise(hashPassword(Redacted.make(PASSWORD), FAST_SCRYPT));
     const parsed = parsePasswordHash(line);
     if (!("hash" in parsed)) throw new Error("hash did not parse");
     cachedHash = parsed;
@@ -70,6 +81,10 @@ export interface OAuthHarness {
   readonly logs: Array<string>;
   /** Runs a store operation against the server's database. */
   readonly store: <A, E>(f: (store: OAuthStore) => Effect.Effect<A, E>) => Promise<A>;
+  /** Runs an effect against the server's database. */
+  readonly sql: <A, E>(effect: Effect.Effect<A, E, SqlClient.SqlClient>) => Promise<A>;
+  /** The server's accounts (as /admin changes them). */
+  readonly accounts: () => AccountsShape;
   readonly close: () => Promise<void>;
 }
 
@@ -77,11 +92,19 @@ export interface OAuthHarness {
 export const PEER_HEADER = "x-test-peer";
 
 export async function startOAuth(
-  options: { throttle?: ThrottlePolicy; trustedProxies?: ReadonlyArray<string> } = {},
+  options: {
+    throttle?: ThrottlePolicy;
+    trustedProxies?: ReadonlyArray<string>;
+    /** A database file instead of memory (survives `close`, for restart tests). */
+    dbPath?: string;
+    /** The accounts FIO_TOKEN / FIO_ACCOUNTS would configure (default: main and savings). */
+    configured?: AppConfigShape["accounts"];
+  } = {},
 ): Promise<OAuthHarness> {
   const hash = await passwordHash();
   const trustedProxies = (options.trustedProxies ?? []).flatMap((entry) => parseTrustedProxy(entry) ?? []);
-  const auth: HttpAuthConfig = { kind: "oauth", publicUrl: PUBLIC_URL, passwordHash: Redacted.make(hash) };
+  const accountSeed = accountSeedOf(options.configured ?? testConfig().accounts);
+  const auth: HttpAuthConfig = { kind: "oauth", publicUrl: PUBLIC_URL, passwordHash: Redacted.make(hash), dataKey: DATA_KEY, accountSeed };
   const transport: HttpTransportConfig = {
     kind: "http",
     host: "127.0.0.1",
@@ -94,7 +117,7 @@ export async function startOAuth(
   const config = testConfig(transport);
   const scope = await Effect.runPromise(Scope.make());
   const db: Context.Context<SqlClient.SqlClient> = await Effect.runPromise(
-    Layer.buildWithScope(memoryDatabase(SERVER_MIGRATIONS), scope),
+    Layer.buildWithScope(testDatabase(options.dbPath ?? ":memory:", SERVER_MIGRATIONS), scope),
   );
   const release = await Effect.runPromise(Deferred.make<void>());
   const clock = new SkewedClock();
@@ -102,7 +125,17 @@ export async function startOAuth(
   const capture = Logger.make<unknown, void>((entry) => {
     logs.push(Logger.formatLogFmt.log(entry));
   });
-  const oauth = Auth.oauth({ publicUrl: PUBLIC_URL, passwordHash: Redacted.make(hash), throttle: options.throttle, trustedProxies });
+  // As Auth.Live builds it, with the test's throttling and scrypt parameters.
+  const oauth = Layer.mergeAll(
+    Auth.oauth({ publicUrl: PUBLIC_URL, trustedProxies }),
+    AdminLive({ publicUrl: PUBLIC_URL, dataKey: DATA_KEY, trustedProxies }),
+  ).pipe(Layer.provide(AdminPassword.layer(Redacted.make(hash), options.throttle, FAST_SCRYPT)));
+  let accounts: AccountsShape | undefined;
+  const captureAccounts = Layer.effectDiscard(
+    Effect.map(Effect.service(Accounts), (service) => {
+      accounts = service;
+    }),
+  );
   // Request handlers run with the router's context, not the layer's: clock and logger are provided per request.
   const captureLayer = Logger.layer([capture]);
   const withClock = HttpRouter.middleware(
@@ -117,8 +150,8 @@ export async function startOAuth(
       ),
     { global: true },
   );
-  const app = httpRouterApp(Layer.mergeAll(ToolsLive, withClock), oauth, SERVER_INFO, transport).pipe(
-    Layer.provide(testServices(config, release)),
+  const app = httpRouterApp(Layer.mergeAll(ToolsLive, withClock, AccountChangesLive, captureAccounts), oauth, SERVER_INFO, transport).pipe(
+    Layer.provide(testServices(config, release, Accounts.stored(DATA_KEY, accountSeed))),
     Layer.provide(Layer.succeedContext(db)),
     Layer.provide(HttpServer.layerServices),
     Layer.provide(Logger.layer([capture])),
@@ -133,6 +166,11 @@ export async function startOAuth(
       Effect.runPromise(
         Effect.flatMap(makeOAuthStore(), f).pipe(Effect.provide(Layer.succeedContext(db)), Effect.provideService(Clock.Clock, clock)),
       ),
+    sql: (effect) => Effect.runPromise(effect.pipe(Effect.provide(Layer.succeedContext(db)), Effect.provideService(Clock.Clock, clock))),
+    accounts: () => {
+      if (accounts === undefined) throw new Error("the app has not started yet (make a request first)");
+      return accounts;
+    },
     close: async () => {
       await web.dispose();
       await Effect.runPromise(Deferred.succeed(release, undefined));
@@ -181,6 +219,15 @@ export class Browser {
   }
 }
 
+/** The consent form's CSRF token and form id. */
+export const consentFormOf = async (response: Response) => {
+  const html = await response.text();
+  const csrf = /name="csrf" value="([^"]+)"/.exec(html)?.[1];
+  const form = /name="form" value="([^"]+)"/.exec(html)?.[1];
+  if (csrf === undefined || form === undefined) throw new Error(`no consent form in the page (status ${response.status})`);
+  return { csrf, form };
+};
+
 export const csrfOf = async (response: Response) => {
   const match = /name="csrf" value="([^"]+)"/.exec(await response.text());
   if (match?.[1] === undefined) throw new Error(`no CSRF token in the page (status ${response.status})`);
@@ -203,9 +250,9 @@ export async function authorizeInBrowser(harness: OAuthHarness, authorizationUrl
   const csrf = await csrfOf(await browser.get("/login"));
   const login = await browser.post("/login", { csrf, password: PASSWORD });
   if (login.status !== 303) throw new Error(`login answered ${login.status}`);
-  const consentCsrf = await csrfOf(await browser.get("/consent"));
+  const consentForm = await consentFormOf(await browser.get("/consent"));
   const done = await browser.post("/consent", {
-    csrf: consentCsrf,
+    ...consentForm,
     decision: consent.decision ?? "approve",
     account: consent.accounts ?? ["main", "savings"],
     scope: consent.payments === true ? ["fio:payments"] : [],

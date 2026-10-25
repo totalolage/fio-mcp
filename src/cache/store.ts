@@ -293,8 +293,28 @@ const cents = (value: number | null) => (value ?? 0) / 100;
 
 const escapeLike = (text: string) => `%${text.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
 
+/**
+ * What `purgeTokens` did: how many bank accounts' data it deleted, the
+ * kept tokens bound to the bank accounts whose data stayed, and how many
+ * cached bank accounts no kept token is bound to afterwards (not touched:
+ * nothing says whose they are). No deletion and no sharing token means
+ * nothing was cached under the purged tokens.
+ */
+export interface PurgeOutcome {
+  readonly deleted: number;
+  readonly sharedWith: ReadonlyArray<string>;
+  readonly unattributed: number;
+}
+
 export const makeCacheStore = Effect.fn("CacheStore.make")(function* () {
   const sql = yield* SqlClient.SqlClient;
+  /**
+   * Tokens no account uses any more (removed or replaced at /admin). Writes
+   * for them are dropped; the check runs inside each write's transaction,
+   * so a write admitted before the retirement either commits before a purge
+   * transaction (which then deletes it) or sees the token retired.
+   */
+  const retired = new Set<string>();
 
   const where = (accountKey: string, f: TransactionFilters) => {
     const clauses = [sql`account_key = ${accountKey}`];
@@ -408,7 +428,12 @@ export const makeCacheStore = Effect.fn("CacheStore.make")(function* () {
     `;
 
   const putSyncState = (tokenFingerprint: string, state: SyncState) =>
-    writeSyncState(tokenFingerprint, state).pipe(Effect.asVoid, cacheFailure("save the sync state"));
+    sql
+      // Checked when the transaction runs, not when the effect is built.
+      .withTransaction(
+        Effect.suspend(() => (retired.has(tokenFingerprint) ? Effect.void : Effect.asVoid(writeSyncState(tokenFingerprint, state)))),
+      )
+      .pipe(cacheFailure("save the sync state"));
 
   /**
    * Rows, coverage, binding, account header and sync state of one response, in
@@ -438,6 +463,9 @@ export const makeCacheStore = Effect.fn("CacheStore.make")(function* () {
       const info = statement.info;
       return yield* sql.withTransaction(
         Effect.gen(function* () {
+          if (retired.has(input.tokenFingerprint)) {
+            return { accountKey, rowsWritten: 0, rowsDeleted: 0, coverage: undefined } satisfies CommitResult;
+          }
           yield* sql`
             INSERT INTO accounts ${sql.insert({
               account_key: accountKey,
@@ -631,8 +659,85 @@ export const makeCacheStore = Effect.fn("CacheStore.make")(function* () {
       cacheFailure("count cached transactions"),
     );
 
+  /** Keeps a renamed account's binding label current (it is otherwise refreshed on the next download). */
+  const renameBinding = (tokenFingerprint: string, accountName: string) =>
+    sql`UPDATE bindings SET account_name = ${accountName} WHERE token_fingerprint = ${tokenFingerprint}`.pipe(
+      Effect.asVoid,
+      cacheFailure("rename the account binding"),
+    );
+
+  /**
+   * Deletes what the cache holds for `fingerprints` (every token a removed
+   * account had): their bindings and sync state, and each bank account they
+   * are bound to with its movements, coverage and balance, unless a token in
+   * `keep` (every token the configured accounts have or had) is bound to
+   * that bank account. A token in `keep` keeps its binding. Bindings of
+   * tokens in neither set (removed earlier, or bound before token history
+   * was recorded) do not keep a bank account; on a bank account the purge
+   * reaches they are deleted with their sync state, so re-adding such a
+   * token verifies it with FIO again.
+   */
+  const purgeTokens = (fingerprints: ReadonlyArray<string>, keep: ReadonlySet<string>) =>
+    sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const dropToken = (fingerprint: string) =>
+            Effect.andThen(
+              sql`DELETE FROM bindings WHERE token_fingerprint = ${fingerprint}`,
+              sql`DELETE FROM sync_state WHERE token_fingerprint = ${fingerprint}`,
+            );
+          const reached = new Set<string>();
+          for (const fingerprint of fingerprints) {
+            const [bound] = yield* sql<{ account_key: string }>`
+              SELECT account_key FROM bindings WHERE token_fingerprint = ${fingerprint}
+            `;
+            if (bound !== undefined) reached.add(bound.account_key);
+            if (!keep.has(fingerprint)) yield* dropToken(fingerprint);
+          }
+          let deleted = 0;
+          const sharedWith = new Set<string>();
+          for (const accountKey of [...reached].sort()) {
+            const bound = yield* sql<{ token_fingerprint: string }>`
+              SELECT token_fingerprint FROM bindings WHERE account_key = ${accountKey} ORDER BY token_fingerprint
+            `;
+            let shared = false;
+            for (const { token_fingerprint: other } of bound) {
+              if (keep.has(other)) {
+                shared = true;
+                sharedWith.add(other);
+              } else {
+                yield* dropToken(other);
+              }
+            }
+            if (shared) continue;
+            yield* sql`DELETE FROM transactions WHERE account_key = ${accountKey}`;
+            yield* sql`DELETE FROM coverage_days WHERE account_key = ${accountKey}`;
+            yield* sql`DELETE FROM accounts WHERE account_key = ${accountKey}`;
+            deleted += 1;
+          }
+          const cached = yield* sql<{ account_key: string; token_fingerprint: string | null }>`
+            SELECT a.account_key, b.token_fingerprint FROM accounts a LEFT JOIN bindings b ON b.account_key = a.account_key
+          `;
+          const attributed = new Set(cached.filter((row) => row.token_fingerprint !== null && keep.has(row.token_fingerprint)).map((row) => row.account_key));
+          const unattributed = new Set(cached.map((row) => row.account_key).filter((key) => !attributed.has(key))).size;
+          return { deleted, sharedWith: [...sharedWith], unattributed } satisfies PurgeOutcome;
+        }),
+      )
+      .pipe(cacheFailure("delete the cached data"));
+
+  /** Stops every later write for the token (see `retired`). */
+  const retire = (tokenFingerprint: string) => Effect.sync(() => void retired.add(tokenFingerprint));
+  /** The token is configured again: its writes are accepted again. */
+  const reinstate = (tokenFingerprint: string) => Effect.sync(() => void retired.delete(tokenFingerprint));
+  const isRetired = (tokenFingerprint: string) => retired.has(tokenFingerprint);
+
   return {
     binding,
+    renameBinding,
+    purgeTokens,
+    retire,
+    reinstate,
+    isRetired,
     account,
     syncState,
     putSyncState,

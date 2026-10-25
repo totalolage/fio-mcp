@@ -50,13 +50,25 @@ export interface RedactorShape {
   readonly redactDeep: <T>(value: T) => T;
   /** Short, single-line, token-free excerpt of a response body for error messages. */
   readonly excerpt: (body: string) => string;
+  /**
+   * Adds secrets to redact from now on (tokens added at runtime through
+   * /admin). Secrets are never removed: a replaced token may still appear
+   * in a late log line.
+   */
+  readonly register: (secrets: ReadonlyArray<string>) => void;
 }
 
-export function makeRedactor(secrets: ReadonlyArray<string>): RedactorShape {
-  // Longest first so a secret that contains another is fully replaced.
-  const forms = [...new Set(secrets.filter((s) => s.length > 0).flatMap(tokenForms))].sort(
-    (a, b) => b.length - a.length,
-  );
+export function makeRedactor(initial: ReadonlyArray<string>): RedactorShape {
+  const known = new Set<string>();
+  let forms: ReadonlyArray<string> = [];
+  const register = (secrets: ReadonlyArray<string>) => {
+    const fresh = secrets.filter((s) => s.length > 0 && !known.has(s));
+    if (fresh.length === 0) return;
+    for (const secret of fresh) known.add(secret);
+    // Longest first so a secret that contains another is fully replaced.
+    forms = [...new Set([...known].flatMap(tokenForms))].sort((a, b) => b.length - a.length);
+  };
+  register(initial);
   const redact = (text: string): string => {
     let out = text;
     for (const form of forms) out = out.split(form).join(REDACTED);
@@ -74,7 +86,7 @@ export function makeRedactor(secrets: ReadonlyArray<string>): RedactorShape {
     );
     return text.length > EXCERPT_LENGTH ? `${text.slice(0, EXCERPT_LENGTH)}…` : text;
   };
-  return { redact, redactDeep, excerpt };
+  return { redact, redactDeep, excerpt, register };
 }
 
 function deep(value: unknown, redact: (text: string) => string): unknown {
@@ -92,6 +104,12 @@ function deep(value: unknown, redact: (text: string) => string): unknown {
   return value;
 }
 
+/**
+ * One instance per process. The stderr logger (main.ts provides
+ * AppLoggerLive around the app) and the app layers build `Redactor.Live`
+ * from the same memo map, so a token registered at runtime is redacted in
+ * logs too.
+ */
 export class Redactor extends Context.Service<Redactor, RedactorShape>()("fio-mcp/Redactor") {
   static readonly Default = Layer.effect(
     Redactor,

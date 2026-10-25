@@ -5,10 +5,12 @@ import { assert, describe, it } from "@effect/vitest";
 import { Deferred, Effect, Fiber, Layer, Redacted, Ref } from "effect";
 import { SqlClient } from "effect/sql";
 import { TestClock } from "effect/testing";
-import { tokenFingerprint } from "../src/accounts.js";
+import { type Account, Accounts, tokenFingerprint } from "../src/accounts.js";
+import { makeAccountAdmin } from "../src/admin/accounts.js";
 import { addDays, type DayRange } from "../src/cache/dates.js";
 import { SERVER_MIGRATIONS } from "../src/cache/db.js";
 import { CacheSyncLive, historyUnlockMessage, type SyncRequest, Transactions } from "../src/cache/service.js";
+import { accountSeedOf } from "../src/config.js";
 import {
   FioServerError,
   HISTORY_UNLOCK_STEPS,
@@ -16,6 +18,8 @@ import {
   RateLimited,
   TooManyItems,
 } from "../src/errors.js";
+import type { FioApi } from "../src/fio-api.js";
+import { Redactor } from "../src/redaction.js";
 import {
   account,
   cacheLayer,
@@ -29,9 +33,11 @@ import {
   statement,
   TODAY,
   TOKEN_A,
+  TOKEN_B,
   tx,
   verifiedStatus,
 } from "./support/cache.js";
+import { seededConfig } from "./support/config.js";
 import { testDatabase } from "./support/database.js";
 import { fakeFio, type PeriodsScript } from "./support/fio-api.js";
 
@@ -738,6 +744,213 @@ describe("cache sync", () => {
           ]);
         }).pipe(Effect.provide(CacheSyncLive));
       }).pipe(Effect.provide(cacheLayer(cfg, fio.layer)));
+    }),
+  );
+});
+
+/** The token's job in this process, as get_cache_status reports it; null when there is none. */
+const jobOf = (acc: Account) =>
+  Effect.gen(function* () {
+    const [status] = yield* Effect.orDie((yield* Transactions).status([acc]));
+    return status?.job ?? null;
+  });
+
+/** Records movement `id` for `acc` through the cache (as get_statement does); whether it was stored. */
+const recorded = (acc: Account, id: number, accountId?: string) =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* (yield* Transactions).record(acc, statement(TODAY, TODAY, [tx(id, TODAY, 5)], accountId));
+    const [row] = yield* Effect.orDie(sql<{ n: number }>`SELECT COUNT(*) AS n FROM transactions WHERE movement_id = ${id}`);
+    return row?.n === 1;
+  });
+
+describe("retiring a token removed at /admin", () => {
+  it.effect("stops the running job and wakes whoever waits for it", () =>
+    Effect.gen(function* () {
+      yield* setNow();
+      const fio = yield* fakeFio(() => Effect.never);
+      yield* Effect.gen(function* () {
+        const cache = yield* Transactions;
+        const acc = yield* account();
+        yield* cache.sync(acc, { kind: "backfill" });
+        yield* settle;
+        // A resume joins the running job and waits for it.
+        const waiting = yield* Effect.forkChild(cache.sync(acc, { kind: "resume" }, 3_600_000), { startImmediately: true });
+        yield* settle;
+        yield* cache.retire(acc.tokenFingerprint);
+        const outcome = yield* Effect.orDie(Fiber.join(waiting));
+        if (!outcome.started) return assert.fail("the resume did not join the job");
+        assert.isTrue(outcome.joined);
+        assert.strictEqual(outcome.job.status, "failed");
+        assert.include(outcome.job.lastError ?? "", "removed");
+        // Forgotten: nothing runs for it any more; retiring again changes nothing.
+        assert.isNull(yield* jobOf(acc));
+        yield* cache.retire(acc.tokenFingerprint);
+        assert.isNull(yield* jobOf(acc));
+      }).pipe(Effect.provide(cacheLayer(config(), fio.layer)));
+    }),
+  );
+
+  it.effect("stops its job, refuses new jobs, and drops its writes until it is reinstated", () =>
+    Effect.gen(function* () {
+      yield* setNow();
+      const fio = yield* fakeFio(() => Effect.never);
+      yield* Effect.gen(function* () {
+        const cache = yield* Transactions;
+        const acc = yield* account();
+        const fp = acc.tokenFingerprint;
+        yield* cache.sync(acc, { kind: "backfill" });
+        yield* settle;
+        yield* cache.retire(fp);
+        assert.isNull(yield* jobOf(acc));
+        // A pass that read the accounts before the removal starts nothing.
+        const refused = yield* Effect.orDie(cache.sync(acc, { kind: "incremental" }));
+        if (!refused.started) return assert.fail("no refusal reported");
+        assert.strictEqual(refused.job.status, "failed");
+        assert.include(refused.job.lastError ?? "", "removed");
+        assert.isNull(yield* jobOf(acc));
+        // A resume (startup, background) reports nothing to do.
+        assert.isFalse((yield* Effect.orDie(cache.sync(acc, { kind: "resume" }))).started);
+        // A write after the removal stores nothing.
+        assert.isFalse(yield* recorded(acc, 1));
+        // Added again: accepted again.
+        yield* cache.reinstate(fp);
+        assert.isTrue(yield* recorded(acc, 1));
+        const started = yield* Effect.orDie(cache.sync(acc, { kind: "incremental" }));
+        if (!started.started) return assert.fail("no job started");
+        assert.strictEqual(started.job.status, "running");
+      }).pipe(Effect.provide(cacheLayer(config(), fio.layer)));
+    }),
+  );
+
+  const ADMIN_KEY = Redacted.make(new Uint8Array(32).fill(5));
+  /** The cache on the server's database, with the accounts stored in it (as in HTTP mode with OAuth). */
+  const adminLayer = (fio: Layer.Layer<FioApi>) => {
+    const cfg = config();
+    return Transactions.Default.pipe(
+      Layer.provideMerge(Accounts.stored(ADMIN_KEY, accountSeedOf(cfg.accounts))),
+      Layer.provideMerge(testDatabase(":memory:", SERVER_MIGRATIONS)),
+      Layer.provideMerge(Layer.mergeAll(Redactor.Default, fio)),
+      Layer.provideMerge(seededConfig(cfg)),
+    );
+  };
+
+  it.effect("removing an account with purge stops writes for every token it had, not only the current one", () =>
+    Effect.gen(function* () {
+      yield* setNow();
+      const fio = yield* fakeFio(() => Effect.never);
+      yield* Effect.gen(function* () {
+        const cache = yield* Transactions;
+        const admin = yield* makeAccountAdmin(ADMIN_KEY);
+        const sql = yield* SqlClient.SqlClient;
+        const before = yield* account();
+        const old = before.tokenFingerprint;
+        assert.isTrue(yield* recorded(before, 1));
+        yield* admin.rotate(before.id, TOKEN_B);
+        // A process that did not see the token replaced (the retired set is in memory) still runs a job for it.
+        yield* cache.reinstate(old);
+        yield* cache.sync(before, { kind: "backfill" });
+        yield* settle;
+        assert.strictEqual((yield* jobOf(before))?.status, "running");
+
+        const removed = yield* admin.remove(before.id, true);
+        assert.deepStrictEqual(removed.cache, { kind: "purged", deleted: 1, accounts: [], unattributed: 0 });
+        // The old token's job was stopped and its late writes store nothing.
+        assert.isNull(yield* jobOf(before));
+        assert.isFalse(yield* recorded(before, 2));
+        const [left] = yield* sql<{ n: number }>`
+          SELECT (SELECT COUNT(*) FROM transactions) + (SELECT COUNT(*) FROM bindings) + (SELECT COUNT(*) FROM sync_state) AS n
+        `;
+        assert.strictEqual(left?.n, 0);
+        assert.deepStrictEqual(yield* (yield* Accounts).list, []);
+      }).pipe(Effect.provide(adminLayer(fio.layer)));
+    }),
+  );
+
+  it.effect("removing an account with purge fences only the tokens no other account uses, also when the purge fails", () =>
+    Effect.gen(function* () {
+      yield* setNow();
+      const fio = yield* fakeFio(() => Effect.never);
+      yield* Effect.gen(function* () {
+        const cache = yield* Transactions;
+        const admin = yield* makeAccountAdmin(ADMIN_KEY);
+        const sql = yield* SqlClient.SqlClient;
+        const before = yield* account();
+        const TOKEN_C = "c".repeat(64);
+        const [onlyMain = "", gammas = "", shared = ""] = [TOKEN_A, TOKEN_B, TOKEN_C].map((token) => tokenFingerprint(Redacted.make(token)));
+        let rowId = 0;
+        const write = (tokenFingerprint: string, accountId: string) => recorded({ ...before, tokenFingerprint }, ++rowId, accountId);
+        // main caches X with its first token and Z with its second; gamma now uses the second, beta the third (main's current).
+        yield* write(onlyMain, "2000000001");
+        yield* admin.rotate(before.id, TOKEN_B);
+        yield* write(gammas, "2000000003");
+        yield* admin.rotate(before.id, TOKEN_C);
+        yield* admin.add({ name: "gamma", token: TOKEN_B, accountNumber: undefined, currency: undefined });
+        yield* admin.add({ name: "beta", token: TOKEN_C, accountNumber: undefined, currency: undefined });
+        yield* write(shared, "2000000002");
+        const beta = (yield* (yield* Accounts).list).find((some) => some.name === "beta");
+        if (beta === undefined) return assert.fail("beta was not added");
+        // A process that did not see the first token replaced still runs a job for it; beta's job runs too.
+        yield* cache.reinstate(onlyMain);
+        yield* cache.sync(before, { kind: "backfill" });
+        yield* cache.sync(beta, { kind: "backfill" });
+        yield* settle;
+        assert.strictEqual((yield* jobOf(before))?.status, "running");
+
+        // The purge fails: main stays, the token only it had stays fenced, the tokens others use still write.
+        yield* sql`DROP TABLE accounts`;
+        assert.strictEqual((yield* Effect.flip(admin.remove(before.id, true)))._tag, "CacheError");
+        yield* sql`CREATE TABLE accounts (account_key TEXT PRIMARY KEY, account_id TEXT NOT NULL, bank_id TEXT NOT NULL, iban TEXT, bic TEXT, currency TEXT, balance REAL, balance_date TEXT, updated_at INTEGER NOT NULL)`;
+        assert.deepStrictEqual((yield* (yield* Accounts).list).map((some) => some.name).sort(), ["beta", "gamma", "main"]);
+        assert.isNull(yield* jobOf(before));
+        assert.isFalse(yield* write(onlyMain, "2000000001"));
+        assert.isTrue(yield* write(gammas, "2000000003"));
+        assert.isTrue(yield* write(shared, "2000000002"));
+        assert.strictEqual((yield* jobOf(beta))?.status, "running");
+
+        // Removing again: X, which only main's first token reached, goes; Z and Y stay for gamma and beta.
+        const removed = yield* admin.remove(before.id, true);
+        if (removed.cache.kind !== "purged") return assert.fail(`not purged: ${removed.cache.kind}`);
+        assert.deepStrictEqual(
+          { ...removed.cache, accounts: [...removed.cache.accounts].sort() },
+          { kind: "purged", deleted: 1, accounts: ["beta", "gamma"], unattributed: 0 },
+        );
+        const kept = yield* sql<{ account_key: string }>`SELECT DISTINCT account_key FROM transactions ORDER BY account_key`;
+        assert.notInclude(kept.map((row) => row.account_key).join(" "), "2000000001");
+        assert.strictEqual(kept.length, 2);
+        assert.isFalse(yield* write(onlyMain, "2000000001"));
+        assert.isTrue(yield* write(gammas, "2000000003"));
+        assert.isTrue(yield* write(shared, "2000000002"));
+        assert.strictEqual((yield* jobOf(beta))?.status, "running");
+      }).pipe(Effect.provide(adminLayer(fio.layer)));
+    }),
+  );
+
+  it.effect("a purge that fails removes nothing: the account, its token history and its writes stay", () =>
+    Effect.gen(function* () {
+      yield* setNow();
+      const fio = yield* fakeFio(() => Effect.never);
+      yield* Effect.gen(function* () {
+        const admin = yield* makeAccountAdmin(ADMIN_KEY);
+        const sql = yield* SqlClient.SqlClient;
+        const main = yield* account();
+        yield* recorded(main, 1);
+        yield* admin.rotate(main.id, TOKEN_B);
+        // The purge's last statement for a bank account fails.
+        yield* sql`DROP TABLE accounts`;
+        const failed = yield* Effect.flip(admin.remove(main.id, true));
+        assert.strictEqual(failed._tag, "CacheError");
+        yield* sql`CREATE TABLE accounts (account_key TEXT PRIMARY KEY, account_id TEXT NOT NULL, bank_id TEXT NOT NULL, iban TEXT, bic TEXT, currency TEXT, balance REAL, balance_date TEXT, updated_at INTEGER NOT NULL)`;
+        assert.deepStrictEqual((yield* (yield* Accounts).list).map((some) => some.name), ["main"]);
+        const [left] = yield* sql<{ n: number }>`SELECT COUNT(*) AS n FROM transactions`;
+        assert.strictEqual(left?.n, 1);
+        // The current token writes again; removing again (now succeeding) still reaches the replaced token's data.
+        assert.isTrue(yield* recorded(yield* account(), 2));
+        const removed = yield* admin.remove(main.id, true);
+        assert.deepStrictEqual(removed.cache, { kind: "purged", deleted: 1, accounts: [], unattributed: 0 });
+        const [after] = yield* sql<{ n: number }>`SELECT (SELECT COUNT(*) FROM transactions) + (SELECT COUNT(*) FROM bindings) AS n`;
+        assert.strictEqual(after?.n, 0);
+      }).pipe(Effect.provide(adminLayer(fio.layer)));
     }),
   );
 });

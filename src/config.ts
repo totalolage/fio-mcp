@@ -4,6 +4,7 @@ import type { IpNetwork } from "effect/net";
 import { ConfigError } from "./errors.js";
 import { type PasswordHash, PasswordHashError, parsePasswordHash } from "./oauth/crypto.js";
 import { parsePublicUrl } from "./oauth/urls.js";
+import { parseDataKey } from "./token-crypto.js";
 import { parseTrustedProxy } from "./transport/client-address.js";
 
 /**
@@ -11,7 +12,12 @@ import { parseTrustedProxy } from "./transport/client-address.js";
  *
  * Secrets (FIO tokens) come from a variable or from a file named by its
  * `_FILE` twin, never both, and are held as `Redacted`; the admin password
- * hash comes from a file only.
+ * hash and the data key come from files only.
+ *
+ * With OAuth over HTTP the FIO accounts live in the database (encrypted
+ * with the data key, managed at /admin); FIO_TOKEN / FIO_ACCOUNTS are then
+ * optional and only seed an empty database once (src/account-store.ts),
+ * which reads them only then.
  * Diagnostics name the variable, field, or path, never a value: a misplaced
  * token must not reach stderr.
  */
@@ -54,9 +60,34 @@ export type HttpAuthConfig =
       readonly kind: "oauth";
       /** The public origin: OAuth issuer; the resource is this plus /mcp. */
       readonly publicUrl: string;
+      /** The bootstrap hash; a password changed at /admin (stored in the database) takes precedence. */
       readonly passwordHash: Redacted.Redacted<PasswordHash>;
+      /** AES-256-GCM key (FIO_MCP_DATA_KEY_FILE) for the FIO tokens in the database. */
+      readonly dataKey: Redacted.Redacted<Uint8Array>;
+      /** FIO_TOKEN / FIO_ACCOUNTS, read only if the database needs them. */
+      readonly accountSeed: AccountSeed;
     }
   | { readonly kind: "unauthenticated" };
+
+/**
+ * The accounts FIO_TOKEN / FIO_ACCOUNTS (or their _FILE variants) would
+ * import in HTTP mode with OAuth. They are read and validated only when the
+ * database has no accounts and was never edited (src/account-store.ts), so
+ * once it holds the accounts, a stale, broken or deleted seed cannot stop
+ * startup.
+ */
+export interface AccountSeed {
+  /** Whether a seed variable is set; says nothing about its value. */
+  readonly configured: boolean;
+  /** Reads and validates the seed with the stdio rules. */
+  readonly load: Effect.Effect<ReadonlyArray<AccountConfig>, ConfigError>;
+}
+
+/** A seed that is already read (tests). */
+export const accountSeedOf = (accounts: ReadonlyArray<AccountConfig>): AccountSeed => ({
+  configured: accounts.length > 0,
+  load: Effect.succeed(accounts),
+});
 
 export interface CacheConfig {
   readonly enabled: boolean;
@@ -73,6 +104,11 @@ export interface CacheConfig {
 }
 
 export interface AppConfigShape {
+  /**
+   * Accounts from FIO_TOKEN / FIO_ACCOUNTS. Never empty for stdio and
+   * unauthenticated HTTP; empty with OAuth, where the database is
+   * authoritative and these only seed it (`auth.accountSeed`).
+   */
   readonly accounts: ReadonlyArray<AccountConfig>;
   /** Every configured secret that must never leave the process: the FIO tokens. */
   readonly secrets: ReadonlyArray<Redacted.Redacted<string>>;
@@ -113,12 +149,12 @@ export const MIN_SYNC_INTERVAL_MINUTES = 5;
 const ACCOUNT_NAME_INVISIBLE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
 // URL-safe characters only: tokens go into URL paths, and protocol-level
 // redaction can then never cut through JSON or SSE framing.
-const TOKEN = new RegExp(`^[A-Za-z0-9._~-]{${MIN_TOKEN_LENGTH},}$`);
-const ACCOUNT_NUMBER = /^\d{1,10}$/;
-const CURRENCY = /^[A-Z]{3}$/;
+export const TOKEN = new RegExp(`^[A-Za-z0-9._~-]{${MIN_TOKEN_LENGTH},}$`);
+export const ACCOUNT_NUMBER = /^\d{1,10}$/;
+export const CURRENCY = /^[A-Z]{3}$/;
 const DATE = /^(?!0000)\d{4}-\d{2}-\d{2}$/;
 
-const FIELD_RULES = {
+export const FIELD_RULES = {
   name: "must be 1-64 Unicode code points after trimming, with no control, format or line separator characters",
   token: `must be at least ${MIN_TOKEN_LENGTH} characters of letters, digits, '.', '_', '~' or '-' (FIO tokens are 64 characters)`,
   accountNumber: "must be the FIO account number without bank code (1-10 digits)",
@@ -212,11 +248,15 @@ const isCalendarDate = (value: string): boolean => {
 
 const RawAccount = Schema.Record(Schema.String, Schema.Unknown);
 
-const validAccountName = (value: string): boolean => {
+/** The account-name rule (before trimming): 1-64 code points after trimming, nothing invisible. */
+export const validAccountName = (value: string): boolean => {
   if (ACCOUNT_NAME_INVISIBLE.test(value)) return false;
   const length = Array.from(value.trim()).length;
   return length >= 1 && length <= 64;
 };
+
+/** Names are unique ignoring case after trimming. */
+export const accountNameKey = (name: string): string => name.trim().toLowerCase();
 
 /** Validates one account object, describing failures by field name and rule only. */
 const parseAccount = Effect.fn("config.parseAccount")(function* (raw: unknown, index: number | undefined) {
@@ -248,7 +288,8 @@ const parseAccount = Effect.fn("config.parseAccount")(function* (raw: unknown, i
   return { name, token: Redacted.make(token), accountNumber, currency } satisfies AccountConfig;
 });
 
-const loadAccounts = Effect.fn("config.loadAccounts")(function* () {
+/** `optional`: none configured is fine (OAuth over HTTP, where the database holds the accounts). */
+const loadAccounts = Effect.fn("config.loadAccounts")(function* (optional: boolean) {
   const single = yield* secretVar("FIO_TOKEN");
   const multi = yield* secretVar("FIO_ACCOUNTS");
   if (Option.isSome(single) && Option.isSome(multi)) {
@@ -266,7 +307,7 @@ const loadAccounts = Effect.fn("config.loadAccounts")(function* () {
     const accounts = yield* Effect.forEach(parsed, (raw: unknown, index) => parseAccount(raw, index));
     const firstIndex = new Map<string, number>();
     for (const [index, account] of accounts.entries()) {
-      const key = account.name.toLowerCase();
+      const key = accountNameKey(account.name);
       const earlier = firstIndex.get(key);
       if (earlier !== undefined) {
         return yield* fail(
@@ -278,6 +319,7 @@ const loadAccounts = Effect.fn("config.loadAccounts")(function* () {
     return accounts;
   }
   if (Option.isNone(single)) {
+    if (optional) return [];
     return yield* fail(
       "No FIO token configured: set FIO_TOKEN (or FIO_TOKEN_FILE), or FIO_ACCOUNTS (or FIO_ACCOUNTS_FILE) for several accounts",
     );
@@ -328,7 +370,45 @@ const loadHttpAuth = Effect.fn("config.loadHttpAuth")(function* () {
   if (hash instanceof PasswordHashError) {
     return yield* fail(`FIO_MCP_ADMIN_PASSWORD_HASH_FILE: file ${hash.detail}`);
   }
-  return { kind: "oauth", publicUrl: parsedUrl.origin, passwordHash: Redacted.make(hash) } satisfies HttpAuthConfig;
+  const dataKey = yield* loadDataKey();
+  return {
+    kind: "oauth",
+    publicUrl: parsedUrl.origin,
+    passwordHash: Redacted.make(hash),
+    dataKey,
+    accountSeed: yield* loadAccountSeed(),
+  } satisfies HttpAuthConfig;
+});
+
+const SEED_VARS = ["FIO_TOKEN", "FIO_TOKEN_FILE", "FIO_ACCOUNTS", "FIO_ACCOUNTS_FILE"];
+
+/** Notes which seed variables are set; reading them waits for `load`, with this environment and file system. */
+const loadAccountSeed = Effect.fn("config.loadAccountSeed")(function* () {
+  let configured = false;
+  for (const key of SEED_VARS) if (Option.isSome(yield* optionalVar(key))) configured = true;
+  const services = yield* Effect.context<FileSystem.FileSystem>();
+  return { configured, load: Effect.provideContext(loadAccounts(true), services) } satisfies AccountSeed;
+});
+
+const DATA_KEY_HELP = "create one with `openssl rand -hex 32 > fio_mcp_data_key` and keep a copy outside the database backups";
+
+/** FIO_MCP_DATA_KEY_FILE: 32 bytes as 64 hex digits or base64. Never echoes the content. */
+const loadDataKey = Effect.fn("config.loadDataKey")(function* () {
+  const file = yield* optionalVar("FIO_MCP_DATA_KEY_FILE");
+  if (Option.isNone(file)) {
+    return yield* fail(
+      `HTTP mode with OAuth requires FIO_MCP_DATA_KEY_FILE, the key that encrypts the FIO tokens in the database; ${DATA_KEY_HELP}`,
+    );
+  }
+  const fs = yield* FileSystem.FileSystem;
+  const content = yield* fs
+    .readFileString(file.value)
+    .pipe(Effect.mapError(() => new ConfigError({ detail: "FIO_MCP_DATA_KEY_FILE: file not readable" })));
+  const key = parseDataKey(content);
+  if (key === undefined) {
+    return yield* fail(`FIO_MCP_DATA_KEY_FILE: file must contain 32 bytes as 64 hex digits or base64; ${DATA_KEY_HELP}`);
+  }
+  return key;
 });
 
 const loadTrustedProxies = Effect.fn("config.loadTrustedProxies")(function* () {
@@ -394,8 +474,8 @@ const loadCache = Effect.fn("config.loadCache")(function* () {
 
 /** Reads and validates the whole configuration. */
 export const loadConfig = Effect.fn("config.load")(function* () {
-  const accounts = yield* loadAccounts();
   const transport = yield* loadTransport();
+  const accounts = transport.kind === "http" && transport.auth.kind === "oauth" ? [] : yield* loadAccounts(false);
   const baseUrl = Option.getOrElse(yield* optionalVar("FIO_API_BASE_URL"), () => DEFAULT_BASE_URL).replace(/\/+$/, "");
   const cache = yield* loadCache();
   if (transport.kind === "http" && transport.auth.kind === "oauth" && cache.dbPath === "") {

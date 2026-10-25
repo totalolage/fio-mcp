@@ -1,4 +1,4 @@
-import { Clock, Context, DateTime, Deferred, Effect, Layer, Predicate, Queue, Ref, Result, SynchronizedRef } from "effect";
+import { Clock, Context, DateTime, Deferred, Effect, Fiber, Layer, Predicate, Queue, Ref, Result, SynchronizedRef } from "effect";
 import { AppConfig } from "./config.js";
 import { RateLimited, type TokenBusy } from "./errors.js";
 
@@ -87,6 +87,13 @@ interface TokenLimiter {
   readonly state: Ref.Ref<TokenState>;
   /** Wakes the dispatcher after arrivals, cancellations, and 409 blocks. */
   readonly wake: Queue.Queue<void>;
+  readonly dispatcher: Fiber.Fiber<never>;
+  /**
+   * Calls of `run` that hold this limiter, from looking it up to their end.
+   * Counted under the limiters lock, as `forget` checks it: a call that
+   * already holds a limiter never finds it dropped (and its dispatcher gone).
+   */
+  users: number;
 }
 
 const CONFLICT_REASON = "FIO returned HTTP 409 (the token was used elsewhere within the last 30 s).";
@@ -104,6 +111,12 @@ export interface RateLimiterShape {
     request: Effect.Effect<A, E | TokenBusy, R>,
   ) => Effect.Effect<A, Exclude<E, TokenBusy> | RateLimited, R>;
   readonly state: (key: string) => Effect.Effect<RateLimitState>;
+  /**
+   * Drops the state of a token no account uses any more (removed or
+   * replaced at /admin). A token with calls in flight or waiting keeps it,
+   * so its spacing still holds. Using the key again starts afresh.
+   */
+  readonly forget: (key: string) => Effect.Effect<void>;
 }
 
 const initialState: TokenState = {
@@ -212,7 +225,7 @@ export const makeRateLimiter = Effect.fn("RateLimiter.make")(function* (options:
     };
 
   /** Hands out slots; fails interactive waiters a 409 pushed past their budget. */
-  const dispatch = (limiter: TokenLimiter): Effect.Effect<never> =>
+  const dispatch = (limiter: Pick<TokenLimiter, "state" | "wake">): Effect.Effect<never> =>
     Effect.gen(function* () {
       const now = yield* Clock.currentTimeMillis;
       const { rejected, grant, waitMs } = yield* Ref.modify(limiter.state, step(now));
@@ -227,19 +240,23 @@ export const makeRateLimiter = Effect.fn("RateLimiter.make")(function* (options:
         : Queue.take(limiter.wake).pipe(Effect.timeoutOrElse({ duration: waitMs, orElse: () => Effect.void }));
     }).pipe(Effect.forever);
 
-  const limiterFor = (key: string) =>
-    SynchronizedRef.modifyEffect(limiters, (map) => {
-      const existing = map.get(key);
-      if (existing !== undefined) return Effect.succeed([existing, map] as const);
-      return Effect.gen(function* () {
-        const limiter: TokenLimiter = {
-          state: yield* Ref.make(initialState),
-          wake: yield* Queue.sliding<void>(1),
-        };
-        yield* Effect.forkIn(dispatch(limiter), scope);
-        return [limiter, new Map(map).set(key, limiter)] as const;
-      });
-    });
+  /** The token's limiter, made on first use; `use` makes the caller one of its `users`. */
+  const limiterFor = (key: string, use = false) =>
+    SynchronizedRef.modifyEffect(
+      limiters,
+      Effect.fnUntraced(function* (map) {
+        let limiter = map.get(key);
+        let next = map;
+        if (limiter === undefined) {
+          const state = yield* Ref.make(initialState);
+          const wake = yield* Queue.sliding<void>(1);
+          limiter = { state, wake, dispatcher: yield* Effect.forkIn(dispatch({ state, wake }), scope), users: 0 };
+          next = new Map(map).set(key, limiter);
+        }
+        if (use) limiter.users += 1;
+        return [limiter, next] as const;
+      }),
+    );
 
   const signal = (limiter: TokenLimiter) => Queue.offer(limiter.wake, undefined).pipe(Effect.asVoid);
 
@@ -290,7 +307,21 @@ export const makeRateLimiter = Effect.fn("RateLimiter.make")(function* (options:
     priority: Priority,
     request: Effect.Effect<A, E | TokenBusy, R>,
   ): Effect.fn.Return<A, Exclude<E, TokenBusy> | RateLimited, R> {
-    const limiter = yield* limiterFor(key);
+    return yield* Effect.acquireUseRelease(
+      limiterFor(key, true),
+      (limiter) => limited(limiter, priority, request),
+      (limiter) =>
+        Effect.sync(() => {
+          limiter.users -= 1;
+        }),
+    );
+  });
+
+  const limited = Effect.fnUntraced(function* <A, E, R>(
+    limiter: TokenLimiter,
+    priority: Priority,
+    request: Effect.Effect<A, E | TokenBusy, R>,
+  ): Effect.fn.Return<A, Exclude<E, TokenBusy> | RateLimited, R> {
     const arrival = yield* Clock.currentTimeMillis;
     const deadline = priority === "interactive" ? arrival + maxWaitMs : Number.POSITIVE_INFINITY;
     yield* acquire(limiter, priority, deadline, false);
@@ -319,7 +350,24 @@ export const makeRateLimiter = Effect.fn("RateLimiter.make")(function* (options:
       } satisfies RateLimitState;
   });
 
-  return { run, state } satisfies RateLimiterShape;
+  const forget = (key: string) =>
+    SynchronizedRef.updateEffect(limiters, (map) => {
+      const limiter = map.get(key);
+      if (limiter === undefined) return Effect.succeed(map);
+      return Effect.gen(function* () {
+        const s = yield* Ref.get(limiter.state);
+        const now = yield* Clock.currentTimeMillis;
+        // Busy: a call holds it (waiting, running, or retrying after a 409), or the
+        // interval since its last request has not passed yet.
+        if (limiter.users > 0 || readyAt(s) > now) return map;
+        yield* Fiber.interrupt(limiter.dispatcher);
+        const next = new Map(map);
+        next.delete(key);
+        return next;
+      });
+    });
+
+  return { run, state, forget } satisfies RateLimiterShape;
 });
 
 export class RateLimiter extends Context.Service<RateLimiter, RateLimiterShape>()("fio-mcp/RateLimiter") {

@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { NodeFileSystem } from "@effect/platform-node";
 import { assert, describe, it } from "@effect/vitest";
-import { Effect, Layer, } from "effect";
+import { Effect, Layer, Option } from "effect";
 import { SqlClient } from "effect/sql";
 import { backupDatabase, CACHE_MIGRATIONS, migrate, SERVER_MIGRATIONS } from "../src/cache/db.js";
 import { makeCacheStore } from "../src/cache/store.js";
@@ -12,6 +12,7 @@ import {
   account,
   cacheLayer,
   config,
+  NOW,
   seedRange,
   serveFrom,
   setNow,
@@ -70,6 +71,9 @@ describe("cache database", () => {
         assert.deepStrictEqual(yield* migrate(SERVER_MIGRATIONS), [
           [3, "pending_range_replace"],
           [4, "grant_account_fingerprints"],
+          [5, "create_accounts"],
+          [6, "grant_last_used"],
+          [7, "account_token_history"],
         ]);
         const store = yield* makeCacheStore();
         const pending = (fp: string) => Effect.map(store.syncState(fp), (state) => state.pending);
@@ -152,5 +156,28 @@ describe("cache database", () => {
       const error = yield* Effect.flip(backupDatabase(destination));
       assert.instanceOf(error, InvalidInput);
     }).pipe(withDb(":memory:"), Effect.provide(NodeFileSystem.layer)),
+  );
+});
+
+describe("a retired token", () => {
+  it.effect("drops a write and a sync-state save built before the retirement and run after a purge, until reinstated", () =>
+    Effect.gen(function* () {
+      const store = yield* makeCacheStore();
+      const sql = yield* SqlClient.SqlClient;
+      const fp = "f".repeat(32);
+      const late = { accountName: "main", tokenFingerprint: fp, statement: statement(TODAY, TODAY, [tx(1, TODAY, 5)]), fetchedAt: NOW };
+      // Built before the retirement, run after it and the purge.
+      const lateState = store.putSyncState(fp, yield* store.syncState(fp));
+      yield* store.retire(fp);
+      yield* store.purgeTokens([fp], new Set());
+      assert.strictEqual((yield* store.commit(late)).rowsWritten, 0);
+      yield* lateState;
+      assert.isTrue(Option.isNone(yield* store.binding(fp)));
+      const [rows] = yield* sql<{ n: number }>`SELECT (SELECT COUNT(*) FROM transactions) + (SELECT COUNT(*) FROM sync_state) AS n`;
+      assert.strictEqual(rows?.n, 0);
+      // Added again: accepted again.
+      yield* store.reinstate(fp);
+      assert.strictEqual((yield* store.commit(late)).rowsWritten, 1);
+    }).pipe(withDb(":memory:")),
   );
 });

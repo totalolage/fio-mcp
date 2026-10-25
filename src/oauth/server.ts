@@ -1,8 +1,8 @@
 import { ByteSize, Clock, Effect, Option, Redacted, Result, Schema } from "effect";
 import { Cookies, HttpServerRequest, HttpServerResponse } from "effect/http";
 import type { IpNetwork } from "effect/net";
-import { Accounts } from "../accounts.js";
-import type { HttpAuthConfig } from "../config.js";
+import { type Account, Accounts } from "../accounts.js";
+import { AdminPassword } from "../admin/password.js";
 import { SCOPE_PAYMENTS, SCOPE_READ, SCOPES } from "../mcp/permissions.js";
 import { AuthUnavailable, Unauthorized } from "../transport/auth-errors.js";
 import { clientAddress } from "../transport/client-address.js";
@@ -25,10 +25,16 @@ import {
   UnsupportedGrantType,
   UnsupportedResponseType,
 } from "./errors.js";
-import { DEFAULT_THROTTLE, makeLoginGuard, type ThrottlePolicy } from "./login.js";
 import { consentPage, errorPage, loginPage, pageHeaders, redirectFormTarget } from "./pages.js";
 import { makeWindowLimiter } from "./rate-limit.js";
-import { type AuthSession, makeSessions, type PendingAuthorization, SESSION_COOKIE, SESSION_TTL_MS } from "./sessions.js";
+import {
+  type AuthSession,
+  MAX_CONSENT_FORMS,
+  makeSessions,
+  type PendingAuthorization,
+  SESSION_COOKIE,
+  SESSION_TTL_MS,
+} from "./sessions.js";
 import { type Client, type Grant, makeOAuthStore, type OAuthStore } from "./store.js";
 import { isResource, MCP_RESOURCE_PATH, redirectUriMatches, redirectUriProblem, withParams } from "./urls.js";
 
@@ -82,10 +88,9 @@ const CORS_PATHS = [
   "/revoke",
 ] as const;
 
+/** The admin password and its sign-in throttling come from `AdminPassword` (src/admin/password.ts). */
 export interface OAuthSettings {
   readonly publicUrl: string;
-  readonly passwordHash: Extract<HttpAuthConfig, { kind: "oauth" }>["passwordHash"];
-  readonly throttle?: ThrottlePolicy | undefined;
   /** Proxies whose X-Forwarded-For names the client address (see clientAddress). */
   readonly trustedProxies?: ReadonlyArray<IpNetwork.IpNetwork> | undefined;
 }
@@ -211,12 +216,13 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
   const store: OAuthStore = yield* makeOAuthStore();
   const accounts = yield* Accounts;
   const sessions = yield* makeSessions();
-  const guard = yield* makeLoginGuard(settings.passwordHash, settings.throttle ?? DEFAULT_THROTTLE);
+  const password = yield* AdminPassword;
   const issuer = settings.publicUrl;
   const resource = `${issuer}${MCP_RESOURCE_PATH}`;
   const resourceMetadataUrl = `${issuer}${PROTECTED_RESOURCE_PATH}${MCP_RESOURCE_PATH}`;
-  const accountNames = accounts.list.map((account) => account.name);
   const registrations: Array<number> = [];
+  /** When each grant's last use was recorded; /mcp writes it at most once a minute per grant. */
+  const touched = new Map<string, number>();
   const authorizationsByAddress = makeWindowLimiter({
     limit: LIMITS.authorizationsPerAddress,
     windowMs: LIMITS.authorizationWindowMs,
@@ -234,6 +240,19 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
 
   // -- Resource server -------------------------------------------------------
 
+  const touch = (grantId: string, now: number) => {
+    if ((touched.get(grantId) ?? Number.NEGATIVE_INFINITY) > now - 60_000) return Effect.void;
+    touched.delete(grantId);
+    touched.set(grantId, now);
+    // Bounded: the oldest entries go first (Map keeps insertion order).
+    while (touched.size > 10_000) {
+      const oldest = touched.keys().next();
+      if (oldest.done === true) break;
+      touched.delete(oldest.value);
+    }
+    return store.touchGrant(grantId, now).pipe(Effect.ignore);
+  };
+
   const authenticate = Effect.fnUntraced(function* (request: HttpServerRequest.HttpServerRequest) {
     const header = request.headers.authorization;
     if (header === undefined || header === "") return yield* new Unauthorized({ challenge: challenge() });
@@ -245,6 +264,7 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
     if (Option.isNone(grant) || grant.value.resource !== resource) {
       return yield* new Unauthorized({ challenge: challenge("invalid_token") });
     }
+    yield* touch(grant.value.grantId, now);
     return {
       subject: grant.value.grantId,
       scopes: grant.value.scopes,
@@ -461,6 +481,14 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
   const currentSession = Effect.fnUntraced(function* (request: HttpServerRequest.HttpServerRequest) {
     const session = yield* sessions.find(request.cookies[SESSION_COOKIE]);
     if (Option.isNone(session)) return yield* expired;
+    // Signed in before the admin password changed: no longer.
+    if (session.value.loggedIn) {
+      const stamp = yield* password.stamp.pipe(Effect.orElseSucceed(() => undefined));
+      if (stamp === undefined || stamp !== session.value.passwordStamp) {
+        yield* sessions.end(session.value);
+        return yield* expired;
+      }
+    }
     return session.value;
   });
 
@@ -499,20 +527,33 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
       extra,
     );
 
-  const renderConsent = (session: AuthSession, status = 200, error?: string) =>
-    html(
+  /** The consent page for the accounts configured now; the session remembers what this form showed. */
+  const renderConsent = Effect.fnUntraced(function* (
+    session: AuthSession,
+    configured: ReadonlyArray<Account>,
+    status = 200,
+    error?: string,
+  ) {
+    const formId = yield* randomId("");
+    session.consentForms.set(formId, new Map(configured.map((account) => [account.name, account.tokenFingerprint])));
+    for (const old of [...session.consentForms.keys()].slice(0, Math.max(0, session.consentForms.size - MAX_CONSENT_FORMS))) {
+      session.consentForms.delete(old);
+    }
+    return html(
       consentPage({
+        formId,
         clientId: session.request.clientId,
         clientName: session.request.clientName,
         redirectUri: session.request.redirectUri,
         csrf: Redacted.value(session.csrf),
         paymentsRequested: session.request.requestedScopes.includes(SCOPE_PAYMENTS),
-        accounts: accountNames,
+        accounts: configured.map((account) => account.name),
         error,
       }),
       status,
       redirectFormTarget(session.request.redirectUri),
     );
+  });
 
   const showLogin = Effect.fnUntraced(function* (request: HttpServerRequest.HttpServerRequest) {
     const session = yield* currentSession(request);
@@ -524,11 +565,12 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
     const form = yield* pageForm(request);
     yield* checkForm(request, session, form);
     if (session.loggedIn) return redirect("/consent");
-    const password = Result.getOrUndefined(single(form, "password")) ?? "";
-    const result = yield* guard.attempt(addressOf(request), Redacted.make(password));
+    const entered = Result.getOrUndefined(single(form, "password")) ?? "";
+    const result = yield* password.signIn(addressOf(request), Redacted.make(entered));
     switch (result._tag) {
       case "Accepted": {
-        const next = yield* sessions.login(session);
+        // Bound to the hash the password matched: a change in between ends this session.
+        const next = yield* sessions.login(session, result.value);
         const now = yield* Clock.currentTimeMillis;
         return redirect("/consent", sessionCookie(Redacted.value(next.cookie), next.session.expiresAt - now));
       }
@@ -541,12 +583,15 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
           `Too many failed attempts. Try again in ${result.retryAfterSeconds} s.`,
           { "retry-after": String(result.retryAfterSeconds) },
         );
+      case "Unavailable":
+        return renderLogin(session, 503, "Sign-in is unavailable. See the server log.");
     }
   });
 
   const showConsent = Effect.fnUntraced(function* (request: HttpServerRequest.HttpServerRequest) {
     const session = yield* currentSession(request);
-    return session.loggedIn ? renderConsent(session) : redirect("/login");
+    if (!session.loggedIn) return redirect("/login");
+    return yield* renderConsent(session, yield* accounts.list);
   });
 
   const submitConsent = Effect.fnUntraced(function* (request: HttpServerRequest.HttpServerRequest) {
@@ -567,8 +612,31 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
     }
     // The form carries names for display; the grant binds the tokens behind them.
     const chosen = form.getAll("account");
-    const chosenAccounts = accounts.list.filter((account) => chosen.includes(account.name));
-    if (chosenAccounts.length === 0) return renderConsent(session, 400, "Select at least one account.");
+    const configured = yield* accounts.list;
+    // Only what the page showed, still behind the same token: a token
+    // replaced (or a name reused) at /admin since then is shown again.
+    const shown = session.consentForms.get(Result.getOrUndefined(single(form, "form")) ?? "");
+    const changed = shown === undefined || chosen.some((name) => {
+      const current = configured.find((account) => account.name === name);
+      return current === undefined || shown?.get(name) !== current.tokenFingerprint;
+    });
+    if (changed) {
+      return yield* renderConsent(
+        session,
+        configured,
+        409,
+        "The accounts changed while this page was open. Review the selection and approve again.",
+      );
+    }
+    const chosenAccounts = configured.filter((account) => chosen.includes(account.name));
+    if (chosenAccounts.length === 0) {
+      return yield* renderConsent(
+        session,
+        configured,
+        400,
+        configured.length === 0 ? "No FIO accounts are configured yet. Add one at /admin first." : "Select at least one account.",
+      );
+    }
     const scopes = form.getAll("scope").includes(SCOPE_PAYMENTS) ? [SCOPE_READ, SCOPE_PAYMENTS] : [SCOPE_READ];
     const client = yield* store.client(pending.clientId).pipe(Effect.orElseSucceed(() => Option.none<Client>()));
     if (Option.isNone(client)) {

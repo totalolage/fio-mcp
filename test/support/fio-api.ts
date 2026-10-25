@@ -60,9 +60,14 @@ export const STATEMENT: NormalizedStatement = {
   transactions: [],
 };
 
+/** What `slotHoldingFio` answers for `lastStatement` (the token test at /admin). */
+export const LAST_STATEMENT = '{"year":2026,"id":7}';
+
 /**
  * A FioApi whose `periods` goes through the real RateLimiter and holds its
- * slot until `release` completes, then answers STATEMENT.
+ * slot until `release` completes, then answers STATEMENT, and whose
+ * `lastStatement` answers LAST_STATEMENT through the rate limiter. Nothing
+ * else is implemented (in particular nothing that moves the `last` marker).
  */
 export const slotHoldingFio = (release: Deferred.Deferred<void>) =>
   Layer.unwrap(
@@ -71,6 +76,7 @@ export const slotHoldingFio = (release: Deferred.Deferred<void>) =>
       return Layer.mock(FioApi, {
         periods: (account, _from, _to, priority) =>
           limiter.run(account.tokenFingerprint, priority ?? "interactive", Effect.as(Deferred.await(release), STATEMENT)),
+        lastStatement: (account) => limiter.run(account.tokenFingerprint, "interactive", Effect.succeed(LAST_STATEMENT)),
       });
     }),
   );

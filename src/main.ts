@@ -8,6 +8,7 @@ import {
   CommandFailed,
   hashPasswordCommand,
   listClients,
+  resetAdminPassword,
   revokeAllTokens,
   revokeClient,
 } from "./app.js";
@@ -20,6 +21,9 @@ const USAGE = [
   "       fio-mcp clients list         list registered OAuth clients",
   "       fio-mcp clients revoke <id>  remove a client and revoke its tokens",
   "       fio-mcp tokens revoke-all    revoke every OAuth grant",
+  "       fio-mcp reset-admin-password [--set]",
+  "                                    drop the password set at /admin (the hash file applies again),",
+  "                                    or with --set store a new one read like hash-password",
 ].join("\n");
 
 const serve = Layer.launch(AppLive);
@@ -40,6 +44,7 @@ const configured = (
       | Effect.Error<ReturnType<typeof backup>>
       | Effect.Error<typeof listClients>
       | Effect.Error<typeof revokeAllTokens>
+      | Effect.Error<ReturnType<typeof resetAdminPassword>>
       | CommandFailed
     >
   | undefined => {
@@ -49,6 +54,8 @@ const configured = (
   if (name === "clients" && arg === "list" && rest.length === 0) return listClients;
   if (name === "clients" && arg === "revoke" && rest.length === 1 && rest[0] !== "") return revokeClient(rest[0] ?? "");
   if (name === "tokens" && arg === "revoke-all" && rest.length === 0) return revokeAllTokens;
+  if (name === "reset-admin-password" && arg === undefined) return resetAdminPassword(false);
+  if (name === "reset-admin-password" && arg === "--set" && rest.length === 0) return resetAdminPassword(true);
   return undefined;
 };
 

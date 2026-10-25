@@ -1,7 +1,7 @@
 import { type Deferred, Layer, Redacted } from "effect";
 import { Accounts } from "../../src/accounts.js";
 import { Transactions } from "../../src/cache/service.js";
-import { type AppConfigShape, MAX_RESPONSE_BYTES, type TransportConfig } from "../../src/config.js";
+import { type AppConfig, type AppConfigShape, MAX_RESPONSE_BYTES, type TransportConfig } from "../../src/config.js";
 import { RateLimiter } from "../../src/rate-limiter.js";
 import { Redactor } from "../../src/redaction.js";
 import { seededConfig } from "./config.js";
@@ -44,10 +44,19 @@ export function testConfig(transport: TransportConfig = { kind: "stdio" }): AppC
   };
 }
 
-/** The app's services with a fake FioApi; one instance shared by every session. */
-export const testServices = (config: AppConfigShape, release: Deferred.Deferred<void>) =>
+/**
+ * The app's services with a fake FioApi; one instance shared by every
+ * session. `accounts` defaults to the configured ones (FIO_TOKEN /
+ * FIO_ACCOUNTS); the OAuth harness passes the database-backed layer.
+ */
+export const testServices = <E = never, R = never>(
+  config: AppConfigShape,
+  release: Deferred.Deferred<void>,
+  accounts: Layer.Layer<Accounts, E, R | Redactor | AppConfig> = Accounts.Default,
+) =>
   Transactions.Disabled.pipe(
     Layer.provideMerge(slotHoldingFio(release)),
-    Layer.provideMerge(Layer.mergeAll(Redactor.Default, Accounts.Default, RateLimiter.Default)),
+    Layer.provideMerge(Layer.mergeAll(accounts, RateLimiter.Default)),
+    Layer.provideMerge(Redactor.Default),
     Layer.provideMerge(seededConfig(config)),
   );

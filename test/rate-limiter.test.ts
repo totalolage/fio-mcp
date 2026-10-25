@@ -475,3 +475,59 @@ describe("RateLimiter", () => {
     }).pipe(Effect.scoped),
   );
 });
+
+describe("forgetting a token no account uses", () => {
+  it.effect("keeps a token whose interval is still running and drops it once it passed", () =>
+    Effect.gen(function* () {
+      const rl = yield* limiter({ intervalMs: 30_000, maxWaitMs: 5_000 });
+      assert.strictEqual(yield* rl.run(KEY, "interactive", Effect.succeed(1)), 1);
+      // Removed and re-added within the interval: the spacing still holds.
+      yield* rl.forget(KEY);
+      const early = yield* Effect.exit(rl.run(KEY, "interactive", Effect.succeed(2)));
+      assert.isTrue(Exit.isFailure(early));
+      yield* TestClock.adjust("30 seconds");
+      yield* rl.forget(KEY);
+      assert.strictEqual((yield* rl.state(KEY)).nextSlotInSeconds, 0);
+      assert.strictEqual(yield* rl.run(KEY, "interactive", Effect.succeed(3)), 3);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("keeps a token while a call holds it, even once its interval passed", () =>
+    Effect.gen(function* () {
+      const rl = yield* limiter({ intervalMs: 1_000, maxWaitMs: 5_000 });
+      // A request that takes longer than the interval, then gets a 409 and retries.
+      const { calls, request } = yield* flaky(1, 3_000);
+      const call = yield* Effect.forkChild(rl.run(KEY, "interactive", request));
+      yield* settle;
+      yield* TestClock.adjust("2 seconds");
+      // Removed meanwhile: the call still holds the token's limiter, so it stays.
+      yield* rl.forget(KEY);
+      yield* TestClock.adjust("10 seconds");
+      yield* settle;
+      assert.deepStrictEqual(call.pollUnsafe(), Exit.succeed("ok"));
+      assert.strictEqual(yield* Ref.get(calls), 2);
+      // Done: now it is dropped (a fresh limiter has no 409 on record).
+      yield* rl.forget(KEY);
+      assert.isNull((yield* rl.state(KEY)).last409At);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("drops a token once a call that held it was interrupted", () =>
+    Effect.gen(function* () {
+      const rl = yield* limiter({ intervalMs: 1_000, maxWaitMs: 5_000 });
+      const { request } = yield* flaky(1);
+      const first = yield* Effect.forkChild(rl.run(KEY, "interactive", request));
+      yield* settle;
+      yield* TestClock.adjust("1 second");
+      assert.strictEqual(yield* Fiber.join(first), "ok");
+      assert.isNotNull((yield* rl.state(KEY)).last409At);
+      // A call waiting for its slot, then interrupted.
+      const waiting = yield* Effect.forkChild(rl.run(KEY, "interactive", Effect.succeed(1)));
+      yield* settle;
+      yield* Fiber.interrupt(waiting);
+      yield* TestClock.adjust("2 seconds");
+      yield* rl.forget(KEY);
+      assert.isNull((yield* rl.state(KEY)).last409At);
+    }).pipe(Effect.scoped),
+  );
+});

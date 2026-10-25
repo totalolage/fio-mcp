@@ -2,7 +2,7 @@
 
 # fio-mcp
 
-An [MCP](https://modelcontextprotocol.io) server for [FIO Bank](https://www.fio.cz)'s REST API ("API Bankovnictví"). Its tools read transactions and statements, and prepare and upload payment orders, which still have to be signed in Internetbanking. Every tool is listed whatever the FIO tokens may do; if a token isn't allowed to do something, the tool answers "You don't have permissions to do that." Over HTTP with OAuth, a client sees only the tools and accounts it was granted.
+An [MCP](https://modelcontextprotocol.io) server for [FIO Bank](https://www.fio.cz)'s REST API ("API Bankovnictví"). Its tools read transactions and statements, and prepare and upload payment orders, which still have to be signed in Internetbanking. Every tool is listed whatever the FIO tokens may do; if a token isn't allowed to do something, the tool answers "You don't have permissions to do that." Over HTTP with OAuth, a client sees only the tools and accounts it was granted, and an [admin UI](#admin-ui) at `/admin` manages the accounts (tokens encrypted in the database), the connected clients and the admin password.
 
 FIO allows one request per token every 30 seconds. To keep interactive use fast, the server keeps a local SQLite cache of your transactions and answers searches and summaries from it without calling FIO.
 
@@ -29,12 +29,21 @@ Run it with `node dist/main.js` or, once installed as a package, `bunx fio-mcp`.
 | `fio-mcp` | Serve MCP (`FIO_MCP_TRANSPORT=stdio` or `http`). |
 | `fio-mcp backup <dest>` | Write a consistent copy of the database (see [Backup](#backup)). |
 | `fio-mcp hash-password` | Read the admin password from the terminal (no echo) or stdin and print its scrypt hash. |
+| `fio-mcp reset-admin-password` | Forget the password set at `/admin`, so the hash in `FIO_MCP_ADMIN_PASSWORD_HASH_FILE` applies again. With `--set`, store a new one instead, read like `hash-password`. See [Admin password](#admin-password). |
 | `fio-mcp clients list` / `clients revoke <id>` | List or revoke registered OAuth clients. |
 | `fio-mcp tokens revoke-all` | Revoke every OAuth grant. |
 
 ## Configuration
 
-Everything is set through environment variables. The FIO secrets (`FIO_TOKEN`, `FIO_ACCOUNTS`) can instead be read from a file named by the same variable with a `_FILE` suffix, for example `FIO_TOKEN_FILE=/run/secrets/fio_token`; the admin password hash is always read from `FIO_MCP_ADMIN_PASSWORD_HASH_FILE`. A trailing newline in the file is ignored. Setting both a variable and its `_FILE` twin is an error.
+Everything is set through environment variables. The FIO secrets (`FIO_TOKEN`, `FIO_ACCOUNTS`) can instead be read from a file named by the same variable with a `_FILE` suffix, for example `FIO_TOKEN_FILE=/run/secrets/fio_token`; the admin password hash is always read from `FIO_MCP_ADMIN_PASSWORD_HASH_FILE` and the data key from `FIO_MCP_DATA_KEY_FILE`. A trailing newline in the file is ignored. Setting both a variable and its `_FILE` twin is an error.
+
+Where the accounts come from depends on the mode:
+
+| Mode | Accounts |
+|---|---|
+| stdio | `FIO_TOKEN` / `FIO_ACCOUNTS` (required), read at every start. Nothing is stored. |
+| HTTP with OAuth | The database, encrypted with `FIO_MCP_DATA_KEY_FILE`, managed at [`/admin`](#admin-ui). `FIO_TOKEN` / `FIO_ACCOUNTS` are optional: they seed an empty database once (see [Moving accounts into the database](#moving-accounts-into-the-database)). |
+| HTTP with `FIO_MCP_ALLOW_UNAUTHENTICATED=true` | `FIO_TOKEN` / `FIO_ACCOUNTS` (required), as in stdio. There is no admin UI (there is no password). |
 
 ### One account
 
@@ -87,13 +96,14 @@ Names are trimmed and must be 1–64 Unicode code points with no control, format
 | `FIO_MCP_HOST` | `0.0.0.0` | HTTP bind address. |
 | `FIO_MCP_PORT` | `3000` | HTTP port. |
 | `FIO_MCP_PUBLIC_URL` | none; **required in HTTP mode** | The https origin clients use, without a path (e.g. `https://fio.home.arpa`). It is the OAuth issuer, and tokens are valid only for `<origin>/mcp`. It is never derived from `Host` or `X-Forwarded-*`. |
-| `FIO_MCP_ADMIN_PASSWORD_HASH_FILE` | none; **required in HTTP mode** | File containing the admin password's scrypt hash, from `fio-mcp hash-password`. |
+| `FIO_MCP_ADMIN_PASSWORD_HASH_FILE` | none; **required in HTTP mode** | File containing the admin password's scrypt hash, from `fio-mcp hash-password`. Once the password is changed at `/admin`, the hash stored in the database takes precedence; the file is the bootstrap and recovery value. |
+| `FIO_MCP_DATA_KEY_FILE` | none; **required in HTTP mode with OAuth** | File with the 32-byte key that encrypts the FIO tokens in the database: 64 hex digits (`openssl rand -hex 32`) or base64. See [Token encryption](#token-encryption). |
 | `FIO_MCP_ALLOW_UNAUTHENTICATED` | `false` | `true` runs HTTP mode without OAuth: every caller gets full access, and a security warning is logged at startup. Only for a trusted test setup. |
 | `FIO_MCP_ALLOWED_HOSTS` | any | Comma-separated `Host` values accepted (DNS-rebinding defence); an entry without a port matches any port. Include the public host. |
 | `FIO_MCP_ALLOWED_ORIGINS` | none | Browser `Origin` values accepted on `/mcp`. Requests without `Origin` (ordinary MCP clients) are always accepted. |
 | `FIO_MCP_TRUSTED_PROXIES` | none | Comma-separated IP addresses or CIDR networks (e.g. `172.18.0.5` or `172.18.0.0/16`) of reverse proxies in front of fio-mcp. Only for requests from these addresses, the client address for sign-in throttling is taken from `X-Forwarded-For` (the rightmost address that is not itself a trusted proxy). It is never used for URLs, the issuer or the resource. Empty trusts no one. |
 
-In HTTP mode the OAuth tables live in the same SQLite file as the cache, so `FIO_DB_PATH` is needed even with `FIO_CACHE_ENABLED=false`.
+In HTTP mode the OAuth tables, the encrypted accounts and the admin settings live in the same SQLite file as the cache, so `FIO_DB_PATH` is needed even with `FIO_CACHE_ENABLED=false`.
 
 Configuration errors name the variable, field, or file path, never its value.
 
@@ -245,7 +255,7 @@ fio-mcp backup /path/to/fio-backup.sqlite          # or: node dist/main.js backu
 docker exec <container> node dist/main.js backup /data/fio-backup-$(date +%F).sqlite
 ```
 
-This uses SQLite `VACUUM INTO`, which writes a consistent copy while the server is running. The destination must not exist and is created readable only by its owner. Do not copy `fio.sqlite` directly while the server runs: in WAL mode the recent changes live in `fio.sqlite-wal`, and a plain copy can be inconsistent. If you prefer the `sqlite3` shell, `sqlite3 /data/fio.sqlite ".backup /data/fio-backup.sqlite"` is also safe. To restore, stop the server and replace `fio.sqlite` (and remove any `fio.sqlite-wal` / `fio.sqlite-shm`) with the backup.
+This uses SQLite `VACUUM INTO`, which writes a consistent copy while the server is running. In HTTP mode with OAuth the copy includes the accounts, with the FIO tokens encrypted: a backup alone reveals no token, and restoring it needs the same `FIO_MCP_DATA_KEY_FILE`. Keep a copy of the key file, but not next to the backups. The destination must not exist and is created readable only by its owner. Do not copy `fio.sqlite` directly while the server runs: in WAL mode the recent changes live in `fio.sqlite-wal`, and a plain copy can be inconsistent. If you prefer the `sqlite3` shell, `sqlite3 /data/fio.sqlite ".backup /data/fio-backup.sqlite"` is also safe. To restore, stop the server and replace `fio.sqlite` (and remove any `fio.sqlite-wal` / `fio.sqlite-shm`) with the backup.
 
 ## Errors
 
@@ -267,6 +277,7 @@ Every expected failure is a typed error in the Effect error channel, never a thr
 | `InvalidInput` | Arguments that pass the schema but don't make sense together, or a missing payer account number. |
 | `CacheError` | The local SQLite cache failed; details go to the server log. |
 | `ConfigError` | Startup only: invalid configuration, naming the variable but never its value. |
+| `DataKeyMismatch`, `TokenDecryptionFailed` | Startup only (HTTP with OAuth): `FIO_MCP_DATA_KEY_FILE` does not match the database, or a stored token does not decrypt. See [Token encryption](#token-encryption). |
 
 OAuth endpoints use the same approach: each failure is a tagged error mapped to its RFC error code (`invalid_request`, `invalid_client`, `invalid_grant`, `invalid_target`, `invalid_scope`, `unsupported_grant_type`, `access_denied`, `invalid_token`, …) and HTTP status.
 
@@ -275,6 +286,7 @@ HTTP 409 is a `TokenBusy` error inside the server that the rate limiter always t
 ## Security
 
 - Tokens are `Redacted` values from configuration to the moment a request is built, so they never show up in logs, errors, or tool results by accident.
+- In HTTP mode with OAuth the tokens are stored only encrypted (AES-256-GCM, see [Token encryption](#token-encryption)); the admin UI never shows more than their last four characters.
 - As a second line of defence, every tool result is redacted, and so is everything the server writes to the MCP channel (stdio frames and HTTP response bodies) and to the log. Response excerpts in error messages are redacted before they are truncated, so a cut can't leave part of a token behind. Tokens are limited to URL-safe characters, so redaction can never cut through JSON or SSE framing.
 - Logs go to stderr only. In stdio mode stdout carries nothing but MCP messages.
 - Configuration errors name the bad variable, field, or path but never echo its value.
@@ -295,7 +307,15 @@ HTTP mode is protected by OAuth, with fio-mcp as its own authorization server (M
    # or, outside Docker: fio-mcp hash-password > admin.hash
    ```
 
-2. Set `FIO_MCP_PUBLIC_URL` and `FIO_MCP_ADMIN_PASSWORD_HASH_FILE` (see [HTTP transport](#http-transport)). Without both, HTTP mode refuses to start.
+2. Create the data key that encrypts the FIO tokens in the database, readable only by the container user:
+
+   ```bash
+   openssl rand -hex 32 > fio_mcp_data_key        # or: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+   chmod 0440 fio_mcp_data_key
+   ```
+
+3. Set `FIO_MCP_PUBLIC_URL`, `FIO_MCP_ADMIN_PASSWORD_HASH_FILE` and `FIO_MCP_DATA_KEY_FILE` (see [HTTP transport](#http-transport)). Without them, HTTP mode refuses to start.
+4. Add the FIO accounts at `https://<host>/admin`, or let `FIO_TOKEN` / `FIO_ACCOUNTS` seed the empty database on the first start (then remove them; see [Moving accounts into the database](#moving-accounts-into-the-database)).
 
 ### Connecting a client
 
@@ -304,7 +324,7 @@ Add `https://<host>/mcp` (for example `https://fio.home.arpa/mcp`) as a remote M
 - **Scopes.** `fio:read` covers every reading tool, the cache tools, sync, and the download marker. `fio:payments` additionally allows `preview_payment_orders` and `submit_payment_orders`.
 - **Accounts** the client may use.
 
-A grant covers the accounts behind the chosen FIO tokens, not their names. Renaming an account keeps its grants; giving an old name to another token does not pass the grant on. Replacing an account's token (FIO tokens expire within 180 days) removes that account from existing grants: its calls are refused until you reconnect the client and select it again. Accounts configured with the same token are the same FIO account, so a grant for one covers them all. Grants made before this rule (by name) were revoked on upgrade; reconnect those clients.
+A grant covers the accounts behind the chosen FIO tokens, not their names. Renaming an account keeps its grants; giving an old name to another token does not pass the grant on. Replacing an account's token (FIO tokens expire within 180 days) removes that account from existing grants: its calls are refused until you reconnect the client and select it again. Accounts configured with the same token are the same FIO account, so a grant for one covers them all. Grants made before this rule (by name) were revoked on upgrade; reconnect those clients. If an account is renamed or gets a new token while the consent page is open, approving it shows the page again with the current accounts instead of authorizing what changed.
 
 HTTP sessions list only what the grant allows; stdio lists everything. Without `fio:payments` the payment tools are not listed, the `account` enum names only the granted accounts, and when a grant covers no configured account (for example after its token was replaced) the tools that take an account are not listed either. `get_server_status` and `get_cache_status` show only granted accounts. The list is for discovery: every call is still checked, and a call outside the grant, including one to a tool that is not listed, answers "You don't have permissions to do that." To widen a grant, remove and re-add the server in the client.
 
@@ -317,6 +337,7 @@ HTTP sessions list only what the grant allows; stdio lists everything. Without `
 | `/register` | Dynamic Client Registration (RFC 7591), public clients only |
 | `/authorize` | Authorization code with PKCE (S256 required) and resource indicator (RFC 8707) |
 | `/login`, `/consent` | Sign-in and consent pages |
+| `/admin` | [Admin UI](#admin-ui) (its own sign-in; not reachable with OAuth tokens) |
 | `/token` | Code exchange and refresh |
 | `/revoke` | Token revocation (RFC 7009) |
 | `/mcp` | MCP; `Authorization: Bearer <access token>`. Without a valid token: 401 with `WWW-Authenticate: Bearer resource_metadata="<public url>/.well-known/oauth-protected-resource/mcp", scope="fio:read"`, with no `error` when `Authorization` is missing or empty, `, error="invalid_request"` when it is not a Bearer token, and `, error="invalid_token"` for a token that is unknown, expired, revoked or issued for another resource |
@@ -325,20 +346,81 @@ HTTP sessions list only what the grant allows; stdio lists everything. Without `
 - **Tokens** are random and stored only as SHA-256 hashes. Authorization codes are single-use and live 60 s; access tokens 1 hour; refresh tokens 30 days, rotated on every use. Reusing an old refresh token or an authorization code revokes the whole grant. Tokens are bound to the audience `<public url>/mcp`, and every token request, refresh included, must name it as `resource`.
 - **MCP sessions** are bound to the grant that opened them; another grant presenting the session id gets 404. Each grant may hold 32 sessions and the server 1,000. When full, a session unused for an hour is ended (its id then answers 404) to make room; otherwise new sessions are refused (429 for the grant, 503 for the server).
 - **Limits on /mcp:** request bodies up to 1 MiB (413 beyond; a 100-order payment import is about 100 KB), initialize requests up to 64 KiB, and 16 requests in progress per grant (429). On Effect 4.0.5, chunked uploads with no Content-Length that exceed the limit are cut off with a connection reset rather than a 413 until the Effect 4.0.6 upgrade.
-- **Sign-in** compares the password against the scrypt hash in constant time, one check at a time across all clients; a sign-in that arrives during a check gets 429 instead of waiting, so a flood cannot stack scrypt's memory. Each check needs about 128 MiB of scrypt workspace with the `hash-password` defaults (N=2^17, r=8, p=1; hashes needing more than 256 MiB are refused), and the container peaked at about 256 MiB during one. The trade-off: sign-ins from many addresses can keep the check busy and delay yours. After 5 failures from a client address, attempts wait 1, 2, 4 and 8 s; the 10th consecutive failure locks the address out for 15 minutes. An address may start 20 sign-ins per 10 minutes (429). Up to 100 sign-ins in progress and 20 signed-in sessions are kept; starting sign-ins never ends a signed-in one, and a flood through one client displaces that client's own sign-ins first. Behind a reverse proxy, set `FIO_MCP_TRUSTED_PROXIES`, or every browser shares the proxy's address: one person's failed logins lock everyone out, and 20 sign-ins block new ones for everyone for 10 minutes. Logs record counts only.
+- **Sign-in** (on `/login` and `/admin/login` alike, with one shared throttle) compares the password against the scrypt hash in constant time, one check at a time across all clients; a sign-in that arrives during a check gets 429 instead of waiting, so a flood cannot stack scrypt's memory. Each check needs about 128 MiB of scrypt workspace with the `hash-password` defaults (N=2^17, r=8, p=1; hashes needing more than 256 MiB are refused), and the container peaked at about 256 MiB during one. The trade-off: sign-ins from many addresses can keep the check busy and delay yours. After 5 failures from a client address, attempts wait 1, 2, 4 and 8 s; the 10th consecutive failure locks the address out for 15 minutes. An address may start 20 sign-ins per 10 minutes (429). Up to 100 sign-ins in progress and 20 signed-in sessions are kept; starting sign-ins never ends a signed-in one, and a flood through one client displaces that client's own sign-ins first. Behind a reverse proxy, set `FIO_MCP_TRUSTED_PROXIES`, or every browser shares the proxy's address: one person's failed logins lock everyone out, and 20 sign-ins block new ones for everyone for 10 minutes. Logs record counts only.
 - **Pages** use a short-lived, server-side, signed cookie (`HttpOnly`, `Secure`, `SameSite=Lax`, 10 minutes), a CSRF token on every form, an Origin check, and strict headers (CSP with `frame-ancestors 'none'`, `no-store`).
 
 ### Administration
+
+The [admin UI](#admin-ui) covers this in the browser. From the command line:
 
 ```sh
 docker exec <container> node dist/main.js clients list
 docker exec <container> node dist/main.js clients revoke <client_id>
 docker exec <container> node dist/main.js tokens revoke-all
+docker exec <container> node dist/main.js reset-admin-password
 ```
+
+## Admin UI
+
+With OAuth over HTTP, `https://<host>/admin` manages the server. It has three pages:
+
+- **Accounts** (`/admin`): add an account (name, FIO token, optionally account number and currency), rename it, replace its token, remove it, and test its token. Tokens go into a write-only password field and are shown only as their last four characters. The token test makes one read-only FIO call (`lastStatement`, the latest statement's number), which never moves the `last` download marker; it goes through the token's rate limiter like a tool call, so a second test within 30 s answers "Rate limited" at once. A passed test shows that FIO accepts the token for reading, not whether it may submit payment orders. Removing asks whether to keep the account's cached transactions (the default; they are used again if the same token or bank account comes back) or delete them. Deleting covers the bank accounts that any token the account has had is linked to, including tokens it replaced. It keeps a bank account when another account has or had a token for it, the same token included (another account using the same token keeps what that token cached, and the rest is still deleted); the confirmation names that account. The server has recorded each account's tokens since the upgrade that added token history, starting from the token each account had then. Cached bank accounts that no configured account's token is linked to are left alone, and the confirmation counts them without giving a reason, because several things lead there: for example data cached only under a token an account replaced before that upgrade, data kept when an account was removed, or data downloaded by a token that FIO later reported for a different bank account.
+- **Connected clients** (`/admin/clients`): every registered OAuth client with its redirect URIs, registration and last authorization, and its live authorizations: scopes, accounts by their current name (tokens replaced or removed since are counted, not named), when it was authorized and when it last used `/mcp` (to the minute). Revoke one authorization, remove a client with all its tokens, or revoke everything.
+- **Admin password** (`/admin/password`): see [Admin password](#admin-password).
+
+Names follow the same rules as `FIO_ACCOUNTS`: trimmed, 1–64 code points, no control, format or line-separator characters, unique ignoring case. Error messages name the field and rule, never the value.
+
+### Sessions and security
+
+- `/admin` has its own sign-in with the admin password. It never reads the `Authorization` header, so an MCP access token grants nothing there. Failed sign-ins count together with `/login` (same delays and 15-minute lockout per address, one scrypt check at a time), and an address may open 20 sign-in forms per 10 minutes.
+- The session lives in server memory; the browser holds the cookie `__Secure-fio-mcp-admin` (`HttpOnly`, `Secure`, `SameSite=Strict`, `Path=/admin`). Signing in issues a new session id. A session ends after 15 minutes without a request, after 8 hours in any case, at sign-out, when the admin password changes, and when the server restarts. At most 10 signed-in sessions are kept (the oldest goes).
+- Every change is a POST with the session's CSRF token, compared in constant time, and is refused when the browser's `Origin` is not `FIO_MCP_PUBLIC_URL`. Results are shown on the next page; nothing goes into URLs.
+- Pages are server-rendered without JavaScript, every value is HTML-escaped, and they carry the sign-in pages' headers: a CSP with `default-src 'none'`, no scripts, one hashed style, `form-action 'self'`, `frame-ancestors 'none'`, plus `X-Frame-Options: DENY`, `no-store` and `nosniff`.
+- Changes are logged with the account id (`acct_…`); tokens and passwords never are.
+
+### Accounts at runtime
+
+Changes at `/admin` take effect at once, without a restart:
+
+- **Tools.** The tool schemas are registered again when the account names change (the `account` enum, or no `account` parameter with one account), and every HTTP session's `tools/list` is computed per request from its grant and the current accounts. The server sends `notifications/tools/list_changed`; with Effect's Streamable HTTP endpoint there is no standalone event stream (GET `/mcp` answers 405), so a session receives the notification with its next tool call's response, and clients that do not act on it see the change on their next `tools/list` or reconnect. A call that still names a renamed or removed account answers `Unknown account`.
+- **Rate limiter and sync.** Both are keyed by token fingerprint. A new token (an added account, a replaced token) gets its own limiter and the sync startup would give it (`FIO_SYNC_ON_STARTUP`); a token no account uses any more is retired: its sync job is stopped and awaited, no new job starts and nothing more is written to the cache for it (also not by tool calls already under way), and its limiter state is dropped once its 30-second interval has passed. Adding the token again lifts this. Periodic sync works on the accounts configured at that moment.
+- **Grants** follow the token: see [Connecting a client](#connecting-a-client).
+
+### Token encryption
+
+- The tokens are encrypted with AES-256-GCM (Node's `crypto`) under the key in `FIO_MCP_DATA_KEY_FILE`, with a fresh random 96-bit nonce for every encryption and the account's row id as additional authenticated data, so a ciphertext copied to another row does not decrypt. No token is stored in plaintext; a database file or backup alone reveals none. The server starts unattended, reading the key file like the other secrets.
+- The encryption protects against reading the database (a stolen file or backup), not against writing it: someone who can change the database can still replace the admin password hash, add OAuth grants, or edit account names, without ever learning a token. Keep `/data` writable only by the container user.
+- At every start the server decrypts a check value and every stored token. A wrong key file, or a row that was altered, stops the start with a message that names neither key nor token; no account is dropped silently.
+- If the key file is lost the tokens cannot be recovered: stop the server, delete the accounts and the check value (`sqlite3 fio.sqlite "DELETE FROM fio_accounts; DELETE FROM server_settings WHERE key = 'data_key_check';"`), start with a new key, and add the accounts again with new tokens from Internetbanking.
+- To change the key, add the accounts again under a new database or with the steps above; there is no re-encryption command.
+
+### Moving accounts into the database
+
+On the first start in HTTP mode with OAuth, if the database has no accounts and was never edited at `/admin`, the accounts from `FIO_TOKEN` / `FIO_ACCOUNTS` (or their `_FILE` variants) are imported, encrypted, and the server logs how many. From then on the database decides: the variables are ignored with a warning at every start, even after every account was removed at `/admin`, and they are not read, so a broken value or a deleted accounts file does not stop the start. When an import is due, they are checked as strictly as in stdio mode and an error stops the start. Remove the variables and delete the accounts file, which holds the tokens in plaintext.
+
+### Admin password
+
+`/admin/password` changes the password after checking the current one like a sign-in (it counts as a failed sign-in when wrong). The new password needs 12 to 1024 characters and is hashed with the same scrypt parameters and the same one-at-a-time check as `hash-password`. Its hash is stored in the database and from then on takes precedence over `FIO_MCP_ADMIN_PASSWORD_HASH_FILE`. Every other admin session, and every OAuth sign-in waiting for consent, ends; the browser that changed it stays signed in under a new session.
+
+If the password is lost:
+
+```sh
+docker exec <container> node dist/main.js reset-admin-password           # the hash file applies again
+docker exec -it <container> node dist/main.js reset-admin-password --set  # or store a new password, typed twice at a hidden prompt
+```
+
+`-t` gives the command a terminal, so it prompts and does not echo. To pipe the password in instead (from a script, or without a terminal), use `-i` alone: the command then reads standard input to its end, once, with no prompt. In Bash:
+
+```bash
+IFS= read -rs -p 'New admin password: ' pw && echo
+printf '%s\n' "$pw" | docker exec -i <container> node dist/main.js reset-admin-password --set; unset pw
+```
+
+The server reads the stored hash at every sign-in, so either takes effect at once and ends every signed-in session.
 
 ### Reverse proxy
 
-Forward the whole host, or at least `/mcp`, `/.well-known/oauth-protected-resource`, `/.well-known/oauth-protected-resource/mcp`, `/.well-known/oauth-authorization-server`, `/register`, `/authorize`, `/login`, `/consent`, `/token`, `/revoke`, and optionally `/healthz`. TLS must terminate at the proxy, because the sign-in cookie is `Secure`. If `FIO_MCP_ALLOWED_HOSTS` is set, it must include the public host.
+Forward the whole host, or at least `/mcp`, `/.well-known/oauth-protected-resource`, `/.well-known/oauth-protected-resource/mcp`, `/.well-known/oauth-authorization-server`, `/register`, `/authorize`, `/login`, `/consent`, `/token`, `/revoke`, `/admin` with everything below it, and optionally `/healthz`. TLS must terminate at the proxy, because the sign-in cookies are `Secure`. If `FIO_MCP_ALLOWED_HOSTS` is set, it must include the public host.
 
 Set `FIO_MCP_TRUSTED_PROXIES` to the proxy's address as fio-mcp sees it:
 
@@ -372,9 +454,9 @@ services:
     ports:
       - "3000:3000"                                    # Traefik connects through this published port
     environment:
-      FIO_TOKEN_FILE: /run/secrets/fio_token          # or FIO_ACCOUNTS_FILE
       FIO_MCP_PUBLIC_URL: https://fio.home.arpa
       FIO_MCP_ADMIN_PASSWORD_HASH_FILE: /run/secrets/fio_mcp_admin_hash
+      FIO_MCP_DATA_KEY_FILE: /run/secrets/fio_mcp_data_key   # encrypts the FIO tokens in /data/fio.sqlite
       FIO_MCP_ALLOWED_HOSTS: fio.home.arpa
       FIO_MCP_TRUSTED_PROXIES: 172.16.0.0/12             # Docker bridge gateways (Traefik via the published port)
       FIO_SYNC_INTERVAL_MINUTES: "60"
@@ -382,6 +464,8 @@ services:
       - /mnt/<pool>/fio-mcp:/data                       # writable by the container user
       - /path/to/secrets:/run/secrets:ro
 ```
+
+The accounts are added at `/admin`. To import existing ones, set `FIO_ACCOUNTS_FILE` (or `FIO_TOKEN_FILE`) for the first start only, then remove it and delete the file (see [Moving accounts into the database](#moving-accounts-into-the-database)).
 
 The container has no Traefik labels: Traefik's Docker provider would route to the container's own address, not to the published port. Route through Traefik's file provider instead:
 
@@ -513,7 +597,12 @@ src/
   errors.ts             tagged errors and HTTP status mapping
   redaction.ts          Redactor service and the redacting stderr logger
   rate-limiter.ts       per-token dispatcher with interactive and background queues
-  accounts.ts           configured accounts, token fingerprints, learned payer details
+  accounts.ts           the accounts (from the environment, or stored and changeable at runtime), token fingerprints, learned payer details
+  account-store.ts      encrypted accounts and server settings in SQLite, import from the environment
+  account-migrations.ts the account store's tables
+  account-runtime.ts    sync jobs and rate limiters following account changes
+  token-crypto.ts       data key and AES-256-GCM token encryption
+  admin/                admin UI: sessions, pages, account changes, admin password
   fio-api.ts            FioApi service: interface and adapter on the generated client
   generated/            generated OpenAPI client (do not edit)
   statement.ts          JSON statement normalisation
@@ -521,7 +610,7 @@ src/
   fio-countries.ts      country codes from the XSD's country_type enumeration
   import-response.ts    import response parser
   cache/                SQLite database, migrations, store, sync engine, Transactions service
-  mcp/                  tool definitions and handlers (FIO tools, cache tools)
+  mcp/                  tool definitions and handlers (FIO tools, cache tools), registration that follows the accounts
   transport/            stdio and HTTP transports, auth seam, frame redaction, grant-filtered tools/list
 openapi/fio-api.yaml    FIO REST API spec
 scripts/                client generator, image ship script
@@ -536,6 +625,8 @@ Tests mock HTTP and make no network calls.
 - The response body of `lastStatement` and the read-only upload response are undocumented. The parsing and classification above are best effort.
 - Only the Fio XML import format is used. ABO and SEPA `pain.001`/`pain.008` uploads are not exposed.
 - Every OAuth client sees all configured account names in the tool schemas, whatever accounts its grant covers. Names are not secrets; calls for other accounts are refused.
+- HTTP sessions receive `notifications/tools/list_changed` only with their next tool call's response: Effect's Streamable HTTP endpoint has no GET event stream. See [Accounts at runtime](#accounts-at-runtime).
+- Admin sessions live in memory and end when the server restarts.
 - A call without the needed scope answers the tool error "You don't have permissions to do that." instead of HTTP 403 `insufficient_scope` (MCP authorization's step-up flow). To widen a grant, remove and re-add the server in the client.
 - MCP authorization 2026-07-28 prefers Client ID Metadata Documents; fio-mcp supports only Dynamic Client Registration because it never fetches URLs.
 - Effect's MCP server always sends all four tool annotation hints, so tools that previously omitted `destructiveHint`/`idempotentHint` now state them explicitly (with the same meaning).

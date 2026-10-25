@@ -1,4 +1,5 @@
 import { Clock, DateTime, Effect, Queue, Redacted, Schema, Stdio, Stream, Terminal } from "effect";
+import { makeSettingsStore, SETTING } from "../account-store.js";
 import { hashPassword, type ScryptParams } from "./crypto.js";
 import { makeOAuthStore } from "./store.js";
 
@@ -13,7 +14,7 @@ export class CommandFailed extends Schema.TaggedError<CommandFailed>()("CommandF
 }) {}
 
 export const MIN_PASSWORD_LENGTH = 12;
-const MAX_PASSWORD_LENGTH = 1024;
+export const MAX_PASSWORD_LENGTH = 1024;
 
 const write = (sink: "stdout" | "stderr", text: string) =>
   Effect.flatMap(Stdio.Stdio, (stdio) =>
@@ -58,6 +59,12 @@ const readPiped = Effect.flatMap(Stdio.Stdio, (stdio) =>
  * FIO_MCP_ADMIN_PASSWORD_HASH_FILE on standard output.
  */
 export const hashPasswordCommand = Effect.fn("cli.hashPassword")(function* (params?: ScryptParams) {
+  const hash = yield* readNewPasswordHash(params);
+  yield* write("stdout", `${hash}\n`);
+});
+
+/** Reads a new admin password (twice on a terminal) and returns its scrypt hash line. */
+const readNewPasswordHash = Effect.fnUntraced(function* (params?: ScryptParams) {
   const stdio = yield* Stdio.Stdio;
   const interactive = yield* stdio.stdinIsTerminal;
   const password = interactive ? yield* readHidden("Admin password: ") : yield* readPiped;
@@ -73,8 +80,31 @@ export const hashPasswordCommand = Effect.fn("cli.hashPassword")(function* (para
       return yield* new CommandFailed({ message: "the passwords do not match" });
     }
   }
-  const hash = yield* hashPassword(password, params).pipe(Effect.mapError((error) => new CommandFailed({ message: error.message })));
-  yield* write("stdout", `${hash}\n`);
+  return yield* hashPassword(password, params).pipe(Effect.mapError((error) => new CommandFailed({ message: error.message })));
+});
+
+/**
+ * `fio-mcp reset-admin-password`: removes the password set at /admin, so the
+ * hash in FIO_MCP_ADMIN_PASSWORD_HASH_FILE applies again. With `--set`,
+ * stores the hash of a new password instead (read like `hash-password`).
+ * The running server reads the stored hash on every sign-in, so either
+ * applies at once and ends every signed-in session.
+ */
+export const resetAdminPasswordCommand = Effect.fn("cli.resetAdminPassword")(function* (set: boolean, params?: ScryptParams) {
+  const settings = yield* makeSettingsStore();
+  const failed = (error: { readonly message: string }) => new CommandFailed({ message: error.message });
+  if (set) {
+    const hash = yield* readNewPasswordHash(params);
+    yield* settings.put(SETTING.adminPasswordHash, hash).pipe(Effect.mapError(failed));
+    return yield* write("stderr", "Stored the new admin password; it replaces FIO_MCP_ADMIN_PASSWORD_HASH_FILE.\n");
+  }
+  const removed = yield* settings.remove(SETTING.adminPasswordHash).pipe(Effect.mapError(failed));
+  yield* write(
+    "stderr",
+    removed
+      ? "Removed the admin password set at /admin; FIO_MCP_ADMIN_PASSWORD_HASH_FILE applies again.\n"
+      : "No admin password was set at /admin; FIO_MCP_ADMIN_PASSWORD_HASH_FILE already applies.\n",
+  );
 });
 
 const iso = (millis: number | null) => (millis === null ? "never" : DateTime.formatIso(DateTime.makeUnsafe(millis)));
