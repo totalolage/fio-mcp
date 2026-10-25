@@ -491,4 +491,24 @@ describe("forgetting a token no account uses", () => {
       assert.strictEqual(yield* rl.run(KEY, "interactive", Effect.succeed(3)), 3);
     }).pipe(Effect.scoped),
   );
+
+  it.effect("keeps a token while a call holds it, even once its interval passed", () =>
+    Effect.gen(function* () {
+      const rl = yield* limiter({ intervalMs: 1_000, maxWaitMs: 5_000 });
+      // A request that takes longer than the interval, then gets a 409 and retries.
+      const { calls, request } = yield* flaky(1, 3_000);
+      const call = yield* Effect.forkChild(rl.run(KEY, "interactive", request));
+      yield* settle;
+      yield* TestClock.adjust("2 seconds");
+      // Removed meanwhile: the call still holds the token's limiter, so it stays.
+      yield* rl.forget(KEY);
+      yield* TestClock.adjust("10 seconds");
+      yield* settle;
+      assert.deepStrictEqual(call.pollUnsafe(), Exit.succeed("ok"));
+      assert.strictEqual(yield* Ref.get(calls), 2);
+      // Done: now it is dropped.
+      yield* rl.forget(KEY);
+      assert.strictEqual((yield* rl.state(KEY)).nextSlotInSeconds, 0);
+    }).pipe(Effect.scoped),
+  );
 });
