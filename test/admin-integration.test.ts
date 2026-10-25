@@ -25,7 +25,7 @@ import { formatPasswordHash } from "../src/oauth/crypto.js";
 import { makeOAuthStore } from "../src/oauth/store.js";
 import { loadConfigFrom } from "./fixtures.js";
 import { testDatabase } from "./support/database.js";
-import { type OAuthHarness, PASSWORD, PUBLIC_URL, SkewedClock, passwordHash, tokensFor } from "./support/oauth.js";
+import { type OAuthHarness, PASSWORD, PUBLIC_URL, passwordHash, SkewedClock, tokensFor } from "./support/oauth.js";
 import { FIO_TOKEN, SAVINGS_TOKEN } from "./support/transport.js";
 
 // Real sockets, SQLite on disk, scrypt and background sync on a shared, often
@@ -208,6 +208,8 @@ async function build(
       const url = new URL(request.url);
       if (url.origin !== PUBLIC_URL) throw new Error(`not the app: ${url.origin}`);
       const body = request.method === "GET" || request.method === "HEAD" ? undefined : await request.arrayBuffer();
+      // The browser's side of the socket, outside Effect.
+      // @effect-diagnostics-next-line globalFetch:off
       return fetch(`${base}${url.pathname}${url.search}`, { method: request.method, headers: request.headers, body, redirect: "manual" });
     },
     clock: new SkewedClock(),
