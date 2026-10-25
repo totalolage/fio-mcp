@@ -3,8 +3,9 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { type CallToolResult, ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import { Effect, Layer, Redacted, Sink, Stdio, Stream, Terminal } from "effect";
 import { SqlClient } from "effect/sql";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { tokenFingerprint } from "../src/accounts.js";
+import { MAX_ADMIN_SESSIONS } from "../src/admin/sessions.js";
 import { makeCacheStore } from "../src/cache/store.js";
 import { resetAdminPasswordCommand } from "../src/oauth/cli.js";
 import { NOW, statement, TODAY, tx } from "./support/cache.js";
@@ -31,6 +32,11 @@ const ADMIN_COOKIE = "__Secure-fio-mcp-admin";
 const NEW_MAIN_TOKEN = "rotatedT0ken-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMN";
 const THIRD_TOKEN = "thirdT0ken-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQ";
 const NEW_PASSWORD = "a brand new admin password";
+
+// End to end: every test builds the whole app (router, SQLite, McpServer) and
+// drives it with many requests. A loaded host stalls whole test workers for
+// 10-15 s at times, past the 5 s default; this file allows 30 s.
+vi.setConfig({ testTimeout: 30_000, hookTimeout: 30_000 });
 
 let harness: OAuthHarness;
 
@@ -213,7 +219,8 @@ describe("admin sign-in and sessions", () => {
   it("creates no session for sign-in posts without a sign-in form", async () => {
     const legit = new Admin();
     await legit.page("/admin/login");
-    for (let i = 0; i < 150; i++) {
+    // One more post than the pool holds would evict the open form if posts made sessions.
+    for (let i = 0; i <= MAX_ADMIN_SESSIONS.preLogin; i++) {
       const response = await harness.fetch(`${PUBLIC_URL}/admin/login`, {
         method: "POST",
         headers: { "content-type": "application/x-www-form-urlencoded", origin: PUBLIC_URL },
@@ -223,7 +230,7 @@ describe("admin sign-in and sessions", () => {
       expect(response.headers.get("location")).toBe("/admin/login");
       expect(response.headers.getSetCookie()).toEqual([]);
     }
-    // The pool of sign-in forms (100) was not churned: the open form still signs in.
+    // The pool of sign-in forms was not churned: the open form still signs in.
     const right = await legit.post("/admin/login", { password: PASSWORD });
     expect(right.status).toBe(303);
     expect(right.headers.get("location")).toBe("/admin");
