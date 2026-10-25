@@ -506,9 +506,28 @@ describe("forgetting a token no account uses", () => {
       yield* settle;
       assert.deepStrictEqual(call.pollUnsafe(), Exit.succeed("ok"));
       assert.strictEqual(yield* Ref.get(calls), 2);
-      // Done: now it is dropped.
+      // Done: now it is dropped (a fresh limiter has no 409 on record).
       yield* rl.forget(KEY);
-      assert.strictEqual((yield* rl.state(KEY)).nextSlotInSeconds, 0);
+      assert.isNull((yield* rl.state(KEY)).last409At);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("drops a token once a call that held it was interrupted", () =>
+    Effect.gen(function* () {
+      const rl = yield* limiter({ intervalMs: 1_000, maxWaitMs: 5_000 });
+      const { request } = yield* flaky(1);
+      const first = yield* Effect.forkChild(rl.run(KEY, "interactive", request));
+      yield* settle;
+      yield* TestClock.adjust("1 second");
+      assert.strictEqual(yield* Fiber.join(first), "ok");
+      assert.isNotNull((yield* rl.state(KEY)).last409At);
+      // A call waiting for its slot, then interrupted.
+      const waiting = yield* Effect.forkChild(rl.run(KEY, "interactive", Effect.succeed(1)));
+      yield* settle;
+      yield* Fiber.interrupt(waiting);
+      yield* TestClock.adjust("2 seconds");
+      yield* rl.forget(KEY);
+      assert.isNull((yield* rl.state(KEY)).last409At);
     }).pipe(Effect.scoped),
   );
 });
