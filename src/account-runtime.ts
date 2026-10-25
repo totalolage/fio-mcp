@@ -9,10 +9,17 @@ import { RateLimiter } from "./rate-limiter.js";
  * machinery, which is keyed by token fingerprint:
  *
  * - a token no account uses any more (account removed, token replaced):
- *   its cache sync job stops and its idle rate-limiter state is dropped;
+ *   its idle rate-limiter state is dropped. Its cache sync job is not
+ *   stopped here: /admin retires the token in the cache before publishing
+ *   the change (`Accounts.replace`), which stops the job;
  * - a new token (account added, token replaced): it gets the sync startup
  *   would have given it (FIO_SYNC_ON_STARTUP), and a rate limiter on first
  *   use.
+ *
+ * Changes are handled one after another, possibly late: by the time a
+ * removal is handled, the token may be in use again (removed and added
+ * again, or replaced and put back). A removed token that is configured
+ * again by then is left alone.
  *
  * Renames change no fingerprint, so nothing here. Tool schemas and
  * `tools/list` follow the accounts on their own (src/mcp/registration.ts,
@@ -35,7 +42,7 @@ export const AccountChangesLive: Layer.Layer<never, never, Accounts | Transactio
         previous = list;
         for (const fingerprint of before) {
           if (now.has(fingerprint)) continue;
-          yield* cache.cancelSync(fingerprint);
+          if (fingerprints(yield* accounts.list).has(fingerprint)) continue;
           yield* limiter.forget(fingerprint);
         }
         const added = list.filter((account) => !before.has(account.tokenFingerprint));

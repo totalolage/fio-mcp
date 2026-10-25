@@ -170,11 +170,6 @@ export interface TransactionsShape {
   readonly retire: (tokenFingerprint: string) => Effect.Effect<void>;
   /** A token configured again (re-added): writes and sync are accepted again. */
   readonly reinstate: (tokenFingerprint: string) => Effect.Effect<void>;
-  /**
-   * Stops and forgets the token's running job. Its saved pending ranges
-   * stay, so the token resumes where it stopped if it comes back.
-   */
-  readonly cancelSync: (tokenFingerprint: string) => Effect.Effect<void>;
 }
 
 export const NOT_VERIFIED =
@@ -435,7 +430,6 @@ const makeTransactions = Effect.fn("Transactions.make")(function* () {
     sync: startSync,
     retire: (tokenFingerprint) => Effect.andThen(store.retire(tokenFingerprint), sync.cancel(tokenFingerprint)),
     reinstate: store.reinstate,
-    cancelSync: sync.cancel,
   } satisfies TransactionsShape;
 });
 
@@ -461,7 +455,6 @@ export class Transactions extends Context.Service<Transactions, TransactionsShap
         sync: () => disabled,
         retire: () => Effect.void,
         reinstate: () => Effect.void,
-        cancelSync: () => Effect.void,
       } satisfies TransactionsShape;
     }),
   );

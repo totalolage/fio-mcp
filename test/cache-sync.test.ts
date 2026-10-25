@@ -764,7 +764,7 @@ const recorded = (acc: Account, id: number, accountId?: string) =>
     return row?.n === 1;
   });
 
-describe("cancelling a removed token's sync", () => {
+describe("retiring a token removed at /admin", () => {
   it.effect("stops the running job and wakes whoever waits for it", () =>
     Effect.gen(function* () {
       yield* setNow();
@@ -777,21 +777,20 @@ describe("cancelling a removed token's sync", () => {
         // A resume joins the running job and waits for it.
         const waiting = yield* Effect.forkChild(cache.sync(acc, { kind: "resume" }, 3_600_000), { startImmediately: true });
         yield* settle;
-        yield* cache.cancelSync(acc.tokenFingerprint);
+        yield* cache.retire(acc.tokenFingerprint);
         const outcome = yield* Effect.orDie(Fiber.join(waiting));
         if (!outcome.started) return assert.fail("the resume did not join the job");
         assert.isTrue(outcome.joined);
         assert.strictEqual(outcome.job.status, "failed");
         assert.include(outcome.job.lastError ?? "", "removed");
-        // Forgotten: nothing runs for it any more, and a later start begins anew.
+        // Forgotten: nothing runs for it any more; retiring again changes nothing.
         assert.isNull(yield* jobOf(acc));
-        yield* cache.cancelSync(acc.tokenFingerprint);
+        yield* cache.retire(acc.tokenFingerprint);
+        assert.isNull(yield* jobOf(acc));
       }).pipe(Effect.provide(cacheLayer(config(), fio.layer)));
     }),
   );
-});
 
-describe("retiring a token removed at /admin", () => {
   it.effect("stops its job, refuses new jobs, and drops its writes until it is reinstated", () =>
     Effect.gen(function* () {
       yield* setNow();
