@@ -30,16 +30,16 @@
     "prepare": "effect-tsgo patch --typescript --no-oxlint && bun run build"
   },
   "dependencies": {
-    "@effect/platform-node": "4.0.5",
-    "@effect/sql-sqlite-node": "4.0.5",
-    "effect": "4.0.5",
+    "@effect/platform-node": "4.0.6",
+    "@effect/sql-sqlite-node": "4.0.6",
+    "effect": "4.0.6",
     "fast-xml-parser": "5.11.2"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.15",
-    "@effect/openapi-generator": "4.0.5",
+    "@effect/openapi-generator": "4.0.6",
     "@effect/tsgo": "0.53.3",
-    "@effect/vitest": "4.0.5",
+    "@effect/vitest": "4.0.6",
     "@modelcontextprotocol/sdk": "1.32.1",
     "@types/node": "26.6.5",
     "typescript": "7.0.2",

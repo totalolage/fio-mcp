@@ -230,10 +230,7 @@ describe("HTTP transport", () => {
         body: "x".repeat(MAX_BODY_BYTES + 1),
       });
       assert.strictEqual(big.status, 413);
-      // Effect 4.0.5 destroys the request once a streamed body passes
-      // MaxBodySize, so the connection resets before the 413 can be sent.
-      // The reset is accepted only until Effect 4.0.6; restore the 413-only assertion then.
-      assert.include([413, "reset"], yield* postChunked(`${base}/mcp`, 4 * MAX_BODY_BYTES));
+      assert.strictEqual(yield* postChunked(`${base}/mcp`, 4 * MAX_BODY_BYTES), 413);
       assert.strictEqual((yield* postInitialize(base)).status, 200);
     }).pipe(Effect.scoped),
   );
