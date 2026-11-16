@@ -1,5 +1,5 @@
 import { Schema, SchemaTransformation } from "effect";
-import { XmlText, XsBoolean, XsInteger } from "./xsd.js";
+import { XmlText, XsBase64Text, XsBoolean, XsInteger } from "./xsd.js";
 
 /**
  * Shared ISDS message models (dmBaseTypes.xsd, ISDS v3.11). Field names follow the XSD element
@@ -89,7 +89,7 @@ export type MessageEnvelope = typeof MessageEnvelope.Type;
 
 /** tHash with its `algorithm` attribute: the parser puts the digest under `#text`. */
 const MessageHashWithAlgorithm = Schema.Struct({
-  "#text": Schema.String,
+  "#text": XsBase64Text,
   algorithm: Schema.optional(Schema.String),
 }).pipe(
   Schema.decodeTo(
@@ -106,10 +106,12 @@ const MessageHashWithAlgorithm = Schema.Struct({
 /**
  * tHash: base64 digest text with an optional `algorithm` attribute (dmBaseTypes.xsd:160-170).
  * Without attributes the element parses as plain text, so both forms decode to `{ value, algorithm? }`.
+ * `value` is the digest's base64 text with XML whitespace removed; text that is not valid
+ * base64 fails to decode, so the response fails with `IsdsInvalidResponse`.
  */
 export const MessageHash = Schema.Union([
   MessageHashWithAlgorithm,
-  Schema.String.pipe(
+  XsBase64Text.pipe(
     Schema.decodeTo(
       Schema.toType(MessageHashWithAlgorithm),
       SchemaTransformation.transform({

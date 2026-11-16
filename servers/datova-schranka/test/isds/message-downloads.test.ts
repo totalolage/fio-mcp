@@ -147,6 +147,33 @@ describe("ping", () => {
 });
 
 describe("downloadMessageEnvelope", () => {
+  it.effect("a message hash that is not base64 fails as an invalid response, with or without algorithm", () =>
+    Effect.gen(function* () {
+      const original = fixture("MessageEnvelopeDownload.xml");
+      const hash = `<p:dmHash algorithm="SHA-256">MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=</p:dmHash>`;
+      for (const replacement of [
+        `<p:dmHash algorithm="SHA-256">not-base64!</p:dmHash>`,
+        `<p:dmHash>not-base64!</p:dmHash>`,
+        `<p:dmHash>QUJD=</p:dmHash>`,
+      ]) {
+        const { error } = yield* fails(downloadMessageEnvelope({ dmID: "8765432" }), ok(original.replace(hash, replacement)));
+        assert.strictEqual(error._tag, "IsdsInvalidResponse", replacement);
+      }
+    }),
+  );
+
+  it.effect("a message hash keeps its base64 text, with XML whitespace removed", () =>
+    Effect.gen(function* () {
+      const original = fixture("MessageEnvelopeDownload.xml");
+      const hash = `<p:dmHash algorithm="SHA-256">MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=</p:dmHash>`;
+      const { result } = yield* run(
+        downloadMessageEnvelope({ dmID: "8765432" }),
+        ok(original.replace(hash, "<p:dmHash>MDEyMzQ1Njc4\n  OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=</p:dmHash>")),
+      );
+      assert.deepStrictEqual(result.dmHash, { value: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=" });
+    }),
+  );
+
   it.effect("decodes tReturnedMessageEnvelope", () =>
     Effect.gen(function* () {
       const { result } = yield* run(

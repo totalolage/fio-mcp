@@ -57,11 +57,11 @@ const Base64Text = Schema.String.pipe(
 );
 
 /**
- * xs:base64Binary ↔ bytes. XML whitespace inside the lexical form is allowed (XSD Part 2
- * §3.2.16) and dropped; anything else outside the base64 alphabet fails. Uses Node's native codec,
- * since attachments run to tens of megabytes.
+ * xs:base64Binary kept as text: XML whitespace inside the lexical form is allowed (XSD Part 2
+ * §3.2.16) and dropped; anything else outside the base64 alphabet, or a broken quantum, fails.
+ * For values callers compare as text, such as message hashes.
  */
-export const XsBase64 = Schema.String.pipe(
+export const XsBase64Text = Schema.String.pipe(
   Schema.decodeTo(
     Base64Text,
     SchemaTransformation.transform({
@@ -69,6 +69,13 @@ export const XsBase64 = Schema.String.pipe(
       encode: (text: string) => text,
     }),
   ),
+);
+
+/**
+ * xs:base64Binary ↔ bytes, validated as `XsBase64Text`. Uses Node's native codec, since
+ * attachments run to tens of megabytes.
+ */
+export const XsBase64 = XsBase64Text.pipe(
   Schema.decodeTo(
     Schema.Uint8Array,
     SchemaTransformation.transform({
