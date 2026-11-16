@@ -164,8 +164,9 @@ export const BIC = /^[A-Z]{6}[A-Z0-9]{2}([A-Z0-9]{3})?$/;
 
 /**
  * Where untrusted strings sit in a result. At paths the spec does not name,
- * only marked excerpts are guarded; non-string values at a guarded path are
- * left as they are.
+ * only marked excerpts are guarded. An object or array where the spec expects
+ * a text or identifier string has every string inside it guarded the same way
+ * (fail closed); other non-string values are left as they are.
  */
 export type GuardSpec =
   | { readonly _tag: "Marked" }
@@ -245,9 +246,12 @@ function rewrite(value: unknown, spec: GuardSpec, f: (sanitised: string) => stri
       if (!isRecord(value)) return value;
       return Object.fromEntries(Object.entries(value).map(([key, field]) => [key, rewrite(field, MARKED, f)]));
     case "Text":
-      return typeof value === "string" ? f(sanitiseUntrusted(value, spec.cap, { keepLayout: spec.keepLayout })) : value;
+      return typeof value === "string"
+        ? f(sanitiseUntrusted(value, spec.cap, { keepLayout: spec.keepLayout }))
+        : everyString(value, spec, f);
     case "Identifier":
-      return typeof value === "string" && !spec.pattern.test(value) ? f(sanitiseUntrusted(value, FREE_TEXT_CAP)) : value;
+      if (typeof value !== "string") return everyString(value, spec, f);
+      return spec.pattern.test(value) ? value : f(sanitiseUntrusted(value, FREE_TEXT_CAP));
     case "Array":
       return Array.isArray(value) ? value.map((item) => rewrite(item, spec.item, f)) : value;
     case "Struct": {
@@ -272,6 +276,13 @@ function rewrite(value: unknown, spec: GuardSpec, f: (sanitised: string) => stri
       return next;
     }
   }
+}
+
+/** Applies a string spec to every string inside an object or array (keys stay as they are). */
+function everyString(value: unknown, spec: GuardSpec, f: (sanitised: string) => string): unknown {
+  if (Array.isArray(value)) return value.map((item) => rewrite(item, spec, f));
+  if (!isRecord(value)) return value;
+  return Object.fromEntries(Object.entries(value).map(([key, field]) => [key, rewrite(field, spec, f)]));
 }
 
 /**
