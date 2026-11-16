@@ -1,6 +1,7 @@
 import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem";
 import { ConfigProvider, Effect, Layer, Redacted } from "effect";
 import { type AccountConfig, type AppConfigShape, loadConfig, MAX_RESPONSE_BYTES } from "../src/config.js";
+import { DEFAULT_PAYMENT_LIMITS } from "../src/payment-limits.js";
 
 export const READ_TOKEN = "rEaDtOkEnAbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcdefghijklmnopqr";
 export const PAY_TOKEN = "pAyToKeNAbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcdefghijklmnopqrs";
@@ -174,6 +175,7 @@ export function testConfig(accounts: ReadonlyArray<TestAccount>, overrides: Part
       encrypt: false,
       dataKey: undefined,
     },
+    paymentLimits: DEFAULT_PAYMENT_LIMITS,
     ...overrides,
   };
 }

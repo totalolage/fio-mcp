@@ -7,11 +7,13 @@ import { Transactions } from "../../src/cache/service.js";
 import { makeCacheStore, type PendingRange, type SyncMode } from "../../src/cache/store.js";
 import { type AppConfigShape, type CacheConfig, DEFAULT_BACKFILL_FROM, DEFAULT_CACHE_MAX_AGE_MINUTES, DEFAULT_OVERLAP_DAYS, MAX_RESPONSE_BYTES } from "../../src/config.js";
 import type { FioApi } from "../../src/fio-api.js";
+import { DEFAULT_PAYMENT_LIMITS } from "../../src/payment-limits.js";
 import { Redactor } from "../../src/redaction.js";
 import type { NormalizedStatement, Transaction } from "../../src/statement.js";
 import { seededConfig } from "./config.js";
 import { testDatabase } from "./database.js";
 import type { PeriodsScript } from "./fio-api.js";
+import { memoryPaymentControls } from "./payments.js";
 
 export const TOKEN_A = "a".repeat(64);
 export const TOKEN_B = "b".repeat(64);
@@ -49,6 +51,7 @@ export function config(
       dataKey: undefined,
       ...overrides.cache,
     },
+    paymentLimits: DEFAULT_PAYMENT_LIMITS,
   };
 }
 
@@ -121,7 +124,10 @@ export const serveFrom =
 
 /** Base services for cache tests: config, accounts, redactor, the DB at cache.dbPath (":memory:" by default), and the cache. */
 const baseLayer = (cfg: AppConfigShape, fio: Layer.Layer<FioApi>) =>
-  Layer.mergeAll(Accounts.Default, Redactor.Default, fio).pipe(Layer.provideMerge(seededConfig(cfg)));
+  memoryPaymentControls().pipe(
+    Layer.provideMerge(Layer.mergeAll(Accounts.Default, Redactor.Default, fio)),
+    Layer.provideMerge(seededConfig(cfg)),
+  );
 
 export const cacheLayer = (cfg: AppConfigShape, fio: Layer.Layer<FioApi>) =>
   Transactions.Default.pipe(

@@ -2,12 +2,13 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { assert, describe, it } from "@effect/vitest";
-import { ConfigProvider, Effect, Layer, Logger, Redacted } from "effect";
+import { ConfigProvider, Effect, Layer, Logger, Redacted, Result } from "effect";
 import { HttpRouter } from "effect/http";
 import { TestClock } from "effect/testing";
 import { type AppConfigShape, MIN_RATE_LIMIT_INTERVAL_MS } from "../src/config.js";
 import { ConfigError } from "../src/errors.js";
 import { hashPassword } from "../src/oauth/crypto.js";
+import { type PaymentFormValues, parsePaymentForm } from "../src/payment-form.js";
 import { Redactor } from "../src/redaction.js";
 import { Auth, UNAUTHENTICATED_WARNING, unauthenticatedWarning } from "../src/transport/auth.js";
 import { loadConfigFrom, PAY_TOKEN, READ_TOKEN } from "./fixtures.js";
@@ -831,6 +832,115 @@ describe("loadConfig", () => {
       });
       const xdg = yield* loadConfigFrom({ FIO_TOKEN: READ_TOKEN, XDG_DATA_HOME: "/xdg" });
       assert.strictEqual(xdg.cache.dbPath, "/xdg/fio-mcp/fio.sqlite");
+    }),
+  );
+});
+
+describe("payment limits", () => {
+  const PER_ORDER = "FIO_MCP_PAYMENT_MAX_PER_ORDER";
+  const PER_DAY = "FIO_MCP_PAYMENT_MAX_PER_DAY";
+  const ORDERS = "FIO_MCP_PAYMENT_MAX_ORDERS_PER_DAY";
+
+  it.effect("refuses consent-form limits above the configured ceiling", () =>
+    Effect.gen(function* () {
+      const { paymentLimits } = yield* loadConfigFrom({
+        FIO_TOKEN: READ_TOKEN,
+        [PER_ORDER]: "CZK:1000",
+        [PER_DAY]: "CZK:2000",
+        [ORDERS]: "5",
+      });
+      const form = (fields: Partial<PaymentFormValues>): PaymentFormValues => ({
+        maxPerOrder: "CZK:1000",
+        maxPerDay: "CZK:2000",
+        maxOrdersPerDay: "5",
+        mode: "off",
+        allowlist: "",
+        ...fields,
+      });
+      assert.isTrue(Result.isSuccess(parsePaymentForm(form({}), paymentLimits)));
+      assert.isTrue(Result.isSuccess(parsePaymentForm(form({ maxPerOrder: "CZK:10", maxPerDay: "CZK:20" }), paymentLimits)));
+      for (const above of [
+        { maxPerOrder: "CZK:1000.01" },
+        { maxPerDay: "CZK:2001" },
+        { maxOrdersPerDay: "6" },
+        { maxPerOrder: "CZK:1000,EUR:1", maxPerDay: "CZK:2000,EUR:1" },
+      ]) {
+        const parsed = parsePaymentForm(form(above), paymentLimits);
+        assert.isTrue(Result.isFailure(parsed), JSON.stringify(above));
+        if (Result.isFailure(parsed)) assert.match(parsed.failure, /server ceiling|not allowed by the server/);
+      }
+    }),
+  );
+
+  it.effect("defaults to CZK:50000,EUR:2000 per order, CZK:100000,EUR:4000 per day and 20 orders", () =>
+    Effect.gen(function* () {
+      const config = yield* loadConfigFrom({ FIO_TOKEN: READ_TOKEN, [PER_ORDER]: "  ", [PER_DAY]: "" });
+      assert.deepStrictEqual(config.paymentLimits, {
+        maxPerOrder: { CZK: 50_000, EUR: 2_000 },
+        maxPerDay: { CZK: 100_000, EUR: 4_000 },
+        maxOrdersPerDay: 20,
+      });
+    }),
+  );
+
+  it.effect("reads custom values", () =>
+    Effect.gen(function* () {
+      const config = yield* loadConfigFrom({
+        FIO_TOKEN: READ_TOKEN,
+        [PER_ORDER]: " CZK:1000.5, USD:10 ",
+        [PER_DAY]: "USD:20,CZK:5000",
+        [ORDERS]: " 5 ",
+      });
+      assert.deepStrictEqual(config.paymentLimits, {
+        maxPerOrder: { CZK: 1000.5, USD: 10 },
+        maxPerDay: { USD: 20, CZK: 5000 },
+        maxOrdersPerDay: 5,
+      });
+    }),
+  );
+
+  for (const [key, value] of [
+    [PER_ORDER, "CZK:-12345"],
+    [PER_ORDER, "CZK:12.345"],
+    [PER_DAY, "czk:777777"],
+    [PER_DAY, "CZK:5,CZK:6"],
+    [PER_DAY, "CZK777777"],
+    [ORDERS, "0"],
+    [ORDERS, "2.5"],
+    [ORDERS, "lots"],
+  ] as const) {
+    it.effect(`fails on an invalid ${key}, naming the variable and not the value`, () =>
+      Effect.gen(function* () {
+        const message = yield* configError({ FIO_TOKEN: READ_TOKEN, [key]: value });
+        assert.include(message, key);
+        assert.notInclude(message, value);
+      }),
+    );
+  }
+
+  it.effect("fails when the two maps list different currencies", () =>
+    Effect.gen(function* () {
+      // Setting only one map keeps the other at its default (CZK and EUR).
+      const value = "CZK:1000";
+      const message = yield* configError({ FIO_TOKEN: READ_TOKEN, [PER_ORDER]: value });
+      assert.include(message, PER_ORDER);
+      assert.include(message, PER_DAY);
+      assert.include(message, "same currencies");
+      assert.notInclude(message, value);
+    }),
+  );
+
+  it.effect("fails when a per-order limit exceeds the daily limit", () =>
+    Effect.gen(function* () {
+      const message = yield* configError({
+        FIO_TOKEN: READ_TOKEN,
+        [PER_ORDER]: "CZK:654321,EUR:10",
+        [PER_DAY]: "CZK:123456,EUR:10",
+      });
+      assert.include(message, PER_ORDER);
+      assert.include(message, PER_DAY);
+      assert.notInclude(message, "654321");
+      assert.notInclude(message, "123456");
     }),
   );
 });

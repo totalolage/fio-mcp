@@ -19,6 +19,7 @@ import {
   type RecordedRequest,
 } from "./support/fio-http.js";
 import { connect, type Harness, text } from "./support/mcp.js";
+import { memoryPaymentControls } from "./support/payments.js";
 import { nonces, unguard } from "./support/untrusted.js";
 
 const inputSchemas = (accountNames: ReadonlyArray<string>) =>
@@ -308,7 +309,7 @@ describe("SEC-05 guards over MCP", () => {
 /** The FIO tool handlers in process, over the scripted FIO HTTP client. */
 const inProcess = (route: FioHttpHandler) => {
   const cfg = testConfig([readAccount()]);
-  return Transactions.Disabled.pipe(
+  return Layer.mergeAll(Transactions.Disabled, memoryPaymentControls()).pipe(
     Layer.provideMerge(FioApi.Default),
     Layer.provideMerge(Layer.mergeAll(Redactor.Default, Accounts.Default, RateLimiter.Default)),
     Layer.provideMerge(seededConfig(cfg)),

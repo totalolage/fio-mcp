@@ -8,8 +8,12 @@ import { markUntrusted } from "./mcp/untrusted.js";
 
 export const PERMISSION_DENIED = "You don't have permissions to do that.";
 
-export const UPLOAD_UNCERTAIN =
-  "The upload may or may not have created a batch. Check the pending batches in FIO Internetbanking before submitting again, or the orders could be duplicated.";
+const PAYMENT_TOKEN_HINT =
+  'Payment orders need a token created with the "Sledování účtu a zadávání platebních a inkasních příkazů" permission (Internetbanking → Nastavení → API).';
+
+export { PAYMENT_TOKEN_HINT };
+
+export const UPLOAD_UNCERTAIN = `The upload may or may not have created a batch. Check the pending batches in FIO Internetbanking (Platby → Příkazy k autorizaci) before submitting again, or the orders could be duplicated; do not resubmit until the user has checked. When FIO answered with a server error (HTTP 5xx), the most common cause is a read-only or invalid token. ${PAYMENT_TOKEN_HINT}`;
 
 /** The limiter could not give this call a slot within its wait budget, or FIO kept answering 409. */
 export class RateLimited extends Schema.TaggedError<RateLimited>()("RateLimited", {
@@ -143,12 +147,34 @@ export class UploadOutcomeUnknown extends Schema.TaggedError<UploadOutcomeUnknow
   }
 }
 
+/**
+ * A payment upload that definitely created no batch: it was never sent, or
+ * FIO refused it. Final for its idempotency key, so `detail` ends with the
+ * new-key advice and never says to retry.
+ */
+export class UploadRefused extends Schema.TaggedError<UploadRefused>()("UploadRefused", {
+  detail: Schema.String,
+}) {
+  override get message(): string {
+    return this.detail;
+  }
+}
+
 /** The local SQLite cache failed. The SQL cause is logged (redacted), not shown. */
 export class CacheError extends Schema.TaggedError<CacheError>()("CacheError", {
   operation: Schema.String,
 }) {
   override get message(): string {
     return `The local transaction cache failed while trying to ${this.operation}. See the server log for details.`;
+  }
+}
+
+/** The payment audit log (SQLite) failed. The SQL cause is logged (redacted), not shown. */
+export class PaymentAuditError extends Schema.TaggedError<PaymentAuditError>()("PaymentAuditError", {
+  operation: Schema.String,
+}) {
+  override get message(): string {
+    return `The payment audit log failed while trying to ${this.operation}. See the server log for details.`;
   }
 }
 
@@ -176,11 +202,6 @@ export type FioRequestError =
 /** The FIO operation class, which decides how HTTP 500 is read. */
 export type Operation = "read" | "import";
 
-const PAYMENT_TOKEN_HINT =
-  'Payment orders need a token created with the "Sledování účtu a zadávání platebních a inkasních příkazů" permission (Internetbanking → Nastavení → API).';
-
-export { PAYMENT_TOKEN_HINT };
-
 function detail(excerpt: string): string {
   // Marked as bank text: tool results guard it (SEC-05).
   return excerpt === "" ? "" : ` Response: ${markUntrusted(excerpt)}`;
@@ -191,11 +212,11 @@ function detail(excerpt: string): string {
  * already be redacted and truncated.
  *
  * Permission refusals: FIO documents no permission error, so this covers
- * the signals that can only mean the token may not do this. HTTP 401/403 on
- * any call (undocumented but unambiguous), and HTTP 500 on a payment upload,
- * FIO's code for a missing or inactive token and the most likely answer to
- * a read-only token trying to upload. HTTP 500 on reads keeps FIO's
- * documented meaning.
+ * the signals that can only mean the token may not do this: HTTP 401/403 on
+ * any call (undocumented but unambiguous). HTTP 500 on reads keeps FIO's
+ * documented meaning ("token does not exist or is inactive"). Every 5xx on a
+ * payment upload, 500 included, is a FioServerError: the batch may exist,
+ * so the caller reports an unknown outcome rather than a refusal.
  */
 export function errorForStatus(
   status: number,
@@ -219,11 +240,9 @@ export function errorForStatus(
     case 422:
       return new HistoryAuthorizationRequired();
     case 500:
-      return operation === "import"
-        ? new PermissionDenied({
-            detail: `FIO rejected this token for payment orders (HTTP 500, which FIO documents as "token does not exist or is inactive"): it is read-only, or inactive or expired. ${PAYMENT_TOKEN_HINT}`,
-          })
-        : new TokenRejected({ excerpt });
+      // On an upload FIO may have created the batch before failing, so a
+      // 500 there is an unknown outcome (SEC-06), never a definite refusal.
+      return operation === "import" ? new FioServerError({ status, excerpt }) : new TokenRejected({ excerpt });
     default:
       return new FioServerError({ status, excerpt });
   }

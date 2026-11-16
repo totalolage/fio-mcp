@@ -90,6 +90,9 @@ describe("cache database", () => {
           [5, "create_accounts"],
           [6, "grant_last_used"],
           [7, "account_token_history"],
+          [8, "grant_payment_settings"],
+          [9, "payment_audit"],
+          [10, "payment_pending"],
           [11, "cache_sealed_rows"],
         ]);
         const store = yield* makeCacheStore();

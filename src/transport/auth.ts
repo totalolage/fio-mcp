@@ -9,6 +9,7 @@ import { Transactions } from "../cache/service.js";
 import { AppConfig } from "../config.js";
 import { FioApi } from "../fio-api.js";
 import { makeOAuthServer, type OAuthSettings } from "../oauth/server.js";
+import { PaymentControls } from "../payment-controls.js";
 import { serveAdminListener } from "./admin-listener.js";
 import type { AuthUnavailable, Unauthorized } from "./auth-errors.js";
 import { LOCAL_PRINCIPAL, type Principal } from "./principal.js";
@@ -67,7 +68,7 @@ export class Auth extends Context.Service<Auth, AuthShape>()("fio-mcp/transport/
    */
   static readonly oauth = (
     settings: OAuthSettings,
-  ): Layer.Layer<Auth, never, HttpRouter.HttpRouter | SqlClient.SqlClient | Accounts | AdminPassword> =>
+  ): Layer.Layer<Auth, never, HttpRouter.HttpRouter | SqlClient.SqlClient | Accounts | AdminPassword | AppConfig> =>
     Layer.effect(
       Auth,
       Effect.gen(function* () {
@@ -106,7 +107,7 @@ export class Auth extends Context.Service<Auth, AuthShape>()("fio-mcp/transport/
           adminListener === undefined ? admin : serveAdminListener(admin, adminListener, transport),
         ).pipe(
           Layer.provide(AdminPassword.layer(passwordHash, undefined, undefined, transport.auth.totpSecret)),
-          Layer.provide(Layer.mergeAll(Database.Live, Accounts.Live, FioApi.Live, Transactions.Live)),
+          Layer.provide(Layer.mergeAll(Database.Live, Accounts.Live, FioApi.Live, Transactions.Live, PaymentControls.Live)),
         );
       }
       const onNetwork = transport.kind === "http" && transport.auth.kind === "unauthenticated" && transport.auth.onNetwork === true;

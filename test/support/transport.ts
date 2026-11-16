@@ -2,10 +2,15 @@ import { type Deferred, Layer, Redacted } from "effect";
 import { Accounts } from "../../src/accounts.js";
 import { Transactions } from "../../src/cache/service.js";
 import { type AppConfig, type AppConfigShape, MAX_RESPONSE_BYTES, type TransportConfig } from "../../src/config.js";
+import type { CacheError } from "../../src/errors.js";
+import type { FioApi, FioApiShape } from "../../src/fio-api.js";
+import type { PaymentControls } from "../../src/payment-controls.js";
+import { DEFAULT_PAYMENT_LIMITS } from "../../src/payment-limits.js";
 import { RateLimiter } from "../../src/rate-limiter.js";
 import { Redactor } from "../../src/redaction.js";
 import { seededConfig } from "./config.js";
 import { slotHoldingFio } from "./fio-api.js";
+import { memoryPaymentControls } from "./payments.js";
 
 /** A FIO-shaped read token (64 URL-safe characters). */
 export const FIO_TOKEN = "fioT0ken-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRS";
@@ -43,6 +48,7 @@ export function testConfig(transport: TransportConfig = { kind: "stdio" }): AppC
       encrypt: false,
       dataKey: undefined,
     },
+    paymentLimits: DEFAULT_PAYMENT_LIMITS,
   };
 }
 
@@ -50,14 +56,19 @@ export function testConfig(transport: TransportConfig = { kind: "stdio" }): AppC
  * The app's services with a fake FioApi; one instance shared by every
  * session. `accounts` defaults to the configured ones (FIO_TOKEN /
  * FIO_ACCOUNTS); the OAuth harness passes the database-backed layer.
+ * `payments` is the one PaymentControls the tools (and /admin) share; it
+ * defaults to one on a fresh in-memory ledger, and the OAuth harness passes
+ * one on the server database.
  */
-export const testServices = <E = never, R = never>(
+export const testServices = <E = never, R = never, PE = never, PR = never>(
   config: AppConfigShape,
   release: Deferred.Deferred<void>,
   accounts: Layer.Layer<Accounts, E, R | Redactor | AppConfig> = Accounts.Default,
+  fio: Partial<FioApiShape> = {},
+  payments: Layer.Layer<PaymentControls, PE | CacheError, PR | AppConfig | FioApi | Redactor | Accounts> = memoryPaymentControls(),
 ) =>
-  Transactions.Disabled.pipe(
-    Layer.provideMerge(slotHoldingFio(release)),
+  Layer.mergeAll(Transactions.Disabled, payments).pipe(
+    Layer.provideMerge(slotHoldingFio(release, fio)),
     Layer.provideMerge(Layer.mergeAll(accounts, RateLimiter.Default)),
     Layer.provideMerge(Redactor.Default),
     Layer.provideMerge(seededConfig(config)),

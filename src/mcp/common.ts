@@ -8,11 +8,13 @@ import {
   FioTransportError,
   HistoryAuthorizationRequired,
   InvalidInput,
+  PaymentAuditError,
   PermissionDenied,
   RateLimited,
   TokenRejected,
   TooManyItems,
   UploadOutcomeUnknown,
+  UploadRefused,
   XmlParseError,
 } from "../errors.js";
 import { type GuardSpec, guardMarked, guardResult, hasMarks } from "./untrusted.js";
@@ -37,7 +39,9 @@ export const ToolFailure = Schema.Union([
   XmlParseError,
   InvalidInput,
   UploadOutcomeUnknown,
+  UploadRefused,
   CacheError,
+  PaymentAuditError,
 ]);
 
 /**

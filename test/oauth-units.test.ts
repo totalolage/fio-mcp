@@ -33,6 +33,8 @@ import { makeOAuthServer } from "../src/oauth/server.js";
 import { MAX_SESSIONS, makeSessions, type PendingAuthorization } from "../src/oauth/sessions.js";
 import { makeOAuthStore } from "../src/oauth/store.js";
 import { isResource, parsePublicUrl, redirectUriMatches, redirectUriProblem } from "../src/oauth/urls.js";
+import { paymentFormValues } from "../src/payment-form.js";
+import { DEFAULT_GRANT_PAYMENTS, DEFAULT_PAYMENT_LIMITS } from "../src/payment-limits.js";
 import { testConfig } from "./fixtures.js";
 import { seededConfig } from "./support/config.js";
 import { memoryDatabase } from "./support/database.js";
@@ -96,6 +98,9 @@ describe("URL rules", () => {
       redirectUri: "http://127.0.0.1:45678/callback",
       csrf: "csrf",
       paymentsRequested: false,
+      paymentsChecked: false,
+      payments: paymentFormValues(DEFAULT_GRANT_PAYMENTS, DEFAULT_PAYMENT_LIMITS),
+      paymentCeiling: DEFAULT_PAYMENT_LIMITS,
       accounts: ["<b>&"],
       error: undefined,
     });
@@ -107,7 +112,7 @@ describe("URL rules", () => {
 describe("authorization endpoint request target", () => {
   const services = Layer.mergeAll(
     memoryDatabase(SERVER_MIGRATIONS),
-    Accounts.Default.pipe(Layer.provide(seededConfig(testConfig([])))),
+    Accounts.Default.pipe(Layer.provideMerge(seededConfig(testConfig([])))),
   );
 
   it.effect("shows an error page for an absolute-form target that is not a URL", () =>
@@ -435,7 +440,7 @@ describe("admin commands", () => {
       const now = yield* Clock.currentTimeMillis;
       const setup = Effect.fnUntraced(function* (clientId: string) {
         yield* store.insertClient({ clientId, clientName: null, redirectUris: ["https://a.example/cb"], createdAt: now, lastUsedAt: null }, 10);
-        const grant = { grantId: `grant_${clientId}`, clientId, scopes: ["fio:read"], accountFingerprints: ["main"], resource: "https://fio.example.test/mcp" };
+        const grant = { grantId: `grant_${clientId}`, clientId, scopes: ["fio:read"], accountFingerprints: ["main"], resource: "https://fio.example.test/mcp", payments: DEFAULT_GRANT_PAYMENTS };
         yield* store.createGrant(grant, { codeHash: `c_${clientId}`, clientId, redirectUri: "https://a.example/cb", codeChallenge: "x", expiresAt: now + 60_000 }, now);
         yield* store.insertTokens(grant.grantId, pair(clientId, 0));
         return grant;
@@ -469,7 +474,7 @@ describe("admin commands", () => {
         yield* store.insertClient({ clientId, clientName: `App ${clientId}`, redirectUris: ["https://a.example/cb"], createdAt: now, lastUsedAt: null }, 10);
         const grantId = `grant_${clientId}`;
         yield* store.createGrant(
-          { grantId, clientId, scopes: ["fio:read"], accountFingerprints: ["main"], resource: "https://fio.example.test/mcp" },
+          { grantId, clientId, scopes: ["fio:read"], accountFingerprints: ["main"], resource: "https://fio.example.test/mcp", payments: DEFAULT_GRANT_PAYMENTS },
           { codeHash: `code_${clientId}`, clientId, redirectUri: "https://a.example/cb", codeChallenge: "x", expiresAt: now + 60_000 },
           now,
         );
