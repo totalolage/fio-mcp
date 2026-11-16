@@ -12,6 +12,7 @@ import {
   revokeAllTokens,
   revokeClient,
 } from "./app.js";
+import { serveLeased } from "./instance-lease.js";
 import { makeRedactor, stderrLogger } from "./redaction.js";
 
 const USAGE = [
@@ -26,7 +27,7 @@ const USAGE = [
   "                                    or with --set store a new one read like hash-password",
 ].join("\n");
 
-const serve = Layer.launch(AppLive);
+const serve = serveLeased(AppLive);
 
 const backupTo = (dest: string) =>
   backup(dest).pipe(
