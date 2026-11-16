@@ -2,8 +2,9 @@
 # Builds the linux/amd64 image from a clean checkout, tags it
 # fio-mcp:<package.json version>-<short git sha> and fio-mcp:<version>, and
 # streams it to a docker host over ssh (docker save | gzip | ssh ... docker
-# load). No registry is involved. It then checks that the remote image ID
-# matches the local one.
+# load). No registry is involved. Before shipping it checks that the image
+# has no redis packages, and afterwards that the remote image ID matches the
+# local one.
 #
 # Usage: bun run ship:image -- [--dry-run] [--no-compress]
 #
@@ -121,6 +122,14 @@ fi
 id=$(docker image inspect --format '{{.Id}}' "$tag")
 if ! printf '%s\n' "$id" | grep -Eqx 'sha256:[0-9a-f]{64}'; then
   echo "error: unexpected local image ID for $tag: '$id'" >&2
+  exit 1
+fi
+
+# The unused redis peer of @effect/platform-node must not reach the image
+# (the Dockerfile's deps stage installs with --omit=peer).
+if ! docker run --rm --network none --entrypoint sh "$tag" \
+  -c 'test ! -e /app/node_modules/redis && test ! -e /app/node_modules/@redis' >&2; then
+  echo "error: $tag contains node_modules/redis or node_modules/@redis" >&2
   exit 1
 fi
 

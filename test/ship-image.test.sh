@@ -37,6 +37,7 @@ case $1 in
     echo "build output"
     ;;
   image) echo "$SHIM_LOCAL_ID" ;;
+  run) [ -z "${SHIM_IMAGE_REDIS:-}" ] || exit 1 ;;
   save)
     [ -z "${SHIM_SAVE_FAIL:-}" ] || exit 3
     if [ -n "${SHIM_SAVE_BIG:-}" ]; then
@@ -139,7 +140,7 @@ tag=fio-mcp:1.2.3-$sha
 failures=0
 case_name=
 
-knobs='DRY_RUN DOCKER FIO_MCP_SSH_HOST FIO_MCP_REMOTE_DOCKER SHIP_TMPDIR SHIP_NEW_SESSION SHIM_BUILDX SHIM_BUILD_FAIL SHIM_BUILD_BLOCK SHIM_SAVE_FAIL SHIM_SAVE_BIG SHIM_GZIP_FAIL SHIM_GZIP_TRUNCATE SHIM_LOAD_FAIL SHIM_LOAD_EARLY SHIM_PREFLIGHT_FAIL SHIM_INSPECT_FAIL SHIM_REMOTE_ID SHIM_SSH_EXEC SHIM_EXPECT_GZIP SHIM_REMOTE_PARTIAL_FAIL SHIM_REMOTE_VALIDATE_GZIP'
+knobs='DRY_RUN DOCKER FIO_MCP_SSH_HOST FIO_MCP_REMOTE_DOCKER SHIP_TMPDIR SHIP_NEW_SESSION SHIM_BUILDX SHIM_BUILD_FAIL SHIM_BUILD_BLOCK SHIM_SAVE_FAIL SHIM_SAVE_BIG SHIM_GZIP_FAIL SHIM_GZIP_TRUNCATE SHIM_LOAD_FAIL SHIM_LOAD_EARLY SHIM_PREFLIGHT_FAIL SHIM_INSPECT_FAIL SHIM_REMOTE_ID SHIM_SSH_EXEC SHIM_EXPECT_GZIP SHIM_REMOTE_PARTIAL_FAIL SHIM_REMOTE_VALIDATE_GZIP SHIM_IMAGE_REDIS'
 # shellcheck disable=SC2086 # word list on purpose
 unset $knobs
 ship_sh=${SHIP_SH:-sh}
@@ -158,6 +159,7 @@ run_ship() {
     SHIM_LOAD_EARLY="${SHIM_LOAD_EARLY:-}" SHIM_PREFLIGHT_FAIL="${SHIM_PREFLIGHT_FAIL:-}" SHIM_INSPECT_FAIL="${SHIM_INSPECT_FAIL:-}" \
     SHIM_REMOTE_ID="${SHIM_REMOTE_ID:-}" SHIM_SSH_EXEC="${SHIM_SSH_EXEC:-}" SHIM_EXPECT_GZIP="${SHIM_EXPECT_GZIP:-1}" \
     SHIM_REMOTE_PARTIAL_FAIL="${SHIM_REMOTE_PARTIAL_FAIL:-}" SHIM_REMOTE_VALIDATE_GZIP="${SHIM_REMOTE_VALIDATE_GZIP:-}" \
+    SHIM_IMAGE_REDIS="${SHIM_IMAGE_REDIS:-}" \
     $ship_sh "$repo/scripts/ship-image.sh" "$@"
 }
 
@@ -254,6 +256,22 @@ expect_stdout_result
 [ "$(wc -l <"$work/log/sudo.log")" -eq "$(wc -l <"$work/log/docker.log")" ] ||
   fail "docker calls bypassed DOCKER: $(cat "$work/log/sudo.log")"
 grep -Fqx -- "-n docker save $tag" "$work/log/sudo.log" || fail "save did not use DOCKER"
+
+case_name="checks the image for redis before shipping"
+ship
+redis_check="run --rm --network none --entrypoint sh $tag -c test ! -e /app/node_modules/redis && test ! -e /app/node_modules/@redis"
+grep -Fqx -- "$redis_check" "$work/log/docker.log" || fail "no redis check: $(cat "$work/log/docker.log")"
+
+case_name="fails without shipping when the image contains redis"
+SHIM_IMAGE_REDIS=1 ship
+expect_failure
+expect_err "$tag contains node_modules/redis or node_modules/@redis"
+[ ! -e "$work/log/ssh.log" ] || fail "ssh was called: $(cat "$work/log/ssh.log")"
+
+case_name="--dry-run fails when the image contains redis"
+SHIM_IMAGE_REDIS=1 ship --dry-run
+expect_failure
+expect_err "$tag contains node_modules/redis or node_modules/@redis"
 
 case_name="fails when the build fails"
 SHIM_BUILD_FAIL=1 ship
