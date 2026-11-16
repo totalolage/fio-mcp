@@ -2,12 +2,12 @@ import { Schema } from "effect";
 
 const Service = Schema.Literals(["operations", "info", "search", "access"]);
 
-/** The PKCS#12 archive or its passphrase was rejected while building the TLS context. */
+/** The credentials are unusable: the PKCS#12 archive or passphrase was rejected while building the TLS context, or the username is invalid for HTTP Basic. */
 export class IsdsCredentialsError extends Schema.TaggedError<IsdsCredentialsError>()("IsdsCredentialsError", {
   detail: Schema.String,
 }) {
   override get message(): string {
-    return `The ISDS client certificate could not be loaded: ${this.detail}`;
+    return `The ISDS credentials could not be used: ${this.detail}`;
   }
 }
 
@@ -51,7 +51,7 @@ export class IsdsAuthError extends Schema.TaggedError<IsdsAuthError>()("IsdsAuth
   httpStatus: Schema.Finite,
 }) {
   override get message(): string {
-    return `ISDS refused the client certificate (HTTP ${this.httpStatus}).`;
+    return `ISDS refused the credentials (HTTP ${this.httpStatus}).`;
   }
 }
 
