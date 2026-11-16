@@ -57,7 +57,14 @@ export interface LoginPage {
   readonly redirectUri: string;
   readonly csrf: string;
   readonly error: string | undefined;
+  /** Ask for the authenticator code too (FIO_MCP_ADMIN_TOTP_SECRET_FILE is set). */
+  readonly totp?: boolean;
 }
+
+/** The second-factor field of both sign-in forms (/login and /admin/login). */
+export const TOTP_FIELD = `<label for="totp">Authenticator code</label>
+<input id="totp" type="text" name="totp" inputmode="numeric" autocomplete="one-time-code" maxlength="16" required>
+`;
 
 export const loginPage = (page: LoginPage): string =>
   layout(
@@ -69,7 +76,7 @@ ${page.error === undefined ? "" : `<p class="error" role="alert">${escapeHtml(pa
 <input type="hidden" name="csrf" value="${escapeHtml(page.csrf)}">
 <label for="password">Admin password</label>
 <input id="password" type="password" name="password" autocomplete="current-password" required autofocus>
-<p><button type="submit">Sign in</button></p>
+${page.totp === true ? TOTP_FIELD : ""}<p><button type="submit">Sign in</button></p>
 </form>`,
   );
 

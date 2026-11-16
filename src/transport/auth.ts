@@ -74,7 +74,7 @@ export class Auth extends Context.Service<Auth, AuthShape>()("fio-mcp/transport/
           Auth.oauth({ publicUrl, trustedProxies }),
           AdminLive({ publicUrl, dataKey, trustedProxies }),
         ).pipe(
-          Layer.provide(AdminPassword.layer(passwordHash)),
+          Layer.provide(AdminPassword.layer(passwordHash, undefined, undefined, transport.auth.totpSecret)),
           Layer.provide(Layer.mergeAll(Database.Live, Accounts.Live, FioApi.Live, Transactions.Live)),
         );
       }

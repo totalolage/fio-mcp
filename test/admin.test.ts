@@ -6,8 +6,10 @@ import { SqlClient } from "effect/sql";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { tokenFingerprint } from "../src/accounts.js";
 import { MAX_ADMIN_SESSIONS } from "../src/admin/sessions.js";
+import { totpCode } from "../src/admin/totp.js";
 import { makeCacheStore } from "../src/cache/store.js";
 import { resetAdminPasswordCommand } from "../src/oauth/cli.js";
+import { DEFAULT_THROTTLE } from "../src/oauth/login.js";
 import { NOW, statement, TODAY, tx } from "./support/cache.js";
 import { LAST_STATEMENT } from "./support/fio-api.js";
 import {
@@ -668,5 +670,65 @@ describe("admin password", () => {
     await resetPassword(true, "a password from the cli\n");
     expect((await recovered.get("/admin")).status).toBe(303);
     await new Admin().signIn("a password from the cli");
+  });
+});
+
+describe("admin TOTP second factor at /admin/login (SEC-03)", () => {
+  const SECRET = new TextEncoder().encode("12345678901234567890");
+  const codeNow = (steps = 0) => totpCode(SECRET, Math.floor(harness.clock.currentTimeMillisUnsafe() / 1000) + steps * 30);
+  const wrongCode = () => {
+    const valid = new Set([codeNow(-1), codeNow(), codeNow(1)]);
+    return ["000000", "111111", "222222", "333333"].find((code) => !valid.has(code)) ?? "444444";
+  };
+
+  it("shows no code field when the secret is not configured", async () => {
+    const { html } = await new Admin().page("/admin/login");
+    expect(html).not.toContain('name="totp"');
+  });
+
+  it("needs a current, unused code with the password and counts a wrong or missing one", async () => {
+    await harness.close();
+    harness = await startOAuth({ throttle: { ...DEFAULT_THROTTLE, freeFailures: 1 }, totpSecret: Redacted.make(SECRET) });
+    const admin = new Admin();
+    const { html } = await admin.page("/admin/login");
+    expect(html).toContain('name="totp"');
+    expect(html).toContain('autocomplete="one-time-code"');
+
+    const missing = await admin.post("/admin/login", { password: PASSWORD });
+    expect(missing.status).toBe(401);
+    expect(await missing.text()).toContain("Wrong password or code.");
+    expect((await admin.post("/admin/login", { password: PASSWORD, totp: wrongCode() })).status).toBe(401);
+    // Both counted: the second failure started the backoff, even for a correct code.
+    expect((await admin.post("/admin/login", { password: PASSWORD, totp: codeNow() })).status).toBe(429);
+    harness.clock.advance(1000);
+
+    const code = codeNow();
+    expect((await admin.post("/admin/login", { password: PASSWORD, totp: code })).status).toBe(303);
+    expect((await admin.get("/admin")).status).toBe(200);
+    // The same code in another sign-in, here or at /login: refused.
+    const again = new Admin();
+    await again.page("/admin/login");
+    expect((await again.post("/admin/login", { password: PASSWORD, totp: code })).status).toBe(401);
+    // A fresh code works.
+    expect((await again.post("/admin/login", { password: PASSWORD, totp: codeNow(1) })).status).toBe(303);
+  });
+});
+
+describe("busy sign-in at /admin/login (SEC-09)", () => {
+  it("answers a sign-in that finds another check running as busy, with retry-after 1", async () => {
+    await harness.close();
+    // Nothing is locked out here: every 429 must be the busy answer.
+    harness = await startOAuth({ throttle: { ...DEFAULT_THROTTLE, freeFailures: 100, lockoutFailures: 200 } });
+    const admins = Array.from({ length: 8 }, () => new Admin());
+    for (const admin of admins) await admin.page("/admin/login");
+    let busy: Response | undefined;
+    for (let round = 0; round < 5 && busy === undefined; round++) {
+      const responses = await Promise.all(admins.map((admin) => admin.post("/admin/login", { password: "wrong password!" })));
+      for (const response of responses) expect([401, 429]).toContain(response.status);
+      busy = responses.find((response) => response.status === 429);
+    }
+    if (busy === undefined) throw new Error("no sign-in was turned away as busy in 5 rounds");
+    expect(busy.headers.get("retry-after")).toBe("1");
+    expect(await busy.text()).toContain("Sign-in busy, try again.");
   });
 });

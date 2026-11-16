@@ -99,12 +99,21 @@ export async function startOAuth(
     dbPath?: string;
     /** The accounts FIO_TOKEN / FIO_ACCOUNTS would configure (default: main and savings). */
     configured?: AppConfigShape["accounts"];
+    /** FIO_MCP_ADMIN_TOTP_SECRET_FILE's secret: sign-ins then need a code too. */
+    totpSecret?: Redacted.Redacted<Uint8Array>;
   } = {},
 ): Promise<OAuthHarness> {
   const hash = await passwordHash();
   const trustedProxies = (options.trustedProxies ?? []).flatMap((entry) => parseTrustedProxy(entry) ?? []);
   const accountSeed = accountSeedOf(options.configured ?? testConfig().accounts);
-  const auth: HttpAuthConfig = { kind: "oauth", publicUrl: PUBLIC_URL, passwordHash: Redacted.make(hash), dataKey: DATA_KEY, accountSeed };
+  const auth: HttpAuthConfig = {
+    kind: "oauth",
+    publicUrl: PUBLIC_URL,
+    passwordHash: Redacted.make(hash),
+    dataKey: DATA_KEY,
+    accountSeed,
+    totpSecret: options.totpSecret,
+  };
   const transport: HttpTransportConfig = {
     kind: "http",
     host: "127.0.0.1",
@@ -129,7 +138,7 @@ export async function startOAuth(
   const oauth = Layer.mergeAll(
     Auth.oauth({ publicUrl: PUBLIC_URL, trustedProxies }),
     AdminLive({ publicUrl: PUBLIC_URL, dataKey: DATA_KEY, trustedProxies }),
-  ).pipe(Layer.provide(AdminPassword.layer(Redacted.make(hash), options.throttle, FAST_SCRYPT)));
+  ).pipe(Layer.provide(AdminPassword.layer(Redacted.make(hash), options.throttle, FAST_SCRYPT, options.totpSecret)));
   let accounts: AccountsShape | undefined;
   const captureAccounts = Layer.effectDiscard(
     Effect.map(Effect.service(Accounts), (service) => {

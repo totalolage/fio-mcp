@@ -521,6 +521,7 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
         redirectUri: session.request.redirectUri,
         csrf: Redacted.value(session.csrf),
         error,
+        totp: password.totpEnabled,
       }),
       status,
       [],
@@ -566,7 +567,8 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
     yield* checkForm(request, session, form);
     if (session.loggedIn) return redirect("/consent");
     const entered = Result.getOrUndefined(single(form, "password")) ?? "";
-    const result = yield* password.signIn(addressOf(request), Redacted.make(entered));
+    const code = Result.getOrUndefined(single(form, "totp"));
+    const result = yield* password.signIn(addressOf(request), Redacted.make(entered), code);
     switch (result._tag) {
       case "Accepted": {
         // Bound to the hash the password matched: a change in between ends this session.
@@ -575,8 +577,10 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
         return redirect("/consent", sessionCookie(Redacted.value(next.cookie), next.session.expiresAt - now));
       }
       case "Rejected":
-        return renderLogin(session, 401, "Wrong password.");
+        return renderLogin(session, 401, password.totpEnabled ? "Wrong password or code." : "Wrong password.");
       case "Throttled":
+        // Busy: another check is running; this attempt was not counted.
+        if (result.busy === true) return renderLogin(session, 429, "Sign-in busy, try again.", { "retry-after": "1" });
         return renderLogin(
           session,
           429,

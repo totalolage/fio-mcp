@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { assert, describe, it } from "@effect/vitest";
 import { Effect, Redacted } from "effect";
-import { MIN_RATE_LIMIT_INTERVAL_MS } from "../src/config.js";
+import { type AppConfigShape, MIN_RATE_LIMIT_INTERVAL_MS } from "../src/config.js";
 import { ConfigError } from "../src/errors.js";
 import { hashPassword } from "../src/oauth/crypto.js";
 import { loadConfigFrom, PAY_TOKEN, READ_TOKEN } from "./fixtures.js";
@@ -316,6 +316,46 @@ describe("loadConfig", () => {
       assert.strictEqual(normalized.transport.kind, "http");
       if (normalized.transport.kind === "http" && normalized.transport.auth.kind === "oauth") {
         assert.strictEqual(normalized.transport.auth.publicUrl, "https://fio.example.test");
+      }
+    }),
+  );
+
+  it.effect("loads the optional admin TOTP secret and refuses a bad one without echoing it", () =>
+    Effect.gen(function* () {
+      const hash = yield* hashPassword(Redacted.make("test-admin-password"), { ln: 14, r: 8, p: 1 });
+      const env = {
+        FIO_TOKEN: READ_TOKEN,
+        FIO_MCP_TRANSPORT: "http",
+        FIO_MCP_PUBLIC_URL: "https://fio.example.test",
+        FIO_MCP_ADMIN_PASSWORD_HASH_FILE: secretFile(`${hash}\n`),
+        FIO_MCP_DATA_KEY_FILE: secretFile(`${"ab".repeat(32)}\n`),
+      };
+      const totpOf = (config: AppConfigShape) =>
+        config.transport.kind === "http" && config.transport.auth.kind === "oauth" ? config.transport.auth.totpSecret : "not oauth";
+      // Unset, or set to blanks: no second factor.
+      assert.isUndefined(totpOf(yield* loadConfigFrom(env)));
+      assert.isUndefined(totpOf(yield* loadConfigFrom({ ...env, FIO_MCP_ADMIN_TOTP_SECRET_FILE: "  " })));
+      // Lowercase, spaces and padding are accepted; the file is named with surrounding blanks.
+      const secret = totpOf(
+        yield* loadConfigFrom({ ...env, FIO_MCP_ADMIN_TOTP_SECRET_FILE: ` ${secretFile("gezd gnbv gy3t qojq gezd gnbv gy3t qojq====\n")} ` }),
+      );
+      if (secret === undefined || typeof secret === "string") return assert.fail("expected a TOTP secret");
+      assert.strictEqual(new TextDecoder().decode(Redacted.value(secret)), "12345678901234567890");
+      assert.notInclude(String(secret), "12345");
+
+      const missing = join(mkdtempSync(join(tmpdir(), "fio-mcp-config-")), "gone");
+      const cases: ReadonlyArray<readonly [string, string]> = [
+        [missing, "FIO_MCP_ADMIN_TOTP_SECRET_FILE: file not readable"],
+        [secretFile("NOT-BASE32!\n"), "FIO_MCP_ADMIN_TOTP_SECRET_FILE: file must contain a base32 secret; create one with `fio-mcp totp-init`"],
+        [secretFile("\n"), "FIO_MCP_ADMIN_TOTP_SECRET_FILE: file must contain a base32 secret; create one with `fio-mcp totp-init`"],
+        // 15 bytes: under the 128-bit minimum.
+        [
+          secretFile("GEZDGNBVGY3TQOJQGEZDGNBV\n"),
+          "FIO_MCP_ADMIN_TOTP_SECRET_FILE: the secret must be at least 16 bytes (26 base32 characters); create one with `fio-mcp totp-init`",
+        ],
+      ];
+      for (const [file, expected] of cases) {
+        assert.strictEqual(yield* configError({ ...env, FIO_MCP_ADMIN_TOTP_SECRET_FILE: file }), expected);
       }
     }),
   );
