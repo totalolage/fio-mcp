@@ -143,6 +143,7 @@ describe("reconcileSentMessage", () => {
         ["Faktura\u202F17", "Faktura17"],
         ["Faktura\u008517", "Faktura17"],
         ["Faktura\u0085 17", "Faktura 17"],
+        ["Faktura\u008517", "Faktura 17"],
       ];
       for (const [dmAnnotation, listed] of cases) {
         const { result } = yield* reconcile({ ...sent, dmAnnotation }, sentList([{ ...matching, dmAnnotation: listed }]));
