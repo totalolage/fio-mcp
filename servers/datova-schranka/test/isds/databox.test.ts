@@ -1,6 +1,12 @@
 import { assert, describe, it } from "@effect/vitest";
 import { Effect } from "effect";
-import { checkDataBox, type FindDataBoxesQuery, findDataBoxes, getOwnerInfo } from "../../src/isds/databox.js";
+import {
+  checkDataBox,
+  type FindDataBoxesQuery,
+  findDataBoxes,
+  getOwnerInfo,
+  isKnownDataBoxType,
+} from "../../src/isds/databox.js";
 import { dbStatus, fakeTransport, fixture, ok, serverError, soapFault, soapResponse } from "./fake-transport.js";
 
 type Reply = Parameters<typeof fakeTransport>[0];
@@ -98,11 +104,35 @@ describe("getOwnerInfo (GetOwnerInfoFromLogin)", () => {
     }),
   );
 
-  it.effect("an unknown dbType is an invalid response", () =>
+  it.effect("an unknown dbType decodes as its string; known types narrow with isKnownDataBoxType", () =>
     Effect.gen(function* () {
-      const xml = fixture("GetOwnerInfoFromLogin.xml").replace("<p:dbType>PO</p:dbType>", "<p:dbType>XX</p:dbType>");
-      const { error } = yield* runFailing(getOwnerInfo(), ok(xml));
-      assert.strictEqual(error._tag, "IsdsInvalidResponse");
+      const xml = fixture("GetOwnerInfoFromLogin.xml").replace("<p:dbType>PO</p:dbType>", "<p:dbType>PFO_NOVY</p:dbType>");
+      const { result } = yield* run(getOwnerInfo(), ok(xml));
+      assert.strictEqual(result.dbType, "PFO_NOVY");
+      assert.isFalse(isKnownDataBoxType(result.dbType));
+      const known = yield* run(getOwnerInfo(), ok(fixture("GetOwnerInfoFromLogin.xml")));
+      assert.isTrue(isKnownDataBoxType(known.result.dbType));
+    }),
+  );
+
+  it.effect("FindDataBox2 results with an unknown dbType still decode", () =>
+    Effect.gen(function* () {
+      const xml = fixture("FindDataBox2.xml").replace("<p:dbType>PFO</p:dbType>", "<p:dbType>PFO_BUDOUCI</p:dbType>");
+      const { result } = yield* run(findDataBoxes({ dbType: "PO", firmName: "Novák" }), ok(xml));
+      assert.include(
+        result.boxes.map((box) => box.dbType),
+        "PFO_BUDOUCI",
+      );
+    }),
+  );
+
+  it.effect("a request dbType outside the enumeration is still rejected before sending", () =>
+    Effect.gen(function* () {
+      // Deliberately outside FindDataBoxType, as an untyped caller could send it.
+      const query = { dbType: "PFO_BUDOUCI", ic: "12345678" } as unknown as FindDataBoxesQuery;
+      const { error, requests } = yield* runFailing(findDataBoxes(query), ok(fixture("FindDataBox2.xml")));
+      assert.strictEqual(error._tag, "IsdsInvalidRequest");
+      assert.strictEqual(requests.length, 0);
     }),
   );
 

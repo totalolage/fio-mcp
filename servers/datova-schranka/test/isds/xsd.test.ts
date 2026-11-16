@@ -1,6 +1,6 @@
 import { assert, describe, it } from "@effect/vitest";
-import { Effect, Schema } from "effect";
-import { XsBase64, xmlTextMax } from "../../src/isds/xsd.js";
+import { Effect, Result, Schema } from "effect";
+import { XsBase64, XsInteger, xmlTextMax } from "../../src/isds/xsd.js";
 
 const decodeBase64 = Schema.decodeUnknownEffect(XsBase64);
 const encodeBase64 = Schema.encodeEffect(XsBase64);
@@ -37,4 +37,21 @@ describe("xmlTextMax", () => {
       assert.strictEqual((yield* Effect.exit(decode("a\u0001")))._tag, "Failure");
     }),
   );
+});
+
+describe("XsInteger", () => {
+  const decode = Schema.decodeUnknownResult(XsInteger);
+  it("accepts the xs:integer lexical form with collapsed surrounding whitespace", () => {
+    assert.strictEqual(Result.getOrThrow(decode("42")), 42);
+    assert.strictEqual(Result.getOrThrow(decode("+7")), 7);
+    assert.strictEqual(Result.getOrThrow(decode("-0012")), -12);
+    assert.strictEqual(Result.getOrThrow(decode(" \n\t12\r\n ")), 12);
+    assert.strictEqual(Result.getOrThrow(decode(String(Number.MAX_SAFE_INTEGER))), Number.MAX_SAFE_INTEGER);
+  });
+
+  it("rejects other number syntaxes and unsafe magnitudes", () => {
+    for (const text of ["1e3", "0x10", "", " ", "1.0", "1 2", "--1", "Infinity", "NaN", "\u00a012", "9007199254740992"]) {
+      assert.isTrue(Result.isFailure(decode(text)), text);
+    }
+  });
 });

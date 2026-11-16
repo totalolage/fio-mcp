@@ -34,16 +34,34 @@ type Json = { readonly [key: string]: unknown };
 
 const isRecord = (value: unknown): value is Json => typeof value === "object" && value !== null && !Array.isArray(value);
 
-/** `xsi:nil="true"` on an element with no content, after the parser dropped the prefix. */
-const isNil = (value: unknown): boolean =>
-  isRecord(value) && (value.nil === "true" || value.nil === "1") && Object.keys(value).every((key) => key === "nil" || key === "type");
+/** Text XML treats as whitespace (§2.3 S): what a pretty-printer puts between elements. */
+const isXmlWhitespace = (value: unknown): boolean => typeof value === "string" && /^[\t\n\r ]*$/.test(value);
 
-/** Drops nil elements, so a nillable optional element decodes as absent rather than as an object. */
+/**
+ * `xsi:nil="true"` on an element with no content, after the parser dropped the prefix
+ * (whitespace inside it, as a pretty-printer may leave, counts as no content).
+ */
+const isNil = (value: unknown): boolean =>
+  isRecord(value) &&
+  (value.nil === "true" || value.nil === "1") &&
+  Object.entries(value).every(
+    ([key, child]) => key === "nil" || key === "type" || (key === xmlTextKey && isXmlWhitespace(child)),
+  );
+
+/**
+ * Prepares a parsed response for decoding: drops nil elements, so a nillable optional element
+ * decodes as absent rather than as an object, and drops whitespace-only "#text" from elements
+ * that also carry attributes or children, which is the indentation of a pretty-printed
+ * response rather than content. Text of an element without attributes or children is a plain
+ * string and stays untouched, leading and trailing spaces included. Elements parsed raw (see
+ * `IsdsOperation.raw`) are strings and pass through as received.
+ */
 const normalize = (value: unknown): unknown => {
   if (Array.isArray(value)) return value.filter((item) => !isNil(item)).map(normalize);
   if (!isRecord(value)) return value;
   const out: Record<string, unknown> = {};
   for (const [key, child] of Object.entries(value)) {
+    if (key === xmlTextKey && isXmlWhitespace(child)) continue;
     if (!isNil(child)) out[key] = normalize(child);
   }
   return out;
@@ -86,10 +104,18 @@ export interface IsdsOperation<A> {
   readonly operation: string;
   /** The request body element (the operation element), unqualified; `soapEnvelope` adds the namespace. */
   readonly request: XmlElement;
-  /** Decodes the content of `<{operation}Response>`, after nil elements were dropped. */
+  /**
+   * Decodes the content of `<{operation}Response>`, after nil elements and indentation-only
+   * "#text" were dropped (see `normalize`).
+   */
   readonly response: Schema.Decoder<A>;
   /** Local names of elements that may repeat, so one occurrence still decodes as an array. */
   readonly repeating?: ReadonlySet<string>;
+  /**
+   * Local names of elements whose content is arbitrary XML (xs:any), kept as the raw inner XML
+   * string exactly as received instead of being parsed, nil-filtered or array-forced.
+   */
+  readonly raw?: ReadonlySet<string>;
   /** Which status element the response carries. */
   readonly status: "dm" | "db";
   /**
@@ -116,7 +142,7 @@ export const interpretResponse = Effect.fn("IsdsSoap.interpretResponse")(functio
   const invalid = (detail: string) =>
     new IsdsInvalidResponse({ service: operation.service, operation: operation.operation, detail });
 
-  const parsed = parseXml(reply.body, operation.repeating);
+  const parsed = parseXml(reply.body, operation.repeating, operation.raw);
   if (Result.isFailure(parsed)) return yield* invalid(parsed.failure);
   const document = normalize(parsed.success);
   const envelope = isRecord(document) ? document.Envelope : undefined;

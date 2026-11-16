@@ -1,6 +1,14 @@
 import { assert, describe, it } from "@effect/vitest";
 import { Result } from "effect";
-import { decodeXmlEntities, escapeXml, findInvalidXmlChar, parseXml, renderXml, xmlElement } from "../../src/isds/xml.js";
+import {
+  decodeXmlEntities,
+  escapeXml,
+  escapeXmlAttribute,
+  findInvalidXmlChar,
+  parseXml,
+  renderXml,
+  xmlElement,
+} from "../../src/isds/xml.js";
 
 const render = (...args: Parameters<typeof xmlElement>) => Result.getOrThrow(renderXml(xmlElement(...args)));
 
@@ -76,5 +84,33 @@ describe("parseXml", () => {
 
   it("rejects malformed XML", () => {
     assert.isTrue(Result.isFailure(parseXml("<a><b></a>")));
+  });
+});
+
+describe("attribute values", () => {
+  it("escapes line feeds and tabs in attributes but not in element text", () => {
+    assert.strictEqual(escapeXmlAttribute("a\nb\tc\rd"), "a&#10;b&#9;c&#13;d");
+    const xml = Result.getOrThrow(renderXml(xmlElement("r", "x\ty\nz", { a: "1\n\t2" })));
+    assert.strictEqual(xml, `<r a="1&#10;&#9;2">x\ty\nz</r>`);
+  });
+
+  it("survive attribute-value normalization through a parser round trip", () => {
+    const value = "line one\nline\ttwo\r\n";
+    const xml = Result.getOrThrow(renderXml(xmlElement("r", [xmlElement("f", "t", { dmFileDescr: value })])));
+    assert.deepStrictEqual(Result.getOrThrow(parseXml(xml)), { r: { f: { "#text": "t", dmFileDescr: value } } });
+  });
+});
+
+describe("parseXml raw elements", () => {
+  it("keeps the inner XML of a raw element verbatim, at any depth and with prefixes", () => {
+    const inner = `<q:a xmlns:q="urn:q" xsi:nil="true"/><item/><item>2</item> &amp; <![CDATA[<c>]]>  `;
+    const parsed = Result.getOrThrow(
+      parseXml(`<p:r xmlns:p="urn:p"><p:f><p:dmXMLContent>${inner}</p:dmXMLContent></p:f></p:r>`, new Set(["item", "f"]), new Set(["dmXMLContent"])),
+    );
+    assert.deepStrictEqual(parsed, { r: { f: [{ dmXMLContent: inner }] } });
+  });
+
+  it("still rejects a document whose raw content is malformed", () => {
+    assert.isTrue(Result.isFailure(parseXml("<r><raw><a></raw></r>", new Set(), new Set(["raw"]))));
   });
 });

@@ -21,7 +21,9 @@ const xsiNamespace = "http://www.w3.org/2001/XMLSchema-instance";
  * PDF §2.1.2, p. 45; the overview on p. 42 says "menšími než 20 MB", less than). The PDF defines neither the
  * unit (10^6 or 2^20) nor what is measured (decoded bytes, base64 or the whole request), so this
  * uses the smaller reading: 20,000,000 bytes of decoded attachment content in total. A message the
- * server would accept between 20,000,000 and 20,971,520 bytes is refused locally.
+ * server would accept between 20,000,000 and 20,971,520 bytes is refused locally. This is a
+ * conservative local policy, not a server threshold anyone has measured: ISDS may enforce a
+ * different figure or count differently.
  */
 export const createMessageMaxAttachmentBytes = 20_000_000;
 
@@ -220,11 +222,17 @@ export const checkAttachmentSize = Effect.fn("Isds.createMessage.checkAttachment
  * the attachments total more than `createMessageMaxAttachmentBytes`. Messages over 20 MB need
  * the VoDZ service (UploadAttachment + CreateBigMessage), which is not implemented (TODO).
  *
- * ISDS has no idempotency key: a retry after an unknown outcome can send the message twice. On
- * `IsdsTimeoutError` with `requestSent: true` the message may or may not exist; reconcile with
- * `reconcileSentMessage` before retrying. The timeout is propagated unchanged, never mapped to a
- * success or a failure. A non-success dmStatus fails with `IsdsStatusError` (e.g. 1214
- * `AttachmentRejected`); a 0000 response without dmID fails with `IsdsInvalidResponse`.
+ * ISDS has no idempotency key, and a created message is legally binding: a retry after an
+ * unknown outcome can send it twice. Once the request was sent, ISDS may have created the
+ * message even though the call fails with
+ * - `IsdsTimeoutError` with `requestSent: true`,
+ * - `IsdsTransportError` with reason `Connection` or `ResponseTooLarge` (the request went out,
+ *   the reply was lost or refused),
+ * - `IsdsHttpError` (e.g. a proxy or load balancer error page after ISDS accepted it), or
+ * - `IsdsInvalidResponse`, including status 0000 without a dmID.
+ * After any of these, reconcile with `reconcileSentMessage` before retrying. These failures are
+ * propagated unchanged, never mapped to a success or a failure. A non-success dmStatus fails
+ * with `IsdsStatusError` (e.g. 1214 `AttachmentRejected`): ISDS answered that it refused it.
  */
 export const createMessage = Effect.fn("Isds.createMessage")(function* (input: CreateMessageInput) {
   const valid = yield* decodeInput(input).pipe(

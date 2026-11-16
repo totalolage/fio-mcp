@@ -47,22 +47,15 @@ export const FileMetaType = Schema.Literals(["main", "enclosure", "signature", "
 export type FileMetaType = typeof FileMetaType.Type;
 
 /**
- * The content of a dmXMLContent element (`xs:any processContents="skip"`): the element tree as
- * the response parser leaves it. Element local names are keys (namespace prefixes dropped),
- * attributes are merged in without a prefix, text of an element with attributes or children
- * sits under "#text" (whitespace between child elements included), every value is a string,
- * and repeated sibling elements become arrays. It is a structural view for reading, not a
- * byte-exact copy of the signed XML: for verifiable content use `downloadSignedMessage`.
+ * The content of a dmXMLContent element (`xs:any processContents="skip"`, dmBaseTypes.xsd:80-88):
+ * the inner XML exactly as ISDS sent it, between `<dmXMLContent>` and `</dmXMLContent>`, not
+ * parsed and with entity references, CDATA sections, comments and surrounding whitespace kept
+ * verbatim. Namespace declarations made on ancestors (dmXMLContent itself, the SOAP envelope)
+ * are not part of it, so a prefix the content uses without declaring it must be resolved by
+ * the caller. It is the XML as transmitted in this response, not the signed original: for
+ * verifiable content use `downloadSignedMessage`.
  */
-export type XmlValue = string | ReadonlyArray<XmlValue> | { readonly [name: string]: XmlValue };
-export const XmlValue: Schema.Codec<XmlValue> = Schema.Union([
-  Schema.String,
-  Schema.Array(Schema.suspend((): Schema.Codec<XmlValue> => XmlValue)),
-  Schema.Record(
-    Schema.String,
-    Schema.suspend((): Schema.Codec<XmlValue> => XmlValue),
-  ),
-]);
+export const XmlContent = Schema.String;
 
 /** The attributes of a dmFile (tFilesArray, dmBaseTypes.xsd:92-144). */
 const fileAttributes = {
@@ -76,12 +69,12 @@ const fileAttributes = {
 
 /**
  * One returned document (dmFile). tFile is a choice (dmBaseTypes.xsd:73-91), so a file carries
- * exactly one of `dmEncodedContent` (the decoded bytes) or `dmXMLContent` (see `XmlValue`);
+ * exactly one of `dmEncodedContent` (the decoded bytes) or `dmXMLContent` (see `XmlContent`);
  * narrow with `"dmEncodedContent" in file`.
  */
 export const MessageFile = Schema.Union([
   Schema.Struct({ ...fileAttributes, dmEncodedContent: Base64Bytes }),
-  Schema.Struct({ ...fileAttributes, dmXMLContent: XmlValue }),
+  Schema.Struct({ ...fileAttributes, dmXMLContent: XmlContent }),
 ]);
 export type MessageFile = typeof MessageFile.Type;
 
@@ -94,6 +87,9 @@ export type DeliveryEvent = typeof DeliveryEvent.Type;
 
 /** Elements that repeat in these responses; one occurrence must still decode as an array. */
 const repeating: ReadonlySet<string> = new Set(["dmFile", "dmEvent"]);
+
+/** Elements whose content is arbitrary XML, kept as the raw inner XML string (see `XmlContent`). */
+const raw: ReadonlySet<string> = new Set(["dmXMLContent"]);
 
 /**
  * tReturnedMessageEnvelope (dmBaseTypes.xsd:611-643): the envelope of a message with its
@@ -227,6 +223,7 @@ export const downloadMessage = Effect.fn("Isds.downloadMessage")(function* (inpu
     request: messageIdRequest(operation, dmID),
     response: Schema.Struct({ dmReturnedMessage: ReturnedMessage }),
     repeating,
+    raw,
     status: "dm",
   });
   return response.dmReturnedMessage;

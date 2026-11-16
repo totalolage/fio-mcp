@@ -21,8 +21,26 @@ export const XsBoolean = Schema.Literals(["true", "false", "1", "0"]).pipe(
 /** xs:dateTime ↔ DateTime.Utc. ISDS sends an offset (e.g. `2026-01-02T10:00:00.123+01:00`). */
 export const XsDateTime = Schema.DateTimeUtcFromString;
 
-/** xs:integer / xs:int / xs:long within the safe integer range ↔ number. */
-export const XsInteger = Schema.FiniteFromString.pipe(Schema.check(Schema.isInt()));
+/**
+ * xs:integer / xs:int / xs:long within the safe integer range ↔ number. Only the xs:integer
+ * lexical form (XSD Part 2 §3.3.13): an optional sign and decimal digits, with surrounding XML
+ * whitespace allowed (whiteSpace facet "collapse"). "1e3", "0x10", "1.0" and "" are rejected,
+ * as is any value outside ±(2^53 − 1), which a JavaScript number can't hold exactly.
+ */
+export const XsInteger = Schema.String.pipe(
+  Schema.check(Schema.isPattern(/^[\t\n\r ]*[+-]?[0-9]+[\t\n\r ]*$/)),
+  Schema.decodeTo(
+    Schema.Finite.pipe(
+      Schema.check(
+        Schema.makeFilter((value: number) => (Number.isSafeInteger(value) ? undefined : "Expected a safe integer")),
+      ),
+    ),
+    SchemaTransformation.transform({
+      decode: (text: string) => Number(text.trim()),
+      encode: (value: number) => String(value),
+    }),
+  ),
+);
 
 /** Canonical base64 text: whole quanta of the standard alphabet with at most two `=` of padding. */
 const Base64Text = Schema.String.pipe(
@@ -91,12 +109,13 @@ export const xmlTextMax = (maxLength: number) =>
 
 /**
  * A repeating element inside an optional container, e.g. `<dmRecords><dmRecord/>…</dmRecords>`.
- * The container may be absent or empty (`<dmRecords/>` parses as ""), which decodes as [].
+ * The container may be absent or empty (`<dmRecords/>` parses as "", a pretty-printed
+ * `<dmRecords>\n</dmRecords>` as whitespace), which decodes as [].
  * The element name must be in the operation's `repeating` set so one item still parses as an array.
  */
 export const xmlList = <S extends Schema.Top>(itemName: string, item: S) =>
   Schema.Union([
-    Schema.Literal(""),
+    Schema.String.pipe(Schema.check(Schema.isPattern(/^[\t\n\r ]*$/))),
     Schema.Struct({ [itemName]: Schema.optional(Schema.Array(item)) }),
   ]).pipe(
     Schema.decodeTo(

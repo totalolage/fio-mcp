@@ -73,6 +73,16 @@ const escapes: Readonly<Record<string, string>> = {
 /** Escapes text for use in element content or a double- or single-quoted attribute value. */
 export const escapeXml = (text: string): string => text.replace(/[&<>"'\r]/g, (char) => escapes[char] ?? char);
 
+const attributeEscapes: Readonly<Record<string, string>> = { ...escapes, "\n": "&#10;", "\t": "&#9;" };
+
+/**
+ * Escapes an attribute value. Besides `escapeXml`, line feeds and tabs become character
+ * references: attribute-value normalization (XML 1.0 §3.3.3) turns a literal one into a space,
+ * but leaves a referenced one intact.
+ */
+export const escapeXmlAttribute = (text: string): string =>
+  text.replace(/[&<>"'\r\n\t]/g, (char) => attributeEscapes[char] ?? char);
+
 /**
  * Serializes an element tree. Fails with a description when any text or attribute value
  * contains a character XML cannot represent.
@@ -93,7 +103,7 @@ export const renderXml = (root: XmlElement): Result.Result<string, string> => {
       if (invalid !== undefined) {
         return Result.fail(`attribute ${name} of <${next.name}> contains a character XML cannot carry at index ${invalid}`);
       }
-      parts.push(` ${name}="${escapeXml(value)}"`);
+      parts.push(` ${name}="${escapeXmlAttribute(value)}"`);
     }
     if (typeof next.content === "string") {
       const invalid = findInvalidXmlChar(next.content);
@@ -143,7 +153,7 @@ const entityDecoder = {
 /** The key under which the parser stores an element's text when it also has attributes. */
 export const xmlTextKey = "#text";
 
-const parserOptions = (repeating: ReadonlySet<string>) => ({
+const parserOptions = (repeating: ReadonlySet<string>, raw: ReadonlySet<string>) => ({
   // Namespace prefixes are dropped; callers check the SOAP structure by local name.
   removeNSPrefix: true,
   ignoreAttributes: false,
@@ -162,21 +172,32 @@ const parserOptions = (repeating: ReadonlySet<string>) => ({
   entityDecoder,
   isArray: (tagName: string, _jPath: unknown, _isLeafNode: boolean, isAttribute: boolean) =>
     !isAttribute && repeating.has(tagName),
+  // Stop nodes: the parser keeps their content as the raw text between the tags.
+  stopNodes: [...raw].map((name) => `*.${name}`),
 });
 
 /**
  * Parses an XML document into plain objects: element local names as keys, attributes merged
  * in without a prefix, every value a string. Elements named in `repeating` are always arrays,
- * so a single occurrence decodes like many. Fails with a description on malformed XML or on a
- * document type declaration (SOAP forbids them; refusing them rules out entity expansion).
+ * so a single occurrence decodes like many. Elements named in `raw` keep their content as the
+ * inner XML exactly as received (markup, entity references, CDATA and comments unexpanded;
+ * namespace declarations of ancestors are not included); the whole document, raw content
+ * included, must still be well-formed. Text is never trimmed, so whitespace between elements
+ * of a pretty-printed document shows up as "#text" (see `soap.ts` for how responses drop it).
+ * Fails with a description on malformed XML or on a document type declaration (SOAP forbids
+ * them; refusing them rules out entity expansion).
  */
-export const parseXml = (xml: string, repeating: ReadonlySet<string> = new Set()): Result.Result<unknown, string> => {
+export const parseXml = (
+  xml: string,
+  repeating: ReadonlySet<string> = new Set(),
+  raw: ReadonlySet<string> = new Set(),
+): Result.Result<unknown, string> => {
   if (/<!DOCTYPE/i.test(xml)) {
     return Result.fail("the document contains a DOCTYPE declaration");
   }
   return Result.try({
     // `true` validates well-formedness first; without it the parser silently repairs input.
-    try: (): unknown => new XMLParser(parserOptions(repeating)).parse(xml, true),
+    try: (): unknown => new XMLParser(parserOptions(repeating, raw)).parse(xml, true),
     catch: (error) => `malformed XML: ${error instanceof Error ? error.message : String(error)}`,
   });
 };

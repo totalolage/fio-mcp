@@ -26,8 +26,8 @@ const invalidRequest = (operation: string) => (error: Schema.SchemaError) =>
 // ---------------------------------------------------------------------------------------------
 // Shared types
 
-/** tDbType (dbTypes.xsd:210-237): the type of an existing data box, as ISDS reports it. */
-export const DataBoxType = Schema.Literals([
+/** tDbType (dbTypes.xsd:210-237): the data box types this client knows of. */
+export const KnownDataBoxType = Schema.Literals([
   "FO",
   "PFO",
   "PFO_REQ",
@@ -51,7 +51,20 @@ export const DataBoxType = Schema.Literals([
   "OVM_PFO",
   "OVM_PO",
 ]);
-export type DataBoxType = typeof DataBoxType.Type;
+export type KnownDataBoxType = typeof KnownDataBoxType.Type;
+
+/** Whether a reported `dbType` is one of the tDbType values this client knows of. */
+export const isKnownDataBoxType = Schema.is(KnownDataBoxType);
+
+/**
+ * The type of an existing data box, as ISDS reports it in responses. ISDS adds subtypes over
+ * time (PFO_ARCH, PFO_AIAT and PFO_AZI arrived in XSD v3.04, dbTypes.xsd:77), so a value outside tDbType still
+ * decodes rather than failing the whole response: it is typed `KnownDataBoxType | (string & {})`,
+ * which keeps editor completion for the known values while admitting any string. Narrow with
+ * `isKnownDataBoxType`. Request inputs stay strict (see `FindDataBoxType`).
+ */
+export type DataBoxType = KnownDataBoxType | (string & {});
+export const DataBoxType: Schema.Codec<DataBoxType> = Schema.String;
 
 /**
  * The FindDataBox2 input `dbType` enumeration (dbTypes.xsd:696-722). It differs from

@@ -214,10 +214,59 @@ describe("downloadMessage", () => {
       assert.strictEqual(xml?.dmFileMetaType, "enclosure");
       assert.strictEqual(xml?.dmUpFileGuid, "g-1");
       if (xml === undefined || !("dmXMLContent" in xml)) return assert.fail("expected an XML file");
-      const content = xml.dmXMLContent;
-      if (typeof content !== "object" || Array.isArray(content)) return assert.fail("expected an element tree");
-      const form = "Formular" in content ? content.Formular : undefined;
-      assert.deepInclude(form, { verze: "2", Polozka: ["A", "B"] });
+      assert.strictEqual(
+        xml.dmXMLContent,
+        `
+                <f:Formular xmlns:f="urn:example:form" verze="2"><f:Polozka>A</f:Polozka><f:Polozka>B</f:Polozka></f:Formular>
+              `,
+      );
+    }),
+  );
+
+  it.effect("keeps dmXMLContent verbatim: nil-looking, repeated-name and escaped content untouched", () =>
+    Effect.gen(function* () {
+      const inner =
+          `<x:Doc xmlns:x="urn:x" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">` +
+          `<x:Gone xsi:nil="true"/><dmFile>1</dmFile><dmEvent/><x:Note> a &amp; b <![CDATA[<y>]]><!-- c --></x:Note>` +
+          `<dmXMLContent>nested</dmXMLContent></x:Doc>\n  `;
+      const original = fixture("MessageDownload.xml");
+      const start = original.indexOf("<p:dmXMLContent>") + "<p:dmXMLContent>".length;
+      const end = original.indexOf("</p:dmXMLContent>");
+      const { result } = yield* run(
+        downloadMessage({ dmID: "8765432" }),
+        ok(`${original.slice(0, start)}${inner}${original.slice(end)}`),
+      );
+      const xml = result.dmDm.dmFiles[1];
+      if (xml === undefined || !("dmXMLContent" in xml)) return assert.fail("expected an XML file");
+      assert.strictEqual(xml.dmXMLContent, inner);
+    }),
+  );
+
+  it.effect("an empty dmXMLContent decodes as an empty string", () =>
+    Effect.gen(function* () {
+      const original = fixture("MessageDownload.xml");
+      const start = original.indexOf("<p:dmXMLContent>");
+      const end = original.indexOf("</p:dmXMLContent>") + "</p:dmXMLContent>".length;
+      const { result } = yield* run(
+        downloadMessage({ dmID: "8765432" }),
+        ok(`${original.slice(0, start)}<p:dmXMLContent/>${original.slice(end)}`),
+      );
+      const xml = result.dmDm.dmFiles[1];
+      if (xml === undefined || !("dmXMLContent" in xml)) return assert.fail("expected an XML file");
+      assert.strictEqual(xml.dmXMLContent, "");
+    }),
+  );
+
+  it.effect("malformed XML inside dmXMLContent fails as an invalid response", () =>
+    Effect.gen(function* () {
+      const original = fixture("MessageDownload.xml");
+      const start = original.indexOf("<p:dmXMLContent>") + "<p:dmXMLContent>".length;
+      const end = original.indexOf("</p:dmXMLContent>");
+      const { error } = yield* fails(
+        downloadMessage({ dmID: "8765432" }),
+        ok(`${original.slice(0, start)}<a><b></a>${original.slice(end)}`),
+      );
+      assert.strictEqual(error._tag, "IsdsInvalidResponse");
     }),
   );
 
