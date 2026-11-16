@@ -80,7 +80,7 @@ export function makeRedactor(initial: ReadonlyArray<string>): RedactorShape {
     // leave a token prefix that redact no longer recognizes.
     const text = redact(
       redact(body)
-        .replace(/<[^>]+>/g, " ")
+        .replace(/<[^<>]*>/g, " ")
         .replace(/\s+/g, " ")
         .trim(),
     );
