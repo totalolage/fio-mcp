@@ -2,10 +2,11 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { assert, describe, it } from "@effect/vitest";
-import { Effect, Redacted } from "effect";
+import { Effect, Redacted, Result } from "effect";
 import { MIN_RATE_LIMIT_INTERVAL_MS } from "../src/config.js";
 import { ConfigError } from "../src/errors.js";
 import { hashPassword } from "../src/oauth/crypto.js";
+import { type PaymentFormValues, parsePaymentForm } from "../src/payment-form.js";
 import { loadConfigFrom, PAY_TOKEN, READ_TOKEN } from "./fixtures.js";
 
 const configError = (env: Record<string, string>) =>
@@ -513,6 +514,37 @@ describe("payment limits", () => {
   const PER_ORDER = "FIO_MCP_PAYMENT_MAX_PER_ORDER";
   const PER_DAY = "FIO_MCP_PAYMENT_MAX_PER_DAY";
   const ORDERS = "FIO_MCP_PAYMENT_MAX_ORDERS_PER_DAY";
+
+  it.effect("refuses consent-form limits above the configured ceiling", () =>
+    Effect.gen(function* () {
+      const { paymentLimits } = yield* loadConfigFrom({
+        FIO_TOKEN: READ_TOKEN,
+        [PER_ORDER]: "CZK:1000",
+        [PER_DAY]: "CZK:2000",
+        [ORDERS]: "5",
+      });
+      const form = (fields: Partial<PaymentFormValues>): PaymentFormValues => ({
+        maxPerOrder: "CZK:1000",
+        maxPerDay: "CZK:2000",
+        maxOrdersPerDay: "5",
+        mode: "off",
+        allowlist: "",
+        ...fields,
+      });
+      assert.isTrue(Result.isSuccess(parsePaymentForm(form({}), paymentLimits)));
+      assert.isTrue(Result.isSuccess(parsePaymentForm(form({ maxPerOrder: "CZK:10", maxPerDay: "CZK:20" }), paymentLimits)));
+      for (const above of [
+        { maxPerOrder: "CZK:1000.01" },
+        { maxPerDay: "CZK:2001" },
+        { maxOrdersPerDay: "6" },
+        { maxPerOrder: "CZK:1000,EUR:1", maxPerDay: "CZK:2000,EUR:1" },
+      ]) {
+        const parsed = parsePaymentForm(form(above), paymentLimits);
+        assert.isTrue(Result.isFailure(parsed), JSON.stringify(above));
+        if (Result.isFailure(parsed)) assert.match(parsed.failure, /server ceiling|not allowed by the server/);
+      }
+    }),
+  );
 
   it.effect("defaults to CZK:50000,EUR:2000 per order, CZK:100000,EUR:4000 per day and 20 orders", () =>
     Effect.gen(function* () {
