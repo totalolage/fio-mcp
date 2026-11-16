@@ -19,8 +19,11 @@ const nilElement = (name: string): XmlElement => xmlElement(name, [], { "xsi:nil
 const nillableElement = (name: string, value: string | number | undefined): XmlElement =>
   value === undefined ? nilElement(name) : xmlElement(name, String(value));
 
-const timeElement = (name: string, value: DateTime.Utc | undefined): XmlElement =>
-  nillableElement(name, value === undefined ? undefined : formatXsDateTime(value));
+/** The window bounds as xs:dateTime text (dmFromTime/dmToTime); undefined is sent as nil. */
+interface FormattedWindow {
+  readonly from: string | undefined;
+  readonly to: string | undefined;
+}
 
 const PositiveInt = Schema.Finite.pipe(Schema.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(1)));
 
@@ -107,27 +110,54 @@ const repeating: ReadonlySet<string> = new Set(["dmRecord"]);
 const invalidRequest = (operation: string) => (error: { readonly message: string }) =>
   new IsdsInvalidRequest({ operation, detail: error.message });
 
-/** Validates the input and rejects a window whose start is after its end. */
+/**
+ * Renders one bound; fails when it has no xs:dateTime form ISDS accepts (see formatXsDateTime),
+ * so a non-finite or out-of-range instant becomes IsdsInvalidRequest, never a defect.
+ */
+const formatBound = (operation: string, name: "from" | "to", value: DateTime.Utc) =>
+  Effect.fromOption(formatXsDateTime(value)).pipe(
+    Effect.mapError(
+      () =>
+        new IsdsInvalidRequest({
+          operation,
+          detail: `\`${name}\` is not a finite instant in years 0001–9999, so it has no xs:dateTime form`,
+        }),
+    ),
+  );
+
+/**
+ * Validates the input, rejects a window whose start is after its end, and renders the bounds
+ * (every check runs before anything is sent).
+ */
 const validateWindow = Effect.fn("Isds.validateWindow")(function* <A extends MessageStateChangesInput>(
   operation: string,
   schema: Schema.Decoder<A>,
   input: unknown,
 ) {
   const decoded = yield* Schema.decodeUnknownEffect(schema)(input).pipe(Effect.mapError(invalidRequest(operation)));
+  const window: FormattedWindow = {
+    from: decoded.from === undefined ? undefined : yield* formatBound(operation, "from", decoded.from),
+    to: decoded.to === undefined ? undefined : yield* formatBound(operation, "to", decoded.to),
+  };
   if (decoded.from !== undefined && decoded.to !== undefined && DateTime.isGreaterThan(decoded.from, decoded.to)) {
     return yield* new IsdsInvalidRequest({ operation, detail: "`from` is after `to`" });
   }
-  return decoded;
+  return { input: decoded, window };
 });
 
 /**
  * Builds tListOfSentInput / tListOfFReceivedInput (dmBaseTypes.xsd:784-817, 828-861): every
  * element is required, all but dmStatusFilter nillable. The org-unit element is always nil.
  */
-const listRequest = (operation: string, orgUnitElement: string, input: ListMessagesInput): XmlElement =>
+const listRequest = (
+  operation: string,
+  orgUnitElement: string,
+  input: ListMessagesInput,
+  window: FormattedWindow,
+): XmlElement =>
   xmlElement(operation, [
-    timeElement("dmFromTime", input.from),
-    timeElement("dmToTime", input.to),
+    nillableElement("dmFromTime", window.from),
+    nillableElement("dmToTime", window.to),
     nilElement(orgUnitElement),
     xmlElement("dmStatusFilter", String(messageStateMask(input.states ?? ("all" satisfies MessageStateFilter)))),
     nillableElement("dmOffset", input.offset),
@@ -138,7 +168,7 @@ const listMessages = Effect.fn("Isds.listMessages")(function* (
   operation: "GetListOfReceivedMessages" | "GetListOfSentMessages",
   input: ListMessagesInput,
 ) {
-  const valid = yield* validateWindow(operation, ListMessagesInput, input);
+  const { input: valid, window } = yield* validateWindow(operation, ListMessagesInput, input);
   const request: IsdsOperation<typeof MessageListResponse.Type> = {
     service: "info",
     operation,
@@ -146,6 +176,7 @@ const listMessages = Effect.fn("Isds.listMessages")(function* (
       operation,
       operation === "GetListOfReceivedMessages" ? "dmRecipientOrgUnitNum" : "dmSenderOrgUnitNum",
       valid,
+      window,
     ),
     response: MessageListResponse,
     repeating,
@@ -201,11 +232,11 @@ export const getMessageStateChanges = Effect.fn("Isds.getMessageStateChanges")(f
   input: MessageStateChangesInput = {},
 ) {
   const operation = "GetMessageStateChanges";
-  const valid = yield* validateWindow(operation, MessageStateChangesInput, input);
+  const { window } = yield* validateWindow(operation, MessageStateChangesInput, input);
   const { response } = yield* callIsds({
     service: "info",
     operation,
-    request: xmlElement(operation, [timeElement("dmFromTime", valid.from), timeElement("dmToTime", valid.to)]),
+    request: xmlElement(operation, [nillableElement("dmFromTime", window.from), nillableElement("dmToTime", window.to)]),
     response: StateChangesResponse,
     repeating,
     status: "dm",
