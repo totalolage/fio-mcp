@@ -759,6 +759,22 @@ describe("admin TOTP second factor at /admin/login (SEC-03)", () => {
   });
 });
 
+describe("busy password check at /admin/password (SEC-09)", () => {
+  it("says sign-in busy, not the lockout text, when another check holds the slot", async () => {
+    await harness.close();
+    // A real busy answer depends on timing; the stub returns it for every change.
+    harness = await startOAuth({
+      adminPassword: (real) => ({
+        ...real,
+        change: () => Effect.succeed({ _tag: "Throttled", retryAfterSeconds: 1, busy: true } as const),
+      }),
+    });
+    const admin = await signedIn();
+    const result = await admin.act("/admin/password", { current: PASSWORD, next: NEW_PASSWORD, confirm: NEW_PASSWORD });
+    expect(result.message).toBe("Sign-in busy, try again.");
+  });
+});
+
 describe("busy sign-in at /admin/login (SEC-09)", () => {
   it("answers a sign-in that finds another check running as busy, with retry-after 1", async () => {
     await harness.close();

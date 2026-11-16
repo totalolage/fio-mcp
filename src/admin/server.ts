@@ -403,6 +403,8 @@ export const makeAdminServer = Effect.fn("AdminServer.make")(function* (settings
         case "Rejected":
           return { kind: "error", text: "The current password is wrong." } satisfies Flash;
         case "Throttled":
+          // Busy: another check is running; this attempt was not counted.
+          if (result.busy === true) return { kind: "error", text: "Sign-in busy, try again." } satisfies Flash;
           return { kind: "error", text: `Too many failed attempts. Try again in ${result.retryAfterSeconds} s.` } satisfies Flash;
         case "Unavailable":
           return { kind: "error", text: "The password could not be checked. See the server log." } satisfies Flash;
