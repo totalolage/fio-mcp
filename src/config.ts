@@ -101,6 +101,14 @@ export interface CacheConfig {
   readonly overlapDays: number;
   /** A cached day fetched less than this long ago counts as fresh. */
   readonly maxAgeMinutes: number;
+  /** FIO_CACHE_ENCRYPT: seal the cached free-text and identifying columns with `dataKey` (src/cache/encryption.ts). */
+  readonly encrypt: boolean;
+  /**
+   * The data key (FIO_MCP_DATA_KEY_FILE) the cache seals with, or opens rows
+   * sealed earlier with. Always set when `encrypt` is; undefined when the
+   * variable is not set.
+   */
+  readonly dataKey: Redacted.Redacted<Uint8Array> | undefined;
 }
 
 export interface AppConfigShape {
@@ -123,7 +131,15 @@ export interface AppConfigShape {
   readonly maxResponseBytes: number;
   readonly transport: TransportConfig;
   readonly cache: CacheConfig;
+  /**
+   * FIO_MCP_MARKER_TOOLS (SEC-10). `disabled` leaves out get_new_transactions
+   * and set_download_marker, the tools that move the token's download marker
+   * in the bank. Absent means `enabled`.
+   */
+  readonly markerTools?: MarkerTools;
 }
+
+export type MarkerTools = "enabled" | "disabled";
 
 export const DEFAULT_BASE_URL = "https://fioapi.fio.cz/v1/rest";
 export const DEFAULT_RATE_LIMIT_INTERVAL_MS = 30_000;
@@ -392,14 +408,12 @@ const loadAccountSeed = Effect.fn("config.loadAccountSeed")(function* () {
 
 const DATA_KEY_HELP = "create one with `openssl rand -hex 32 > fio_mcp_data_key` and keep a copy outside the database backups";
 
-/** FIO_MCP_DATA_KEY_FILE: 32 bytes as 64 hex digits or base64. Never echoes the content. */
-const loadDataKey = Effect.fn("config.loadDataKey")(function* () {
+const OAUTH_DATA_KEY_REQUIRED = `HTTP mode with OAuth requires FIO_MCP_DATA_KEY_FILE, the key that encrypts the FIO tokens in the database; ${DATA_KEY_HELP}`;
+
+/** FIO_MCP_DATA_KEY_FILE: 32 bytes as 64 hex digits or base64. Never echoes the content. Fails with `missing` when unset. */
+const loadDataKey = Effect.fn("config.loadDataKey")(function* (missing: string = OAUTH_DATA_KEY_REQUIRED) {
   const file = yield* optionalVar("FIO_MCP_DATA_KEY_FILE");
-  if (Option.isNone(file)) {
-    return yield* fail(
-      `HTTP mode with OAuth requires FIO_MCP_DATA_KEY_FILE, the key that encrypts the FIO tokens in the database; ${DATA_KEY_HELP}`,
-    );
-  }
+  if (Option.isNone(file)) return yield* fail(missing);
   const fs = yield* FileSystem.FileSystem;
   const content = yield* fs
     .readFileString(file.value)
@@ -443,7 +457,22 @@ const loadTransport = Effect.fn("config.loadTransport")(function* () {
   } satisfies TransportConfig;
 });
 
-const loadCache = Effect.fn("config.loadCache")(function* () {
+const CACHE_DATA_KEY_REQUIRED = `FIO_CACHE_ENCRYPT is on but FIO_MCP_DATA_KEY_FILE is not set; the cache is encrypted with that key; ${DATA_KEY_HELP}`;
+
+/**
+ * FIO_CACHE_ENCRYPT and the key it uses: with OAuth the data key loaded for
+ * the FIO tokens; otherwise FIO_MCP_DATA_KEY_FILE, required when encryption
+ * is on and read whenever it is set (it opens rows sealed earlier when
+ * encryption has been turned off).
+ */
+const loadCacheEncryption = Effect.fn("config.loadCacheEncryption")(function* (transport: TransportConfig) {
+  const encrypt = yield* boolVar("FIO_CACHE_ENCRYPT", false);
+  if (transport.kind === "http" && transport.auth.kind === "oauth") return { encrypt, dataKey: transport.auth.dataKey };
+  const keyFileSet = Option.isSome(yield* optionalVar("FIO_MCP_DATA_KEY_FILE"));
+  return { encrypt, dataKey: encrypt || keyFileSet ? yield* loadDataKey(CACHE_DATA_KEY_REQUIRED) : undefined };
+});
+
+const loadCache = Effect.fn("config.loadCache")(function* (transport: TransportConfig) {
   const enabled = yield* boolVar("FIO_CACHE_ENABLED", true);
   const explicitPath = yield* optionalVar("FIO_DB_PATH");
   const xdg = yield* optionalVar("XDG_DATA_HOME");
@@ -469,7 +498,14 @@ const loadCache = Effect.fn("config.loadCache")(function* () {
     backfillFrom,
     overlapDays: yield* intVar("FIO_SYNC_OVERLAP_DAYS", DEFAULT_OVERLAP_DAYS, 1),
     maxAgeMinutes: yield* intVar("FIO_CACHE_MAX_AGE_MINUTES", DEFAULT_CACHE_MAX_AGE_MINUTES, 0),
+    ...(yield* loadCacheEncryption(transport)),
   } satisfies CacheConfig;
+});
+
+const loadMarkerTools = Effect.fn("config.loadMarkerTools")(function* () {
+  const value = Option.getOrElse(yield* optionalVar("FIO_MCP_MARKER_TOOLS"), () => "enabled").toLowerCase();
+  if (value !== "enabled" && value !== "disabled") return yield* fail("FIO_MCP_MARKER_TOOLS must be enabled or disabled");
+  return value satisfies MarkerTools;
 });
 
 /** Reads and validates the whole configuration. */
@@ -477,7 +513,7 @@ export const loadConfig = Effect.fn("config.load")(function* () {
   const transport = yield* loadTransport();
   const accounts = transport.kind === "http" && transport.auth.kind === "oauth" ? [] : yield* loadAccounts(false);
   const baseUrl = Option.getOrElse(yield* optionalVar("FIO_API_BASE_URL"), () => DEFAULT_BASE_URL).replace(/\/+$/, "");
-  const cache = yield* loadCache();
+  const cache = yield* loadCache(transport);
   if (transport.kind === "http" && transport.auth.kind === "oauth" && cache.dbPath === "") {
     return yield* fail(
       "FIO_DB_PATH is not set and neither XDG_DATA_HOME nor HOME is, so the OAuth clients and tokens have no location",
@@ -498,6 +534,7 @@ export const loadConfig = Effect.fn("config.load")(function* () {
     maxResponseBytes: MAX_RESPONSE_BYTES,
     transport,
     cache,
+    markerTools: yield* loadMarkerTools(),
   };
   return config;
 });

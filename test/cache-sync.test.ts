@@ -900,7 +900,7 @@ describe("retiring a token removed at /admin", () => {
         // The purge fails: main stays, the token only it had stays fenced, the tokens others use still write.
         yield* sql`DROP TABLE accounts`;
         assert.strictEqual((yield* Effect.flip(admin.remove(before.id, true)))._tag, "CacheError");
-        yield* sql`CREATE TABLE accounts (account_key TEXT PRIMARY KEY, account_id TEXT NOT NULL, bank_id TEXT NOT NULL, iban TEXT, bic TEXT, currency TEXT, balance REAL, balance_date TEXT, updated_at INTEGER NOT NULL)`;
+        yield* sql`CREATE TABLE accounts (account_key TEXT PRIMARY KEY, account_id TEXT NOT NULL, bank_id TEXT NOT NULL, iban TEXT, bic TEXT, currency TEXT, balance REAL, balance_date TEXT, updated_at INTEGER NOT NULL, sealed INTEGER NOT NULL DEFAULT 0)`;
         assert.deepStrictEqual((yield* (yield* Accounts).list).map((some) => some.name).sort(), ["beta", "gamma", "main"]);
         assert.isNull(yield* jobOf(before));
         assert.isFalse(yield* write(onlyMain, "2000000001"));
@@ -940,7 +940,7 @@ describe("retiring a token removed at /admin", () => {
         yield* sql`DROP TABLE accounts`;
         const failed = yield* Effect.flip(admin.remove(main.id, true));
         assert.strictEqual(failed._tag, "CacheError");
-        yield* sql`CREATE TABLE accounts (account_key TEXT PRIMARY KEY, account_id TEXT NOT NULL, bank_id TEXT NOT NULL, iban TEXT, bic TEXT, currency TEXT, balance REAL, balance_date TEXT, updated_at INTEGER NOT NULL)`;
+        yield* sql`CREATE TABLE accounts (account_key TEXT PRIMARY KEY, account_id TEXT NOT NULL, bank_id TEXT NOT NULL, iban TEXT, bic TEXT, currency TEXT, balance REAL, balance_date TEXT, updated_at INTEGER NOT NULL, sealed INTEGER NOT NULL DEFAULT 0)`;
         assert.deepStrictEqual((yield* (yield* Accounts).list).map((some) => some.name), ["main"]);
         const [left] = yield* sql<{ n: number }>`SELECT COUNT(*) AS n FROM transactions`;
         assert.strictEqual(left?.n, 1);

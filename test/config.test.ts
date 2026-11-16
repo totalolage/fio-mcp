@@ -22,6 +22,25 @@ const secretFile = (content: string) => {
   return path;
 };
 
+describe("FIO_MCP_MARKER_TOOLS", () => {
+  it.effect("defaults to enabled and reads enabled or disabled, trimmed and case-insensitive", () =>
+    Effect.gen(function* () {
+      assert.strictEqual((yield* loadConfigFrom({ FIO_TOKEN: READ_TOKEN })).markerTools, "enabled");
+      assert.strictEqual((yield* loadConfigFrom({ FIO_TOKEN: READ_TOKEN, FIO_MCP_MARKER_TOOLS: "  " })).markerTools, "enabled");
+      const disabled = yield* loadConfigFrom({ FIO_TOKEN: READ_TOKEN, FIO_MCP_MARKER_TOOLS: " Disabled " });
+      assert.strictEqual(disabled.markerTools, "disabled");
+    }),
+  );
+
+  it.effect("fails startup on any other value without echoing it", () =>
+    Effect.gen(function* () {
+      const message = yield* configError({ FIO_TOKEN: READ_TOKEN, FIO_MCP_MARKER_TOOLS: "off-ish" });
+      assert.include(message, "FIO_MCP_MARKER_TOOLS");
+      assert.notInclude(message, "off-ish");
+    }),
+  );
+});
+
 describe("loadConfig", () => {
   it.effect("reads a single token with defaults", () =>
     Effect.gen(function* () {
@@ -470,6 +489,60 @@ describe("loadConfig", () => {
       const message = yield* configError({ ...env, FIO_MCP_TRUSTED_PROXIES: "172.18.0.0/16,secret-proxy-name" });
       assert.include(message, "FIO_MCP_TRUSTED_PROXIES entry 2");
       assert.notInclude(message, "secret-proxy-name");
+    }),
+  );
+
+  it.effect("reads FIO_CACHE_ENCRYPT, off by default, and requires FIO_MCP_DATA_KEY_FILE without OAuth", () =>
+    Effect.gen(function* () {
+      const keyBytes = Array.from({ length: 32 }, () => 0xab);
+      const keyFile = secretFile(`${"ab".repeat(32)}\n`);
+      const off = yield* loadConfigFrom({ FIO_TOKEN: READ_TOKEN });
+      assert.isFalse(off.cache.encrypt);
+      assert.isUndefined(off.cache.dataKey);
+      assert.isFalse((yield* loadConfigFrom({ FIO_TOKEN: READ_TOKEN, FIO_CACHE_ENCRYPT: "  " })).cache.encrypt);
+
+      const on = yield* loadConfigFrom({ FIO_TOKEN: READ_TOKEN, FIO_CACHE_ENCRYPT: " true ", FIO_MCP_DATA_KEY_FILE: keyFile });
+      assert.isTrue(on.cache.encrypt);
+      assert.deepStrictEqual(Array.from(Redacted.value(on.cache.dataKey ?? Redacted.make(new Uint8Array()))), keyBytes);
+      // Off with the key file set: the key stays available to decrypt rows sealed while it was on.
+      const turnedOff = yield* loadConfigFrom({ FIO_TOKEN: READ_TOKEN, FIO_CACHE_ENCRYPT: "off", FIO_MCP_DATA_KEY_FILE: keyFile });
+      assert.isFalse(turnedOff.cache.encrypt);
+      assert.isDefined(turnedOff.cache.dataKey);
+
+      const invalid = yield* configError({ FIO_TOKEN: READ_TOKEN, FIO_CACHE_ENCRYPT: "encrypt-please" });
+      assert.include(invalid, "FIO_CACHE_ENCRYPT must be true or false");
+      assert.notInclude(invalid, "encrypt-please");
+      const withoutKey: ReadonlyArray<Record<string, string>> = [
+        { FIO_TOKEN: READ_TOKEN, FIO_CACHE_ENCRYPT: "true" },
+        { FIO_TOKEN: READ_TOKEN, FIO_CACHE_ENCRYPT: "1", FIO_MCP_TRANSPORT: "http", FIO_MCP_ALLOW_UNAUTHENTICATED: "true" },
+      ];
+      for (const env of withoutKey) {
+        const missing = yield* configError(env);
+        assert.include(missing, "FIO_CACHE_ENCRYPT");
+        assert.include(missing, "FIO_MCP_DATA_KEY_FILE");
+      }
+      const badKey = yield* configError({
+        FIO_TOKEN: READ_TOKEN,
+        FIO_CACHE_ENCRYPT: "true",
+        FIO_MCP_DATA_KEY_FILE: secretFile(`${READ_TOKEN}\n`),
+      });
+      assert.include(badKey, "FIO_MCP_DATA_KEY_FILE");
+      assert.notInclude(badKey, READ_TOKEN);
+
+      // OAuth: the data key loaded for the FIO tokens.
+      const hash = yield* hashPassword(Redacted.make("test-admin-password"), { ln: 14, r: 8, p: 1 });
+      const oauth = yield* loadConfigFrom({
+        FIO_MCP_TRANSPORT: "http",
+        FIO_MCP_PUBLIC_URL: "https://fio.example.test",
+        FIO_MCP_ADMIN_PASSWORD_HASH_FILE: secretFile(`${hash}\n`),
+        FIO_MCP_DATA_KEY_FILE: keyFile,
+        FIO_CACHE_ENCRYPT: "yes",
+      });
+      assert.isTrue(oauth.cache.encrypt);
+      assert.strictEqual(
+        oauth.cache.dataKey,
+        oauth.transport.kind === "http" && oauth.transport.auth.kind === "oauth" ? oauth.transport.auth.dataKey : undefined,
+      );
     }),
   );
 

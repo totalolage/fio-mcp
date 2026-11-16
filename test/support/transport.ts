@@ -40,6 +40,8 @@ export function testConfig(transport: TransportConfig = { kind: "stdio" }): AppC
       backfillFrom: "2000-01-01",
       overlapDays: 10,
       maxAgeMinutes: 60,
+      encrypt: false,
+      dataKey: undefined,
     },
   };
 }

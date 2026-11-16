@@ -171,6 +171,8 @@ export function testConfig(accounts: ReadonlyArray<TestAccount>, overrides: Part
       backfillFrom: "2000-01-01",
       overlapDays: 10,
       maxAgeMinutes: 60,
+      encrypt: false,
+      dataKey: undefined,
     },
     ...overrides,
   };
