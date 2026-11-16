@@ -1,4 +1,4 @@
-import { Effect, Option, Result, Schema } from "effect";
+import { Effect, Option, Schema } from "effect";
 import { SqlClient } from "effect/sql";
 import { type CacheError, FioResponseError } from "../errors.js";
 import type { NormalizedStatement, StatementInfo, Transaction } from "../statement.js";
@@ -7,6 +7,7 @@ import { cacheFailure } from "./db.js";
 import {
   CacheKeyMissing,
   type CacheSealing,
+  fromResult,
   openRow,
   PLAINTEXT,
   SEALED_ACCOUNT_COLUMNS,
@@ -369,10 +370,7 @@ export const makeCacheStore = Effect.fn("CacheStore.make")(function* (sealing: C
 
   /** The row with its sealed values opened (CacheValueUnreadable when one does not decrypt). */
   const openTransaction = <R extends TransactionRow>(row: R) =>
-    Result.match(openRow(readKey, "transactions", SEALED_TRANSACTION_COLUMNS, row.account_key, row.movement_id, row), {
-      onFailure: Effect.fail,
-      onSuccess: Effect.succeed,
-    });
+    fromResult(openRow(readKey, "transactions", SEALED_TRANSACTION_COLUMNS, row.account_key, row.movement_id, row));
   const readTransactions = (rows: ReadonlyArray<TransactionRow>) =>
     Effect.forEach(rows, (row) => Effect.map(openTransaction(row), toTransaction));
 
@@ -389,9 +387,25 @@ export const makeCacheStore = Effect.fn("CacheStore.make")(function* (sealing: C
     return { ...record, ...sealed, sealed: 1 };
   });
 
-  /** Whether `filters`/`groupBy` read sealed columns, which then need decrypted rows. */
-  const needsPlaintext = (filters: TransactionFilters, groupBy?: GroupBy) =>
-    sealing.encrypt && (filters.counterparty !== undefined || filters.text !== undefined || groupBy === "counterparty");
+  /**
+   * Whether `filters`/`groupBy` read sealed columns of rows that may be
+   * sealed: always with encryption on; with it off only when the account
+   * has sealed rows (sealed by another process, or before the startup
+   * reconcile), which then read like the rest instead of being matched as
+   * ciphertext.
+   */
+  const needsPlaintext = Effect.fn("CacheStore.needsPlaintext")(function* (
+    accountKey: string,
+    filters: TransactionFilters,
+    groupBy?: GroupBy,
+  ) {
+    if (filters.counterparty === undefined && filters.text === undefined && groupBy !== "counterparty") return false;
+    if (sealing.encrypt) return true;
+    const [row] = yield* sql<{ sealed: number }>`
+      SELECT EXISTS (SELECT 1 FROM transactions WHERE account_key = ${accountKey} AND sealed = 1) AS sealed
+    `;
+    return row?.sealed === 1;
+  });
 
   /**
    * What the search and summary queries read FROM: the transactions table,
@@ -405,7 +419,7 @@ export const makeCacheStore = Effect.fn("CacheStore.make")(function* (sealing: C
     filters: TransactionFilters,
     groupBy?: GroupBy,
   ) {
-    if (!needsPlaintext(filters, groupBy)) return sql.literal("transactions");
+    if (!(yield* needsPlaintext(accountKey, filters, groupBy))) return sql.literal("transactions");
     const others = where(accountKey, { ...filters, counterparty: undefined, text: undefined });
     const rows = yield* sql<TransactionRow>`
       SELECT ${sql.literal(SOURCE_COLUMNS.join(", "))} FROM transactions WHERE ${others}
@@ -475,9 +489,7 @@ export const makeCacheStore = Effect.fn("CacheStore.make")(function* (sealing: C
     }>`SELECT * FROM accounts WHERE account_key = ${accountKey}`.pipe(
       Effect.flatMap(([stored]) => {
         if (stored === undefined) return Effect.succeedNone;
-        return Result.match(openRow(readKey, "accounts", SEALED_ACCOUNT_COLUMNS, accountKey, undefined, stored), {
-          onFailure: Effect.fail,
-          onSuccess: (row) =>
+        return Effect.flatMap(fromResult(openRow(readKey, "accounts", SEALED_ACCOUNT_COLUMNS, accountKey, undefined, stored)), (row) =>
             Effect.succeedSome<CachedAccount>({
               accountKey,
               accountId: row.account_id,
@@ -488,7 +500,7 @@ export const makeCacheStore = Effect.fn("CacheStore.make")(function* (sealing: C
               balance: row.balance,
               balanceDate: row.balance_date,
             }),
-        });
+        );
       }),
       cacheFailure("read the cached account"),
     );

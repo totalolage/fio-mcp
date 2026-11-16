@@ -31,7 +31,11 @@ export interface CacheSealing {
 /** No encryption (the default, and what tests get unless they ask). */
 export const PLAINTEXT: CacheSealing = { encrypt: false, dataKey: undefined };
 
-/** The sealed columns of `transactions`; `raw_json` repeats them all, so it is sealed too. */
+/**
+ * The sealed columns of `transactions`: the ones SEC-13 lists, plus
+ * `executed_by` (who executed the order, a person's name) and `details`
+ * (card and merchant details), and `raw_json`, which repeats them all.
+ */
 export const SEALED_TRANSACTION_COLUMNS = [
   "counterparty_account",
   "counterparty_bank_code",
@@ -42,6 +46,8 @@ export const SEALED_TRANSACTION_COLUMNS = [
   "message",
   "comment",
   "payer_reference",
+  "executed_by",
+  "details",
   "raw_json",
 ] as const;
 export type SealedTransactionColumn = (typeof SEALED_TRANSACTION_COLUMNS)[number];
@@ -76,9 +82,12 @@ const decode = (text: string): Sealed | undefined => {
 export class CacheValueUnreadable extends Schema.TaggedError<CacheValueUnreadable>()("CacheValueUnreadable", {
   table: Schema.String,
   column: Schema.String,
+  /** The movement of a `transactions` row; null for an `accounts` row. */
+  movementId: Schema.NullOr(Schema.Number),
 }) {
   override get message(): string {
-    return `A sealed value in the cache's ${this.table}.${this.column} could not be decrypted: the row was altered or copied from another row, or FIO_MCP_DATA_KEY_FILE changed.`;
+    const row = this.movementId === null ? "" : ` of movement ${this.movementId}`;
+    return `The sealed value in the cache's ${this.table}.${this.column}${row} could not be decrypted: the row was altered or copied from another row, or FIO_MCP_DATA_KEY_FILE changed. Remove the cached transactions of that account and download them again.`;
   }
 }
 
@@ -92,7 +101,7 @@ export class CacheKeyMissing extends Schema.TaggedError<CacheKeyMissing>()("Cach
 /** The data key does not open the rows the cache sealed earlier: a different key file. */
 export class CacheKeyMismatch extends Schema.TaggedError<CacheKeyMismatch>()("CacheKeyMismatch", {}) {
   override get message(): string {
-    return "FIO_MCP_DATA_KEY_FILE does not hold the key the cached transactions were encrypted with (FIO_CACHE_ENCRYPT). Restore the original key file, or remove the cached transactions and download them again.";
+    return "FIO_MCP_DATA_KEY_FILE does not decrypt the cached transactions (FIO_CACHE_ENCRYPT): the key file differs from the one they were encrypted with, or the cached rows were altered. Restore the original key file, or remove the cached transactions and download them again.";
   }
 }
 
@@ -123,7 +132,7 @@ export const openValue = (
       ? Result.fail("invalid" as const)
       : open(key, sealed, cacheAad(table, column, accountKey, movementId));
   return Result.match(opened, {
-    onFailure: () => Result.fail(new CacheValueUnreadable({ table, column })),
+    onFailure: () => Result.fail(new CacheValueUnreadable({ table, column, movementId: movementId ?? null })),
     onSuccess: (plaintext) => Result.succeed(Redacted.value(plaintext)),
   });
 };
@@ -169,9 +178,14 @@ export const openRow = <R extends { readonly sealed: number }>(
   return Result.succeed(opened as R);
 };
 
+/** The Result as an Effect. */
+export const fromResult = <A, E>(result: Result.Result<A, E>): Effect.Effect<A, E> =>
+  Result.match(result, { onFailure: Effect.fail, onSuccess: Effect.succeed });
+
 const RECONCILE_BATCH = 500;
 
 interface TransactionValues {
+  readonly row_id: number;
   readonly account_key: string;
   readonly movement_id: number;
   readonly sealed: number;
@@ -184,11 +198,15 @@ interface AccountValues {
   readonly iban: string | null;
 }
 
-/** Fails with CacheKeyMismatch unless `key` opens a sealed value of each table (when there is one). */
+/**
+ * Fails with CacheKeyMismatch unless `key` opens a sealed value of each
+ * table (when there is one): a wrong key fails here, before any row is
+ * converted, rather than on the first row read.
+ */
 const checkKey = Effect.fn("Cache.checkEncryptionKey")(function* (key: Redacted.Redacted<Uint8Array>) {
   const sql = yield* SqlClient.SqlClient;
   const [transaction] = yield* sql<TransactionValues>`
-    SELECT account_key, movement_id, sealed, raw_json FROM transactions WHERE sealed = 1 LIMIT 1
+    SELECT rowid AS row_id, account_key, movement_id, sealed, raw_json FROM transactions WHERE sealed = 1 LIMIT 1
   `;
   const [account] = yield* sql<AccountValues>`
     SELECT account_key, sealed, iban FROM accounts WHERE sealed = 1 AND iban IS NOT NULL LIMIT 1
@@ -200,38 +218,38 @@ const checkKey = Effect.fn("Cache.checkEncryptionKey")(function* (key: Redacted.
   if (!opens) return yield* new CacheKeyMismatch();
 });
 
-const TRANSACTION_SELECT = `account_key, movement_id, sealed, ${SEALED_TRANSACTION_COLUMNS.join(", ")}`;
+const TRANSACTION_SELECT = `rowid AS row_id, account_key, movement_id, sealed, ${SEALED_TRANSACTION_COLUMNS.join(", ")}`;
 
-/** Every row of both tables brought to `encrypt` (sealed or opened), in batches, inside the caller's transaction. */
+/**
+ * Every row of both tables brought to `encrypt` (sealed or opened), inside
+ * the caller's transaction. Transactions are read in rowid batches, so the
+ * whole pass reads each row once.
+ */
 const convertAll = Effect.fn("Cache.convertRows")(function* (key: Redacted.Redacted<Uint8Array>, encrypt: boolean) {
   const sql = yield* SqlClient.SqlClient;
   const from = encrypt ? 0 : 1;
   let converted = 0;
+  let after = 0;
   for (;;) {
     const rows = yield* sql<TransactionValues>`
-      SELECT ${sql.literal(TRANSACTION_SELECT)} FROM transactions WHERE sealed = ${from} LIMIT ${RECONCILE_BATCH}
+      SELECT ${sql.literal(TRANSACTION_SELECT)} FROM transactions
+      WHERE sealed = ${from} AND rowid > ${after} ORDER BY rowid LIMIT ${RECONCILE_BATCH}
     `;
     if (rows.length === 0) break;
     for (const row of rows) {
-      const values: Record<string, string | null> = {};
-      if (encrypt) {
-        for (const column of SEALED_TRANSACTION_COLUMNS) {
-          const value = row[column];
-          values[column] = yield* sealValue(key, "transactions", column, row.account_key, row.movement_id, typeof value === "string" ? value : null);
-        }
-      } else {
-        const opened = yield* Result.match(
-          openRow(key, "transactions", SEALED_TRANSACTION_COLUMNS, row.account_key, row.movement_id, row),
-          { onFailure: Effect.fail, onSuccess: Effect.succeed },
-        );
-        for (const column of SEALED_TRANSACTION_COLUMNS) {
-          const value = opened[column];
-          values[column] = typeof value === "string" ? value : null;
-        }
+      after = row.row_id;
+      const stored: Record<string, string | null> = {};
+      for (const column of SEALED_TRANSACTION_COLUMNS) {
+        const value = row[column];
+        stored[column] = typeof value === "string" ? value : null;
       }
+      const values = encrypt
+        ? yield* sealValues(key, "transactions", row.account_key, row.movement_id, stored)
+        : yield* fromResult(
+            openRow(key, "transactions", SEALED_TRANSACTION_COLUMNS, row.account_key, row.movement_id, { ...stored, sealed: 1 }),
+          );
       yield* sql`
-        UPDATE transactions SET ${sql.update({ ...values, sealed: encrypt ? 1 : 0 })}
-        WHERE account_key = ${row.account_key} AND movement_id = ${row.movement_id}
+        UPDATE transactions SET ${sql.update({ ...values, sealed: encrypt ? 1 : 0 })} WHERE rowid = ${row.row_id}
       `;
       converted += 1;
     }
@@ -240,10 +258,7 @@ const convertAll = Effect.fn("Cache.convertRows")(function* (key: Redacted.Redac
   for (const row of accounts) {
     const iban = encrypt
       ? yield* sealValue(key, "accounts", "iban", row.account_key, undefined, row.iban)
-      : (yield* Result.match(openRow(key, "accounts", SEALED_ACCOUNT_COLUMNS, row.account_key, undefined, row), {
-          onFailure: Effect.fail,
-          onSuccess: Effect.succeed,
-        })).iban;
+      : (yield* fromResult(openRow(key, "accounts", SEALED_ACCOUNT_COLUMNS, row.account_key, undefined, row))).iban;
     yield* sql`UPDATE accounts SET ${sql.update({ iban, sealed: encrypt ? 1 : 0 })} WHERE account_key = ${row.account_key}`;
     converted += 1;
   }
@@ -251,11 +266,31 @@ const convertAll = Effect.fn("Cache.convertRows")(function* (key: Redacted.Redac
 });
 
 /**
- * Startup: brings the cache to FIO_CACHE_ENCRYPT. On, it seals every
- * plaintext row; off, it opens every sealed row (which needs the data key).
- * One transaction, so an interrupted run leaves the tables as they were and
- * the next startup repeats it; a run with nothing to convert changes nothing.
- * Fails when the key does not open what was sealed earlier.
+ * After sealing: rebuilds the database file (VACUUM) and truncates the
+ * write-ahead log, so the plaintext the rows held before is not left in
+ * free pages or old log frames. Another connection holding the database
+ * open (a running CLI command) can keep the log from being truncated; that
+ * is logged, and the next checkpoint overwrites it.
+ */
+const dropPlaintextRemnants = Effect.fn("Cache.dropPlaintextRemnants")(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  yield* sql`VACUUM`;
+  const [checkpoint] = yield* sql<{ busy: number }>`PRAGMA wal_checkpoint(TRUNCATE)`;
+  if ((checkpoint?.busy ?? 0) !== 0) {
+    yield* Effect.logWarning(
+      "cache: the database is open elsewhere, so its write-ahead log was not truncated after encrypting the cache; it may hold earlier plaintext until the next checkpoint",
+    );
+  }
+});
+
+/**
+ * Startup of the cache service: brings the cache to FIO_CACHE_ENCRYPT. On,
+ * it seals every plaintext row and then drops the plaintext's remnants from
+ * the file; off, it opens every sealed row (which needs the data key). The
+ * conversion is one transaction, so an interrupted run leaves the tables as
+ * they were and the next startup repeats it; a run with nothing to convert
+ * changes nothing. Fails when the key is missing or does not open what was
+ * sealed earlier, and when a sealed row does not decrypt.
  */
 export const reconcileCacheEncryption = Effect.fn("Cache.reconcileEncryption")(function* (sealing: CacheSealing) {
   const sql = yield* SqlClient.SqlClient;
@@ -272,6 +307,7 @@ export const reconcileCacheEncryption = Effect.fn("Cache.reconcileEncryption")(f
   yield* checkKey(key);
   if ((pending?.n ?? 0) === 0) return;
   const converted = yield* sql.withTransaction(convertAll(key, sealing.encrypt));
+  if (sealing.encrypt) yield* dropPlaintextRemnants();
   yield* Effect.logInfo(
     sealing.encrypt
       ? `cache: encrypted ${converted} cached rows (FIO_CACHE_ENCRYPT is on)`

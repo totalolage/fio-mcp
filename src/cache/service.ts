@@ -5,7 +5,8 @@ import { type CacheError, type FioRequestError, InvalidInput } from "../errors.j
 import { FioApi } from "../fio-api.js";
 import type { NormalizedStatement, StatementInfo, Transaction } from "../statement.js";
 import { addDays, type DayRange, minDate, pragueDateOf, pragueToday, rangeLength } from "./dates.js";
-import { Database } from "./db.js";
+import { cacheFailure, Database } from "./db.js";
+import { reconcileCacheEncryption } from "./encryption.js";
 import { fromFio, type Source, selectSource, type TransactionsResult } from "./source.js";
 import {
   type CachedAccount,
@@ -208,6 +209,8 @@ function cachedInfo(account: Option.Option<CachedAccount>, range: DayRange): Sta
 const makeTransactions = Effect.fn("Transactions.make")(function* () {
   const config = yield* AppConfig;
   const fio = yield* FioApi;
+  // Before any read or write: the cached rows sealed or opened per FIO_CACHE_ENCRYPT. Here, not in Database, so CLI commands leave them as they are.
+  yield* reconcileCacheEncryption(config.cache).pipe(cacheFailure("apply FIO_CACHE_ENCRYPT to the cached transactions"));
   const store = yield* makeCacheStore(config.cache);
   const sync = yield* makeCacheSync(store, fio, config);
   const { overlapDays, maxAgeMinutes } = config.cache;
