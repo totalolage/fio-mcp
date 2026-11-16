@@ -407,12 +407,16 @@ describe("a separate admin listener (FIO_MCP_ADMIN_PORT)", () => {
     const onAdminPort: OAuthHarness = { ...app.harness, fetch: socketFetch(`http://127.0.0.1:${adminPort}`) };
 
     // The main port has no admin routes, in any spelling.
-    for (const path of ["/admin", "/admin/login", "/ADMIN", "//admin", "/%61dmin"]) {
+    for (const path of ["/admin", "/admin/login", "/ADMIN", "//admin", "/%61dmin", "/admin/payments", "/admin/payments/pending"]) {
       expect((await app.harness.fetch(`${PUBLIC_URL}${path}`)).status, path).toBe(404);
     }
     // The admin port serves only /admin: no MCP endpoint, no OAuth pages.
     expect((await onAdminPort.fetch(`${PUBLIC_URL}/mcp`, { method: "POST" })).status).toBe(404);
     expect((await onAdminPort.fetch(`${PUBLIC_URL}/authorize`)).status).toBe(404);
+    // ... and the payments pages with it (a sign-in redirect when signed out).
+    for (const path of ["/admin/payments", "/admin/payments/pending"]) {
+      expect((await onAdminPort.fetch(`${PUBLIC_URL}${path}`, { redirect: "manual" })).status, path).toBe(303);
+    }
 
     const admin = new Admin(onAdminPort);
     await admin.signIn();

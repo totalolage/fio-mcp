@@ -313,6 +313,8 @@ export interface Consent {
   /** Payment settings fields overriding the pre-filled server defaults (sent with `payments`). */
   readonly paymentSettings?: Readonly<Record<string, string>>;
   readonly decision?: "approve" | "deny";
+  /** The authentication code for /login, when the harness has a TOTP secret. */
+  readonly totp?: string;
 }
 
 /** The consent page's payment settings as pre-filled from DEFAULT_PAYMENT_LIMITS. */
@@ -335,7 +337,7 @@ export async function authorizeInBrowser(harness: OAuthHarness, authorizationUrl
     throw new Error(`authorize answered ${start.status} ${start.headers.get("location")}: ${await start.text()}`);
   }
   const csrf = await csrfOf(await browser.get("/login"));
-  const login = await browser.post("/login", { csrf, password: PASSWORD });
+  const login = await browser.post("/login", { csrf, password: PASSWORD, ...(consent.totp === undefined ? {} : { totp: consent.totp }) });
   if (login.status !== 303) throw new Error(`login answered ${login.status}`);
   const consentForm = await consentFormOf(await browser.get("/consent"));
   const done = await browser.post("/consent", {

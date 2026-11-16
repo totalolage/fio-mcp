@@ -284,7 +284,7 @@ describe("admin sign-in and sessions", () => {
 describe("network allowlist (FIO_MCP_ADMIN_ALLOWED_CIDRS)", () => {
   const OUTSIDE = { [PEER_HEADER]: "192.0.2.1" };
   const INSIDE = { [PEER_HEADER]: "10.1.2.3" };
-  const PENDING = HttpRouter.add("GET", "/admin/payments/pending", HttpServerResponse.text("pending payments"));
+  const PROBE = HttpRouter.add("GET", "/admin/extra/probe", HttpServerResponse.text("extra route"));
   const hidden = async (response: Response) => {
     expect(response.status).toBe(404);
     expect(response.headers.get("cache-control")).toBe("no-store");
@@ -293,7 +293,7 @@ describe("network allowlist (FIO_MCP_ADMIN_ALLOWED_CIDRS)", () => {
 
   beforeEach(async () => {
     await harness.close();
-    harness = await startOAuth({ allowedNetworks: ["10.0.0.0/8"], extraAdminRoutes: PENDING });
+    harness = await startOAuth({ allowedNetworks: ["10.0.0.0/8"], extraAdminRoutes: PROBE });
   });
 
   it("answers 404 to clients outside the list on every /admin route and spelling", async () => {
@@ -308,11 +308,27 @@ describe("network allowlist (FIO_MCP_ADMIN_ALLOWED_CIDRS)", () => {
   });
 
   it("covers a route registered under /admin the way AdminLive registers its routes", async () => {
-    await hidden(await harness.fetch(`${PUBLIC_URL}/admin/payments/pending`, { headers: OUTSIDE }));
-    await hidden(await harness.fetch(`${PUBLIC_URL}/ADMIN/payments/pending`, { headers: OUTSIDE }));
-    const inside = await harness.fetch(`${PUBLIC_URL}/admin/payments/pending`, { headers: INSIDE });
+    await hidden(await harness.fetch(`${PUBLIC_URL}/admin/extra/probe`, { headers: OUTSIDE }));
+    await hidden(await harness.fetch(`${PUBLIC_URL}/ADMIN/extra/probe`, { headers: OUTSIDE }));
+    const inside = await harness.fetch(`${PUBLIC_URL}/admin/extra/probe`, { headers: INSIDE });
     expect(inside.status).toBe(200);
-    expect(await inside.text()).toBe("pending payments");
+    expect(await inside.text()).toBe("extra route");
+  });
+
+  it("covers the payments pages and actions AdminLive registers", async () => {
+    for (const path of ["/admin/payments", "/admin/payments/pending", "/ADMIN/payments/pending", "/admin/payments?grant=x"]) {
+      await hidden(await harness.fetch(`${PUBLIC_URL}${path}`, { headers: OUTSIDE }));
+    }
+    const outsider = new Admin(OUTSIDE);
+    await hidden(await outsider.post("/admin/payments/pending/approve", { pending: "p" }));
+    await hidden(await outsider.post("/admin/payments/pending/decline", { pending: "p" }));
+    // Inside the list the real pages answer: a sign-in redirect, then the page.
+    const anonymous = await harness.fetch(`${PUBLIC_URL}/admin/payments/pending`, { headers: INSIDE, redirect: "manual" });
+    expect(anonymous.status).toBe(303);
+    const admin = new Admin(INSIDE);
+    await admin.signIn();
+    expect((await admin.page("/admin/payments/pending")).response.status).toBe(200);
+    expect((await admin.page("/admin/payments")).response.status).toBe(200);
   });
 
   it("keeps the admin flows working for clients inside the list", async () => {
@@ -713,8 +729,9 @@ describe("payments at /admin", () => {
   };
 
   /** A real grant consented in confirm mode, listing LISTED, as its principal. */
-  const confirmPrincipal = async (): Promise<Principal> => {
+  const confirmPrincipal = async (totp?: string): Promise<Principal> => {
     const { clientId } = await tokensFor(harness, {
+      ...(totp === undefined ? {} : { totp }),
       payments: true,
       paymentSettings: { payAllowlistMode: "confirm", payAllowlist: `${LISTED}, Landlord` },
     });
@@ -730,7 +747,7 @@ describe("payments at /admin", () => {
   };
 
   /** Restarts the app with a FIO fake that records every uploaded XML. */
-  const startRecording = async (secondFactor?: () => Effect.Effect<LoginResult<void>>) => {
+  const startRecording = async (secondFactor?: () => Effect.Effect<LoginResult<void>>, totpSecret?: Redacted.Redacted<Uint8Array>) => {
     await harness.close();
     const uploads: Array<string> = [];
     harness = await startOAuth({
@@ -742,15 +759,20 @@ describe("payments at /admin", () => {
           }),
       },
       ...(secondFactor === undefined ? {} : { secondFactor }),
+      ...(totpSecret === undefined ? {} : { totpSecret }),
     });
     return uploads;
   };
 
   /** Signs in and holds a two-order batch (one payee listed) for confirmation. */
-  const holdBatch = async () => {
+  const holdBatch = async (
+    signIn: (admin: Admin) => Promise<unknown> = (admin) => admin.signIn(),
+    /** With TOTP on: a fresh code for the OAuth /login behind the grant. */
+    oauthCode?: () => string,
+  ) => {
     const admin = new Admin();
-    await admin.signIn();
-    const principal = await confirmPrincipal();
+    await signIn(admin);
+    const principal = await confirmPrincipal(oauthCode?.());
     const { exit, xml } = await submitAs(principal, [domestic(100), domestic(250, "19-2000145399/0800")]);
     if (!Exit.isSuccess(exit)) throw new Error(`submit failed: ${String(exit.cause)}`);
     expect(exit.value.outcome).toBe("awaiting-admin-confirmation");
@@ -920,6 +942,94 @@ describe("payments at /admin", () => {
       expect((await admin.page("/admin/payments/pending")).html).toContain(pendingId);
     }
     factor = { _tag: "Accepted", value: undefined };
+    expect((await admin.act("/admin/payments/pending/approve", { pending: pendingId })).message).toContain("accepted");
+    expect(uploads).toEqual([xml]);
+  });
+
+  describe("with the admin TOTP secret set (SEC-03)", () => {
+    const SECRET = new TextEncoder().encode("12345678901234567890");
+    const APPROVE = "/admin/payments/pending/approve";
+    const WRONG_CODE = "The authentication code is wrong. Nothing was uploaded.";
+    const codeNow = () => totpCode(SECRET, Math.floor(harness.clock.currentTimeMillisUnsafe() / 1000));
+    const wrongCode = () => {
+      const valid = new Set([-1, 0, 1].map((steps) => totpCode(SECRET, Math.floor(harness.clock.currentTimeMillisUnsafe() / 1000) + steps * 30)));
+      return ["000000", "111111", "222222", "333333"].find((code) => !valid.has(code)) ?? "444444";
+    };
+    /** The next step's code, for the OAuth sign-in behind the held batch's grant. */
+    const nextCode = () => {
+      harness.clock.advance(30_000);
+      return codeNow();
+    };
+    /** Signs in with the password and the current code; returns that code. */
+    const signInWithCode = async (admin: Admin) => {
+      const code = codeNow();
+      await admin.page("/admin/login");
+      expect((await admin.post("/admin/login", { password: PASSWORD, totp: code })).status).toBe(303);
+      await admin.page("/admin");
+      return code;
+    };
+
+    it("approves only with a current, unused code: missing, wrong and replayed codes upload nothing", async () => {
+      const uploads = await startRecording(undefined, Redacted.make(SECRET));
+      let signInCode = "";
+      const { admin, xml, pendingId } = await holdBatch(async (a) => {
+        signInCode = await signInWithCode(a);
+      }, nextCode);
+      expect((await admin.page("/admin/payments/pending")).html).toContain('name="totp"');
+
+      expect((await admin.act(APPROVE, { pending: pendingId })).message).toBe(WRONG_CODE);
+      expect((await admin.act(APPROVE, { pending: pendingId, totp: wrongCode() })).message).toBe(WRONG_CODE);
+      // The code that signed in is spent: it never approves.
+      expect((await admin.act(APPROVE, { pending: pendingId, totp: signInCode })).message).toBe(WRONG_CODE);
+      expect(uploads).toEqual([]);
+      expect((await admin.page("/admin/payments/pending")).html).toContain(pendingId);
+
+      // A second batch, held by a fresh sign-in, before the first is approved.
+      const second = await holdBatch(async (a) => {
+        harness.clock.advance(30_000);
+        await signInWithCode(a);
+      }, nextCode);
+      harness.clock.advance(30_000);
+      const approval = codeNow();
+      expect((await admin.act(APPROVE, { pending: pendingId, totp: approval })).message).toContain("accepted");
+      expect(uploads).toEqual([xml]);
+
+      // The code that approved one batch never approves another, even within its window.
+      expect((await second.admin.act(APPROVE, { pending: second.pendingId, totp: approval })).message).toBe(WRONG_CODE);
+      expect(uploads).toEqual([xml]);
+      harness.clock.advance(30_000);
+      expect((await second.admin.act(APPROVE, { pending: second.pendingId, totp: codeNow() })).message).toContain("accepted");
+      expect(uploads).toEqual([xml, second.xml]);
+    });
+
+    it("throttles repeated wrong approval codes", async () => {
+      const uploads = await startRecording(undefined, Redacted.make(SECRET));
+      const { admin, pendingId } = await holdBatch(signInWithCode, nextCode);
+      const messages: Array<string> = [];
+      // DEFAULT_THROTTLE: five free failures; the sixth starts the backoff.
+      for (let attempt = 0; attempt < 7; attempt++) {
+        messages.push((await admin.act(APPROVE, { pending: pendingId, totp: wrongCode() })).message);
+      }
+      expect(messages.slice(0, 6)).toEqual(Array(6).fill(WRONG_CODE));
+      expect(messages[6]).toMatch(/^Too many failed attempts\. Try again in \d+ s\. Nothing was uploaded\.$/);
+      expect(uploads).toEqual([]);
+    });
+
+    it("declines without a code, uploading nothing", async () => {
+      const uploads = await startRecording(undefined, Redacted.make(SECRET));
+      const { admin, pendingId } = await holdBatch(signInWithCode, nextCode);
+      expect((await admin.act("/admin/payments/pending/decline", { pending: pendingId })).message).toBe(
+        "Declined the batch; nothing was sent to FIO.",
+      );
+      expect((await admin.act(APPROVE, { pending: pendingId, totp: codeNow() })).message).toContain("Nothing was uploaded.");
+      expect(uploads).toEqual([]);
+    });
+  });
+
+  it("asks for no code and approves without one when TOTP is off", async () => {
+    const uploads = await startRecording();
+    const { admin, xml, pendingId } = await holdBatch();
+    expect((await admin.page("/admin/payments/pending")).html).not.toContain('name="totp"');
     expect((await admin.act("/admin/payments/pending/approve", { pending: pendingId })).message).toContain("accepted");
     expect(uploads).toEqual([xml]);
   });

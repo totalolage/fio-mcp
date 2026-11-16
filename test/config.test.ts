@@ -765,7 +765,7 @@ describe("loadConfig", () => {
       assert.notInclude(invalid, "encrypt-please");
       const withoutKey: ReadonlyArray<Record<string, string>> = [
         { FIO_TOKEN: READ_TOKEN, FIO_CACHE_ENCRYPT: "true" },
-        { FIO_TOKEN: READ_TOKEN, FIO_CACHE_ENCRYPT: "1", FIO_MCP_TRANSPORT: "http", FIO_MCP_ALLOW_UNAUTHENTICATED: "true" },
+        { FIO_TOKEN: READ_TOKEN, FIO_CACHE_ENCRYPT: "1", FIO_MCP_TRANSPORT: "http", FIO_MCP_HOST: "127.0.0.1", FIO_MCP_ALLOW_UNAUTHENTICATED: "true" },
       ];
       for (const env of withoutKey) {
         const missing = yield* configError(env);

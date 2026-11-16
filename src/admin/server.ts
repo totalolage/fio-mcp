@@ -464,18 +464,19 @@ export const makeAdminServer = Effect.fn("AdminServer.make")(function* (settings
    * SEC-03): the single place an approval is checked beyond the signed-in
    * session, Origin and CSRF. Nothing is uploaded unless it is Accepted.
    *
-   * `settings.secondFactor` replaces the check (tests). Otherwise, until
-   * TOTP exists, every approval is Accepted. Wiring TOTP: when
-   * `password.totpEnabled`, return
-   * `password.verifyTotp(clientAddress(request, trustedProxies), field(form, "totp") ?? "")`,
-   * which fails closed (a missing or wrong code is Rejected), and set
-   * `secondFactor` below to `password.totpEnabled` so the pending page asks
-   * for the `totp` field.
+   * `settings.secondFactor` replaces the check (tests). Otherwise, with
+   * FIO_MCP_ADMIN_TOTP_SECRET_FILE set, the form's `totp` code is checked
+   * like a sign-in code: it fails closed (a missing, wrong or already used
+   * code is Rejected, and counts as a failure for this client address).
+   * Without TOTP, every approval is Accepted.
    */
-  const verifySecondFactor: SecondFactorCheck = (request, form) =>
-    settings.secondFactor === undefined ? Effect.succeed({ _tag: "Accepted", value: undefined }) : settings.secondFactor(request, form);
+  const verifySecondFactor: SecondFactorCheck = (request, form) => {
+    if (settings.secondFactor !== undefined) return settings.secondFactor(request, form);
+    if (!password.totpEnabled) return Effect.succeed({ _tag: "Accepted", value: undefined });
+    return password.verifyTotp(clientAddress(request, trustedProxies), field(form, "totp") ?? "");
+  };
   /** The pending page asks for an authentication code (`totp`). */
-  const secondFactor = false;
+  const secondFactor = password.totpEnabled;
 
   /** Audit rows newest first, `?grant=` filters, `?before=` pages back. */
   const showPayments = (request: Request) => {
