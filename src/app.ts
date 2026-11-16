@@ -11,6 +11,7 @@ import { CACHE_INSTRUCTIONS, CacheToolsLive } from "./mcp/cache-tools.js";
 import { FioToolsLive, SERVER_INSTRUCTIONS } from "./mcp/fio-tools.js";
 import { ToolListChangesLive } from "./mcp/registration.js";
 import { listClientsCommand, resetAdminPasswordCommand, revokeAllTokensCommand, revokeClientCommand } from "./oauth/cli.js";
+import { PaymentControls } from "./payment-controls.js";
 import { RateLimiter } from "./rate-limiter.js";
 import { LoggerLive, Redactor } from "./redaction.js";
 import { Auth } from "./transport/auth.js";
@@ -53,6 +54,7 @@ export const ServicesLive = Layer.mergeAll(
   RateLimiter.Live,
   FioApi.Live,
   Transactions.Live,
+  PaymentControls.Live,
 );
 
 /** Tool registrations, re-registered (with `tools/list_changed`) when the accounts change. */

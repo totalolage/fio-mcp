@@ -9,6 +9,7 @@ import { Transactions } from "../cache/service.js";
 import { AppConfig } from "../config.js";
 import { FioApi } from "../fio-api.js";
 import { makeOAuthServer, type OAuthSettings } from "../oauth/server.js";
+import { PaymentControls } from "../payment-controls.js";
 import type { AuthUnavailable, Unauthorized } from "./auth-errors.js";
 import { LOCAL_PRINCIPAL, type Principal } from "./principal.js";
 
@@ -75,7 +76,7 @@ export class Auth extends Context.Service<Auth, AuthShape>()("fio-mcp/transport/
           AdminLive({ publicUrl, dataKey, trustedProxies }),
         ).pipe(
           Layer.provide(AdminPassword.layer(passwordHash)),
-          Layer.provide(Layer.mergeAll(Database.Live, Accounts.Live, FioApi.Live, Transactions.Live)),
+          Layer.provide(Layer.mergeAll(Database.Live, Accounts.Live, FioApi.Live, Transactions.Live, PaymentControls.Live)),
         );
       }
       return Layer.merge(Auth.Open, Layer.effectDiscard(Effect.logWarning(UNAUTHENTICATED_WARNING)));
