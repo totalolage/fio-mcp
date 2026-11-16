@@ -19,13 +19,27 @@ import { HttpServer } from "effect/http";
 import { SqlClient } from "effect/sql";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { tokenFingerprint } from "../src/accounts.js";
+import { encodeBase32, totpCode } from "../src/admin/totp.js";
 import { HttpAppLive } from "../src/app.js";
 import { SERVER_MIGRATIONS } from "../src/cache/db.js";
 import { formatPasswordHash } from "../src/oauth/crypto.js";
 import { makeOAuthStore } from "../src/oauth/store.js";
 import { loadConfigFrom } from "./fixtures.js";
 import { testDatabase } from "./support/database.js";
-import { type OAuthHarness, PASSWORD, PUBLIC_URL, passwordHash, SkewedClock, tokensFor } from "./support/oauth.js";
+import {
+  authorizationUrl,
+  Browser,
+  LOOPBACK_REDIRECT,
+  type OAuthHarness,
+  PASSWORD,
+  PUBLIC_URL,
+  passwordHash,
+  pkcePair,
+  RESOURCE,
+  register,
+  SkewedClock,
+  tokensFor,
+} from "./support/oauth.js";
 import { FIO_TOKEN, SAVINGS_TOKEN } from "./support/transport.js";
 
 // Real sockets, SQLite on disk, scrypt and background sync on a shared, often
@@ -407,6 +421,51 @@ describe("a separate admin listener (FIO_MCP_ADMIN_PORT)", () => {
     const grant = await tokensFor(app.harness, { accounts: ["main", "travel"] });
     const session = await mcpSession(app, grant.access);
     await eventually(async () => expect(await session.accounts()).toEqual(["main", "travel"]));
+  });
+
+  it("shares one AdminPassword with the main port: a code used at /admin/login is refused at /login", async () => {
+    await app.close();
+    const adminPort = await freePort();
+    const secret = new TextEncoder().encode("12345678901234567890");
+    const secretDir = mkdtempSync(join(tmpdir(), "fio-mcp-totp-it-"));
+    try {
+      writeFileSync(join(secretDir, "totp.secret"), encodeBase32(secret));
+      app = await startApp({
+        FIO_MCP_ADMIN_PORT: String(adminPort),
+        FIO_MCP_ADMIN_TOTP_SECRET_FILE: join(secretDir, "totp.secret"),
+      });
+      // The app runs on the real clock.
+      const codeNow = (steps = 0) => totpCode(secret, Math.floor(Date.now() / 1000) + steps * 30);
+      const admin = new Admin({ ...app.harness, fetch: socketFetch(`http://127.0.0.1:${adminPort}`) });
+
+      // The admin listener needs the code, and accepts a current one.
+      await admin.page("/admin/login");
+      expect((await admin.post("/admin/login", { password: PASSWORD })).status).toBe(401);
+      const code = codeNow();
+      const accepted = await admin.post("/admin/login", { password: PASSWORD, totp: code });
+      expect(accepted.status).toBe(303);
+      expect(accepted.headers.get("location")).toBe("/admin");
+
+      // The main listener's OAuth sign-in remembers that code as used: one AdminPassword.
+      const { body } = await register(app.harness, [LOOPBACK_REDIRECT], "TOTP client");
+      const browser = new Browser(app.harness);
+      await browser.get(
+        authorizationUrl({
+          response_type: "code",
+          client_id: String(body.client_id),
+          redirect_uri: LOOPBACK_REDIRECT,
+          code_challenge: pkcePair().challenge,
+          code_challenge_method: "S256",
+          resource: RESOURCE,
+        }),
+      );
+      const csrf = /name="csrf" value="([^"]+)"/.exec(await (await browser.get("/login")).text())?.[1] ?? "";
+      expect((await browser.post("/login", { csrf, password: PASSWORD, totp: code })).status).toBe(401);
+      // A code not used yet signs in there, so the refusal was the replay.
+      expect((await browser.post("/login", { csrf, password: PASSWORD, totp: codeNow(1) })).status).toBe(303);
+    } finally {
+      rmSync(secretDir, { recursive: true, force: true });
+    }
   });
 
   it("applies FIO_MCP_ADMIN_ALLOWED_CIDRS on the admin listener too", async () => {
