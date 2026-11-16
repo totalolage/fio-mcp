@@ -80,8 +80,8 @@ const seed = (times: ReadonlyArray<number>) => {
       }),
     )
     .then(() =>
-      // The listing order: created_at DESC, id DESC (SQLite compares TEXT bytewise, as does `<` on these ASCII ids).
-      [...rows].sort((a, b) => b.createdAt - a.createdAt || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0)),
+      // The listing order: created_at DESC, id DESC (ids are unique; SQLite compares TEXT bytewise, as does `<` on these ASCII ids).
+      [...rows].sort((a, b) => b.createdAt - a.createdAt || (a.id < b.id ? 1 : -1)),
     );
 };
 
