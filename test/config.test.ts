@@ -365,7 +365,7 @@ describe("loadConfig", () => {
       const message = yield* configError(env);
       assert.include(message, "HTTP mode requires FIO_MCP_PUBLIC_URL and FIO_MCP_ADMIN_PASSWORD_HASH_FILE");
 
-      const open = yield* loadConfigFrom({ ...env, FIO_MCP_ALLOW_UNAUTHENTICATED: "true" });
+      const open = yield* loadConfigFrom({ ...env, FIO_MCP_ALLOW_UNAUTHENTICATED: "true", FIO_MCP_HOST: "127.0.0.1" });
       assert.strictEqual(open.transport.kind, "http");
       if (open.transport.kind === "http") assert.strictEqual(open.transport.auth.kind, "unauthenticated");
     }),
@@ -464,7 +464,7 @@ describe("loadConfig", () => {
 
   it.effect("reads trusted proxies and rejects invalid entries without echoing them", () =>
     Effect.gen(function* () {
-      const env = { FIO_TOKEN: READ_TOKEN, FIO_MCP_TRANSPORT: "http", FIO_MCP_ALLOW_UNAUTHENTICATED: "true" };
+      const env = { FIO_TOKEN: READ_TOKEN, FIO_MCP_TRANSPORT: "http", FIO_MCP_ALLOW_UNAUTHENTICATED: "true", FIO_MCP_HOST: "127.0.0.1" };
       const config = yield* loadConfigFrom({ ...env, FIO_MCP_TRUSTED_PROXIES: "172.18.0.0/16, 10.0.0.2,fd00::/8" });
       assert.strictEqual(config.transport.kind === "http" ? config.transport.trustedProxies.length : 0, 3);
       const message = yield* configError({ ...env, FIO_MCP_TRUSTED_PROXIES: "172.18.0.0/16,secret-proxy-name" });
@@ -479,6 +479,7 @@ describe("loadConfig", () => {
         FIO_TOKEN: READ_TOKEN,
         FIO_MCP_TRANSPORT: "HTTP",
         FIO_MCP_ALLOW_UNAUTHENTICATED: "true",
+        FIO_MCP_ALLOW_UNAUTHENTICATED_ON_NETWORK: "true",
         FIO_MCP_PORT: "8080",
         FIO_MCP_ALLOWED_ORIGINS: "https://a.example, https://b.example",
         FIO_MCP_ALLOWED_HOSTS: "Fio.Example:443,localhost",
@@ -491,10 +492,12 @@ describe("loadConfig", () => {
         kind: "http",
         host: "0.0.0.0",
         port: 8080,
-        auth: { kind: "unauthenticated" },
+        auth: { kind: "unauthenticated", onNetwork: true },
         allowedOrigins: ["https://a.example", "https://b.example"],
         allowedHosts: ["fio.example:443", "localhost"],
         trustedProxies: [],
+        adminAllowedNetworks: [],
+        adminListener: undefined,
       });
       assert.deepInclude(config.cache, {
         enabled: true,

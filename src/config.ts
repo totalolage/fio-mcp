@@ -3,7 +3,7 @@ import { Config, Context, Effect, FileSystem, Layer, Option, Predicate, Redacted
 import type { IpNetwork } from "effect/net";
 import { ConfigError } from "./errors.js";
 import { type PasswordHash, PasswordHashError, parsePasswordHash } from "./oauth/crypto.js";
-import { parsePublicUrl } from "./oauth/urls.js";
+import { parseFioBaseUrl, parsePublicUrl } from "./oauth/urls.js";
 import { parseDataKey } from "./token-crypto.js";
 import { parseTrustedProxy } from "./transport/client-address.js";
 
@@ -48,6 +48,29 @@ export type TransportConfig =
        * login and authorization throttling. Empty trusts no one.
        */
       readonly trustedProxies: ReadonlyArray<IpNetwork.IpNetwork>;
+      /**
+       * FIO_MCP_ADMIN_ALLOWED_CIDRS (optional, comma-separated, the syntax of
+       * FIO_MCP_TRUSTED_PROXIES): client networks allowed to reach /admin and
+       * everything below it and the OAuth sign-in pages (GET /authorize,
+       * GET|POST /login, GET|POST /consent). Other clients get 404. The client
+       * address follows the trusted-proxy rules. Empty or unset: no
+       * restriction. Never affects /mcp, /token, /register, /revoke,
+       * /.well-known/* or /healthz.
+       */
+      readonly adminAllowedNetworks?: ReadonlyArray<IpNetwork.IpNetwork> | undefined;
+      /**
+       * FIO_MCP_ADMIN_PORT (optional, 1-65535) and FIO_MCP_ADMIN_HOST
+       * (default 127.0.0.1, only with the port): a second listener that alone
+       * serves /admin (OAuth mode only); the main listener then answers 404
+       * there. The OAuth sign-in pages stay on the main listener, where the
+       * issuer points. The admin session cookie is `Secure` with
+       * `Path=/admin`, so browsers only send it over https: the admin listener
+       * must also sit behind a TLS-terminating proxy, reached at the public
+       * origin (the admin forms check Origin against FIO_MCP_PUBLIC_URL, and
+       * FIO_MCP_ALLOWED_HOSTS applies here too). Unset: /admin is served on
+       * the main listener.
+       */
+      readonly adminListener?: { readonly host: string; readonly port: number } | undefined;
     };
 
 /**
@@ -67,7 +90,14 @@ export type HttpAuthConfig =
       /** FIO_TOKEN / FIO_ACCOUNTS, read only if the database needs them. */
       readonly accountSeed: AccountSeed;
     }
-  | { readonly kind: "unauthenticated" };
+  | {
+      readonly kind: "unauthenticated";
+      /**
+       * FIO_MCP_ALLOW_UNAUTHENTICATED_ON_NETWORK=true: the host is not a
+       * loopback address, and the warning repeats every 10 minutes.
+       */
+      readonly onNetwork?: boolean | undefined;
+    };
 
 /**
  * The accounts FIO_TOKEN / FIO_ACCOUNTS (or their _FILE variants) would
@@ -346,13 +376,35 @@ const loadAccounts = Effect.fn("config.loadAccounts")(function* (optional: boole
 const HTTP_AUTH_REQUIRED =
   "HTTP mode requires FIO_MCP_PUBLIC_URL and FIO_MCP_ADMIN_PASSWORD_HASH_FILE (create the hash with `fio-mcp hash-password`). To run without authentication on a trusted network, set FIO_MCP_ALLOW_UNAUTHENTICATED=true";
 
-const loadHttpAuth = Effect.fn("config.loadHttpAuth")(function* () {
+/** Bind addresses unauthenticated mode accepts without FIO_MCP_ALLOW_UNAUTHENTICATED_ON_NETWORK. */
+const LOOPBACK_BIND_HOSTS: ReadonlySet<string> = new Set(["127.0.0.1", "::1", "localhost"]);
+
+/**
+ * FIO_MCP_ALLOW_UNAUTHENTICATED=true (optional, default false) starts
+ * without authentication, only on a loopback FIO_MCP_HOST (127.0.0.1, ::1,
+ * localhost) unless FIO_MCP_ALLOW_UNAUTHENTICATED_ON_NETWORK=true (optional,
+ * default false) is also set; it cannot be combined with the OAuth
+ * variables.
+ */
+const loadHttpAuth = Effect.fn("config.loadHttpAuth")(function* (host: string) {
   const publicUrl = yield* optionalVar("FIO_MCP_PUBLIC_URL");
   const hashFile = yield* optionalVar("FIO_MCP_ADMIN_PASSWORD_HASH_FILE");
   const allowUnauthenticated = yield* boolVar("FIO_MCP_ALLOW_UNAUTHENTICATED", false);
+  const onNetwork = yield* boolVar("FIO_MCP_ALLOW_UNAUTHENTICATED_ON_NETWORK", false);
+  if (allowUnauthenticated && (Option.isSome(publicUrl) || Option.isSome(hashFile))) {
+    return yield* fail(
+      "FIO_MCP_ALLOW_UNAUTHENTICATED=true cannot be combined with FIO_MCP_PUBLIC_URL or FIO_MCP_ADMIN_PASSWORD_HASH_FILE; unset FIO_MCP_ALLOW_UNAUTHENTICATED to use OAuth",
+    );
+  }
   if (Option.isNone(publicUrl) && Option.isNone(hashFile)) {
-    if (allowUnauthenticated) return { kind: "unauthenticated" } satisfies HttpAuthConfig;
-    return yield* fail(HTTP_AUTH_REQUIRED);
+    if (!allowUnauthenticated) return yield* fail(HTTP_AUTH_REQUIRED);
+    if (LOOPBACK_BIND_HOSTS.has(host)) return { kind: "unauthenticated" } satisfies HttpAuthConfig;
+    if (!onNetwork) {
+      return yield* fail(
+        "FIO_MCP_ALLOW_UNAUTHENTICATED=true requires FIO_MCP_HOST to be a loopback address (127.0.0.1, ::1 or localhost). To serve without authentication on a network anyway, also set FIO_MCP_ALLOW_UNAUTHENTICATED_ON_NETWORK=true",
+      );
+    }
+    return { kind: "unauthenticated", onNetwork: true } satisfies HttpAuthConfig;
   }
   if (Option.isNone(publicUrl)) return yield* fail(`FIO_MCP_ADMIN_PASSWORD_HASH_FILE is set but FIO_MCP_PUBLIC_URL is not. ${HTTP_AUTH_REQUIRED}`);
   if (Option.isNone(hashFile)) return yield* fail(`FIO_MCP_PUBLIC_URL is set but FIO_MCP_ADMIN_PASSWORD_HASH_FILE is not. ${HTTP_AUTH_REQUIRED}`);
@@ -411,18 +463,41 @@ const loadDataKey = Effect.fn("config.loadDataKey")(function* () {
   return key;
 });
 
-const loadTrustedProxies = Effect.fn("config.loadTrustedProxies")(function* () {
+/** A comma-separated list of IP addresses and CIDR networks (parseTrustedProxy). */
+const loadNetworks = Effect.fn("config.loadNetworks")(function* (key: string) {
   const networks: Array<IpNetwork.IpNetwork> = [];
-  for (const [index, entry] of (yield* listVar("FIO_MCP_TRUSTED_PROXIES")).entries()) {
+  for (const [index, entry] of (yield* listVar(key)).entries()) {
     const network = parseTrustedProxy(entry);
     if (network === undefined) {
-      return yield* fail(
-        `FIO_MCP_TRUSTED_PROXIES entry ${index + 1} must be an IP address or a CIDR network such as 172.18.0.0/16`,
-      );
+      return yield* fail(`${key} entry ${index + 1} must be an IP address or a CIDR network such as 172.18.0.0/16`);
     }
     networks.push(network);
   }
   return networks;
+});
+
+const loadTrustedProxies = () => loadNetworks("FIO_MCP_TRUSTED_PROXIES");
+
+/** Default bind address of the admin listener (FIO_MCP_ADMIN_HOST). */
+export const DEFAULT_ADMIN_HOST = "127.0.0.1";
+
+/** FIO_MCP_ADMIN_HOST / FIO_MCP_ADMIN_PORT; see `TransportConfig.adminListener`. */
+const loadAdminListener = Effect.fn("config.loadAdminListener")(function* (port: number) {
+  const adminHost = yield* optionalVar("FIO_MCP_ADMIN_HOST");
+  const rawPort = yield* optionalVar("FIO_MCP_ADMIN_PORT");
+  if (Option.isNone(rawPort)) {
+    if (Option.isSome(adminHost)) return yield* fail("FIO_MCP_ADMIN_HOST is set but FIO_MCP_ADMIN_PORT is not");
+    return undefined;
+  }
+  const adminPort = Number(rawPort.value);
+  if (!Number.isInteger(adminPort) || adminPort < 1 || adminPort > 65_535) {
+    return yield* fail("FIO_MCP_ADMIN_PORT must be an integer from 1 to 65535");
+  }
+  const listener = { host: Option.getOrElse(adminHost, () => DEFAULT_ADMIN_HOST), port: adminPort };
+  if (listener.port === port) {
+    return yield* fail("FIO_MCP_ADMIN_PORT must differ from FIO_MCP_PORT");
+  }
+  return listener;
 });
 
 const loadTransport = Effect.fn("config.loadTransport")(function* () {
@@ -432,15 +507,21 @@ const loadTransport = Effect.fn("config.loadTransport")(function* () {
   const host = Option.getOrElse(yield* optionalVar("FIO_MCP_HOST"), () => DEFAULT_HTTP_HOST);
   const port = yield* intVar("FIO_MCP_PORT", DEFAULT_HTTP_PORT, 1);
   if (port > 65_535) return yield* fail("FIO_MCP_PORT must be an integer from 1 to 65535");
-  return {
+  const transport = {
     kind: "http",
     host,
     port,
-    auth: yield* loadHttpAuth(),
+    auth: yield* loadHttpAuth(host),
     allowedOrigins: yield* listVar("FIO_MCP_ALLOWED_ORIGINS"),
     allowedHosts: (yield* listVar("FIO_MCP_ALLOWED_HOSTS")).map((h) => h.toLowerCase()),
     trustedProxies: yield* loadTrustedProxies(),
+    adminAllowedNetworks: yield* loadNetworks("FIO_MCP_ADMIN_ALLOWED_CIDRS"),
+    adminListener: yield* loadAdminListener(port),
   } satisfies TransportConfig;
+  if (transport.adminListener !== undefined && transport.auth.kind !== "oauth") {
+    return yield* fail("FIO_MCP_ADMIN_PORT needs OAuth (FIO_MCP_PUBLIC_URL); without authentication there is no admin UI");
+  }
+  return transport;
 });
 
 const loadCache = Effect.fn("config.loadCache")(function* () {
@@ -472,11 +553,31 @@ const loadCache = Effect.fn("config.loadCache")(function* () {
   } satisfies CacheConfig;
 });
 
+/**
+ * FIO_API_BASE_URL (optional, default DEFAULT_BASE_URL): an https URL on
+ * fio.cz or a subdomain, without credentials, query or fragment; every FIO
+ * token is sent under it. FIO_API_ALLOW_TEST_BASE_URL=true (optional,
+ * default false; tests only) also accepts http on 127.0.0.1, [::1] and
+ * localhost, and logs a warning.
+ */
+const loadBaseUrl = Effect.fn("config.loadBaseUrl")(function* () {
+  const raw = yield* optionalVar("FIO_API_BASE_URL");
+  const allowTest = yield* boolVar("FIO_API_ALLOW_TEST_BASE_URL", false);
+  if (allowTest) {
+    yield* Effect.logWarning(
+      "FIO_API_ALLOW_TEST_BASE_URL=true: FIO_API_BASE_URL may name an http test server on a loopback address. Never set this in production.",
+    );
+  }
+  const parsed = parseFioBaseUrl(Option.getOrElse(raw, () => DEFAULT_BASE_URL), allowTest);
+  if (parsed === undefined) return yield* fail("FIO_API_BASE_URL must be an https URL on fio.cz");
+  return parsed;
+});
+
 /** Reads and validates the whole configuration. */
 export const loadConfig = Effect.fn("config.load")(function* () {
   const transport = yield* loadTransport();
   const accounts = transport.kind === "http" && transport.auth.kind === "oauth" ? [] : yield* loadAccounts(false);
-  const baseUrl = Option.getOrElse(yield* optionalVar("FIO_API_BASE_URL"), () => DEFAULT_BASE_URL).replace(/\/+$/, "");
+  const baseUrl = yield* loadBaseUrl();
   const cache = yield* loadCache();
   if (transport.kind === "http" && transport.auth.kind === "oauth" && cache.dbPath === "") {
     return yield* fail(

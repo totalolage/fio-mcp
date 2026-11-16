@@ -157,6 +157,7 @@ async function startApp(): Promise<App> {
       { name: "savings", token: SAVINGS_TOKEN },
     ]),
     FIO_API_BASE_URL: fio.baseUrl,
+    FIO_API_ALLOW_TEST_BASE_URL: "true",
     FIO_DB_PATH: dbPath,
     FIO_CACHE_ENABLED: "true",
     // Every new token gets a startup sync: one recent range, one FIO request.
