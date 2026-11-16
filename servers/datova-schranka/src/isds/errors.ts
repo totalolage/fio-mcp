@@ -11,6 +11,15 @@ export class IsdsCredentialsError extends Schema.TaggedError<IsdsCredentialsErro
   }
 }
 
+/** The client configuration is unusable: a base URL that isn't `https:`, or an out-of-range timeout or size cap. */
+export class IsdsConfigError extends Schema.TaggedError<IsdsConfigError>()("IsdsConfigError", {
+  detail: Schema.String,
+}) {
+  override get message(): string {
+    return `The ISDS client configuration is invalid: ${this.detail}`;
+  }
+}
+
 /**
  * The request never produced an HTTP response: TLS handshake failure (including an untrusted
  * server certificate), connection failure, or a response over the size cap.

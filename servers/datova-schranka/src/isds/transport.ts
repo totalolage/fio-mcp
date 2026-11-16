@@ -1,6 +1,7 @@
-import { Context, type Effect } from "effect";
-import type { IsdsService } from "./config.ts";
-import type { IsdsTransportFailure } from "./errors.ts";
+import { Context, type Effect, Layer } from "effect";
+import type { IsdsClientConfig, IsdsService } from "./config.ts";
+import type { IsdsConfigError, IsdsCredentialsError, IsdsTransportFailure } from "./errors.ts";
+import { makeNodeTransport } from "./node-transport.js";
 
 /** One SOAP 1.1 POST to an ISDS service endpoint. */
 export interface IsdsSoapRequest {
@@ -32,4 +33,13 @@ export interface IsdsTransportShape {
  */
 export class IsdsTransport extends Context.Service<IsdsTransport, IsdsTransportShape>()(
   "datova-schranka/IsdsTransport",
-) {}
+) {
+  /**
+   * The live transport over Node `https`: TLS client certificate (PKCS#12) or HTTP Basic,
+   * always verifying the server certificate. Building it fails on an unusable PKCS#12 archive,
+   * passphrase or username (`IsdsCredentialsError`) or a non-`https:` base URL or out-of-range
+   * limit (`IsdsConfigError`). Its connections close when the layer's scope closes.
+   */
+  static readonly layer = (config: IsdsClientConfig): Layer.Layer<IsdsTransport, IsdsCredentialsError | IsdsConfigError> =>
+    Layer.effect(IsdsTransport, makeNodeTransport(config));
+}
