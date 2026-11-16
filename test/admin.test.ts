@@ -2,12 +2,15 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { type CallToolResult, ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import { Effect, Layer, Redacted, Sink, Stdio, Stream, Terminal } from "effect";
+import { HttpRouter, HttpServerResponse } from "effect/http";
 import { SqlClient } from "effect/sql";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { tokenFingerprint } from "../src/accounts.js";
 import { MAX_ADMIN_SESSIONS } from "../src/admin/sessions.js";
+import { totpCode } from "../src/admin/totp.js";
 import { makeCacheStore } from "../src/cache/store.js";
 import { resetAdminPasswordCommand } from "../src/oauth/cli.js";
+import { DEFAULT_THROTTLE } from "../src/oauth/login.js";
 import { NOW, statement, TODAY, tx } from "./support/cache.js";
 import { LAST_STATEMENT } from "./support/fio-api.js";
 import {
@@ -18,6 +21,7 @@ import {
   LOOPBACK_REDIRECT,
   type OAuthHarness,
   PASSWORD,
+  PEER_HEADER,
   PUBLIC_URL,
   pkcePair,
   postMcp,
@@ -269,6 +273,49 @@ describe("admin sign-in and sessions", () => {
     );
     const csrf = await csrfOf(await browser.get("/login"));
     expect((await browser.post("/login", { csrf, password: PASSWORD })).status).toBe(429);
+  });
+});
+
+describe("network allowlist (FIO_MCP_ADMIN_ALLOWED_CIDRS)", () => {
+  const OUTSIDE = { [PEER_HEADER]: "192.0.2.1" };
+  const INSIDE = { [PEER_HEADER]: "10.1.2.3" };
+  const PENDING = HttpRouter.add("GET", "/admin/payments/pending", HttpServerResponse.text("pending payments"));
+  const hidden = async (response: Response) => {
+    expect(response.status).toBe(404);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(await response.text()).toBe("");
+  };
+
+  beforeEach(async () => {
+    await harness.close();
+    harness = await startOAuth({ allowedNetworks: ["10.0.0.0/8"], extraAdminRoutes: PENDING });
+  });
+
+  it("answers 404 to clients outside the list on every /admin route and spelling", async () => {
+    const get = (path: string) => harness.fetch(`${PUBLIC_URL}${path}`, { headers: OUTSIDE });
+    for (const path of ["/admin", "/admin/login", "/admin/clients", "/admin/password", "/ADMIN", "//admin", "/%61dmin"]) {
+      await hidden(await get(path));
+    }
+    const outsider = new Admin(OUTSIDE);
+    await hidden(await outsider.post("/admin/login", { password: PASSWORD }));
+    await hidden(await outsider.post("/admin/accounts/add", { name: "third", token: THIRD_TOKEN }));
+    expect((await harness.accounts().list.pipe(Effect.runPromise)).length).toBe(2);
+  });
+
+  it("covers a route registered under /admin the way AdminLive registers its routes", async () => {
+    await hidden(await harness.fetch(`${PUBLIC_URL}/admin/payments/pending`, { headers: OUTSIDE }));
+    await hidden(await harness.fetch(`${PUBLIC_URL}/ADMIN/payments/pending`, { headers: OUTSIDE }));
+    const inside = await harness.fetch(`${PUBLIC_URL}/admin/payments/pending`, { headers: INSIDE });
+    expect(inside.status).toBe(200);
+    expect(await inside.text()).toBe("pending payments");
+  });
+
+  it("keeps the admin flows working for clients inside the list", async () => {
+    const admin = new Admin(INSIDE);
+    await admin.signIn();
+    const { message } = await admin.act("/admin/accounts/add", { name: "third", token: THIRD_TOKEN });
+    expect(message).not.toBe("");
+    expect((await harness.accounts().list.pipe(Effect.runPromise)).map((account) => account.name)).toContain("third");
   });
 });
 
@@ -668,5 +715,81 @@ describe("admin password", () => {
     await resetPassword(true, "a password from the cli\n");
     expect((await recovered.get("/admin")).status).toBe(303);
     await new Admin().signIn("a password from the cli");
+  });
+});
+
+describe("admin TOTP second factor at /admin/login (SEC-03)", () => {
+  const SECRET = new TextEncoder().encode("12345678901234567890");
+  const codeNow = (steps = 0) => totpCode(SECRET, Math.floor(harness.clock.currentTimeMillisUnsafe() / 1000) + steps * 30);
+  const wrongCode = () => {
+    const valid = new Set([codeNow(-1), codeNow(), codeNow(1)]);
+    return ["000000", "111111", "222222", "333333"].find((code) => !valid.has(code)) ?? "444444";
+  };
+
+  it("shows no code field when the secret is not configured", async () => {
+    const { html } = await new Admin().page("/admin/login");
+    expect(html).not.toContain('name="totp"');
+  });
+
+  it("needs a current, unused code with the password and counts a wrong or missing one", async () => {
+    await harness.close();
+    harness = await startOAuth({ throttle: { ...DEFAULT_THROTTLE, freeFailures: 1 }, totpSecret: Redacted.make(SECRET) });
+    const admin = new Admin();
+    const { html } = await admin.page("/admin/login");
+    expect(html).toContain('name="totp"');
+    expect(html).toContain('autocomplete="one-time-code"');
+
+    const missing = await admin.post("/admin/login", { password: PASSWORD });
+    expect(missing.status).toBe(401);
+    expect(await missing.text()).toContain("Wrong password or code.");
+    expect((await admin.post("/admin/login", { password: PASSWORD, totp: wrongCode() })).status).toBe(401);
+    // Both counted: the second failure started the backoff, even for a correct code.
+    expect((await admin.post("/admin/login", { password: PASSWORD, totp: codeNow() })).status).toBe(429);
+    harness.clock.advance(1000);
+
+    const code = codeNow();
+    expect((await admin.post("/admin/login", { password: PASSWORD, totp: code })).status).toBe(303);
+    expect((await admin.get("/admin")).status).toBe(200);
+    // The same code in another sign-in, here or at /login: refused.
+    const again = new Admin();
+    await again.page("/admin/login");
+    expect((await again.post("/admin/login", { password: PASSWORD, totp: code })).status).toBe(401);
+    // A fresh code works.
+    expect((await again.post("/admin/login", { password: PASSWORD, totp: codeNow(1) })).status).toBe(303);
+  });
+});
+
+describe("busy password check at /admin/password (SEC-09)", () => {
+  it("says sign-in busy, not the lockout text, when another check holds the slot", async () => {
+    await harness.close();
+    // A real busy answer depends on timing; the stub returns it for every change.
+    harness = await startOAuth({
+      adminPassword: (real) => ({
+        ...real,
+        change: () => Effect.succeed({ _tag: "Throttled", retryAfterSeconds: 1, busy: true } as const),
+      }),
+    });
+    const admin = await signedIn();
+    const result = await admin.act("/admin/password", { current: PASSWORD, next: NEW_PASSWORD, confirm: NEW_PASSWORD });
+    expect(result.message).toBe("Sign-in busy, try again.");
+  });
+});
+
+describe("busy sign-in at /admin/login (SEC-09)", () => {
+  it("answers a sign-in that finds another check running as busy, with retry-after 1", async () => {
+    await harness.close();
+    // Nothing is locked out here: every 429 must be the busy answer.
+    harness = await startOAuth({ throttle: { ...DEFAULT_THROTTLE, freeFailures: 100, lockoutFailures: 200 } });
+    const admins = Array.from({ length: 8 }, () => new Admin());
+    for (const admin of admins) await admin.page("/admin/login");
+    let busy: Response | undefined;
+    for (let round = 0; round < 5 && busy === undefined; round++) {
+      const responses = await Promise.all(admins.map((admin) => admin.post("/admin/login", { password: "wrong password!" })));
+      for (const response of responses) expect([401, 429]).toContain(response.status);
+      busy = responses.find((response) => response.status === 429);
+    }
+    if (busy === undefined) throw new Error("no sign-in was turned away as busy in 5 rounds");
+    expect(busy.headers.get("retry-after")).toBe("1");
+    expect(await busy.text()).toContain("Sign-in busy, try again.");
   });
 });

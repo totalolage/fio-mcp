@@ -702,6 +702,7 @@ describe("FioApi over fetch", () => {
         HOME: "/home/test",
         FIO_TOKEN: TOKEN,
         FIO_API_BASE_URL: `http://127.0.0.1:${port}/v1/rest`,
+        FIO_API_ALLOW_TEST_BASE_URL: "true",
         FIO_CACHE_ENABLED: "false",
       };
       yield* Effect.gen(function* () {

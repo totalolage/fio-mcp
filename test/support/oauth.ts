@@ -19,8 +19,8 @@ import { HttpRouter, HttpServer, HttpServerRequest } from "effect/http";
 import type { SqlClient } from "effect/sql";
 import { AccountChangesLive } from "../../src/account-runtime.js";
 import { Accounts, type AccountsShape } from "../../src/accounts.js";
-import { AdminPassword } from "../../src/admin/password.js";
-import { AdminLive } from "../../src/admin/server.js";
+import { AdminPassword, type AdminPasswordShape } from "../../src/admin/password.js";
+import { AdminLive, adminRoutes } from "../../src/admin/server.js";
 import { SERVER_INFO, ToolsLive } from "../../src/app.js";
 import { SERVER_MIGRATIONS } from "../../src/cache/db.js";
 import { type AppConfigShape, accountSeedOf, type HttpAuthConfig } from "../../src/config.js";
@@ -91,20 +91,50 @@ export interface OAuthHarness {
 /** Requests carrying this header appear to come from that socket peer address. */
 export const PEER_HEADER = "x-test-peer";
 
+const adminPasswordLayer = <E, R>(
+  real: Layer.Layer<AdminPassword, E, R>,
+  wrap: ((real: AdminPasswordShape) => AdminPasswordShape) | undefined,
+): Layer.Layer<AdminPassword, E, R> =>
+  wrap === undefined
+    ? real
+    : Layer.effect(
+        AdminPassword,
+        Effect.gen(function* () {
+          return AdminPassword.of(wrap(yield* AdminPassword));
+        }),
+      ).pipe(Layer.provide(real));
+
 export async function startOAuth(
   options: {
     throttle?: ThrottlePolicy;
     trustedProxies?: ReadonlyArray<string>;
+    /** FIO_MCP_ADMIN_ALLOWED_CIDRS entries. */
+    allowedNetworks?: ReadonlyArray<string>;
+    /** More admin routes, registered behind the same restriction as AdminLive's (adminRoutes). */
+    extraAdminRoutes?: Layer.Layer<never, never, HttpRouter.HttpRouter>;
     /** A database file instead of memory (survives `close`, for restart tests). */
     dbPath?: string;
     /** The accounts FIO_TOKEN / FIO_ACCOUNTS would configure (default: main and savings). */
     configured?: AppConfigShape["accounts"];
+    /** FIO_MCP_ADMIN_TOTP_SECRET_FILE's secret: sign-ins then need a code too. */
+    totpSecret?: Redacted.Redacted<Uint8Array>;
+    /** Replaces parts of the real AdminPassword, for outcomes a test cannot reach by timing (e.g. busy). */
+    adminPassword?: (real: AdminPasswordShape) => AdminPasswordShape;
   } = {},
 ): Promise<OAuthHarness> {
   const hash = await passwordHash();
   const trustedProxies = (options.trustedProxies ?? []).flatMap((entry) => parseTrustedProxy(entry) ?? []);
+  const allowedNetworks = (options.allowedNetworks ?? []).flatMap((entry) => parseTrustedProxy(entry) ?? []);
+  const adminSettings = { publicUrl: PUBLIC_URL, dataKey: DATA_KEY, trustedProxies, allowedNetworks };
   const accountSeed = accountSeedOf(options.configured ?? testConfig().accounts);
-  const auth: HttpAuthConfig = { kind: "oauth", publicUrl: PUBLIC_URL, passwordHash: Redacted.make(hash), dataKey: DATA_KEY, accountSeed };
+  const auth: HttpAuthConfig = {
+    kind: "oauth",
+    publicUrl: PUBLIC_URL,
+    passwordHash: Redacted.make(hash),
+    dataKey: DATA_KEY,
+    accountSeed,
+    totpSecret: options.totpSecret,
+  };
   const transport: HttpTransportConfig = {
     kind: "http",
     host: "127.0.0.1",
@@ -113,6 +143,7 @@ export async function startOAuth(
     allowedOrigins: [],
     allowedHosts: [],
     trustedProxies,
+    adminAllowedNetworks: allowedNetworks,
   };
   const config = testConfig(transport);
   const scope = await Effect.runPromise(Scope.make());
@@ -127,9 +158,10 @@ export async function startOAuth(
   });
   // As Auth.Live builds it, with the test's throttling and scrypt parameters.
   const oauth = Layer.mergeAll(
-    Auth.oauth({ publicUrl: PUBLIC_URL, trustedProxies }),
-    AdminLive({ publicUrl: PUBLIC_URL, dataKey: DATA_KEY, trustedProxies }),
-  ).pipe(Layer.provide(AdminPassword.layer(Redacted.make(hash), options.throttle, FAST_SCRYPT)));
+    Auth.oauth({ publicUrl: PUBLIC_URL, trustedProxies, allowedNetworks }),
+    AdminLive(adminSettings),
+    options.extraAdminRoutes === undefined ? Layer.empty : adminRoutes(adminSettings, options.extraAdminRoutes),
+  ).pipe(Layer.provide(adminPasswordLayer(AdminPassword.layer(Redacted.make(hash), options.throttle, FAST_SCRYPT, options.totpSecret), options.adminPassword)));
   let accounts: AccountsShape | undefined;
   const captureAccounts = Layer.effectDiscard(
     Effect.map(Effect.service(Accounts), (service) => {

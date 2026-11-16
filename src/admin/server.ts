@@ -10,6 +10,7 @@ import { pageHeaders } from "../oauth/pages.js";
 import { makeWindowLimiter } from "../oauth/rate-limit.js";
 import { makeOAuthStore } from "../oauth/store.js";
 import { clientAddress } from "../transport/client-address.js";
+import { restrictRoutes } from "../transport/restrict.js";
 import { makeAccountAdmin, type RemovedCache } from "./accounts.js";
 import {
   ADMIN_STYLE_HASH,
@@ -43,6 +44,8 @@ export interface AdminSettings {
   readonly publicUrl: string;
   readonly dataKey: Redacted.Redacted<Uint8Array>;
   readonly trustedProxies?: ReadonlyArray<IpNetwork.IpNetwork> | undefined;
+  /** FIO_MCP_ADMIN_ALLOWED_CIDRS: only these clients reach any /admin route (404 otherwise); empty allows all. */
+  readonly allowedNetworks?: ReadonlyArray<IpNetwork.IpNetwork> | undefined;
 }
 
 const MAX_FORM_BYTES = 16 * 1024;
@@ -165,7 +168,7 @@ export const makeAdminServer = Effect.fn("AdminServer.make")(function* (settings
     error?: string,
     extra: Record<string, string> = {},
     cookies?: Cookies.Cookies,
-  ) => html(adminLoginPage({ csrf: Redacted.value(csrf), error }), status, extra, cookies);
+  ) => html(adminLoginPage({ csrf: Redacted.value(csrf), error, totp: password.totpEnabled }), status, extra, cookies);
 
   const showLogin = Effect.fnUntraced(function* (request: Request) {
     if (Option.isSome(yield* signedIn(request))) return redirect(ADMIN_PATH);
@@ -192,7 +195,7 @@ export const makeAdminServer = Effect.fn("AdminServer.make")(function* (settings
     const session = found.value;
     if (form._tag === "Invalid" || !verified(request, session, form.params)) return refused;
     const entered = Redacted.make(field(form.params, "password") ?? "");
-    const result = yield* password.signIn(clientAddress(request, trustedProxies), entered);
+    const result = yield* password.signIn(clientAddress(request, trustedProxies), entered, field(form.params, "totp"));
     switch (result._tag) {
       case "Accepted": {
         // Bound to the hash the password matched: a change in between ends this session.
@@ -201,8 +204,10 @@ export const makeAdminServer = Effect.fn("AdminServer.make")(function* (settings
         return redirect(ADMIN_PATH, sessionCookie(Redacted.value(next.cookie), ADMIN_ABSOLUTE_MS));
       }
       case "Rejected":
-        return renderLogin(session.csrf, 401, "Wrong password.");
+        return renderLogin(session.csrf, 401, password.totpEnabled ? "Wrong password or code." : "Wrong password.");
       case "Throttled":
+        // Busy: another check is running; this attempt was not counted.
+        if (result.busy === true) return renderLogin(session.csrf, 429, "Sign-in busy, try again.", { "retry-after": "1" });
         return renderLogin(session.csrf, 429, `Too many failed attempts. Try again in ${result.retryAfterSeconds} s.`, {
           "retry-after": String(result.retryAfterSeconds),
         });
@@ -398,6 +403,8 @@ export const makeAdminServer = Effect.fn("AdminServer.make")(function* (settings
         case "Rejected":
           return { kind: "error", text: "The current password is wrong." } satisfies Flash;
         case "Throttled":
+          // Busy: another check is running; this attempt was not counted.
+          if (result.busy === true) return { kind: "error", text: "Sign-in busy, try again." } satisfies Flash;
           return { kind: "error", text: `Too many failed attempts. Try again in ${result.retryAfterSeconds} s.` } satisfies Flash;
         case "Unavailable":
           return { kind: "error", text: "The password could not be checked. See the server log." } satisfies Flash;
@@ -446,14 +453,30 @@ export const makeAdminServer = Effect.fn("AdminServer.make")(function* (settings
   return { routes };
 });
 
-/** Registers the admin routes on the router (HTTP mode with OAuth). */
+/**
+ * Admin routes: every route `routes` adds to the router answers 404 to
+ * clients outside `settings.allowedNetworks` (FIO_MCP_ADMIN_ALLOWED_CIDRS).
+ * The restriction is route middleware over the whole layer, so a route
+ * registered here is covered without being listed anywhere.
+ */
+export const adminRoutes = <E, R>(settings: AdminSettings, routes: Layer.Layer<never, E, R>) =>
+  routes.pipe(
+    Layer.provide(
+      restrictRoutes({ allowedNetworks: settings.allowedNetworks ?? [], trustedProxies: settings.trustedProxies ?? [] }).layer,
+    ),
+  );
+
+/** Registers the admin routes on the router (HTTP mode with OAuth), behind `adminRoutes`. */
 export const AdminLive = (
   settings: AdminSettings,
 ): Layer.Layer<never, never, HttpRouter.HttpRouter | SqlClient.SqlClient | Accounts | AdminPassword | FioApi | Transactions> =>
-  Layer.effectDiscard(
-    Effect.gen(function* () {
-      const server = yield* makeAdminServer(settings);
-      const router = yield* HttpRouter.HttpRouter;
-      for (const route of server.routes) yield* router.add(route.method, route.path, route.handler);
-    }),
+  adminRoutes(
+    settings,
+    Layer.effectDiscard(
+      Effect.gen(function* () {
+        const server = yield* makeAdminServer(settings);
+        const router = yield* HttpRouter.HttpRouter;
+        for (const route of server.routes) yield* router.add(route.method, route.path, route.handler);
+      }),
+    ),
   );

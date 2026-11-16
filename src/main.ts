@@ -14,12 +14,15 @@ import {
   revokeAllTokens,
   revokeClient,
 } from "./app.js";
+import { serveLeased } from "./instance-lease.js";
+import { totpInitCommand } from "./oauth/cli.js";
 import { makeRedactor, stderrLogger } from "./redaction.js";
 
 const USAGE = [
   "usage: fio-mcp                      serve MCP (FIO_MCP_TRANSPORT=stdio|http)",
   "       fio-mcp backup <dest>        copy the database to <dest>",
   "       fio-mcp hash-password        read the admin password (no echo), print its hash",
+  "       fio-mcp totp-init            print a new admin TOTP secret and its otpauth:// URI (stores nothing)",
   "       fio-mcp clients list         list registered OAuth clients",
   "       fio-mcp clients revoke <id>  remove a client and revoke its tokens",
   "       fio-mcp tokens revoke-all    revoke every OAuth grant",
@@ -28,7 +31,7 @@ const USAGE = [
   "                                    or with --set store a new one read like hash-password",
 ].join("\n");
 
-const serve = Layer.launch(AppLive);
+const serve = serveLeased(AppLive);
 
 const backupTo = (dest: string) =>
   backup(dest).pipe(
@@ -66,6 +69,10 @@ const command = (args: ReadonlyArray<string>) => {
   if (args.length === 1 && args[0] === "hash-password") {
     // Needs no configuration: the hash is created before the server is set up.
     return hashPasswordCommand().pipe(Effect.provide(Layer.mergeAll(NodeStdio.layer, NodeTerminal.layer)));
+  }
+  if (args.length === 1 && args[0] === "totp-init") {
+    // Needs no configuration, like hash-password.
+    return totpInitCommand().pipe(Effect.provide(NodeStdio.layer));
   }
   const run = configured(args);
   return run === undefined ? Effect.fail(new CommandFailed({ message: USAGE })) : run.pipe(Effect.provide(AppLoggerLive));
