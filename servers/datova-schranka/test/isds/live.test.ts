@@ -101,7 +101,7 @@ const describeError = (error: unknown): string => {
 };
 
 describe.skipIf(!enabled)("ISDS live (public test environment)", () => {
-  it.effect(
+  it.live(
     "runs the authorized operations",
     () =>
       Effect.gen(function* () {
