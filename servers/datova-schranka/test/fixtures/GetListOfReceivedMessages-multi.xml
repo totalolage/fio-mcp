@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <SOAP-ENV:Body>
+    <p:GetListOfReceivedMessagesResponse xmlns:p="http://isds.czechpoint.cz/v20">
+      <p:dmRecords>
+      <p:dmRecord dmType="K" dmVODZ="false" specMessFlag="1">
+        <p:dmOrdinal>1</p:dmOrdinal>
+        <p:dmID>1234567</p:dmID>
+        <p:dbIDSender>abc1234</p:dbIDSender>
+        <p:dmSender>Firma s.r.o.</p:dmSender>
+        <p:dmSenderAddress>Ulice 1, 110 00 Praha 1</p:dmSenderAddress>
+        <p:dmSenderType>10</p:dmSenderType>
+        <p:dmRecipient>Příjemce a.s.</p:dmRecipient>
+        <p:dmRecipientAddress>Náměstí 2, 602 00 Brno</p:dmRecipientAddress>
+        <p:dmAmbiguousRecipient xsi:nil="true"/>
+        <p:dmSenderOrgUnit xsi:nil="true"/>
+        <p:dmSenderOrgUnitNum xsi:nil="true"/>
+        <p:dbIDRecipient>xyz9876</p:dbIDRecipient>
+        <p:dmRecipientOrgUnit xsi:nil="true"/>
+        <p:dmRecipientOrgUnitNum xsi:nil="true"/>
+        <p:dmToHands>Jan Novák</p:dmToHands>
+        <p:dmAnnotation>Faktura 2026/17 &amp; příloha</p:dmAnnotation>
+        <p:dmRecipientRefNumber xsi:nil="true"/>
+        <p:dmSenderRefNumber>REF-17</p:dmSenderRefNumber>
+        <p:dmRecipientIdent xsi:nil="true"/>
+        <p:dmSenderIdent>SI-1</p:dmSenderIdent>
+        <p:dmLegalTitleLaw>300</p:dmLegalTitleLaw>
+        <p:dmLegalTitleYear>2008</p:dmLegalTitleYear>
+        <p:dmLegalTitleSect xsi:nil="true"/>
+        <p:dmLegalTitlePar xsi:nil="true"/>
+        <p:dmLegalTitlePoint xsi:nil="true"/>
+        <p:dmPersonalDelivery>false</p:dmPersonalDelivery>
+        <p:dmAllowSubstDelivery>true</p:dmAllowSubstDelivery>
+        <p:dmMessageStatus>6</p:dmMessageStatus>
+        <p:dmAttachmentSize>153</p:dmAttachmentSize>
+        <p:dmDeliveryTime>2026-11-02T09:15:30.123+01:00</p:dmDeliveryTime>
+        <p:dmAcceptanceTime>2026-11-02T10:00:00.000+01:00</p:dmAcceptanceTime>
+      </p:dmRecord>
+      <p:dmRecord>
+        <p:dmOrdinal>2</p:dmOrdinal>
+        <p:dmID>1234570</p:dmID>
+        <p:dbIDSender>def5678</p:dbIDSender>
+        <p:dmSender>Úřad města</p:dmSender>
+        <p:dmSenderAddress>Radnice 3, 301 00 Plzeň</p:dmSenderAddress>
+        <p:dmSenderType>10</p:dmSenderType>
+        <p:dmRecipient>Příjemce a.s.</p:dmRecipient>
+        <p:dmRecipientAddress>Náměstí 2, 602 00 Brno</p:dmRecipientAddress>
+        <p:dmAmbiguousRecipient>false</p:dmAmbiguousRecipient>
+        <p:dmSenderOrgUnit xsi:nil="true"/>
+        <p:dmSenderOrgUnitNum xsi:nil="true"/>
+        <p:dbIDRecipient>xyz9876</p:dbIDRecipient>
+        <p:dmRecipientOrgUnit xsi:nil="true"/>
+        <p:dmRecipientOrgUnitNum xsi:nil="true"/>
+        <p:dmToHands xsi:nil="true"/>
+        <p:dmAnnotation>Výzva</p:dmAnnotation>
+        <p:dmRecipientRefNumber xsi:nil="true"/>
+        <p:dmSenderRefNumber xsi:nil="true"/>
+        <p:dmRecipientIdent xsi:nil="true"/>
+        <p:dmSenderIdent xsi:nil="true"/>
+        <p:dmLegalTitleLaw xsi:nil="true"/>
+        <p:dmLegalTitleYear xsi:nil="true"/>
+        <p:dmLegalTitleSect xsi:nil="true"/>
+        <p:dmLegalTitlePar xsi:nil="true"/>
+        <p:dmLegalTitlePoint xsi:nil="true"/>
+        <p:dmPersonalDelivery>true</p:dmPersonalDelivery>
+        <p:dmAllowSubstDelivery>true</p:dmAllowSubstDelivery>
+        <p:dmMessageStatus>4</p:dmMessageStatus>
+        <p:dmAttachmentSize>2</p:dmAttachmentSize>
+        <p:dmDeliveryTime>2026-11-03T08:00:00+01:00</p:dmDeliveryTime>
+        <p:dmAcceptanceTime xsi:nil="true"/>
+        <p:dmFutureElement>ignored</p:dmFutureElement>
+      </p:dmRecord>
+      </p:dmRecords>
+      <p:dmStatus>
+        <p:dmStatusCode>0000</p:dmStatusCode>
+        <p:dmStatusMessage>Provedeno úspěšně.</p:dmStatusMessage>
+      </p:dmStatus>
+    </p:GetListOfReceivedMessagesResponse>
+  </SOAP-ENV:Body>
+</SOAP-ENV:Envelope>
