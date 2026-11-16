@@ -296,8 +296,19 @@ describe("permission denied", () => {
     expect(await names()).toEqual(ALL_TOOLS);
   });
 
-  it("answers HTTP 401/403/500 on a payment upload with the permission message", async () => {
-    for (const code of [401, 403, 500]) {
+  it("answers HTTP 5xx on a payment upload as an unknown outcome (SEC-06)", async () => {
+    for (const code of [500, 502]) {
+      const { call } = await connect([payAccount()], status(code));
+      const result = await call("submit_payment_orders", { orders: [domesticOrder], confirm: true });
+      expect(result.isError).toBe(true);
+      expect(text(result), `HTTP ${code}`).toMatch(/may or may not have created a batch/);
+      expect(text(result)).toMatch(/before submitting again/);
+      expect(text(result)).toMatch(/Sledování účtu a zadávání/);
+    }
+  });
+
+  it("answers HTTP 401/403 on a payment upload with the permission message", async () => {
+    for (const code of [401, 403]) {
       const { call } = await connect([payAccount()], status(code));
       const result = await call("submit_payment_orders", { orders: [domesticOrder], confirm: true });
       expect(result.isError).toBe(true);

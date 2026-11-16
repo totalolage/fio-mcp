@@ -6,7 +6,6 @@ import { TestClock } from "effect/testing";
 import { Accounts } from "../src/accounts.js";
 import { ServicesLive } from "../src/app.js";
 import { type AppConfigShape, MAX_RESPONSE_BYTES } from "../src/config.js";
-import { PERMISSION_DENIED } from "../src/errors.js";
 import { FioApi } from "../src/fio-api.js";
 import { RateLimiter } from "../src/rate-limiter.js";
 import { Redactor } from "../src/redaction.js";
@@ -312,16 +311,17 @@ describe("FioApi", () => {
       }).pipe(Effect.provide(testLayer())),
     );
 
-    it.effect("HTTP 500 on import is PermissionDenied", () =>
-      Effect.gen(function* () {
-        const api = yield* FioApi;
-        const acct = yield* account;
-        yield* FioHttp.enqueue(html(500, "<html><body>Internal error</body></html>"));
-        const error = yield* failure(api.importXml(acct, "<Import/>"));
-        assert.strictEqual(error._tag, "PermissionDenied");
-        assert.isTrue(error.message.startsWith(PERMISSION_DENIED));
-      }).pipe(Effect.provide(testLayer())),
-    );
+    for (const status of [500, 502] as const) {
+      it.effect(`HTTP ${status} on import is FioServerError (the batch may exist)`, () =>
+        Effect.gen(function* () {
+          const api = yield* FioApi;
+          const acct = yield* account;
+          yield* FioHttp.enqueue(html(status, "<html><body>Internal error</body></html>"));
+          const error = yield* failure(api.importXml(acct, "<Import/>"));
+          assert.strictEqual(error._tag, "FioServerError");
+        }).pipe(Effect.provide(testLayer())),
+      );
+    }
   });
 
   describe("HTTP status mapping", () => {

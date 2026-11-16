@@ -8,6 +8,7 @@ import {
   FioTransportError,
   HistoryAuthorizationRequired,
   InvalidInput,
+  PaymentAuditError,
   PermissionDenied,
   RateLimited,
   TokenRejected,
@@ -38,6 +39,7 @@ export const ToolFailure = Schema.Union([
   InvalidInput,
   UploadOutcomeUnknown,
   CacheError,
+  PaymentAuditError,
 ]);
 
 /**
