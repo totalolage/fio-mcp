@@ -132,6 +132,13 @@ if ! docker run --rm --network none --entrypoint sh "$tag" \
   echo "error: $tag contains node_modules/redis or node_modules/@redis" >&2
   exit 1
 fi
+# Every module must still resolve without the omitted peers. main.js is left
+# out because importing it starts the server.
+if ! docker run --rm --network none --entrypoint node "$tag" --input-type=module \
+  -e 'for (const f of (await import("node:fs")).readdirSync("/app/dist", { recursive: true })) if (f.endsWith(".js") && f !== "main.js") await import(`/app/dist/${f}`);' >&2; then
+  echo "error: $tag cannot load its modules; a dependency is missing from node_modules" >&2
+  exit 1
+fi
 
 if [ -n "$dry_run" ]; then
   echo "dry run: built $tag ($id); would ship it to $host and load it with '$remote_docker load'" >&2

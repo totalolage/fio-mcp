@@ -37,7 +37,13 @@ case $1 in
     echo "build output"
     ;;
   image) echo "$SHIM_LOCAL_ID" ;;
-  run) [ -z "${SHIM_IMAGE_REDIS:-}" ] || exit 1 ;;
+  run)
+    case "$*" in
+      *"--entrypoint sh "*) [ -z "${SHIM_IMAGE_REDIS:-}" ] || exit 1 ;;
+      *"--entrypoint node "*) [ -z "${SHIM_IMAGE_MODULES_FAIL:-}" ] || exit 1 ;;
+      *) exit 64 ;;
+    esac
+    ;;
   save)
     [ -z "${SHIM_SAVE_FAIL:-}" ] || exit 3
     if [ -n "${SHIM_SAVE_BIG:-}" ]; then
@@ -140,7 +146,7 @@ tag=fio-mcp:1.2.3-$sha
 failures=0
 case_name=
 
-knobs='DRY_RUN DOCKER FIO_MCP_SSH_HOST FIO_MCP_REMOTE_DOCKER SHIP_TMPDIR SHIP_NEW_SESSION SHIM_BUILDX SHIM_BUILD_FAIL SHIM_BUILD_BLOCK SHIM_SAVE_FAIL SHIM_SAVE_BIG SHIM_GZIP_FAIL SHIM_GZIP_TRUNCATE SHIM_LOAD_FAIL SHIM_LOAD_EARLY SHIM_PREFLIGHT_FAIL SHIM_INSPECT_FAIL SHIM_REMOTE_ID SHIM_SSH_EXEC SHIM_EXPECT_GZIP SHIM_REMOTE_PARTIAL_FAIL SHIM_REMOTE_VALIDATE_GZIP SHIM_IMAGE_REDIS'
+knobs='DRY_RUN DOCKER FIO_MCP_SSH_HOST FIO_MCP_REMOTE_DOCKER SHIP_TMPDIR SHIP_NEW_SESSION SHIM_BUILDX SHIM_BUILD_FAIL SHIM_BUILD_BLOCK SHIM_SAVE_FAIL SHIM_SAVE_BIG SHIM_GZIP_FAIL SHIM_GZIP_TRUNCATE SHIM_LOAD_FAIL SHIM_LOAD_EARLY SHIM_PREFLIGHT_FAIL SHIM_INSPECT_FAIL SHIM_REMOTE_ID SHIM_SSH_EXEC SHIM_EXPECT_GZIP SHIM_REMOTE_PARTIAL_FAIL SHIM_REMOTE_VALIDATE_GZIP SHIM_IMAGE_REDIS SHIM_IMAGE_MODULES_FAIL'
 # shellcheck disable=SC2086 # word list on purpose
 unset $knobs
 ship_sh=${SHIP_SH:-sh}
@@ -159,7 +165,7 @@ run_ship() {
     SHIM_LOAD_EARLY="${SHIM_LOAD_EARLY:-}" SHIM_PREFLIGHT_FAIL="${SHIM_PREFLIGHT_FAIL:-}" SHIM_INSPECT_FAIL="${SHIM_INSPECT_FAIL:-}" \
     SHIM_REMOTE_ID="${SHIM_REMOTE_ID:-}" SHIM_SSH_EXEC="${SHIM_SSH_EXEC:-}" SHIM_EXPECT_GZIP="${SHIM_EXPECT_GZIP:-1}" \
     SHIM_REMOTE_PARTIAL_FAIL="${SHIM_REMOTE_PARTIAL_FAIL:-}" SHIM_REMOTE_VALIDATE_GZIP="${SHIM_REMOTE_VALIDATE_GZIP:-}" \
-    SHIM_IMAGE_REDIS="${SHIM_IMAGE_REDIS:-}" \
+    SHIM_IMAGE_REDIS="${SHIM_IMAGE_REDIS:-}" SHIM_IMAGE_MODULES_FAIL="${SHIM_IMAGE_MODULES_FAIL:-}" \
     $ship_sh "$repo/scripts/ship-image.sh" "$@"
 }
 
@@ -261,6 +267,14 @@ case_name="checks the image for redis before shipping"
 ship
 redis_check="run --rm --network none --entrypoint sh $tag -c test ! -e /app/node_modules/redis && test ! -e /app/node_modules/@redis"
 grep -Fqx -- "$redis_check" "$work/log/docker.log" || fail "no redis check: $(cat "$work/log/docker.log")"
+grep -Fq -- "run --rm --network none --entrypoint node $tag --input-type=module -e " "$work/log/docker.log" ||
+  fail "no module load check: $(cat "$work/log/docker.log")"
+
+case_name="fails without shipping when the image cannot load its modules"
+SHIM_IMAGE_MODULES_FAIL=1 ship
+expect_failure
+expect_err "$tag cannot load its modules"
+[ ! -e "$work/log/ssh.log" ] || fail "ssh was called: $(cat "$work/log/ssh.log")"
 
 case_name="fails without shipping when the image contains redis"
 SHIM_IMAGE_REDIS=1 ship
