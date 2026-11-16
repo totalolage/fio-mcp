@@ -827,6 +827,22 @@ describe("payments at /admin", () => {
     expect(row?.reason).toBe("confirmation expired");
   });
 
+  it("refuses to approve a held batch whose grant was revoked, uploading nothing", async () => {
+    const uploads = await startRecording();
+    const { admin, principal, pendingId } = await holdBatch();
+    expect((await admin.act("/admin/grants/revoke", { grant: principal.subject })).message).toBe("Revoked the authorization.");
+    expect((await admin.page("/admin/payments/pending")).html).toContain("approving it uploads nothing");
+
+    const approved = await admin.act("/admin/payments/pending/approve", { pending: pendingId });
+    expect(approved.message).toContain(`Batch ${pendingId}: refused.`);
+    expect(approved.message).toContain("no longer active");
+    expect(uploads).toEqual([]);
+    const [row] = await audit();
+    expect(row?.outcome).toBe("refused");
+    expect(row?.reason).toBe("approval: grant no longer active");
+    expect((await admin.page("/admin/payments/pending")).html).not.toContain(pendingId);
+  });
+
   it("declines a held batch without uploading it", async () => {
     const uploads = await startRecording();
     const { admin, pendingId } = await holdBatch();
