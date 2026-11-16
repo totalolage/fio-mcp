@@ -7,6 +7,7 @@ import { tokenFingerprint } from "../src/accounts.js";
 import { hashSecret, randomSecret } from "../src/oauth/crypto.js";
 import { DEFAULT_THROTTLE } from "../src/oauth/login.js";
 import { LIMITS } from "../src/oauth/server.js";
+import { DEFAULT_GRANT_PAYMENTS } from "../src/payment-limits.js";
 import { MAX_BODY_BYTES, MAX_CONCURRENT_REQUESTS, SESSION_LIMITS } from "../src/transport/http.js";
 import {
   authorizationUrl,
@@ -236,6 +237,7 @@ describe("metadata and the /mcp challenge", () => {
           scopes: ["fio:read"],
           accountFingerprints: ["main"],
           resource: "https://other.example.test/mcp",
+          payments: DEFAULT_GRANT_PAYMENTS,
         };
         yield* store.createGrant(
           grant,

@@ -313,7 +313,7 @@ describe("account token history", () => {
           const sql = yield* SqlClient.SqlClient;
           assert.deepStrictEqual(yield* migrate(SERVER_MIGRATIONS), []);
           const [applied] = yield* sql<{ id: number }>`SELECT MAX(migration_id) AS id FROM fio_mcp_migrations`;
-          assert.strictEqual(applied?.id, 7);
+          assert.strictEqual(applied?.id, 10);
           assert.deepStrictEqual(
             yield* sql<{ account_id: string; token_fingerprint: string; created_at: number }>`
               SELECT account_id, token_fingerprint, created_at FROM fio_account_tokens ORDER BY account_id

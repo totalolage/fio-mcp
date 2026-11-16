@@ -4,6 +4,7 @@ import type { IpNetwork } from "effect/net";
 import { type Account, Accounts } from "../accounts.js";
 import { AdminPassword } from "../admin/password.js";
 import { SCOPE_PAYMENTS, SCOPE_READ, SCOPES } from "../mcp/permissions.js";
+import { DEFAULT_GRANT_PAYMENTS } from "../payment-limits.js";
 import { AuthUnavailable, Unauthorized } from "../transport/auth-errors.js";
 import { clientAddress } from "../transport/client-address.js";
 import type { Principal } from "../transport/principal.js";
@@ -269,6 +270,8 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
       subject: grant.value.grantId,
       scopes: grant.value.scopes,
       accountFingerprints: grant.value.accountFingerprints,
+      clientId: grant.value.clientId,
+      payments: grant.value.payments,
     } satisfies Principal;
   });
 
@@ -655,6 +658,8 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
       scopes,
       accountFingerprints: [...new Set(chosenAccounts.map((account) => account.tokenFingerprint))],
       resource: pending.resource,
+      // Server-default limits, allowlist off; the consent form sets these (SEC-04/26/27).
+      payments: DEFAULT_GRANT_PAYMENTS,
     };
     yield* store
       .createGrant(

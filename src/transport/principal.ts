@@ -1,4 +1,5 @@
 import { Context, Layer } from "effect";
+import type { GrantPayments } from "../payment-limits.js";
 
 /**
  * Who is calling a tool. The HTTP guard provides it per request on /mcp from
@@ -18,6 +19,13 @@ export interface Principal {
   readonly scopes: "all" | ReadonlyArray<string>;
   /** Token fingerprints (Account.tokenFingerprint) of the granted accounts. */
   readonly accountFingerprints: "all" | ReadonlyArray<string>;
+  /** The OAuth client behind the grant; absent for local and unauthenticated callers. */
+  readonly clientId?: string;
+  /**
+   * The grant's payment limits and payee allowlist. Absent means server
+   * defaults with the allowlist off (LOCAL_PRINCIPAL, Auth.Open).
+   */
+  readonly payments?: GrantPayments;
 }
 
 /** The stdio client (the user's own process) and the unauthenticated HTTP mode. */
