@@ -377,8 +377,10 @@ export function evaluateLimits(
     batchCents[currency] = (batchCents[currency] ?? 0) + cents;
     const limit = toCents(effective.maxPerOrder[currency] ?? 0);
     if (cents > limit) {
+      // SEC-26: name the remaining allowance too (the day's, before this batch).
+      const remaining = Math.max(0, toCents(effective.maxPerDay[currency] ?? 0) - usedCents(currency));
       problems.push(
-        `Order ${index + 1} (${formatCents(cents)} ${currency}) exceeds the per-order limit for ${currency} of ${formatCents(limit)}.`,
+        `Order ${index + 1} (${formatCents(cents)} ${currency}) exceeds the per-order limit for ${currency} of ${formatCents(limit)}; ${formatCents(remaining)} of the daily limit remains ${DAY_NOTE}.`,
       );
     }
   }

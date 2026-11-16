@@ -347,7 +347,7 @@ describe("evaluateLimits", () => {
 
   it("refuses an order above the per-order limit", () => {
     const result = evaluateLimits(effective, [payee(10), payee(60_000)], NO_USAGE);
-    expect(result.problems).toEqual(["Order 2 (60000.00 CZK) exceeds the per-order limit for CZK of 50000.00."]);
+    expect(result.problems).toEqual(["Order 2 (60000.00 CZK) exceeds the per-order limit for CZK of 50000.00; 100000.00 of the daily limit remains today (Europe/Prague)."]);
   });
 
   it("refuses a batch above the remaining daily allowance", () => {
