@@ -12,6 +12,7 @@ import {
   revokeAllTokens,
   revokeClient,
 } from "./app.js";
+import { PURGE_USAGE, parsePurgeArgs, purgePayments } from "./payment-cli.js";
 import { makeRedactor, stderrLogger } from "./redaction.js";
 
 const USAGE = [
@@ -24,6 +25,8 @@ const USAGE = [
   "       fio-mcp reset-admin-password [--set]",
   "                                    drop the password set at /admin (the hash file applies again),",
   "                                    or with --set store a new one read like hash-password",
+  `       ${PURGE_USAGE}`,
+  "                                    delete payment audit rows of days before the date (kept 365 days at least)",
 ].join("\n");
 
 const serve = Layer.launch(AppLive);
@@ -45,6 +48,7 @@ const configured = (
       | Effect.Error<typeof listClients>
       | Effect.Error<typeof revokeAllTokens>
       | Effect.Error<ReturnType<typeof resetAdminPassword>>
+      | Effect.Error<ReturnType<typeof purgePayments>>
       | CommandFailed
     >
   | undefined => {
@@ -56,6 +60,10 @@ const configured = (
   if (name === "tokens" && arg === "revoke-all" && rest.length === 0) return revokeAllTokens;
   if (name === "reset-admin-password" && arg === undefined) return resetAdminPassword(false);
   if (name === "reset-admin-password" && arg === "--set" && rest.length === 0) return resetAdminPassword(true);
+  if (name === "payments") {
+    const before = parsePurgeArgs(args.slice(1));
+    return before === undefined ? undefined : purgePayments(before);
+  }
   return undefined;
 };
 
