@@ -6,16 +6,17 @@ import { SERVER_MIGRATIONS } from "../src/cache/db.js";
 import { type AppConfigShape, MAX_RESPONSE_BYTES } from "../src/config.js";
 import type { InvalidInput } from "../src/errors.js";
 import { FioApi } from "../src/fio-api.js";
-import { PaymentControls } from "../src/payment-controls.js";
+import { NEW_KEY_ADVICE, PaymentControls } from "../src/payment-controls.js";
 import { PaymentLedger } from "../src/payment-ledger.js";
 import { DEFAULT_PAYMENT_LIMITS } from "../src/payment-limits.js";
 import { buildImportXml, type Payer, type PaymentOrder, PaymentOrders } from "../src/payments.js";
 import { RateLimiter } from "../src/rate-limiter.js";
 import { Redactor } from "../src/redaction.js";
 import type { Principal } from "../src/transport/principal.js";
+import { IMPORT_ERROR_XML } from "./fixtures.js";
 import { seededConfig } from "./support/config.js";
 import { memoryDatabase } from "./support/database.js";
-import { FioHttp, text } from "./support/fio-http.js";
+import { FioHttp, html, text } from "./support/fio-http.js";
 
 const TOKEN = "Tk7pQ2vX9mZr4LbN8sYw3HcJ6dFg1KaE5uVo0iRtBnMxWqSzPyGhCjDlUeAfOk2Q";
 const BASE_URL = "https://fio.test/v1/rest";
@@ -145,4 +146,62 @@ describe("audit fields from FIO's import response are redacted", () => {
       }).pipe(Effect.provide(testLayer)),
     );
   }
+});
+
+describe("not-sent and rejected uploads are final for their idempotency key", () => {
+  const assertFinal = (answer: { readonly tag: string; readonly text: string }) => {
+    assert.include(answer.text, NEW_KEY_ADVICE);
+    assert.notMatch(answer.text, /retry after/i);
+    assert.notInclude(answer.text, "before submitting again");
+  };
+
+  it.effect("a RateLimited (FIO 409) upload answers and replays the new-key advice, never Retry after", () =>
+    Effect.gen(function* () {
+      yield* FioHttp.enqueue({ status: 409 }, { status: 409 });
+      const fresh = yield* answerOf("key_ratelimit_1");
+      const replayed = yield* answerOf("key_ratelimit_1");
+      assert.strictEqual(fresh.tag, "UploadRefused");
+      assertFinal(fresh);
+      assert.include(fresh.text, "FIO returned 409 and processed nothing");
+      assert.deepStrictEqual(replayed, fresh);
+      assert.strictEqual(yield* uploadCount, 2); // the limiter's one retry, then never again
+      const rows = yield* rawAuditRows;
+      assert.lengthOf(rows, 1);
+      assert.strictEqual(rows[0]?.outcome, "refused");
+      assert.strictEqual(rows[0]?.reason, "not sent: FIO returned 409 and processed nothing");
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  const rejected = [
+    { name: "an HTTP 404 (FioBadRequest)", reply: html(404, "<html>Not found</html>"), tag: "UploadRefused" },
+    { name: "an HTTP 413 (TooManyItems)", reply: html(413, ""), tag: "UploadRefused" },
+    { name: "a parsed error response", reply: text(IMPORT_ERROR_XML), tag: "success" },
+  ];
+  for (const testCase of rejected) {
+    it.effect(`a rejected upload (${testCase.name}) answers and replays the new-key advice`, () =>
+      Effect.gen(function* () {
+        yield* FioHttp.enqueue(testCase.reply);
+        const fresh = yield* answerOf("key_rejected_1");
+        const replayed = yield* answerOf("key_rejected_1");
+        assert.strictEqual(fresh.tag, testCase.tag);
+        assertFinal(fresh);
+        assert.deepStrictEqual(replayed, fresh);
+        assert.strictEqual(yield* uploadCount, 1);
+        const rows = yield* rawAuditRows;
+        assert.lengthOf(rows, 1);
+        assert.strictEqual(rows[0]?.outcome, "rejected");
+      }).pipe(Effect.provide(testLayer)),
+    );
+  }
+
+  it.effect("an unknown outcome (HTTP 500) keeps its check-Internetbanking guidance, not the new-key advice", () =>
+    Effect.gen(function* () {
+      yield* FioHttp.enqueue(html(500, "boom"));
+      const unknown = yield* answerOf("key_unknown_1");
+      // The unknown outcome keeps its "check Internetbanking" guidance.
+      assert.strictEqual(unknown.tag, "UploadOutcomeUnknown");
+      assert.include(unknown.text, "before submitting again");
+      assert.notInclude(unknown.text, NEW_KEY_ADVICE);
+    }).pipe(Effect.provide(testLayer)),
+  );
 });

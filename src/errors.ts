@@ -147,6 +147,19 @@ export class UploadOutcomeUnknown extends Schema.TaggedError<UploadOutcomeUnknow
   }
 }
 
+/**
+ * A payment upload that definitely created no batch: it was never sent, or
+ * FIO refused it. Final for its idempotency key, so `detail` ends with the
+ * new-key advice and never says to retry.
+ */
+export class UploadRefused extends Schema.TaggedError<UploadRefused>()("UploadRefused", {
+  detail: Schema.String,
+}) {
+  override get message(): string {
+    return this.detail;
+  }
+}
+
 /** The local SQLite cache failed. The SQL cause is logged (redacted), not shown. */
 export class CacheError extends Schema.TaggedError<CacheError>()("CacheError", {
   operation: Schema.String,

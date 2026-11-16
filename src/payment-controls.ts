@@ -9,7 +9,9 @@ import {
   PAYMENT_TOKEN_HINT,
   PaymentAuditError,
   PermissionDenied,
+  type RateLimited,
   UploadOutcomeUnknown,
+  UploadRefused,
 } from "./errors.js";
 import { FioApi } from "./fio-api.js";
 import { type ImportResult, looksLikeMissingPaymentPermission, parseImportResponse } from "./import-response.js";
@@ -38,6 +40,7 @@ import {
   unlistedPayees,
 } from "./payment-limits.js";
 import { type Payer, type PaymentOrder, summarizeOrders } from "./payments.js";
+import { isConflictRefusal } from "./rate-limiter.js";
 import { Redactor } from "./redaction.js";
 import type { Principal } from "./transport/principal.js";
 
@@ -188,15 +191,37 @@ const RecordedJson = Schema.fromJsonString(
 );
 const decodeRecorded = Schema.decodeUnknownEffect(RecordedJson);
 
-/** Appends R3's new-key advice to a final failure that carries a `detail`. */
+/** Why a RateLimited upload was not sent. A 409 means FIO saw the call and processed nothing. */
+const notSentReason = (error: RateLimited): string =>
+  isConflictRefusal(error) ? "FIO returned 409 and processed nothing" : "RateLimited";
+
+/**
+ * R3: a not-sent or rejected upload is final for its idempotency key, so its
+ * failure carries the new-key advice and never a retry hint. Failures without
+ * a `detail` become UploadRefused with the original message (a RateLimited
+ * one without its "Retry after", since the key never uploads again).
+ */
 const withNewKeyAdvice = (failure: ToolFailureType): ToolFailureType => {
   switch (failure._tag) {
     case "InvalidInput":
       return new InvalidInput({ detail: `${failure.detail} ${NEW_KEY_ADVICE}` });
     case "PermissionDenied":
       return new PermissionDenied({ detail: `${failure.detail} ${NEW_KEY_ADVICE}` });
-    default:
+    case "UploadOutcomeUnknown":
+    case "UploadRefused":
       return failure;
+    case "RateLimited":
+      return new UploadRefused({
+        detail: `The batch was not uploaded: ${notSentReason(failure)}. ${failure.reason} This idempotencyKey never uploads again. ${NEW_KEY_ADVICE}`,
+      });
+    case "TooManyItems":
+      return new UploadRefused({
+        detail: `FIO refused the batch as too large (HTTP 413); no batch was created and this idempotencyKey never uploads again. ${NEW_KEY_ADVICE}`,
+      });
+    default:
+      return new UploadRefused({
+        detail: `${failure.message} No batch was created in FIO, and this idempotencyKey never uploads again. ${NEW_KEY_ADVICE}`,
+      });
   }
 };
 
@@ -207,7 +232,7 @@ const nextStepFor = (result: ImportResult): string => {
     case "accepted":
       return "The batch was created but NOT executed. An authorized person must sign it in FIO Internetbanking (SMS or Fio signature) for the payments to be processed.";
     case "rejected":
-      return `FIO rejected the batch; nothing was created. Fix the problems listed and submit again with a new idempotencyKey (a used key never uploads again).`;
+      return `FIO rejected the batch; nothing was created. Fix the problems listed; a used idempotencyKey never uploads again. ${NEW_KEY_ADVICE}`;
     case "unknown": {
       // Status and batch IDs are FIO's text: marked so the output guards them.
       const batch = result.batchIds.length ? `, batch ID ${markUntrusted(result.batchIds.join(", "))}` : "";
@@ -288,12 +313,12 @@ export const makePaymentControls = Effect.gen(function* () {
 
   // R5. FioApi turns FIO's 409 (token used too soon, nothing processed)
   // into RateLimited once its retries run out, so TokenBusy never reaches
-  // here; RateLimited is "not sent" either way.
+  // here; RateLimited is "not sent" either way, and the reason names the 409.
   const classifyError = (error: ToolFailureType): UploadClassification => {
     const base = { result: undefined, batchIds: [], fioErrorCode: error._tag };
     switch (error._tag) {
       case "RateLimited":
-        return { ...base, outcome: "refused", failure: error, reason: "not sent: RateLimited" };
+        return { ...base, outcome: "refused", failure: error, reason: `not sent: ${notSentReason(error)}` };
       case "FioTransportError":
         if (!error.dispatched) return { ...base, outcome: "refused", failure: error, reason: "not sent: FioTransportError" };
         break;
