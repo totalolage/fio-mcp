@@ -56,6 +56,10 @@ function data(result: CallToolResult): any {
   return JSON.parse(text(result));
 }
 
+let keys = 0;
+/** A fresh idempotency key: each submit in these tests is a new user-approved batch. */
+const newKey = () => `server-test-key-${String(++keys).padStart(4, "0")}`;
+
 const domesticOrder = {
   type: "domestic",
   amount: 100,
@@ -288,7 +292,7 @@ describe("permission denied", () => {
 
   it("answers a payment upload refused for the token with the permission message", async () => {
     const { call, names } = await connect([payAccount()], ok(IMPORT_PERMISSION_XML));
-    const result = await call("submit_payment_orders", { orders: [domesticOrder], confirm: true });
+    const result = await call("submit_payment_orders", { orders: [domesticOrder], confirm: true, idempotencyKey: newKey() });
     expect(result.isError).toBe(true);
     expect(text(result).split("\n")[0]).toBe(PERMISSION_DENIED);
     expect(text(result)).toMatch(/Token does not have permission/);
@@ -299,7 +303,7 @@ describe("permission denied", () => {
   it("answers HTTP 5xx on a payment upload as an unknown outcome (SEC-06)", async () => {
     for (const code of [500, 502]) {
       const { call } = await connect([payAccount()], status(code));
-      const result = await call("submit_payment_orders", { orders: [domesticOrder], confirm: true });
+      const result = await call("submit_payment_orders", { orders: [domesticOrder], confirm: true, idempotencyKey: newKey() });
       expect(result.isError).toBe(true);
       expect(text(result), `HTTP ${code}`).toMatch(/may or may not have created a batch/);
       expect(text(result)).toMatch(/before submitting again/);
@@ -310,7 +314,7 @@ describe("permission denied", () => {
   it("answers HTTP 401/403 on a payment upload with the permission message", async () => {
     for (const code of [401, 403]) {
       const { call } = await connect([payAccount()], status(code));
-      const result = await call("submit_payment_orders", { orders: [domesticOrder], confirm: true });
+      const result = await call("submit_payment_orders", { orders: [domesticOrder], confirm: true, idempotencyKey: newKey() });
       expect(result.isError).toBe(true);
       expect(text(result).split("\n")[0], `HTTP ${code}`).toBe(PERMISSION_DENIED);
       expect(text(result)).toMatch(/Sledování účtu a zadávání/);
@@ -328,7 +332,7 @@ describe("permission denied", () => {
         ),
       ),
     );
-    const submitted = data(await call("submit_payment_orders", { orders: [domesticOrder], confirm: true }));
+    const submitted = data(await call("submit_payment_orders", { orders: [domesticOrder], confirm: true, idempotencyKey: newKey() }));
     expect(submitted.result.outcome).toBe("rejected");
   });
 });
@@ -353,7 +357,7 @@ describe("payment tools", () => {
     const order = { ...domesticOrder, messageForRecipient: "Nájem za říjen, Žluťoučký kůň 😀" };
     const preview = data(await call("preview_payment_orders", { orders: [order] }));
     expect(preview.xml).toContain("<messageForRecipient>Nájem za říjen, Žluťoučký kůň 😀</messageForRecipient>");
-    const result = await call("submit_payment_orders", { orders: [order], confirm: true });
+    const result = await call("submit_payment_orders", { orders: [order], confirm: true, idempotencyKey: newKey() });
     const submitted = data(result);
     expect(text(result)).not.toContain(PAY_TOKEN);
     const recorded = await requests();
@@ -377,15 +381,15 @@ describe("payment tools", () => {
       const preview = await call("preview_payment_orders", { orders: [order] });
       expect(preview.isError).toBe(true);
       expect(text(preview)).toMatch(/not valid in XML/);
-      expect((await call("submit_payment_orders", { orders: [order], confirm: true })).isError).toBe(true);
+      expect((await call("submit_payment_orders", { orders: [order], confirm: true, idempotencyKey: newKey() })).isError).toBe(true);
     }
     expect(await fetched()).toBe(0);
   });
 
   it("requires explicit confirmation to submit", async () => {
     const { call, fetched } = await connect([payAccount()]);
-    expect((await call("submit_payment_orders", { orders: [domesticOrder] })).isError).toBe(true);
-    expect((await call("submit_payment_orders", { orders: [domesticOrder], confirm: false })).isError).toBe(true);
+    expect((await call("submit_payment_orders", { orders: [domesticOrder], idempotencyKey: newKey() })).isError).toBe(true);
+    expect((await call("submit_payment_orders", { orders: [domesticOrder], confirm: false, idempotencyKey: newKey() })).isError).toBe(true);
     expect(await fetched()).toBe(0);
   });
 
@@ -401,13 +405,13 @@ describe("payment tools", () => {
   it("warns that the outcome is unknown when an upload fails ambiguously", async () => {
     const ambiguous = IMPORT_OK_XML.replace("<status>ok</status>", "");
     const { call } = await connect([payAccount()], ok(ambiguous));
-    const submitted = data(await call("submit_payment_orders", { orders: [domesticOrder], confirm: true }));
+    const submitted = data(await call("submit_payment_orders", { orders: [domesticOrder], confirm: true, idempotencyKey: newKey() }));
     expect(submitted.result.outcome).toBe("unknown");
     expect(submitted.nextStep).toMatch(/105545555.*Check the pending batches/s);
 
     for (const reply of [status(502), ok("<html>oops</html>"), { transportError: "socket hang up" }]) {
       const { call: callOther } = await connect([payAccount()], reply);
-      const result = await callOther("submit_payment_orders", { orders: [domesticOrder], confirm: true });
+      const result = await callOther("submit_payment_orders", { orders: [domesticOrder], confirm: true, idempotencyKey: newKey() });
       expect(result.isError).toBe(true);
       expect(text(result)).toMatch(/may or may not have created a batch/);
     }
@@ -419,7 +423,7 @@ describe("payment tools", () => {
       "<errorCode>1</errorCode>",
     );
     const { call } = await connect([payAccount()], ok(rejected));
-    const submitted = data(await call("submit_payment_orders", { orders: [domesticOrder], confirm: true }));
+    const submitted = data(await call("submit_payment_orders", { orders: [domesticOrder], confirm: true, idempotencyKey: newKey() }));
     expect(submitted.result.accepted).toBe(false);
   });
 });

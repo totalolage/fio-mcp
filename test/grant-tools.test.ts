@@ -166,7 +166,7 @@ describe("tools/list follows the HTTP session's grant", () => {
       const bob = yield* connect(base, "bob");
       const calls = {
         preview_payment_orders: { account: "main", orders: [ORDER] },
-        submit_payment_orders: { account: "main", orders: [ORDER], confirm: true },
+        submit_payment_orders: { account: "main", orders: [ORDER], confirm: true, idempotencyKey: "grant-test-key-0001" },
       };
       assert.deepStrictEqual(Object.keys(calls).sort(), [...PAYMENT_TOOLS].sort());
       for (const [name, args] of Object.entries(calls)) {
@@ -208,7 +208,7 @@ describe("tools/list follows the HTTP session's grant", () => {
             assert.deepStrictEqual(tool.inputSchema.properties?.account, { type: "string", enum: ["main"], description: "Name of the account to use." }, tool.name);
           }
         }
-        const hidden = yield* call(alice.client, "submit_payment_orders", { account: "main", orders: [ORDER], confirm: true });
+        const hidden = yield* call(alice.client, "submit_payment_orders", { account: "main", orders: [ORDER], confirm: true, idempotencyKey: "grant-test-key-0001" });
         assert.isTrue(hidden.isError);
         assert.match(hidden.text, DENIED);
         const bob = yield* connect(base, "bob", protocol.protocolVersion);

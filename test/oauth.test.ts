@@ -123,7 +123,7 @@ describe("OAuth end to end with the MCP SDK client", () => {
     expect(text(preview)).toContain("fio:payments");
     const submit = (await client.callTool({
       name: "submit_payment_orders",
-      arguments: { account: "main", orders: [ORDER], confirm: true },
+      arguments: { account: "main", orders: [ORDER], confirm: true, idempotencyKey: "oauth-test-key-0001" },
     })) as CallToolResult;
     expect(submit.isError).toBe(true);
     expect(text(submit)).toMatch(/^You don't have permissions to do that\./);
