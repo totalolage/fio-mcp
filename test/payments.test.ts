@@ -409,7 +409,7 @@ describe("signing in Internetbanking stays the backstop (SEC-25)", () => {
     const listed = await tools.tools();
     const submit = listed.find((tool) => tool.name === "submit_payment_orders");
     expect(submit?.description).toMatch(/NOT executed/);
-    expect(submit?.description).toMatch(/sign them in FIO Internetbanking|sign in FIO Internetbanking|sign it in FIO Internetbanking|must then sign in FIO Internetbanking/);
+    expect(submit?.description).toMatch(/must then sign in FIO Internetbanking/);
     expect(submit?.description).toContain(
       "Not idempotent at Fio: never resubmit after an error or an unknown outcome until the user has checked Internetbanking.",
     );
