@@ -11,7 +11,15 @@ import { RateLimiter } from "../rate-limiter.js";
 import { Redactor } from "../redaction.js";
 import { parseLastStatement } from "../statement.js";
 import { annotateTool, DateParam, guardedOutput, JsonObject, ToolFailure, withAccount } from "./common.js";
-import { PAYMENTS, permittedAccount, READ, requireScopes, visibleAccounts } from "./permissions.js";
+import {
+  MARKER_TOOLS,
+  PAYMENTS,
+  permittedAccount,
+  READ,
+  requireMarkerTools,
+  requireScopes,
+  visibleAccounts,
+} from "./permissions.js";
 import { toolsForAccounts } from "./registration.js";
 import { G, markUntrusted, STATEMENT_GUARD } from "./untrusted.js";
 
@@ -233,6 +241,7 @@ export const makeFioHandlers = Effect.fn("FioTools.handlers")(function* (toolkit
     get_new_transactions: ({ account }) =>
       out(
         Effect.gen(function* () {
+          yield* requireMarkerTools(config);
           const acc = yield* permittedAccount(accounts, account);
           const statement = yield* fio.last(acc);
           yield* cache.record(acc, statement);
@@ -244,6 +253,7 @@ export const makeFioHandlers = Effect.fn("FioTools.handlers")(function* (toolkit
     set_download_marker: ({ account, movementId, date }) =>
       out(
         Effect.gen(function* () {
+          yield* requireMarkerTools(config);
           const acc = yield* permittedAccount(accounts, account);
           if (movementId !== undefined && date === undefined) {
             yield* fio.setLastId(acc, movementId);
@@ -369,7 +379,15 @@ export const makeFioHandlers = Effect.fn("FioTools.handlers")(function* (toolkit
 });
 
 /** Registers the FIO toolkit with the MCP server, again whenever the account names change. */
-export const FioToolsLive = toolsForAccounts((names) => {
-  const toolkit = makeFioToolkit(names);
-  return McpServer.registerToolkit(toolkit).pipe(Effect.provide(toolkit.toLayer(makeFioHandlers(toolkit))));
-});
+export const FioToolsLive = toolsForAccounts(
+  Effect.fn("FioTools.register")(function* (names: ReadonlyArray<string>) {
+    const config = yield* AppConfig;
+    const toolkit = makeFioToolkit(names);
+    // FIO_MCP_MARKER_TOOLS=disabled: the marker tools are neither registered nor listed (SEC-10).
+    const registered =
+      config.markerTools === "disabled"
+        ? Toolkit.make(...Object.values(toolkit.tools).filter((tool) => !MARKER_TOOLS.has(tool.name)))
+        : toolkit;
+    yield* McpServer.registerToolkit(registered).pipe(Effect.provide(toolkit.toLayer(makeFioHandlers(toolkit))));
+  }),
+);

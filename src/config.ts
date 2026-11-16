@@ -123,7 +123,15 @@ export interface AppConfigShape {
   readonly maxResponseBytes: number;
   readonly transport: TransportConfig;
   readonly cache: CacheConfig;
+  /**
+   * FIO_MCP_MARKER_TOOLS (SEC-10). `disabled` leaves out get_new_transactions
+   * and set_download_marker, the tools that move the token's download marker
+   * in the bank. Absent means `enabled`.
+   */
+  readonly markerTools?: MarkerTools;
 }
+
+export type MarkerTools = "enabled" | "disabled";
 
 export const DEFAULT_BASE_URL = "https://fioapi.fio.cz/v1/rest";
 export const DEFAULT_RATE_LIMIT_INTERVAL_MS = 30_000;
@@ -472,6 +480,12 @@ const loadCache = Effect.fn("config.loadCache")(function* () {
   } satisfies CacheConfig;
 });
 
+const loadMarkerTools = Effect.fn("config.loadMarkerTools")(function* () {
+  const value = Option.getOrElse(yield* optionalVar("FIO_MCP_MARKER_TOOLS"), () => "enabled").toLowerCase();
+  if (value !== "enabled" && value !== "disabled") return yield* fail("FIO_MCP_MARKER_TOOLS must be enabled or disabled");
+  return value satisfies MarkerTools;
+});
+
 /** Reads and validates the whole configuration. */
 export const loadConfig = Effect.fn("config.load")(function* () {
   const transport = yield* loadTransport();
@@ -498,6 +512,7 @@ export const loadConfig = Effect.fn("config.load")(function* () {
     maxResponseBytes: MAX_RESPONSE_BYTES,
     transport,
     cache,
+    markerTools: yield* loadMarkerTools(),
   };
   return config;
 });

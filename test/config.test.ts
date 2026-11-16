@@ -22,6 +22,25 @@ const secretFile = (content: string) => {
   return path;
 };
 
+describe("FIO_MCP_MARKER_TOOLS", () => {
+  it.effect("defaults to enabled and reads enabled or disabled, trimmed and case-insensitive", () =>
+    Effect.gen(function* () {
+      assert.strictEqual((yield* loadConfigFrom({ FIO_TOKEN: READ_TOKEN })).markerTools, "enabled");
+      assert.strictEqual((yield* loadConfigFrom({ FIO_TOKEN: READ_TOKEN, FIO_MCP_MARKER_TOOLS: "  " })).markerTools, "enabled");
+      const disabled = yield* loadConfigFrom({ FIO_TOKEN: READ_TOKEN, FIO_MCP_MARKER_TOOLS: " Disabled " });
+      assert.strictEqual(disabled.markerTools, "disabled");
+    }),
+  );
+
+  it.effect("fails startup on any other value without echoing it", () =>
+    Effect.gen(function* () {
+      const message = yield* configError({ FIO_TOKEN: READ_TOKEN, FIO_MCP_MARKER_TOOLS: "off-ish" });
+      assert.include(message, "FIO_MCP_MARKER_TOOLS");
+      assert.notInclude(message, "off-ish");
+    }),
+  );
+});
+
 describe("loadConfig", () => {
   it.effect("reads a single token with defaults", () =>
     Effect.gen(function* () {
