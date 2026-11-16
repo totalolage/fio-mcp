@@ -7,6 +7,7 @@ import { RateLimiter } from "../../src/rate-limiter.js";
 import { Redactor } from "../../src/redaction.js";
 import { seededConfig } from "./config.js";
 import { slotHoldingFio } from "./fio-api.js";
+import { memoryPaymentControls } from "./payments.js";
 
 /** A FIO-shaped read token (64 URL-safe characters). */
 export const FIO_TOKEN = "fioT0ken-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRS";
@@ -56,7 +57,7 @@ export const testServices = <E = never, R = never>(
   release: Deferred.Deferred<void>,
   accounts: Layer.Layer<Accounts, E, R | Redactor | AppConfig> = Accounts.Default,
 ) =>
-  Transactions.Disabled.pipe(
+  Layer.mergeAll(Transactions.Disabled, memoryPaymentControls()).pipe(
     Layer.provideMerge(slotHoldingFio(release)),
     Layer.provideMerge(Layer.mergeAll(accounts, RateLimiter.Default)),
     Layer.provideMerge(Redactor.Default),
