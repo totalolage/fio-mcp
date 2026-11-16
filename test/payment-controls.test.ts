@@ -139,6 +139,9 @@ const failureOf = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
       : Effect.die(new Error(`expected a failure, got ${String(exit)}`)),
   );
 
+/** Every grant is live unless a test says otherwise. */
+const live = (_grantId: string) => Effect.succeed(true);
+
 const tagOf = (error: unknown) => (error as { readonly _tag: string })._tag;
 const messageOf = (error: unknown) => (error as { readonly message: string }).message;
 
@@ -468,7 +471,7 @@ describe("payee allowlist", () => {
       assert.strictEqual(view?.audit.outcome, "pending-confirmation");
 
       yield* FioHttp.enqueue(text(IMPORT_OK_XML));
-      const approval = yield* controls.approvePending(String(held.pendingId));
+      const approval = yield* controls.approvePending(String(held.pendingId), live);
       assert.strictEqual(approval.outcome, "accepted");
       const sent = yield* uploads;
       assert.lengthOf(sent, 1);
@@ -476,7 +479,7 @@ describe("payee allowlist", () => {
       assert.strictEqual(sent[0]?.files[0]?.text, yield* buildImportXml(orders, PAYER));
       assert.strictEqual(view?.batch.xmlSha256, sha256Hex(sent[0]?.files[0]?.text ?? ""));
 
-      const again = yield* failureOf(controls.approvePending(String(held.pendingId)));
+      const again = yield* failureOf(controls.approvePending(String(held.pendingId), live));
       assert.strictEqual(tagOf(again), "InvalidInput");
       assert.lengthOf(yield* uploads, 1);
       const replayed = yield* submit([euro(10)], { principal: grant, key });
@@ -527,12 +530,105 @@ describe("payee allowlist", () => {
       assert.lengthOf(yield* controls.listPending, 1);
       yield* TestClock.adjust(1);
       assert.lengthOf(yield* controls.listPending, 0);
-      const error = yield* failureOf(controls.approvePending(String(held.pendingId)));
+      const error = yield* failureOf(controls.approvePending(String(held.pendingId), live));
       assert.strictEqual(tagOf(error), "InvalidInput");
       assert.lengthOf(yield* uploads, 0);
       const [row] = yield* auditRows();
       assert.strictEqual(row?.outcome, "refused");
       assert.strictEqual(row?.reason, "confirmation expired");
+    }).pipe(Effect.provide(testLayer())),
+  );
+});
+
+describe("held batch approval", () => {
+  it.effect("refuses approval when the grant is no longer active and uploads nothing", () =>
+    Effect.gen(function* () {
+      const controls = yield* PaymentControls;
+      const grant = principal(allowlist("confirm", IBAN));
+      const key = freshKey();
+      const held = yield* submit([euro(10)], { principal: grant, key });
+      yield* FioHttp.enqueue(text(IMPORT_OK_XML));
+      const checked: Array<string> = [];
+      const revoked = (grantId: string) => Effect.sync(() => checked.push(grantId)).pipe(Effect.as(false));
+      const approval = yield* controls.approvePending(String(held.pendingId), revoked);
+      assert.deepStrictEqual(checked, ["fio_grant_1"]);
+      assert.strictEqual(approval.outcome, "refused");
+      assert.include(approval.message, "no longer active");
+      assert.lengthOf(yield* uploads, 0);
+      assert.lengthOf(yield* controls.listPending, 0);
+      const [row] = yield* auditRows();
+      assert.strictEqual(row?.outcome, "refused");
+      assert.strictEqual(row?.reason, "approval: grant no longer active");
+      const replay = yield* failureOf(submit([euro(10)], { principal: grant, key }));
+      assert.include(messageOf(replay), "no longer active");
+      const again = yield* failureOf(controls.approvePending(String(held.pendingId), live));
+      assert.strictEqual(tagOf(again), "InvalidInput");
+      assert.lengthOf(yield* uploads, 0);
+    }).pipe(Effect.provide(testLayer())),
+  );
+
+  it.effect("takes the batch and moves its audit row in one transaction", () =>
+    Effect.gen(function* () {
+      const ledger = yield* PaymentLedger;
+      const held = yield* submit([euro(10)], { principal: principal(allowlist("confirm")) });
+      const pendingId = String(held.pendingId);
+      // The audit table's CHECK constraint rejects this outcome, failing the
+      // audit update after the batch's DELETE: the DELETE must roll back.
+      const broken = yield* failureOf(
+        ledger.takePending(pendingId, 0, { outcome: "bogus" as AuditRow["outcome"], reason: "x" }),
+      );
+      assert.strictEqual(tagOf(broken), "PaymentAuditError");
+      assert.isTrue((yield* ledger.getPending(pendingId))._tag === "Some");
+      const [stillHeld] = yield* auditRows();
+      assert.strictEqual(stillHeld?.outcome, "pending-confirmation");
+
+      const taken = yield* ledger.takePending(pendingId, 0, { outcome: "refused", reason: "declined by admin" });
+      assert.isTrue(taken._tag === "Some" && taken.value.moved);
+      assert.isTrue((yield* ledger.getPending(pendingId))._tag === "None");
+      const [row] = yield* auditRows();
+      assert.strictEqual(row?.outcome, "refused");
+    }).pipe(Effect.provide(testLayer())),
+  );
+
+  it.effect("two concurrent approvals of one batch upload it once", () =>
+    Effect.gen(function* () {
+      const controls = yield* PaymentControls;
+      const held = yield* submit([euro(10)], { principal: principal(allowlist("confirm", IBAN)) });
+      yield* FioHttp.enqueue(text(IMPORT_OK_XML));
+      yield* FioHttp.enqueue(text(IMPORT_OK_XML));
+      const approve = Effect.exit(controls.approvePending(String(held.pendingId), live));
+      const results = yield* Effect.all([approve, approve], { concurrency: "unbounded" });
+      assert.strictEqual(results.filter(Exit.isSuccess).length, 1);
+      assert.lengthOf(yield* uploads, 1);
+      const [row] = yield* auditRows();
+      assert.strictEqual(row?.outcome, "accepted");
+    }).pipe(Effect.provide(testLayer())),
+  );
+
+  it.effect("an approval racing the expiry sweep uploads at most once and leaves a consistent row", () =>
+    Effect.gen(function* () {
+      const controls = yield* PaymentControls;
+      const ledger = yield* PaymentLedger;
+      const held = yield* submit([euro(10)], { principal: principal(allowlist("confirm", IBAN)) });
+      yield* FioHttp.enqueue(text(IMPORT_OK_XML));
+      yield* TestClock.adjust(PENDING_TTL_MS - 1);
+      const [approval] = yield* Effect.all(
+        [
+          Effect.exit(controls.approvePending(String(held.pendingId), live)),
+          ledger.expirePending(PENDING_TTL_MS, JSON.stringify({ failure: null })),
+        ],
+        { concurrency: "unbounded" },
+      );
+      const sent = (yield* uploads).length;
+      const [row] = yield* auditRows();
+      assert.lengthOf(yield* ledger.pending(0), 0);
+      if (Exit.isSuccess(approval)) {
+        assert.strictEqual(sent, 1);
+        assert.strictEqual(row?.outcome, "accepted");
+      } else {
+        assert.strictEqual(sent, 0);
+        assert.strictEqual(row?.reason, "confirmation expired");
+      }
     }).pipe(Effect.provide(testLayer())),
   );
 });

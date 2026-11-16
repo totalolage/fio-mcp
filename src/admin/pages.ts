@@ -350,7 +350,7 @@ const pendingBlock = (csrf: string, secondFactor: boolean, row: PendingRow) => `
 <p>Account ${row.accountName === null ? "(unnamed)" : `“${escapeHtml(row.accountName)}”`}; grant <code>${escapeHtml(row.audit.grantId)}</code>${
   row.audit.clientId === null ? "" : `, client <code>${escapeHtml(row.audit.clientId)}</code>`
 }; submitted ${formatTime(row.audit.createdAt)}; dropped unless approved by <strong>${formatTime(row.expiresAt)}</strong>.</p>
-${row.unlisted === undefined ? `<p class="error">The authorization that submitted this batch is no longer active.</p>` : ""}
+${row.unlisted === undefined ? `<p class="error">The authorization that submitted this batch is no longer active, so approving it uploads nothing. Decline it to clear it.</p>` : ""}
 <p>${row.audit.orderCount} orders, total ${totalsText(row.audit.totals)}.</p>
 <ul>${row.audit.payees.map((payee) => pendingPayee(row, payee)).join("")}</ul>
 <p>SHA-256 of the XML uploaded on approval: <code>${escapeHtml(row.xmlSha256)}</code></p>

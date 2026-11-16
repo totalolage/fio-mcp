@@ -70,6 +70,14 @@ const EXPIRED = new PermissionDenied({
   detail: `The admin did not approve this batch within 24 hours, so it was dropped and nothing was sent to FIO. ${NEW_KEY_ADVICE}`,
 });
 
+const GRANT_GONE = new PermissionDenied({
+  detail: `The authorization that submitted this batch is no longer active (revoked or expired), so the approval was refused and nothing was sent to FIO. ${NEW_KEY_ADVICE}`,
+});
+
+const ACCOUNT_GONE = new PermissionDenied({
+  detail: `The account of this batch is no longer configured with the same token, so it was not uploaded. ${NEW_KEY_ADVICE}`,
+});
+
 const DECLINED = new PermissionDenied({
   detail: `An admin declined this batch at /admin/payments/pending; nothing was sent to FIO. ${NEW_KEY_ADVICE}`,
 });
@@ -151,8 +159,15 @@ export interface PaymentControlsShape {
   readonly preview: (input: PreviewInput) => Effect.Effect<PreviewControls, PaymentAuditError>;
   /** Held batches (after an expiry sweep), oldest first. */
   readonly listPending: Effect.Effect<ReadonlyArray<PendingView>, PaymentAuditError>;
-  /** Uploads the held batch's exact XML once. InvalidInput when it is no longer pending. */
-  readonly approvePending: (pendingId: string) => Effect.Effect<ApprovalResult, PaymentAuditError | InvalidInput>;
+  /**
+   * Uploads the held batch's exact XML once. InvalidInput when it is no
+   * longer pending; refused, uploading nothing, when `grantLive` says the
+   * submitting grant is no longer active.
+   */
+  readonly approvePending: <E>(
+    pendingId: string,
+    grantLive: (grantId: string) => Effect.Effect<boolean, E>,
+  ) => Effect.Effect<ApprovalResult, PaymentAuditError | InvalidInput | E>;
   /** Drops the held batch; false when it was no longer pending. */
   readonly declinePending: (pendingId: string) => Effect.Effect<boolean, PaymentAuditError>;
   /** Audit rows newest first, optionally for one grant (/admin/payments). */
@@ -533,32 +548,38 @@ export const makePaymentControls = Effect.gen(function* () {
   const notPending = (pendingId: string) =>
     new InvalidInput({ detail: `Batch ${pendingId} is no longer awaiting confirmation (approved, declined or expired).` });
 
-  const approvePending = Effect.fnUntraced(function* (pendingId: string) {
-      const grantId = yield* pendingGrant(pendingId);
-      if (Option.isNone(grantId)) {
+  /**
+   * Uploads a held batch once. Under the grant's lock, the grant must still
+   * be live (`grantLive`) and the account still configured; the batch is
+   * then taken and its audit row moved to the in-flight unknown state in one
+   * transaction before dispatch (R4), so a crash never strands a pending row.
+   */
+  const approvePending = <E>(pendingId: string, grantLive: (grantId: string) => Effect.Effect<boolean, E>) =>
+    Effect.gen(function* () {
+      const held = yield* ledger.getPending(pendingId);
+      if (Option.isNone(held)) {
         yield* sweep;
-        return yield* Effect.fail(notPending(pendingId));
+        return yield* notPending(pendingId);
       }
+      // A held batch's fields never change; only its presence does.
+      const batch = held.value;
       return yield* withGrantLock(
-        grantId.value,
+        batch.grantId,
         Effect.gen(function* () {
           yield* sweep;
-          const now = yield* Clock.currentTimeMillis;
-          const taken = yield* ledger.takePending(pendingId, now);
-          if (Option.isNone(taken)) return yield* Effect.fail(notPending(pendingId));
-          const batch = taken.value;
           const audit = yield* ledger.get(batch.auditId);
+          const live = yield* grantLive(batch.grantId);
           const account = (yield* accounts.list).find((acc) => acc.tokenFingerprint === batch.accountId);
-          if (account === undefined || Option.isNone(audit)) {
-            const failure = new PermissionDenied({
-              detail: `The account of this batch is no longer configured with the same token, so it was not uploaded. ${NEW_KEY_ADVICE}`,
+          const now = yield* Clock.currentTimeMillis;
+          if (!live || account === undefined || Option.isNone(audit)) {
+            const failure = live ? ACCOUNT_GONE : GRANT_GONE;
+            const reason = live ? "approval: account unavailable" : "approval: grant no longer active";
+            const taken = yield* ledger.takePending(pendingId, now, {
+              outcome: "refused",
+              reason,
+              responseJson: failureJson(failure),
             });
-            yield* ledger.update(
-              batch.auditId,
-              { outcome: "refused", reason: "approval: account unavailable", responseJson: failureJson(failure) },
-              now,
-              "pending-confirmation",
-            );
+            if (Option.isNone(taken)) return yield* notPending(pendingId);
             return {
               pendingId,
               auditId: batch.auditId,
@@ -567,24 +588,23 @@ export const makePaymentControls = Effect.gen(function* () {
               message: failure.message,
             } satisfies ApprovalResult;
           }
-          const moved = yield* ledger.update(
-            batch.auditId,
-            { outcome: "unknown", reason: "upload in progress", responseJson: failureJson(IN_PROGRESS) },
-            now,
-            "pending-confirmation",
-          );
-          if (!moved) return yield* Effect.fail(notPending(pendingId));
+          const taken = yield* ledger.takePending(pendingId, now, {
+            outcome: "unknown",
+            reason: "upload in progress",
+            responseJson: failureJson(IN_PROGRESS),
+          });
+          if (Option.isNone(taken) || !taken.value.moved) return yield* notPending(pendingId);
           // The approved upload replays like a direct one: the recorded
           // response replaces the "awaiting confirmation" one, keeping its
           // account and summary fields.
-          const held: Record<string, unknown> =
+          const heldResponse: Record<string, unknown> =
             audit.value.responseJson === null
               ? {}
               : yield* decodeRecorded(audit.value.responseJson).pipe(
                   Effect.map((recorded) => ("ok" in recorded ? recorded.ok : {})),
                   Effect.orElseSucceed(() => ({})),
                 );
-          const { outcome: _outcome, pendingId: _pending, expiresAt: _expires, nextStep: _next, ...summary } = held;
+          const { outcome: _outcome, pendingId: _pending, expiresAt: _expires, nextStep: _next, ...summary } = heldResponse;
           const success = (result: ImportResult): SubmitSuccess => ({ ...summary, result, nextStep: nextStepFor(result) });
           const { classified, response } = yield* uploadRecorded(batch.auditId, account, batch.xml, success);
           return {
@@ -598,7 +618,7 @@ export const makePaymentControls = Effect.gen(function* () {
           } satisfies ApprovalResult;
         }),
       );
-  });
+    });
 
   const declinePending = Effect.fnUntraced(function* (pendingId: string) {
       const grantId = yield* pendingGrant(pendingId);
@@ -611,15 +631,12 @@ export const makePaymentControls = Effect.gen(function* () {
         Effect.gen(function* () {
           yield* sweep;
           const now = yield* Clock.currentTimeMillis;
-          const taken = yield* ledger.takePending(pendingId, now);
-          if (Option.isNone(taken)) return false;
-          yield* ledger.update(
-            taken.value.auditId,
-            { outcome: "refused", reason: "declined by admin", responseJson: failureJson(DECLINED) },
-            now,
-            "pending-confirmation",
-          );
-          return true;
+          const taken = yield* ledger.takePending(pendingId, now, {
+            outcome: "refused",
+            reason: "declined by admin",
+            responseJson: failureJson(DECLINED),
+          });
+          return Option.isSome(taken);
         }),
       );
   });
@@ -674,7 +691,7 @@ const LazyLedgerLive = Layer.effect(
       hold: (row, batch, response) => via((l) => l.hold(row, batch, response)),
       pending: (now) => via((l) => l.pending(now)),
       getPending: (pendingId) => via((l) => l.getPending(pendingId)),
-      takePending: (pendingId, now) => via((l) => l.takePending(pendingId, now)),
+      takePending: (pendingId, now, patch) => via((l) => l.takePending(pendingId, now, patch)),
       expirePending: (now, responseJson) => via((l) => l.expirePending(now, responseJson)),
       purgeBefore: (day) => via((l) => l.purgeBefore(day)),
     });

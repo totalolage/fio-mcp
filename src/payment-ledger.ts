@@ -128,6 +128,12 @@ export interface PendingBatch {
   readonly expiresAt: number;
 }
 
+/** A held batch taken for approval or decline, and whether its audit row moved with it. */
+export interface TakenBatch {
+  readonly batch: PendingBatch;
+  readonly moved: boolean;
+}
+
 export interface AuditQuery {
   readonly grantId?: string;
   readonly limit: number;
@@ -169,13 +175,18 @@ export interface PaymentLedgerShape {
   readonly pending: (now: number) => Effect.Effect<ReadonlyArray<PendingBatch>, PaymentAuditError>;
   readonly getPending: (pendingId: string) => Effect.Effect<Option.Option<PendingBatch>, PaymentAuditError>;
   /**
-   * Atomically removes an unexpired held batch and returns it; None when it
-   * is gone or expired, so only one caller can ever take it (R2).
+   * In one transaction, removes an unexpired held batch and applies `patch`
+   * to its audit row while that row is still "pending-confirmation", so a
+   * crash can never leave a pending audit row without its batch. None when
+   * the batch is gone or expired, so only one caller can ever take it (R2);
+   * `moved` is false when the audit row was no longer pending (the batch is
+   * removed all the same).
    */
   readonly takePending: (
     pendingId: string,
     now: number,
-  ) => Effect.Effect<Option.Option<PendingBatch>, PaymentAuditError>;
+    patch: AuditPatch,
+  ) => Effect.Effect<Option.Option<TakenBatch>, PaymentAuditError>;
   /**
    * Removes the batches expired at `now` and marks their audit rows refused
    * (reason "confirmation expired", recording `responseJson` for replay).
@@ -425,13 +436,20 @@ export const makePaymentLedger = Effect.gen(function* () {
       failure("read the held payment batch"),
     );
 
-  const takePending: PaymentLedgerShape["takePending"] = (pendingId, now) =>
-    sql<PendingDbRow>`
-      DELETE FROM payment_pending WHERE pending_id = ${pendingId} AND expires_at > ${now} RETURNING *
-    `.pipe(
-      Effect.map(([row]) => Option.map(Option.fromNullishOr(row), toPending)),
-      failure("take the held payment batch"),
-    );
+  const takePending: PaymentLedgerShape["takePending"] = (pendingId, now, patch) =>
+    sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const [row] = yield* sql<PendingDbRow>`
+            DELETE FROM payment_pending WHERE pending_id = ${pendingId} AND expires_at > ${now} RETURNING *
+          `;
+          if (row === undefined) return Option.none<TakenBatch>();
+          const batch = toPending(row);
+          const moved = yield* update(batch.auditId, patch, now, "pending-confirmation");
+          return Option.some<TakenBatch>({ batch, moved });
+        }),
+      )
+      .pipe(failure("take the held payment batch"));
 
   const expirePending: PaymentLedgerShape["expirePending"] = (now, responseJson) =>
     sql

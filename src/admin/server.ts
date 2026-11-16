@@ -557,7 +557,14 @@ export const makeAdminServer = Effect.fn("AdminServer.make")(function* (settings
         case "Accepted":
           break;
       }
-      const result = yield* payments.approvePending(field(form, "pending") ?? "");
+      // Checked again under the grant's lock: a grant revoked after the
+      // page loaded makes the approval upload nothing.
+      const grantLive = (grantId: string) =>
+        Effect.flatMap(Clock.currentTimeMillis, (now) => oauth.listGrants(now)).pipe(
+          Effect.map((grants) => grants.some((grant) => grant.grantId === grantId)),
+          Effect.mapError((error) => ({ message: error.description })),
+        );
+      const result = yield* payments.approvePending(field(form, "pending") ?? "", grantLive);
       yield* Effect.logInfo(`admin: approved a held payment batch (${result.outcome})`);
       return {
         kind: result.outcome === "accepted" ? "ok" : "error",
