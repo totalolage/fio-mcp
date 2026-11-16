@@ -1,5 +1,6 @@
 import { assert, describe, it } from "@effect/vitest";
 import { DateTime, Duration, Effect } from "effect";
+import { TestClock } from "effect/testing";
 import { IsdsTimeoutError } from "../../src/isds/errors.js";
 import {
   attachmentSizeMatches,
@@ -110,6 +111,15 @@ describe("reconcileSentMessage", () => {
       const { requests } = yield* reconcile({ ...sent, slack: Duration.seconds(30) }, sentList([]));
       assert.strictEqual(element(requests[0]?.envelope, "dmFromTime"), "2026-11-16T11:59:30.000Z");
       assert.strictEqual(element(requests[0]?.envelope, "dmToTime"), "2026-11-16T12:00:30.000Z");
+    }),
+  );
+
+  it.effect("extends the window to the current time when that is later", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-11-16T12:30:00Z"));
+      const { requests } = yield* reconcile(sent, sentList([]));
+      assert.strictEqual(element(requests[0]?.envelope, "dmFromTime"), "2026-11-16T11:58:00.000Z");
+      assert.strictEqual(element(requests[0]?.envelope, "dmToTime"), "2026-11-16T12:30:00.000Z");
     }),
   );
 

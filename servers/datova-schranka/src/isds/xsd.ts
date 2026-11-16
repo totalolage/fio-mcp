@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { DateTime, Schema, SchemaTransformation } from "effect";
 import { findInvalidXmlChar } from "./xml.js";
 
@@ -23,8 +24,37 @@ export const XsDateTime = Schema.DateTimeUtcFromString;
 /** xs:integer / xs:int / xs:long within the safe integer range ↔ number. */
 export const XsInteger = Schema.FiniteFromString.pipe(Schema.check(Schema.isInt()));
 
-/** xs:base64Binary ↔ bytes. */
-export const XsBase64 = Schema.Uint8ArrayFromBase64;
+/** Canonical base64 text: whole quanta of the standard alphabet with at most two `=` of padding. */
+const Base64Text = Schema.String.pipe(
+  Schema.check(
+    Schema.makeFilter((text: string) =>
+      text.length % 4 === 0 && /^[A-Za-z0-9+/]*={0,2}$/.test(text) ? undefined : "Expected base64 text",
+    ),
+  ),
+);
+
+/**
+ * xs:base64Binary ↔ bytes. XML whitespace inside the lexical form is allowed (XSD Part 2
+ * §3.2.16) and dropped; anything else outside the base64 alphabet fails. Uses Node's native codec,
+ * since attachments run to tens of megabytes.
+ */
+export const XsBase64 = Schema.String.pipe(
+  Schema.decodeTo(
+    Base64Text,
+    SchemaTransformation.transform({
+      decode: (text: string) => text.replace(/[\t\n\r ]/g, ""),
+      encode: (text: string) => text,
+    }),
+  ),
+  Schema.decodeTo(
+    Schema.Uint8Array,
+    SchemaTransformation.transform({
+      // Copies out of Buffer's shared pool into a plain Uint8Array.
+      decode: (text: string): Uint8Array => new Uint8Array(Buffer.from(text, "base64")),
+      encode: (bytes: Uint8Array) => Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("base64"),
+    }),
+  ),
+);
 
 /** Renders a DateTime for an xs:dateTime request element (UTC, ISO 8601). */
 export const formatXsDateTime = (value: DateTime.DateTime): string => DateTime.formatIso(value);
@@ -39,8 +69,25 @@ export const XmlText = Schema.String.pipe(
   ),
 );
 
-/** XmlText limited to `maxLength` characters (XSD maxLength counts characters). */
-export const xmlTextMax = (maxLength: number) => XmlText.pipe(Schema.check(Schema.isMaxLength(maxLength)));
+/** The number of Unicode code points, which is what XSD maxLength and the spec's "znaků" count. */
+export const characterCount = (text: string): number => {
+  let count = 0;
+  for (const _char of text) count++;
+  return count;
+};
+
+/**
+ * XmlText of at most `maxLength` characters. Counts code points, not UTF-16 units, so a
+ * character outside the BMP (e.g. an emoji) counts once, as in XSD maxLength.
+ */
+export const xmlTextMax = (maxLength: number) =>
+  XmlText.pipe(
+    Schema.check(
+      Schema.makeFilter((text: string) =>
+        characterCount(text) <= maxLength ? undefined : `Expected at most ${maxLength} characters`,
+      ),
+    ),
+  );
 
 /**
  * A repeating element inside an optional container, e.g. `<dmRecords><dmRecord/>…</dmRecords>`.

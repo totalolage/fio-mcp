@@ -41,7 +41,10 @@ export const ReconcileSentMessageInput = Schema.Struct({
    * are excluded; see {@link attachmentSizeMatches}.
    */
   expectedAttachmentBytes: Schema.optional(NonNegativeInt),
-  /** How far around `submittedAt` to search, both ways; 2 minutes when absent. */
+  /**
+   * How far before `submittedAt` to search, and the least far after it (the window always
+   * extends to the current time); 2 minutes when absent.
+   */
   slack: Schema.optional(Schema.Duration),
   /** Records per GetListOfSentMessages page; 1000 when absent. */
   pageSize: Schema.optional(PositiveInt),
@@ -80,12 +83,13 @@ const recordMatches = (input: ReconcileSentMessageInput) => (record: MessageReco
 
 /**
  * Looks for a message a timed-out CreateMessage may have created: lists the box's sent
- * messages (all states) in [submittedAt − slack, submittedAt + slack], paging while pages come
- * back full, and matches recipient, annotation, sender reference number and sender ident (and
+ * messages (all states) in [submittedAt − slack, max(submittedAt + slack, now)], paging while
+ * pages come back full, and matches recipient, annotation, sender reference number and sender ident (and
  * the attachment size when `expectedAttachmentBytes` is given).
  *
  * The list's window filters on dmDeliveryTime, the moment ISDS delivers the message into the
- * recipient's box (PDF §2.9.2 p. 78), which normally follows acceptance within seconds. A
+ * recipient's box (PDF §2.9.2 p. 78), which normally follows acceptance within seconds; the
+ * window therefore extends to the current time, so a delivery that came later still matches. A
  * message still in state 1–2 (no delivery time yet) or rejected by the antivirus check (state
  * 3, never delivered) may therefore be missing from the window; the spec doesn't say.
  *
@@ -106,7 +110,8 @@ export const reconcileSentMessage = Effect.fn("Isds.reconcileSentMessage")(funct
   }
   const pageSize = valid.pageSize ?? defaultPageSize;
   const from = DateTime.subtractDuration(valid.submittedAt, slack);
-  const to = DateTime.addDuration(valid.submittedAt, slack);
+  // A message can't be delivered before it was submitted, but it can be delivered late.
+  const to = DateTime.max(DateTime.addDuration(valid.submittedAt, slack), yield* DateTime.now);
   const matches = recordMatches(valid);
 
   const found = new Set<string>();
