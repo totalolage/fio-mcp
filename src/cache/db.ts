@@ -131,6 +131,16 @@ export const CACHE_MIGRATIONS: Migrations = {
       )
     `;
   }),
+  // FIO_CACHE_ENCRYPT: whether a row's free-text and identifying values are sealed (src/cache/encryption.ts).
+  "0011_cache_sealed_rows": Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`ALTER TABLE transactions ADD COLUMN sealed INTEGER NOT NULL DEFAULT 0 CHECK (sealed IN (0, 1))`;
+    yield* sql`ALTER TABLE accounts ADD COLUMN sealed INTEGER NOT NULL DEFAULT 0 CHECK (sealed IN (0, 1))`;
+    // Answers "does this account have sealed rows?" without a scan while encryption is off (and the index is empty).
+    yield* sql`CREATE INDEX transactions_sealed ON transactions (account_key) WHERE sealed = 1`;
+    // A row while plaintext from before sealing may remain in free pages or the write-ahead log.
+    yield* sql`CREATE TABLE cache_plaintext_remnants (pending INTEGER PRIMARY KEY CHECK (pending = 1))`;
+  }),
 };
 
 const MIGRATIONS_TABLE = "fio_mcp_migrations";

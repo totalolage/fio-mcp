@@ -165,6 +165,8 @@ describe("cache and FIO over one MCP session", () => {
         backfillFrom: "2000-01-01",
         overlapDays: 10,
         maxAgeMinutes: 60,
+        encrypt: false,
+        dataKey: undefined,
       },
     });
     expect(await names()).toEqual(ALL_TOOLS);

@@ -45,6 +45,8 @@ export function config(
       backfillFrom: DEFAULT_BACKFILL_FROM,
       overlapDays: DEFAULT_OVERLAP_DAYS,
       maxAgeMinutes: DEFAULT_CACHE_MAX_AGE_MINUTES,
+      encrypt: false,
+      dataKey: undefined,
       ...overrides.cache,
     },
   };
