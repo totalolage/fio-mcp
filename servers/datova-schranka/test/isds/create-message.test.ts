@@ -137,7 +137,7 @@ describe("createMessage", () => {
     }),
   );
 
-  it.effect("rejects values over the XSD and PDF length limits before sending", () =>
+  it.effect("rejects values over the XSD and PDF length limits, counted in characters, before sending", () =>
     Effect.gen(function* () {
       const cases: ReadonlyArray<CreateMessageInput> = [
         { ...minimal, dbIDRecipient: "abc2de" },
@@ -160,6 +160,24 @@ describe("createMessage", () => {
         assert.strictEqual(error._tag, "IsdsInvalidRequest", JSON.stringify({ ...input, dmFiles: undefined }));
         assert.strictEqual(requests.length, 0);
       }
+      const emoji = "\u{1F600}";
+      for (const input of [
+        { ...minimal, dmAnnotation: `${"x".repeat(255)}${emoji}` },
+        { ...minimal, dmToHands: `${"x".repeat(30)}${emoji}` },
+        { ...minimal, dmSenderIdent: `${"x".repeat(50)}${emoji}` },
+        { ...minimal, dmFiles: [file({ dmFileDescr: `${"x".repeat(255)}${emoji}` })] },
+      ]) {
+        const { error } = yield* sendFailing(input);
+        assert.strictEqual(error._tag, "IsdsInvalidRequest");
+      }
+      const astral = yield* send({
+        ...minimal,
+        dmAnnotation: `${"x".repeat(254)}${emoji}`,
+        dmToHands: `${"x".repeat(29)}${emoji}`,
+        dmSenderIdent: `${"x".repeat(49)}${emoji}`,
+        dmFiles: [file({ dmFileDescr: `${"x".repeat(254)}${emoji}` })],
+      });
+      assert.include(sentEnvelope(astral.requests), `${emoji}</dmAnnotation>`);
       const { requests } = yield* send({
         ...minimal,
         dmAnnotation: "x".repeat(255),

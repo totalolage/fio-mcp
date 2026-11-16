@@ -4,7 +4,7 @@ import { IsdsInvalidRequest, IsdsInvalidResponse, IsdsMessageTooLarge } from "./
 import { DataBoxId, MessageId } from "./models.js";
 import { callIsds, type IsdsOperation, type IsdsOperationError, type IsdsResponseStatus } from "./soap.js";
 import { type XmlElement, xmlElement } from "./xml.js";
-import { XmlText, xmlTextMax } from "./xsd.js";
+import { XmlText } from "./xsd.js";
 
 /**
  * CreateMessage (dm_operations.wsdl, service `operations`): sends one ordinary data message.
@@ -29,6 +29,26 @@ export const createMessageMaxAttachmentBytes = 20_000_000;
 export const createMessageMaxFiles = 100;
 
 const Integer = Schema.Finite.pipe(Schema.check(Schema.isInt()));
+
+/** The number of Unicode code points, which is what XSD maxLength and the PDF's "znaků" count. */
+const characterCount = (text: string): number => {
+  let count = 0;
+  for (const _char of text) count++;
+  return count;
+};
+
+/**
+ * XmlText of at most `maxLength` characters. Counts code points, not UTF-16 units: the shared
+ * `xmlTextMax` (Schema.isMaxLength) would count a character outside the BMP, e.g. an emoji, as two.
+ */
+const xmlTextMax = (maxLength: number) =>
+  XmlText.pipe(
+    Schema.check(
+      Schema.makeFilter((text: string) =>
+        characterCount(text) <= maxLength ? undefined : `Expected at most ${maxLength} characters`,
+      ),
+    ),
+  );
 
 /**
  * dmType values a sender may set (tDmType, dmBaseTypes.xsd:904-920; PDF §2.1, pp. 42-43). The XSD
