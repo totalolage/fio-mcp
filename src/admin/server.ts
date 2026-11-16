@@ -48,10 +48,15 @@ import { ADMIN_ABSOLUTE_MS, ADMIN_COOKIE, ADMIN_PATH, ADMIN_PRELOGIN_MS, type Ad
  * without scripts, frame-ancestors 'none', no-store).
  */
 
+/** Checks the second factor of a payment approval (see `verifySecondFactor`). */
+export type SecondFactorCheck = (request: Request, form: URLSearchParams) => Effect.Effect<LoginResult<void>>;
+
 export interface AdminSettings {
   readonly publicUrl: string;
   readonly dataKey: Redacted.Redacted<Uint8Array>;
   readonly trustedProxies?: ReadonlyArray<IpNetwork.IpNetwork> | undefined;
+  /** Replaces the built-in second-factor check of payment approvals (tests). */
+  readonly secondFactor?: SecondFactorCheck | undefined;
 }
 
 const MAX_FORM_BYTES = 16 * 1024;
@@ -453,14 +458,17 @@ export const makeAdminServer = Effect.fn("AdminServer.make")(function* (settings
    * SEC-03): the single place an approval is checked beyond the signed-in
    * session, Origin and CSRF. Nothing is uploaded unless it is Accepted.
    *
-   * Until TOTP exists every approval is Accepted. Wiring TOTP: when
+   * `settings.secondFactor` replaces the check (tests). Otherwise, until
+   * TOTP exists, every approval is Accepted. Wiring TOTP: when
    * `password.totpEnabled`, return
    * `password.verifyTotp(clientAddress(request, trustedProxies), field(form, "totp") ?? "")`,
    * which fails closed (a missing or wrong code is Rejected), and set
-   * `secondFactor` on the pending page so it asks for the `totp` field.
+   * `secondFactor` below to `password.totpEnabled` so the pending page asks
+   * for the `totp` field.
    */
-  const verifySecondFactor = (_request: Request, _form: URLSearchParams): Effect.Effect<LoginResult<void>> =>
-    Effect.succeed({ _tag: "Accepted", value: undefined });
+  const verifySecondFactor: SecondFactorCheck = (request, form) =>
+    settings.secondFactor === undefined ? Effect.succeed({ _tag: "Accepted", value: undefined }) : settings.secondFactor(request, form);
+  /** The pending page asks for an authentication code (`totp`). */
   const secondFactor = false;
 
   /** Audit rows newest first, `?grant=` filters, `?before=` pages back. */

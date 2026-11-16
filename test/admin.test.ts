@@ -1,13 +1,19 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { type CallToolResult, ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
-import { Effect, Layer, Redacted, Sink, Stdio, Stream, Terminal } from "effect";
+import { Effect, Exit, Layer, Redacted, Schema, Sink, Stdio, Stream, Terminal } from "effect";
 import { SqlClient } from "effect/sql";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { tokenFingerprint } from "../src/accounts.js";
 import { MAX_ADMIN_SESSIONS } from "../src/admin/sessions.js";
 import { makeCacheStore } from "../src/cache/store.js";
 import { resetAdminPasswordCommand } from "../src/oauth/cli.js";
+import type { LoginResult } from "../src/oauth/login.js";
+import { escapeHtml } from "../src/oauth/pages.js";
+import { PENDING_TTL_MS, sha256Hex } from "../src/payment-controls.js";
+import { buildImportXml, type Payer, PaymentOrders } from "../src/payments.js";
+import type { Principal } from "../src/transport/principal.js";
+import { IMPORT_OK_XML } from "./fixtures.js";
 import { NOW, statement, TODAY, tx } from "./support/cache.js";
 import { LAST_STATEMENT } from "./support/fio-api.js";
 import {
@@ -15,8 +21,8 @@ import {
   Browser,
   consentFormOf,
   csrfOf,
+  type InProcessHarness,
   LOOPBACK_REDIRECT,
-  type OAuthHarness,
   PASSWORD,
   PUBLIC_URL,
   pkcePair,
@@ -38,7 +44,7 @@ const NEW_PASSWORD = "a brand new admin password";
 // 10-15 s at times, past the 5 s default; this file allows 30 s.
 vi.setConfig({ testTimeout: 30_000, hookTimeout: 30_000 });
 
-let harness: OAuthHarness;
+let harness: InProcessHarness;
 
 beforeEach(async () => {
   harness = await startOAuth();
@@ -624,6 +630,238 @@ const resetPassword = (set: boolean, stdin = "") => {
   );
   return harness.sql(resetAdminPasswordCommand(set, { ln: 14, r: 8, p: 1 }).pipe(Effect.provide(Layer.mergeAll(stdio, terminal))));
 };
+
+describe("payments at /admin", () => {
+  const PAYER: Payer = { accountNumber: "2900000000", currency: "CZK" };
+  const LISTED = "2212-2000000699/0300";
+  const domestic = (amount: number, account = LISTED) => {
+    const [accountTo, bankCode] = account.split("/");
+    return { type: "domestic", amount, accountTo, bankCode, date: "2026-12-01" };
+  };
+  const decodeOrders = Schema.decodeUnknownSync(PaymentOrders);
+  let keys = 0;
+
+  /** Submits through the server's PaymentControls as `principal`; the exit and the exact XML. */
+  const submitAs = (principal: Principal, raw: ReadonlyArray<unknown>) =>
+    harness.payments((controls) =>
+      Effect.gen(function* () {
+        const account = (yield* harness.accounts().list).find((candidate) => candidate.name === "main");
+        if (account === undefined) return yield* Effect.die("no main account");
+        const orders = decodeOrders(raw);
+        const xml = yield* buildImportXml(orders, PAYER);
+        keys += 1;
+        const exit = yield* Effect.exit(
+          controls.submit({ principal, account, payer: PAYER, orders, xml, idempotencyKey: `admin-test-key-${keys}` }),
+        );
+        return { exit, xml };
+      }),
+    );
+
+  const audit = () => harness.payments((controls) => controls.listAudit({ limit: 50 }));
+
+  const grantOfClient = async (clientId: string) => {
+    const grants = await harness.store((store) => store.listGrants(harness.clock.currentTimeMillisUnsafe()));
+    const grant = grants.find((candidate) => candidate.clientId === clientId);
+    if (grant === undefined) throw new Error(`no live grant for ${clientId}`);
+    return grant;
+  };
+
+  /** A real grant consented in confirm mode, listing LISTED, as its principal. */
+  const confirmPrincipal = async (): Promise<Principal> => {
+    const { clientId } = await tokensFor(harness, {
+      payments: true,
+      paymentSettings: { payAllowlistMode: "confirm", payAllowlist: `${LISTED}, Landlord` },
+    });
+    const grant = await grantOfClient(clientId);
+    expect(grant.payments.allowlist.mode).toBe("confirm");
+    return {
+      subject: grant.grantId,
+      scopes: grant.scopes,
+      accountFingerprints: grant.accountFingerprints,
+      clientId,
+      payments: grant.payments,
+    };
+  };
+
+  /** Restarts the app with a FIO fake that records every uploaded XML. */
+  const startRecording = async (secondFactor?: () => Effect.Effect<LoginResult<void>>) => {
+    await harness.close();
+    const uploads: Array<string> = [];
+    harness = await startOAuth({
+      fio: {
+        importXml: (_account, xml) =>
+          Effect.sync(() => {
+            uploads.push(xml);
+            return IMPORT_OK_XML;
+          }),
+      },
+      ...(secondFactor === undefined ? {} : { secondFactor }),
+    });
+    return uploads;
+  };
+
+  /** Signs in and holds a two-order batch (one payee listed) for confirmation. */
+  const holdBatch = async () => {
+    const admin = new Admin();
+    await admin.signIn();
+    const principal = await confirmPrincipal();
+    const { exit, xml } = await submitAs(principal, [domestic(100), domestic(250, "19-2000145399/0800")]);
+    if (!Exit.isSuccess(exit)) throw new Error(`submit failed: ${String(exit.cause)}`);
+    expect(exit.value.outcome).toBe("awaiting-admin-confirmation");
+    return { admin, principal, xml, pendingId: String(exit.value.pendingId) };
+  };
+
+  it("lists audit rows newest first, only to a signed-in admin, filtered by grant", async () => {
+    const admin = new Admin();
+    await admin.signIn();
+    const principal = (subject: string): Principal => ({ subject, scopes: "all", accountFingerprints: "all" });
+    // Above the default 50000 CZK per order: refused rows, nothing sent.
+    expect(Exit.isFailure((await submitAs(principal("fio_grant_a"), [domestic(60_000)])).exit)).toBe(true);
+    harness.clock.advance(1_000);
+    expect(Exit.isFailure((await submitAs(principal("fio_grant_b"), [domestic(70_000)])).exit)).toBe(true);
+
+    const anonymous = await new Admin().get("/admin/payments");
+    expect(anonymous.status).toBe(303);
+    expect(anonymous.headers.get("location")).toBe("/admin/login");
+    expect(await anonymous.text()).not.toContain("fio_grant_a");
+
+    const all = await admin.page("/admin/payments");
+    expect(all.response.status).toBe(200);
+    expect(all.html.indexOf("fio_grant_b")).toBeGreaterThan(0);
+    expect(all.html.indexOf("fio_grant_b")).toBeLessThan(all.html.indexOf("fio_grant_a"));
+    expect(all.html).toContain("refused");
+    expect(all.html).toContain("60000.00 CZK");
+    expect(all.html).toContain(LISTED);
+
+    const filtered = await admin.page("/admin/payments?grant=fio_grant_a");
+    expect(filtered.html).toContain("60000.00 CZK");
+    expect(filtered.html).not.toContain("fio_grant_b");
+    expect(filtered.html).not.toContain("70000.00 CZK");
+    // Payee details never reach the log.
+    expect(harness.logs.join("\n")).not.toContain("2000000699");
+  });
+
+  it("edits a payments grant's limits and allowlist at /admin/clients, never above the ceiling", async () => {
+    const readOnly = await tokensFor(harness);
+    const payments = await tokensFor(harness, { payments: true });
+    const admin = new Admin();
+    await admin.signIn();
+    const page = await admin.page("/admin/clients");
+    expect(page.html.match(/action="\/admin\/grants\/payments"/g)).toHaveLength(1);
+    const grant = await grantOfClient(payments.clientId);
+    const fields = {
+      grant: grant.grantId,
+      payMaxPerOrder: "CZK:100",
+      payMaxPerDay: "CZK:300",
+      payMaxOrdersPerDay: "2",
+      payAllowlistMode: "enforce",
+      payAllowlist: "de89 3704 0044 0532 0130 00, Hans",
+    };
+    expect((await admin.act("/admin/grants/payments", fields)).message).toBe("Saved the payment limits and payee allowlist.");
+    const saved = {
+      limits: { maxPerOrder: { CZK: 100 }, maxPerDay: { CZK: 300 }, maxOrdersPerDay: 2 },
+      allowlist: { mode: "enforce", entries: [{ account: "DE89370400440532013000", label: "Hans" }] },
+    };
+    expect((await grantOfClient(payments.clientId)).payments).toEqual(saved);
+    expect((await admin.page("/admin/clients")).html).toContain('name="payMaxPerOrder" value="CZK:100"');
+
+    const above = await admin.act("/admin/grants/payments", { ...fields, payMaxPerDay: "CZK:100001" });
+    expect(above.message).toContain("above the server ceiling");
+    const unknownCurrency = await admin.act("/admin/grants/payments", { ...fields, payMaxPerOrder: "USD:1", payMaxPerDay: "USD:1" });
+    expect(unknownCurrency.message).toContain("not allowed by the server");
+    expect((await grantOfClient(payments.clientId)).payments).toEqual(saved);
+
+    const notPayments = await admin.act("/admin/grants/payments", { ...fields, grant: (await grantOfClient(readOnly.clientId)).grantId });
+    expect(notPayments.message).toContain("cannot submit payments");
+    // Without CSRF nothing changes.
+    expect((await admin.post("/admin/grants/payments", { ...fields, payMaxOrdersPerDay: "1" }, { csrf: undefined })).status).toBe(403);
+    expect((await grantOfClient(payments.clientId)).payments).toEqual(saved);
+  });
+
+  it("uploads a held batch's exact XML only after the admin approves it", async () => {
+    const uploads = await startRecording();
+    const { admin, xml, pendingId } = await holdBatch();
+    expect(uploads).toEqual([]);
+
+    const page = await admin.page("/admin/payments/pending");
+    expect(page.html).toContain(pendingId);
+    expect(page.html).toContain(sha256Hex(xml));
+    expect(page.html).toContain(`<pre>${escapeHtml(xml)}</pre>`);
+    expect(page.html).toContain(`${LISTED}</code> (bank 0300): 100.00 CZK <span class="muted">listed</span>`);
+    expect(page.html).toContain('250.00 CZK <span class="unlisted">not on the allowlist</span>');
+    expect(page.html).toContain("350.00 CZK");
+
+    // Without CSRF, or from another origin: refused, nothing uploaded.
+    expect((await admin.post("/admin/payments/pending/approve", { pending: pendingId }, { csrf: undefined })).status).toBe(403);
+    expect((await admin.post("/admin/payments/pending/approve", { pending: pendingId }, { origin: "https://evil.example" })).status).toBe(
+      403,
+    );
+    // Not signed in: back to the sign-in page.
+    const stranger = await new Admin().post("/admin/payments/pending/approve", { pending: pendingId }, { csrf: admin.csrf });
+    expect(stranger.headers.get("location")).toBe("/admin/login");
+    expect(uploads).toEqual([]);
+
+    const approved = await admin.act("/admin/payments/pending/approve", { pending: pendingId });
+    expect(approved.message).toContain(`Batch ${pendingId}: accepted.`);
+    expect(uploads).toEqual([xml]);
+    expect((await audit())[0]?.outcome).toBe("accepted");
+    expect((await admin.page("/admin/payments/pending")).html).not.toContain(pendingId);
+
+    // A second approval uploads nothing.
+    expect((await admin.act("/admin/payments/pending/approve", { pending: pendingId })).message).toContain("no longer awaiting");
+    expect(uploads).toHaveLength(1);
+  });
+
+  it("drops a held batch after 24 hours: approving then uploads nothing", async () => {
+    const uploads = await startRecording();
+    const { pendingId } = await holdBatch();
+    harness.clock.advance(PENDING_TTL_MS + 1_000);
+    // The earlier admin session is past its lifetime; sign in again.
+    const admin = new Admin();
+    await admin.signIn();
+    expect((await admin.page("/admin/payments/pending")).html).not.toContain(pendingId);
+    expect((await admin.act("/admin/payments/pending/approve", { pending: pendingId })).message).toContain("no longer awaiting");
+    expect(uploads).toEqual([]);
+    const [row] = await audit();
+    expect(row?.outcome).toBe("refused");
+    expect(row?.reason).toBe("confirmation expired");
+  });
+
+  it("declines a held batch without uploading it", async () => {
+    const uploads = await startRecording();
+    const { admin, pendingId } = await holdBatch();
+    expect((await admin.post("/admin/payments/pending/decline", { pending: pendingId }, { csrf: undefined })).status).toBe(403);
+    expect((await admin.act("/admin/payments/pending/decline", { pending: pendingId })).message).toBe(
+      "Declined the batch; nothing was sent to FIO.",
+    );
+    expect((await admin.act("/admin/payments/pending/approve", { pending: pendingId })).message).toContain("no longer awaiting");
+    expect(uploads).toEqual([]);
+    const [row] = await audit();
+    expect(row?.outcome).toBe("refused");
+    expect(row?.reason).toBe("declined by admin");
+  });
+
+  it("uploads nothing unless the second factor accepts the approval", async () => {
+    let factor: LoginResult<void> = { _tag: "Rejected" };
+    const uploads = await startRecording(() => Effect.succeed(factor));
+    const { admin, xml, pendingId } = await holdBatch();
+    const refusals: ReadonlyArray<LoginResult<void>> = [
+      { _tag: "Rejected" },
+      { _tag: "Throttled", retryAfterSeconds: 30 },
+      { _tag: "Unavailable" },
+    ];
+    for (const refusal of refusals) {
+      factor = refusal;
+      const outcome = await admin.act("/admin/payments/pending/approve", { pending: pendingId, totp: "000000" });
+      expect(outcome.message).toContain("Nothing was uploaded.");
+      expect(uploads).toEqual([]);
+      expect((await admin.page("/admin/payments/pending")).html).toContain(pendingId);
+    }
+    factor = { _tag: "Accepted", value: undefined };
+    expect((await admin.act("/admin/payments/pending/approve", { pending: pendingId })).message).toContain("accepted");
+    expect(uploads).toEqual([xml]);
+  });
+});
 
 describe("admin password", () => {
   it("changes the password after checking the current one, signing out every other session", async () => {

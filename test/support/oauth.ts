@@ -20,7 +20,7 @@ import type { SqlClient } from "effect/sql";
 import { AccountChangesLive } from "../../src/account-runtime.js";
 import { Accounts, type AccountsShape } from "../../src/accounts.js";
 import { AdminPassword } from "../../src/admin/password.js";
-import { AdminLive } from "../../src/admin/server.js";
+import { AdminLive, type SecondFactorCheck } from "../../src/admin/server.js";
 import { SERVER_INFO, ToolsLive } from "../../src/app.js";
 import { SERVER_MIGRATIONS } from "../../src/cache/db.js";
 import { type AppConfigShape, accountSeedOf, type HttpAuthConfig } from "../../src/config.js";
@@ -114,6 +114,8 @@ export async function startOAuth(
     paymentLimits?: PaymentLimits;
     /** FioApi methods beyond the slot-holding fake (e.g. importXml for payment uploads). */
     fio?: Partial<FioApiShape>;
+    /** Replaces the admin's second-factor check of payment approvals. */
+    secondFactor?: SecondFactorCheck;
   } = {},
 ): Promise<InProcessHarness> {
   const hash = await passwordHash();
@@ -143,7 +145,7 @@ export async function startOAuth(
   // As Auth.Live builds it, with the test's throttling and scrypt parameters.
   const oauth = Layer.mergeAll(
     Auth.oauth({ publicUrl: PUBLIC_URL, trustedProxies }),
-    AdminLive({ publicUrl: PUBLIC_URL, dataKey: DATA_KEY, trustedProxies }),
+    AdminLive({ publicUrl: PUBLIC_URL, dataKey: DATA_KEY, trustedProxies, secondFactor: options.secondFactor }),
   ).pipe(Layer.provide(AdminPassword.layer(Redacted.make(hash), options.throttle, FAST_SCRYPT)));
   let accounts: AccountsShape | undefined;
   const captureAccounts = Layer.effectDiscard(
