@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { ceilingText, PAYMENT_FIELDS, type PaymentFormValues } from "../payment-form.js";
+import type { PaymentLimits } from "../payment-limits.js";
 import { isLoopbackRedirect, originOf } from "./urls.js";
 
 /**
@@ -21,7 +23,10 @@ const STYLE =
   "h1{font-size:1.4rem}fieldset{border:1px solid #ccc;border-radius:6px;margin:1rem 0;padding:.5rem 1rem}" +
   "label{display:block;margin:.35rem 0}input[type=password]{width:100%;padding:.4rem;font-size:1rem;box-sizing:border-box}" +
   "button{font-size:1rem;padding:.45rem 1.1rem;margin-right:.5rem}.warn{background:#fff4d6;border:1px solid #e0b84c;padding:.5rem .75rem;border-radius:6px}" +
-  ".error{color:#a40000}code{word-break:break-all}.muted{color:#555;font-size:.9rem}";
+  ".error{color:#a40000}code{word-break:break-all}.muted{color:#555;font-size:.9rem}" +
+  // Payment settings show only while the payments box is ticked (no script under the CSP).
+  "label.inline{display:inline}.payment-settings{display:none}#payments:checked~.payment-settings{display:block}" +
+  ".payment-settings input[type=text],.payment-settings textarea{width:100%;padding:.4rem;font-size:1rem;box-sizing:border-box}";
 
 /** CSP source hash of an inline style block. */
 export const styleHash = (style: string) => createHash("sha256").update(style, "utf8").digest("base64");
@@ -73,6 +78,38 @@ ${page.error === undefined ? "" : `<p class="error" role="alert">${escapeHtml(pa
 </form>`,
   );
 
+const MODE_LABELS: ReadonlyArray<readonly [string, string]> = [
+  ["off", "Off: orders to any payee (the default)."],
+  ["enforce", "Enforce: refuse orders to payees not on the list. Recommended for AI agents."],
+  [
+    "confirm",
+    "Confirm: hold every batch until an admin approves it at /admin/payments/pending; held batches are dropped after 24 hours.",
+  ],
+];
+
+/**
+ * The payment limit and payee allowlist fields (SEC-26, SEC-27), shared with
+ * /admin/clients. No `required` or `pattern`: the consent page hides them
+ * while payments are not ticked, and the server validates.
+ */
+export const paymentSettingsFields = (values: PaymentFormValues, ceiling: PaymentLimits): string => {
+  const text = (name: string, label: string, value: string) =>
+    `<label>${label} <input type="text" name="${name}" value="${escapeHtml(value)}" autocomplete="off" spellcheck="false"></label>`;
+  const modes = MODE_LABELS.map(
+    ([mode, label]) =>
+      `<label><input type="radio" name="${PAYMENT_FIELDS.mode}" value="${mode}"${values.mode === mode ? " checked" : ""}> ${escapeHtml(label)}</label>`,
+  ).join("\n");
+  return `<p class="muted">Limits apply per Europe/Prague calendar day; a currency not listed in both maps cannot be paid. Format <code>CUR:amount</code>, comma-separated. Server ceilings: ${escapeHtml(ceilingText(ceiling))}.</p>
+${text(PAYMENT_FIELDS.maxPerOrder, "Maximum per order", values.maxPerOrder)}
+${text(PAYMENT_FIELDS.maxPerDay, "Maximum per day", values.maxPerDay)}
+${text(PAYMENT_FIELDS.maxOrdersPerDay, "Maximum orders per day (all currencies)", values.maxOrdersPerDay)}
+<fieldset><legend>Payee allowlist</legend>
+${modes}
+<label>Payees, one per line: <code>[prefix-]number/bankcode</code> or an IBAN, optionally followed by <code>, label</code>
+<textarea name="${PAYMENT_FIELDS.allowlist}" rows="4" spellcheck="false">${escapeHtml(values.allowlist)}</textarea></label>
+</fieldset>`;
+};
+
 export interface ConsentPage {
   readonly clientId: string;
   readonly clientName: string | null;
@@ -80,7 +117,13 @@ export interface ConsentPage {
   readonly csrf: string;
   /** Identifies what this form showed (see AuthSession.consentForms). */
   readonly formId: string;
+  /** Only shows the payments notice; the box is never ticked for the client. */
   readonly paymentsRequested: boolean;
+  /** The owner's own choice on a form shown again after an error; false on a fresh page. */
+  readonly paymentsChecked: boolean;
+  /** Pre-filled with the server defaults, or the owner's values after an error. */
+  readonly payments: PaymentFormValues;
+  readonly paymentCeiling: PaymentLimits;
   readonly accounts: ReadonlyArray<string>;
   readonly error: string | undefined;
 }
@@ -107,7 +150,11 @@ ${page.error === undefined ? "" : `<p class="error" role="alert">${escapeHtml(pa
 <input type="hidden" name="form" value="${escapeHtml(page.formId)}">
 <fieldset><legend>Permissions</legend>
 <label><input type="checkbox" checked disabled> Read accounts, transactions, statements and the local cache; sync; move the download marker (<code>fio:read</code>, required)</label>
-<label><input type="checkbox" name="scope" value="fio:payments"${page.paymentsRequested ? " checked" : ""}> Preview payment orders and submit them to FIO for signing in Internetbanking (<code>fio:payments</code>)</label>
+<input type="checkbox" id="payments" name="scope" value="fio:payments"${page.paymentsChecked ? " checked" : ""}> <label class="inline" for="payments">Preview payment orders and submit them to FIO for signing in Internetbanking (<code>fio:payments</code>)</label>
+${page.paymentsRequested ? `<p class="warn">The application asks to submit payment orders. They create real batches at FIO that must still be signed in Internetbanking, and the grant's payment limits and payee allowlist below apply. Tick the box only if you want this.</p>` : ""}
+<div class="payment-settings">
+${paymentSettingsFields(page.payments, page.paymentCeiling)}
+</div>
 </fieldset>
 <fieldset><legend>Accounts</legend>
 ${accounts}
