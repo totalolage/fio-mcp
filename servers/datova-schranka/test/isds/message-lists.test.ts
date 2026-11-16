@@ -82,6 +82,9 @@ describe("list requests", () => {
         { offset: 0 },
         { limit: 1.5 },
         { limit: 0 },
+        // Would render as "1e+21" / beyond exact integers, which no xs:integer accepts.
+        { limit: 1e21 },
+        { offset: 2 ** 53 },
         { from: DateTime.makeUnsafe("2026-11-02T00:00:00Z"), to: DateTime.makeUnsafe("2026-11-01T00:00:00Z") },
       ];
       for (const input of cases) {

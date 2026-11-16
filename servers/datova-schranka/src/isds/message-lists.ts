@@ -3,7 +3,7 @@ import { IsdsInvalidRequest } from "./errors.js";
 import { MessageEnvelope, type MessageStateFilter, messageStateMask, XsMessageState } from "./models.js";
 import { callIsds, type IsdsOperation } from "./soap.js";
 import { type XmlElement, xmlElement } from "./xml.js";
-import { formatXsDateTime, XsBoolean, XsDateTime, XsInteger, xmlList } from "./xsd.js";
+import { formatXsDateTime, SafeInteger, XsBoolean, XsDateTime, XsInteger, xmlList } from "./xsd.js";
 
 /**
  * The dm_info list operations (dm_info.wsdl, service "info"): GetListOfReceivedMessages,
@@ -25,7 +25,7 @@ interface FormattedWindow {
   readonly to: string | undefined;
 }
 
-const PositiveInt = Schema.Finite.pipe(Schema.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(1)));
+const PositiveInt = SafeInteger.pipe(Schema.check(Schema.isGreaterThanOrEqualTo(1)));
 
 /** A state a dmStatusFilter can select (models.ts ListableMessageState: 1–8 and 10). */
 const ListableMessageStateSchema = Schema.Literals([1, 2, 3, 4, 5, 6, 7, 8, 10]);

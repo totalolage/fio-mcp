@@ -137,6 +137,20 @@ describe("createMessage", () => {
     }),
   );
 
+  it.effect("rejects integers outside the safe range before sending, so none renders as 1e+21", () =>
+    Effect.gen(function* () {
+      for (const input of [
+        { ...minimal, dmSenderOrgUnitNum: 1e21 },
+        { ...minimal, dmRecipientOrgUnitNum: -(2 ** 53) },
+        { ...minimal, dmLegalTitleYear: 2 ** 60 },
+      ]) {
+        const { error, requests } = yield* sendFailing(input);
+        assert.strictEqual(error._tag, "IsdsInvalidRequest");
+        assert.strictEqual(requests.length, 0);
+      }
+    }),
+  );
+
   it.effect("rejects values over the XSD and PDF length limits, counted in characters, before sending", () =>
     Effect.gen(function* () {
       const cases: ReadonlyArray<CreateMessageInput> = [

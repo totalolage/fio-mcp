@@ -22,6 +22,15 @@ export const XsBoolean = Schema.Literals(["true", "false", "1", "0"]).pipe(
 export const XsDateTime = Schema.DateTimeUtcFromString;
 
 /**
+ * An integer within ±(2^53 − 1). Use it for integer request inputs: `String(value)` of such a
+ * number is always the xs:integer lexical form, whereas a larger one (e.g. 1e21) renders in
+ * exponent notation ("1e+21") that no XSD integer type accepts.
+ */
+export const SafeInteger = Schema.Finite.pipe(
+  Schema.check(Schema.makeFilter((value: number) => (Number.isSafeInteger(value) ? undefined : "Expected a safe integer"))),
+);
+
+/**
  * xs:integer / xs:int / xs:long within the safe integer range ↔ number. Only the xs:integer
  * lexical form (XSD Part 2 §3.3.13): an optional sign and decimal digits, with surrounding XML
  * whitespace allowed (whiteSpace facet "collapse"). "1e3", "0x10", "1.0" and "" are rejected,
@@ -30,11 +39,7 @@ export const XsDateTime = Schema.DateTimeUtcFromString;
 export const XsInteger = Schema.String.pipe(
   Schema.check(Schema.isPattern(/^[\t\n\r ]*[+-]?[0-9]+[\t\n\r ]*$/)),
   Schema.decodeTo(
-    Schema.Finite.pipe(
-      Schema.check(
-        Schema.makeFilter((value: number) => (Number.isSafeInteger(value) ? undefined : "Expected a safe integer")),
-      ),
-    ),
+    SafeInteger,
     SchemaTransformation.transform({
       decode: (text: string) => Number(text.trim()),
       encode: (value: number) => String(value),

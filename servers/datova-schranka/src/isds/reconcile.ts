@@ -2,7 +2,7 @@ import { Data, DateTime, Duration, Effect, Option, Schema } from "effect";
 import { IsdsInvalidRequest } from "./errors.js";
 import { listSentMessages, type MessageRecord } from "./message-lists.js";
 import { DataBoxId, type MessageState } from "./models.js";
-import { formatXsDateTime } from "./xsd.js";
+import { formatXsDateTime, SafeInteger } from "./xsd.js";
 
 /**
  * Reconciliation after a CreateMessage call timed out (IsdsTimeoutError): ISDS has no
@@ -36,8 +36,8 @@ export type SentMessageReconciliation = Data.TaggedEnum<{
 }>;
 export const SentMessageReconciliation = Data.taggedEnum<SentMessageReconciliation>();
 
-const PositiveInt = Schema.Finite.pipe(Schema.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(1)));
-const NonNegativeInt = Schema.Finite.pipe(Schema.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0)));
+const PositiveInt = SafeInteger.pipe(Schema.check(Schema.isGreaterThanOrEqualTo(1)));
+const NonNegativeInt = SafeInteger.pipe(Schema.check(Schema.isGreaterThanOrEqualTo(0)));
 
 /**
  * What the timed-out CreateMessage sent. Text fields are compared after {@link normalizeText};

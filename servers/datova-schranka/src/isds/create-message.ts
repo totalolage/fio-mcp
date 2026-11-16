@@ -4,7 +4,7 @@ import { IsdsInvalidRequest, IsdsInvalidResponse, IsdsMessageTooLarge } from "./
 import { DataBoxId, MessageId } from "./models.js";
 import { callIsds, type IsdsOperation, type IsdsOperationError, type IsdsResponseStatus } from "./soap.js";
 import { type XmlElement, xmlElement } from "./xml.js";
-import { XmlText, xmlTextMax } from "./xsd.js";
+import { SafeInteger, XmlText, xmlTextMax } from "./xsd.js";
 
 /**
  * CreateMessage (dm_operations.wsdl, service `operations`): sends one ordinary data message.
@@ -30,7 +30,7 @@ export const createMessageMaxAttachmentBytes = 20_000_000;
 /** At most 100 attachments per message (PDF §2.1.2, p. 45; the XSD leaves dmFile unbounded). */
 export const createMessageMaxFiles = 100;
 
-const Integer = Schema.Finite.pipe(Schema.check(Schema.isInt()));
+const Integer = SafeInteger;
 
 
 /**
