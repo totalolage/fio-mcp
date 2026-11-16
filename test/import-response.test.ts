@@ -1,4 +1,4 @@
-import { Effect } from "effect";
+import { Cause, Effect } from "effect";
 import { describe, expect, it } from "vitest";
 import { XmlParseError } from "../src/errors.js";
 import { looksLikeMissingPaymentPermission, parseImportResponse } from "../src/import-response.js";
@@ -111,5 +111,19 @@ describe("permission refusal heuristic", () => {
       "</status><message>Orders must be authorized; permission required in Internetbanking</message>",
     );
     expect(looksLikeMissingPaymentPermission(parse(accepted))).toBe(false);
+  });
+
+  // GHSA-474x-hrwr-fgx4: fast-xml-parser <= 5.11.2 rescans the rest of the
+  // input from every "<" of an unterminated stop-node body, O(n^2) in n.
+  it("rejects a 1 MB unterminated stop-node body within 1 s", () => {
+    const xml = `<responseImport><result>${"<a ".repeat(Math.ceil(1_048_576 / 3))}`;
+    expect(xml.length).toBeGreaterThanOrEqual(1_048_576);
+    const started = performance.now();
+    const exit = Effect.runSyncExit(parseImportResponse(xml, excerpt));
+    const elapsed = performance.now() - started;
+    expect(elapsed).toBeLessThan(1000);
+    if (exit._tag === "Failure") {
+      expect(Cause.squash(exit.cause)).toBeInstanceOf(XmlParseError);
+    }
   });
 });
