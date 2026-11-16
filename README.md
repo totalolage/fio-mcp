@@ -304,7 +304,7 @@ When the server knows that no batch was created, it says that instead (`UploadRe
 docker exec <container> node dist/main.js payments purge --before 2025-01-01
 ```
 
-It deletes rows whose Prague date is before that day and prints how many. A cut-off less than 365 days ago is refused. If the audit log can't be written, the payment tool fails with `PaymentAuditError`.
+It deletes rows whose Prague date is before that day and prints how many. A cut-off less than 365 days ago is refused. The row is written before the upload: if that fails, the tool fails with `PaymentAuditError` and uploads nothing. If only the update after the upload fails, the server logs the error and still returns FIO's answer, and the row stays `unknown`; check such a batch in Internetbanking.
 
 ## Rate limiting
 
@@ -389,7 +389,7 @@ Every expected failure is a typed error in the Effect error channel, never a thr
 | `XmlParseError` | The payment import response is not valid XML. |
 | `UploadOutcomeUnknown` | A payment upload failed after it may have reached FIO, including any HTTP 5xx; tells you to check Internetbanking before submitting again. A retry with the same `idempotencyKey` returns it again without uploading. See [When the outcome is unknown](#when-the-outcome-is-unknown). |
 | `UploadRefused` | A payment upload certainly created no batch: no rate-limit slot, a failure before the request was sent, HTTP 413 or 404. The `idempotencyKey` is spent; a corrected batch needs a new one. |
-| `PaymentAuditError` | The payment audit log or the idempotency record could not be read or written. |
+| `PaymentAuditError` | The payment audit log or the idempotency record could not be read or written before the upload; nothing was sent. |
 | `InvalidInput` | Arguments that pass the schema but don't make sense together, a missing payer account number, an order with text copied from a bank result (see [Payment safety](#what-the-model-is-told-and-what-the-server-checks)), or an `idempotencyKey` reused for different orders. |
 | `CacheError` | The local SQLite cache failed; details go to the server log. |
 | `ConfigError` | Startup only: invalid configuration, naming the variable but never its value. |

@@ -139,12 +139,17 @@ The server refuses the dangerous combinations on its own (unauthenticated mode w
 ```sh
 #!/bin/sh
 # usage: check-fio-env.sh <compose file> <container>
-forbidden='FIO_MCP_ALLOW_UNAUTHENTICATED|FIO_MCP_ALLOW_UNAUTHENTICATED_ON_NETWORK|FIO_API_BASE_URL|FIO_API_ALLOW_TEST_BASE_URL|FIO_TOKEN|FIO_TOKEN_FILE|FIO_ACCOUNTS|FIO_ACCOUNTS_FILE'
+# Prints the names of forbidden variables, never their values. Exits 1 when one
+# is set, 2 when the check can't run.
+forbidden='FIO_MCP_ALLOW_UNAUTHENTICATED FIO_MCP_ALLOW_UNAUTHENTICATED_ON_NETWORK FIO_API_BASE_URL FIO_API_ALLOW_TEST_BASE_URL FIO_TOKEN FIO_TOKEN_FILE FIO_ACCOUNTS FIO_ACCOUNTS_FILE'
+[ $# -eq 2 ] || { echo "usage: $0 <compose file> <container>" >&2; exit 2; }
+compose=$(cat -- "$1") || { echo "cannot read $1" >&2; exit 2; }
+env=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$2") || { echo "cannot inspect $2" >&2; exit 2; }
 status=0
-if grep -nwE "$forbidden" "$1"; then echo "forbidden variable in $1" >&2; status=1; fi
-if docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$2" | grep -E "^($forbidden)="; then
-  echo "forbidden variable in the environment of $2" >&2; status=1
-fi
+for name in $forbidden; do
+  if printf '%s\n' "$compose" | grep -qw -- "$name"; then echo "$1 names $name" >&2; status=1; fi
+  if printf '%s\n' "$env" | grep -q -- "^$name="; then echo "$2 has $name in its environment" >&2; status=1; fi
+done
 exit $status
 ```
 
@@ -222,7 +227,7 @@ Check: a sign-in attempt from outside the VPN never reaches the sign-in page.
 
 Before each deployment:
 
-- `bun install --frozen-lockfile`, `bun run check` and `bun audit`. Deploy with no advisory in a production dependency, or with the exception written down. (Bun 1.4.2's `bun audit` has no flag to skip development dependencies; judge those by whether they reach the image.)
+- `bun install --frozen-lockfile --ignore-scripts`, so no install script runs, not even the project's own `prepare`. Then run that step by hand (`bunx effect-tsgo patch --typescript --no-oxlint && bun run build`, which patches TypeScript for the Effect diagnostics and builds `dist/`), followed by `bun run check` and `bun audit`. Deploy with no advisory in a production dependency, or with the exception written down. (Bun 1.4.2's `bun audit` has no flag to skip development dependencies; judge those by whether they reach the image.)
 - On Node security releases, bump the digest-pinned `NODE_IMAGE` and `BUN_IMAGE` at the top of the `Dockerfile`.
 - Keep `"trustedDependencies": []` in `package.json` and `minimumReleaseAge` in `bunfig.toml` as they are.
 - Record the audit output and the commit of each deployed tag in your release notes.
