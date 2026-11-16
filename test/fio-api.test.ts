@@ -7,6 +7,7 @@ import { Accounts } from "../src/accounts.js";
 import { ServicesLive } from "../src/app.js";
 import { type AppConfigShape, MAX_RESPONSE_BYTES } from "../src/config.js";
 import { FioApi } from "../src/fio-api.js";
+import { DEFAULT_PAYMENT_LIMITS } from "../src/payment-limits.js";
 import { RateLimiter } from "../src/rate-limiter.js";
 import { Redactor } from "../src/redaction.js";
 import { seededConfig } from "./support/config.js";
@@ -33,6 +34,7 @@ const baseConfig: AppConfigShape = {
     overlapDays: 10,
     maxAgeMinutes: 60,
   },
+  paymentLimits: DEFAULT_PAYMENT_LIMITS,
 };
 
 const testLayer = (config: Partial<AppConfigShape> = {}) =>

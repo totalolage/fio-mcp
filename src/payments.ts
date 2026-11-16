@@ -103,7 +103,8 @@ const country = (what: string) =>
 
 const paymentReason = (what: string) => Schema.Literals(PAYMENT_REASONS).annotate({ description: what });
 
-function compact(value: string): string {
+/** Removes whitespace and upper-cases: the form IBANs and foreign accounts are compared in. */
+export function compact(value: string): string {
   return value.replace(/\s+/g, "").toUpperCase();
 }
 

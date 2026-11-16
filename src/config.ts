@@ -1,9 +1,17 @@
 import { NodeFileSystem } from "@effect/platform-node";
-import { Config, Context, Effect, FileSystem, Layer, Option, Predicate, Redacted, Schema } from "effect";
+import { Config, Context, Effect, FileSystem, Layer, Option, Predicate, Redacted, Result, Schema } from "effect";
 import type { IpNetwork } from "effect/net";
 import { ConfigError } from "./errors.js";
 import { type PasswordHash, PasswordHashError, parsePasswordHash } from "./oauth/crypto.js";
 import { parsePublicUrl } from "./oauth/urls.js";
+import {
+  type CurrencyAmounts,
+  DEFAULT_PAYMENT_LIMITS,
+  type PaymentLimits,
+  parseLimitMap,
+  parseOrdersPerDay,
+  toCents,
+} from "./payment-limits.js";
 import { parseDataKey } from "./token-crypto.js";
 import { parseTrustedProxy } from "./transport/client-address.js";
 
@@ -123,6 +131,11 @@ export interface AppConfigShape {
   readonly maxResponseBytes: number;
   readonly transport: TransportConfig;
   readonly cache: CacheConfig;
+  /**
+   * FIO_MCP_PAYMENT_*: the limits of grants that follow the server defaults,
+   * and the ceiling no grant may exceed (SEC-26).
+   */
+  readonly paymentLimits: PaymentLimits;
 }
 
 export const DEFAULT_BASE_URL = "https://fioapi.fio.cz/v1/rest";
@@ -472,6 +485,40 @@ const loadCache = Effect.fn("config.loadCache")(function* () {
   } satisfies CacheConfig;
 });
 
+const PER_ORDER_VAR = "FIO_MCP_PAYMENT_MAX_PER_ORDER";
+const PER_DAY_VAR = "FIO_MCP_PAYMENT_MAX_PER_DAY";
+
+/** A `CUR:amount,...` limit map. Never echoes the value on failure. */
+const limitMapVar = Effect.fn("config.limitMapVar")(function* (key: string, fallback: CurrencyAmounts) {
+  const raw = yield* optionalVar(key);
+  if (Option.isNone(raw)) return fallback;
+  const parsed = parseLimitMap(raw.value);
+  if (Result.isFailure(parsed)) return yield* fail(`${key}: ${parsed.failure} (format: CZK:50000,EUR:2000)`);
+  return parsed.success;
+});
+
+const loadPaymentLimits = Effect.fn("config.loadPaymentLimits")(function* () {
+  const maxPerOrder = yield* limitMapVar(PER_ORDER_VAR, DEFAULT_PAYMENT_LIMITS.maxPerOrder);
+  const maxPerDay = yield* limitMapVar(PER_DAY_VAR, DEFAULT_PAYMENT_LIMITS.maxPerDay);
+  const ordersKey = "FIO_MCP_PAYMENT_MAX_ORDERS_PER_DAY";
+  const ordersRaw = yield* optionalVar(ordersKey);
+  let maxOrdersPerDay = DEFAULT_PAYMENT_LIMITS.maxOrdersPerDay;
+  if (Option.isSome(ordersRaw)) {
+    const parsed = parseOrdersPerDay(ordersRaw.value);
+    if (Result.isFailure(parsed)) return yield* fail(`${ordersKey} ${parsed.failure}`);
+    maxOrdersPerDay = parsed.success;
+  }
+  // The messages name the variables only: currencies and amounts are values.
+  const orderCurrencies = Object.keys(maxPerOrder).sort().join();
+  if (orderCurrencies !== Object.keys(maxPerDay).sort().join()) {
+    return yield* fail(`${PER_ORDER_VAR} and ${PER_DAY_VAR} must list the same currencies`);
+  }
+  if (Object.keys(maxPerOrder).some((c) => toCents(maxPerOrder[c] ?? 0) > toCents(maxPerDay[c] ?? 0))) {
+    return yield* fail(`Each ${PER_ORDER_VAR} amount must be at most the ${PER_DAY_VAR} amount for its currency`);
+  }
+  return { maxPerOrder, maxPerDay, maxOrdersPerDay } satisfies PaymentLimits;
+});
+
 /** Reads and validates the whole configuration. */
 export const loadConfig = Effect.fn("config.load")(function* () {
   const transport = yield* loadTransport();
@@ -498,6 +545,7 @@ export const loadConfig = Effect.fn("config.load")(function* () {
     maxResponseBytes: MAX_RESPONSE_BYTES,
     transport,
     cache,
+    paymentLimits: yield* loadPaymentLimits(),
   };
   return config;
 });
