@@ -20,7 +20,7 @@ import type { SqlClient } from "effect/sql";
 import { AccountChangesLive } from "../../src/account-runtime.js";
 import { Accounts, type AccountsShape } from "../../src/accounts.js";
 import { AdminPassword } from "../../src/admin/password.js";
-import { AdminLive } from "../../src/admin/server.js";
+import { AdminLive, adminRoutes } from "../../src/admin/server.js";
 import { SERVER_INFO, ToolsLive } from "../../src/app.js";
 import { SERVER_MIGRATIONS } from "../../src/cache/db.js";
 import { type AppConfigShape, accountSeedOf, type HttpAuthConfig } from "../../src/config.js";
@@ -95,6 +95,10 @@ export async function startOAuth(
   options: {
     throttle?: ThrottlePolicy;
     trustedProxies?: ReadonlyArray<string>;
+    /** FIO_MCP_ADMIN_ALLOWED_CIDRS entries. */
+    allowedNetworks?: ReadonlyArray<string>;
+    /** More admin routes, registered behind the same restriction as AdminLive's (adminRoutes). */
+    extraAdminRoutes?: Layer.Layer<never, never, HttpRouter.HttpRouter>;
     /** A database file instead of memory (survives `close`, for restart tests). */
     dbPath?: string;
     /** The accounts FIO_TOKEN / FIO_ACCOUNTS would configure (default: main and savings). */
@@ -103,6 +107,8 @@ export async function startOAuth(
 ): Promise<OAuthHarness> {
   const hash = await passwordHash();
   const trustedProxies = (options.trustedProxies ?? []).flatMap((entry) => parseTrustedProxy(entry) ?? []);
+  const allowedNetworks = (options.allowedNetworks ?? []).flatMap((entry) => parseTrustedProxy(entry) ?? []);
+  const adminSettings = { publicUrl: PUBLIC_URL, dataKey: DATA_KEY, trustedProxies, allowedNetworks };
   const accountSeed = accountSeedOf(options.configured ?? testConfig().accounts);
   const auth: HttpAuthConfig = { kind: "oauth", publicUrl: PUBLIC_URL, passwordHash: Redacted.make(hash), dataKey: DATA_KEY, accountSeed };
   const transport: HttpTransportConfig = {
@@ -113,6 +119,7 @@ export async function startOAuth(
     allowedOrigins: [],
     allowedHosts: [],
     trustedProxies,
+    adminAllowedNetworks: allowedNetworks,
   };
   const config = testConfig(transport);
   const scope = await Effect.runPromise(Scope.make());
@@ -127,8 +134,9 @@ export async function startOAuth(
   });
   // As Auth.Live builds it, with the test's throttling and scrypt parameters.
   const oauth = Layer.mergeAll(
-    Auth.oauth({ publicUrl: PUBLIC_URL, trustedProxies }),
-    AdminLive({ publicUrl: PUBLIC_URL, dataKey: DATA_KEY, trustedProxies }),
+    Auth.oauth({ publicUrl: PUBLIC_URL, trustedProxies, allowedNetworks }),
+    AdminLive(adminSettings),
+    options.extraAdminRoutes === undefined ? Layer.empty : adminRoutes(adminSettings, options.extraAdminRoutes),
   ).pipe(Layer.provide(AdminPassword.layer(Redacted.make(hash), options.throttle, FAST_SCRYPT)));
   let accounts: AccountsShape | undefined;
   const captureAccounts = Layer.effectDiscard(

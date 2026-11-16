@@ -2,6 +2,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { type CallToolResult, ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import { Effect, Layer, Redacted, Sink, Stdio, Stream, Terminal } from "effect";
+import { HttpRouter, HttpServerResponse } from "effect/http";
 import { SqlClient } from "effect/sql";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { tokenFingerprint } from "../src/accounts.js";
@@ -18,6 +19,7 @@ import {
   LOOPBACK_REDIRECT,
   type OAuthHarness,
   PASSWORD,
+  PEER_HEADER,
   PUBLIC_URL,
   pkcePair,
   postMcp,
@@ -269,6 +271,49 @@ describe("admin sign-in and sessions", () => {
     );
     const csrf = await csrfOf(await browser.get("/login"));
     expect((await browser.post("/login", { csrf, password: PASSWORD })).status).toBe(429);
+  });
+});
+
+describe("network allowlist (FIO_MCP_ADMIN_ALLOWED_CIDRS)", () => {
+  const OUTSIDE = { [PEER_HEADER]: "192.0.2.1" };
+  const INSIDE = { [PEER_HEADER]: "10.1.2.3" };
+  const PENDING = HttpRouter.add("GET", "/admin/payments/pending", HttpServerResponse.text("pending payments"));
+  const hidden = async (response: Response) => {
+    expect(response.status).toBe(404);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(await response.text()).toBe("");
+  };
+
+  beforeEach(async () => {
+    await harness.close();
+    harness = await startOAuth({ allowedNetworks: ["10.0.0.0/8"], extraAdminRoutes: PENDING });
+  });
+
+  it("answers 404 to clients outside the list on every /admin route and spelling", async () => {
+    const get = (path: string) => harness.fetch(`${PUBLIC_URL}${path}`, { headers: OUTSIDE });
+    for (const path of ["/admin", "/admin/login", "/admin/clients", "/admin/password", "/ADMIN", "//admin", "/%61dmin"]) {
+      await hidden(await get(path));
+    }
+    const outsider = new Admin(OUTSIDE);
+    await hidden(await outsider.post("/admin/login", { password: PASSWORD }));
+    await hidden(await outsider.post("/admin/accounts/add", { name: "third", token: THIRD_TOKEN }));
+    expect((await harness.accounts().list.pipe(Effect.runPromise)).length).toBe(2);
+  });
+
+  it("covers a route registered under /admin the way AdminLive registers its routes", async () => {
+    await hidden(await harness.fetch(`${PUBLIC_URL}/admin/payments/pending`, { headers: OUTSIDE }));
+    await hidden(await harness.fetch(`${PUBLIC_URL}/ADMIN/payments/pending`, { headers: OUTSIDE }));
+    const inside = await harness.fetch(`${PUBLIC_URL}/admin/payments/pending`, { headers: INSIDE });
+    expect(inside.status).toBe(200);
+    expect(await inside.text()).toBe("pending payments");
+  });
+
+  it("keeps the admin flows working for clients inside the list", async () => {
+    const admin = new Admin(INSIDE);
+    await admin.signIn();
+    const { message } = await admin.act("/admin/accounts/add", { name: "third", token: THIRD_TOKEN });
+    expect(message).not.toBe("");
+    expect((await harness.accounts().list.pipe(Effect.runPromise)).map((account) => account.name)).toContain("third");
   });
 });
 

@@ -2,10 +2,14 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { assert, describe, it } from "@effect/vitest";
-import { Effect, Redacted } from "effect";
+import { ConfigProvider, Effect, Layer, Logger, Redacted } from "effect";
+import { HttpRouter } from "effect/http";
+import { TestClock } from "effect/testing";
 import { MIN_RATE_LIMIT_INTERVAL_MS } from "../src/config.js";
 import { ConfigError } from "../src/errors.js";
 import { hashPassword } from "../src/oauth/crypto.js";
+import { Redactor } from "../src/redaction.js";
+import { Auth, UNAUTHENTICATED_WARNING, unauthenticatedWarning } from "../src/transport/auth.js";
 import { loadConfigFrom, PAY_TOKEN, READ_TOKEN } from "./fixtures.js";
 
 const configError = (env: Record<string, string>) =>
@@ -21,6 +25,208 @@ const secretFile = (content: string) => {
   writeFileSync(path, content, { mode: 0o440 });
   return path;
 };
+
+/** Runs `effect` with a test logger; returns its result and the log lines. */
+const withLogs = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+  Effect.gen(function* () {
+    const logs: Array<string> = [];
+    const capture = Logger.make<unknown, void>((entry) => {
+      logs.push(Logger.formatLogFmt.log(entry));
+    });
+    const result = yield* effect.pipe(Effect.provide(Logger.layer([capture])));
+    return { result, logs };
+  });
+
+const oauthEnv = () =>
+  Effect.gen(function* () {
+    const hash = yield* hashPassword(Redacted.make("test-admin-password"), { ln: 14, r: 8, p: 1 });
+    return {
+      FIO_MCP_TRANSPORT: "http",
+      FIO_MCP_PUBLIC_URL: "https://fio.example.test",
+      FIO_MCP_ADMIN_PASSWORD_HASH_FILE: secretFile(`${hash}\n`),
+      FIO_MCP_DATA_KEY_FILE: secretFile(`${"ab".repeat(32)}\n`),
+    };
+  });
+
+const UNAUTHENTICATED = { FIO_TOKEN: READ_TOKEN, FIO_MCP_TRANSPORT: "http", FIO_MCP_ALLOW_UNAUTHENTICATED: "true" };
+
+describe("FIO_MCP_ADMIN_ALLOWED_CIDRS", () => {
+  const env = { ...UNAUTHENTICATED, FIO_MCP_HOST: "127.0.0.1" };
+
+  it.effect("parses a list of addresses and networks, and is empty when unset", () =>
+    Effect.gen(function* () {
+      const config = yield* loadConfigFrom({ ...env, FIO_MCP_ADMIN_ALLOWED_CIDRS: "10.0.0.0/8, 192.168.1.5,fd00::/8" });
+      if (config.transport.kind !== "http") return assert.fail("expected http");
+      assert.strictEqual(config.transport.adminAllowedNetworks?.length, 3);
+      const unset = yield* loadConfigFrom(env);
+      assert.deepStrictEqual(unset.transport.kind === "http" ? unset.transport.adminAllowedNetworks : undefined, []);
+    }),
+  );
+
+  it.effect("fails startup on an invalid entry without echoing it", () =>
+    Effect.gen(function* () {
+      const message = yield* configError({ ...env, FIO_MCP_ADMIN_ALLOWED_CIDRS: "10.0.0.0/8,office-network" });
+      assert.include(message, "FIO_MCP_ADMIN_ALLOWED_CIDRS entry 2 must be an IP address or a CIDR network");
+      assert.notInclude(message, "office-network");
+    }),
+  );
+});
+
+describe("FIO_MCP_ADMIN_HOST / FIO_MCP_ADMIN_PORT", () => {
+  it.effect("adds an admin listener on 127.0.0.1 by default, and none when the port is unset", () =>
+    Effect.gen(function* () {
+      const oauth = yield* oauthEnv();
+      const off = yield* loadConfigFrom(oauth);
+      assert.strictEqual(off.transport.kind === "http" ? off.transport.adminListener : "stdio", undefined);
+      const on = yield* loadConfigFrom({ ...oauth, FIO_MCP_ADMIN_PORT: "3001" });
+      assert.deepStrictEqual(on.transport.kind === "http" ? on.transport.adminListener : undefined, { host: "127.0.0.1", port: 3001 });
+      const lan = yield* loadConfigFrom({ ...oauth, FIO_MCP_ADMIN_PORT: "3001", FIO_MCP_ADMIN_HOST: "192.168.1.2" });
+      assert.deepStrictEqual(lan.transport.kind === "http" ? lan.transport.adminListener : undefined, { host: "192.168.1.2", port: 3001 });
+    }),
+  );
+
+  it.effect("refuses a bad or clashing port, a host without a port, and the listener without OAuth", () =>
+    Effect.gen(function* () {
+      const oauth = yield* oauthEnv();
+      assert.include(yield* configError({ ...oauth, FIO_MCP_ADMIN_PORT: "70000" }), "FIO_MCP_ADMIN_PORT must be an integer from 1 to 65535");
+      assert.include(yield* configError({ ...oauth, FIO_MCP_ADMIN_PORT: "admin" }), "FIO_MCP_ADMIN_PORT must be an integer");
+      assert.include(yield* configError({ ...oauth, FIO_MCP_ADMIN_PORT: "3000" }), "FIO_MCP_ADMIN_PORT must differ from FIO_MCP_PORT");
+      assert.include(yield* configError({ ...oauth, FIO_MCP_ADMIN_HOST: "127.0.0.1" }), "FIO_MCP_ADMIN_HOST is set but FIO_MCP_ADMIN_PORT is not");
+      const open = { ...UNAUTHENTICATED, FIO_MCP_HOST: "127.0.0.1", FIO_MCP_ADMIN_PORT: "3001" };
+      assert.include(yield* configError(open), "FIO_MCP_ADMIN_PORT needs OAuth");
+    }),
+  );
+});
+
+describe("FIO_API_BASE_URL", () => {
+  const MESSAGE = "FIO_API_BASE_URL must be an https URL on fio.cz";
+  const baseUrl = (url: string | undefined, override = false) => ({
+    FIO_TOKEN: READ_TOKEN,
+    ...(url === undefined ? {} : { FIO_API_BASE_URL: url }),
+    ...(override ? { FIO_API_ALLOW_TEST_BASE_URL: "true" } : {}),
+  });
+
+  it.effect("accepts the default and https URLs on fio.cz in any case", () =>
+    Effect.gen(function* () {
+      assert.strictEqual((yield* loadConfigFrom(baseUrl(undefined))).baseUrl, "https://fioapi.fio.cz/v1/rest");
+      assert.strictEqual((yield* loadConfigFrom(baseUrl("https://fioapi.fio.cz/v1/rest/"))).baseUrl, "https://fioapi.fio.cz/v1/rest");
+      assert.strictEqual((yield* loadConfigFrom(baseUrl("https://FIOAPI.FIO.CZ/v1/rest"))).baseUrl, "https://fioapi.fio.cz/v1/rest");
+      assert.strictEqual((yield* loadConfigFrom(baseUrl("https://fio.cz/api"))).baseUrl, "https://fio.cz/api");
+    }),
+  );
+
+  it.effect("refuses other schemes, hosts, credentials, query and fragment without echoing the value", () =>
+    Effect.gen(function* () {
+      for (const url of [
+        "http://fioapi.fio.cz/v1/rest",
+        "https://fio.cz.evil.com/v1/rest",
+        "https://evilfio.cz/v1/rest",
+        "https://user:pw@fioapi.fio.cz/v1/rest",
+        "https://127.0.0.1/v1/rest",
+        "http://127.0.0.1:1234/v1/rest",
+        "https://fioapi.fio.cz/v1/rest?x=1",
+        "https://fioapi.fio.cz/v1/rest#x",
+        "fioapi.fio.cz/v1/rest",
+      ]) {
+        const message = yield* configError(baseUrl(url));
+        assert.strictEqual(message, MESSAGE, url);
+      }
+    }),
+  );
+
+  it.effect("with FIO_API_ALLOW_TEST_BASE_URL accepts http on loopback only, and warns without the URL", () =>
+    Effect.gen(function* () {
+      const { result, logs } = yield* withLogs(loadConfigFrom(baseUrl("http://127.0.0.1:1234/v1/rest", true)));
+      assert.strictEqual(result.baseUrl, "http://127.0.0.1:1234/v1/rest");
+      assert.strictEqual(logs.length, 1);
+      assert.include(logs[0], "FIO_API_ALLOW_TEST_BASE_URL=true");
+      assert.notInclude(logs[0], "1234");
+      assert.strictEqual((yield* loadConfigFrom(baseUrl("http://localhost:1234/v1/rest", true))).baseUrl, "http://localhost:1234/v1/rest");
+      assert.strictEqual((yield* loadConfigFrom(baseUrl("http://[::1]:1234/v1/rest", true))).baseUrl, "http://[::1]:1234/v1/rest");
+      assert.strictEqual(yield* configError(baseUrl("http://10.0.0.1/v1/rest", true)), MESSAGE);
+      assert.strictEqual(yield* configError(baseUrl("http://fio.example.test/v1/rest", true)), MESSAGE);
+      const quiet = yield* withLogs(loadConfigFrom(baseUrl(undefined)));
+      assert.deepStrictEqual(quiet.logs, []);
+    }),
+  );
+});
+
+describe("unauthenticated HTTP guard", () => {
+  it.effect("starts only on a loopback host", () =>
+    Effect.gen(function* () {
+      for (const host of ["127.0.0.1", "::1", "localhost"]) {
+        const config = yield* loadConfigFrom({ ...UNAUTHENTICATED, FIO_MCP_HOST: host });
+        assert.deepStrictEqual(config.transport.kind === "http" ? config.transport.auth : undefined, { kind: "unauthenticated" }, host);
+      }
+      for (const env of [UNAUTHENTICATED, { ...UNAUTHENTICATED, FIO_MCP_HOST: "0.0.0.0" }, { ...UNAUTHENTICATED, FIO_MCP_HOST: "192.168.1.2" }]) {
+        const message = yield* configError(env);
+        assert.include(message, "FIO_MCP_ALLOW_UNAUTHENTICATED");
+        assert.include(message, "FIO_MCP_HOST");
+      }
+    }),
+  );
+
+  it.effect("starts on 0.0.0.0 with FIO_MCP_ALLOW_UNAUTHENTICATED_ON_NETWORK and repeats the warning every 10 minutes", () =>
+    Effect.gen(function* () {
+      const env = { ...UNAUTHENTICATED, FIO_MCP_HOST: "0.0.0.0", FIO_MCP_ALLOW_UNAUTHENTICATED_ON_NETWORK: "true" };
+      const config = yield* loadConfigFrom(env);
+      assert.deepStrictEqual(config.transport.kind === "http" ? config.transport.auth : undefined, { kind: "unauthenticated", onNetwork: true });
+      const live = Auth.Live.pipe(
+        Layer.provide(Layer.merge(HttpRouter.layer, Redactor.Live)),
+        Layer.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: { HOME: "/home/test", ...env } }))),
+      );
+      const { logs } = yield* withLogs(
+        Effect.scoped(
+          Effect.gen(function* () {
+            yield* Layer.build(live);
+            yield* Effect.yieldNow;
+            yield* TestClock.adjust("10 minutes");
+            yield* Effect.yieldNow;
+            yield* TestClock.adjust("10 minutes");
+            yield* Effect.yieldNow;
+          }),
+        ),
+      );
+      assert.strictEqual(logs.filter((line) => line.includes(UNAUTHENTICATED_WARNING.slice(0, 40))).length, 3);
+    }),
+  );
+
+  it.effect("warns once on a loopback host", () =>
+    Effect.gen(function* () {
+      const { logs } = yield* withLogs(
+        Effect.scoped(
+          Effect.gen(function* () {
+            yield* Layer.build(unauthenticatedWarning(false));
+            yield* TestClock.adjust("30 minutes");
+          }),
+        ),
+      );
+      assert.strictEqual(logs.length, 1);
+      assert.include(logs[0], "FIO_MCP_ALLOW_UNAUTHENTICATED=true");
+    }),
+  );
+
+  it.effect("refuses the flag together with the OAuth variables", () =>
+    Effect.gen(function* () {
+      const oauth = yield* oauthEnv();
+      const cases: ReadonlyArray<Record<string, string>> = [
+        { ...oauth, FIO_MCP_ALLOW_UNAUTHENTICATED: "true" },
+        { FIO_TOKEN: READ_TOKEN, FIO_MCP_TRANSPORT: "http", FIO_MCP_HOST: "127.0.0.1", FIO_MCP_ALLOW_UNAUTHENTICATED: "true", FIO_MCP_PUBLIC_URL: oauth.FIO_MCP_PUBLIC_URL },
+        {
+          FIO_TOKEN: READ_TOKEN,
+          FIO_MCP_TRANSPORT: "http",
+          FIO_MCP_HOST: "127.0.0.1",
+          FIO_MCP_ALLOW_UNAUTHENTICATED: "true",
+          FIO_MCP_ADMIN_PASSWORD_HASH_FILE: oauth.FIO_MCP_ADMIN_PASSWORD_HASH_FILE,
+        },
+      ];
+      for (const env of cases) {
+        const message = yield* configError(env);
+        assert.include(message, "FIO_MCP_ALLOW_UNAUTHENTICATED=true cannot be combined with FIO_MCP_PUBLIC_URL or FIO_MCP_ADMIN_PASSWORD_HASH_FILE");
+      }
+    }),
+  );
+});
 
 describe("loadConfig", () => {
   it.effect("reads a single token with defaults", () =>

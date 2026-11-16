@@ -138,7 +138,7 @@ interface App {
  * Builds HttpAppLive as `fio-mcp` builds it from the environment, with the
  * environment given as a ConfigProvider (process.env stays untouched).
  */
-async function startApp(): Promise<App> {
+async function startApp(extraEnv: Record<string, string> = {}): Promise<App> {
   const dir = mkdtempSync(join(tmpdir(), "fio-mcp-admin-it-"));
   const fio = await startFakeFio();
   // The hash carries FAST_SCRYPT's parameters, so signing in costs little.
@@ -163,6 +163,7 @@ async function startApp(): Promise<App> {
     // Every new token gets a startup sync: one recent range, one FIO request.
     FIO_SYNC_ON_STARTUP: "true",
     FIO_BACKFILL_FROM: day(-7),
+    ...extraEnv,
   };
   const scope = await Effect.runPromise(Scope.make());
   const close = async () => {
@@ -203,16 +204,7 @@ async function build(
   const db = await Effect.runPromise(Layer.buildWithScope(testDatabase(dbPath, SERVER_MIGRATIONS), scope));
   const sql = <A, E>(effect: Effect.Effect<A, E, SqlClient.SqlClient>) => Effect.runPromise(effect.pipe(Effect.provide(db)));
   const harness: OAuthHarness = {
-    // PUBLIC_URL's requests to the socket; redirects come back to the caller, as in the in-process harness.
-    fetch: async (input, init) => {
-      const request = input instanceof Request ? input : new Request(input, init);
-      const url = new URL(request.url);
-      if (url.origin !== PUBLIC_URL) throw new Error(`not the app: ${url.origin}`);
-      const body = request.method === "GET" || request.method === "HEAD" ? undefined : await request.arrayBuffer();
-      // The browser's side of the socket, outside Effect.
-      // @effect-diagnostics-next-line globalFetch:off
-      return fetch(`${base}${url.pathname}${url.search}`, { method: request.method, headers: request.headers, body, redirect: "manual" });
-    },
+    fetch: socketFetch(base),
     clock: new SkewedClock(),
     logs,
     store: (f) => sql(Effect.flatMap(makeOAuthStore(), f)),
@@ -224,6 +216,30 @@ async function build(
   };
   return { base, fio, harness, sql, logs, close };
 }
+
+/** PUBLIC_URL's requests to the socket at `base`; redirects come back to the caller, as in the in-process harness. */
+const socketFetch =
+  (base: string): OAuthHarness["fetch"] =>
+  async (input, init) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    const url = new URL(request.url);
+    if (url.origin !== PUBLIC_URL) throw new Error(`not the app: ${url.origin}`);
+    const body = request.method === "GET" || request.method === "HEAD" ? undefined : await request.arrayBuffer();
+    // The browser's side of the socket, outside Effect.
+    // @effect-diagnostics-next-line globalFetch:off
+    return fetch(`${base}${url.pathname}${url.search}`, { method: request.method, headers: request.headers, body, redirect: "manual" });
+  };
+
+/** A port nothing listens on right now. */
+const freePort = () =>
+  new Promise<number>((resolve, reject) => {
+    const probe = createServer();
+    probe.once("error", reject);
+    probe.listen(0, "127.0.0.1", () => {
+      const { port } = probe.address() as AddressInfo;
+      probe.close(() => resolve(port));
+    });
+  });
 
 /** A browser for /admin: keeps the admin cookie and the last page's CSRF token, follows no redirects. */
 class Admin {
@@ -367,6 +383,42 @@ afterEach(async ({ task }) => {
   await Promise.allSettled(sessions.map((close) => close()));
   sessions = [];
   await app.close();
+});
+
+describe("a separate admin listener (FIO_MCP_ADMIN_PORT)", () => {
+  it("serves /admin only on the admin port, and account changes there reach tools/list on the main port", async () => {
+    await app.close();
+    const adminPort = await freePort();
+    app = await startApp({ FIO_MCP_ADMIN_PORT: String(adminPort) });
+    const onAdminPort: OAuthHarness = { ...app.harness, fetch: socketFetch(`http://127.0.0.1:${adminPort}`) };
+
+    // The main port has no admin routes, in any spelling.
+    for (const path of ["/admin", "/admin/login", "/ADMIN", "//admin", "/%61dmin"]) {
+      expect((await app.harness.fetch(`${PUBLIC_URL}${path}`)).status, path).toBe(404);
+    }
+    // The admin port serves only /admin: no MCP endpoint, no OAuth pages.
+    expect((await onAdminPort.fetch(`${PUBLIC_URL}/mcp`, { method: "POST" })).status).toBe(404);
+    expect((await onAdminPort.fetch(`${PUBLIC_URL}/authorize`)).status).toBe(404);
+
+    const admin = new Admin(onAdminPort);
+    await admin.signIn();
+    expect(await admin.act("/admin/accounts/add", { name: "travel", token: TRAVEL_TOKEN })).toMatch(/^Added “travel”/);
+    // The OAuth sign-in (main port) and the tools see the account added on the admin port.
+    const grant = await tokensFor(app.harness, { accounts: ["main", "travel"] });
+    const session = await mcpSession(app, grant.access);
+    await eventually(async () => expect(await session.accounts()).toEqual(["main", "travel"]));
+  });
+
+  it("applies FIO_MCP_ADMIN_ALLOWED_CIDRS on the admin listener too", async () => {
+    await app.close();
+    const adminPort = await freePort();
+    app = await startApp({ FIO_MCP_ADMIN_PORT: String(adminPort), FIO_MCP_ADMIN_ALLOWED_CIDRS: "10.0.0.0/8" });
+    // The test connects from 127.0.0.1, outside the list.
+    const refused = await socketFetch(`http://127.0.0.1:${adminPort}`)(`${PUBLIC_URL}/admin/login`);
+    expect(refused.status).toBe(404);
+    expect(refused.headers.get("cache-control")).toBe("no-store");
+    expect(await refused.text()).toBe("");
+  });
 });
 
 describe("account changes at /admin reach the MCP tools", () => {
