@@ -28,7 +28,15 @@
       },
       "style": {
         "noNonNullAssertion": "off",
-        "noNestedTernary": "error"
+        "noNestedTernary": "error",
+        "noRestrictedImports": {
+          "level": "error",
+          "options": {
+            "paths": {
+              "@effect/platform-node": "Import the module's subpath, e.g. `import * as NodeFileSystem from \"@effect/platform-node/NodeFileSystem\"`. The package index re-exports NodeRedis, which loads the `redis` peer that the runtime image leaves out (Dockerfile, --omit=peer), so the server would not start."
+            }
+          }
+        }
       },
       "suspicious": {
         "noExplicitAny": "error",

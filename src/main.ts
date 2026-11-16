@@ -1,5 +1,7 @@
 #!/usr/bin/env node
-import { NodeRuntime, NodeStdio, NodeTerminal } from "@effect/platform-node";
+import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
+import * as NodeStdio from "@effect/platform-node/NodeStdio";
+import * as NodeTerminal from "@effect/platform-node/NodeTerminal";
 import { Effect, Layer, Logger } from "effect";
 import {
   AppLive,

@@ -1,4 +1,4 @@
-import { NodeFileSystem } from "@effect/platform-node";
+import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem";
 import { Layer } from "effect";
 import { CACHE_MIGRATIONS, Database, type Migrations } from "../../src/cache/db.js";
 

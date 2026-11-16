@@ -1,6 +1,6 @@
 import { Buffer } from "node:buffer";
 import { createServer } from "node:http";
-import { NodeHttpServer } from "@effect/platform-node";
+import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import { ByteSize, Clock, Context, Effect, Exit, Fiber, Layer, Predicate, Result, Schema, type Scope, Stream, type Types } from "effect";
 import { McpServer } from "effect/ai";
 import { Headers, HttpBody, HttpEffect, HttpMiddleware, HttpRouter, type HttpServerError, HttpServerRequest, HttpServerResponse } from "effect/http";
