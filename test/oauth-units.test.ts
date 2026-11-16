@@ -25,7 +25,8 @@ import { makeOAuthServer } from "../src/oauth/server.js";
 import { MAX_SESSIONS, makeSessions, type PendingAuthorization } from "../src/oauth/sessions.js";
 import { makeOAuthStore } from "../src/oauth/store.js";
 import { isResource, parsePublicUrl, redirectUriMatches, redirectUriProblem } from "../src/oauth/urls.js";
-import { DEFAULT_GRANT_PAYMENTS } from "../src/payment-limits.js";
+import { paymentFormValues } from "../src/payment-form.js";
+import { DEFAULT_GRANT_PAYMENTS, DEFAULT_PAYMENT_LIMITS } from "../src/payment-limits.js";
 import { testConfig } from "./fixtures.js";
 import { seededConfig } from "./support/config.js";
 import { memoryDatabase } from "./support/database.js";
@@ -89,6 +90,9 @@ describe("URL rules", () => {
       redirectUri: "http://127.0.0.1:45678/callback",
       csrf: "csrf",
       paymentsRequested: false,
+      paymentsChecked: false,
+      payments: paymentFormValues(DEFAULT_GRANT_PAYMENTS, DEFAULT_PAYMENT_LIMITS),
+      paymentCeiling: DEFAULT_PAYMENT_LIMITS,
       accounts: ["<b>&"],
       error: undefined,
     });
@@ -100,7 +104,7 @@ describe("URL rules", () => {
 describe("authorization endpoint request target", () => {
   const services = Layer.mergeAll(
     memoryDatabase(SERVER_MIGRATIONS),
-    Accounts.Default.pipe(Layer.provide(seededConfig(testConfig([])))),
+    Accounts.Default.pipe(Layer.provideMerge(seededConfig(testConfig([])))),
   );
 
   it.effect("shows an error page for an absolute-form target that is not a URL", () =>

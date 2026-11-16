@@ -2,6 +2,7 @@ import { type Deferred, Layer, Redacted } from "effect";
 import { Accounts } from "../../src/accounts.js";
 import { Transactions } from "../../src/cache/service.js";
 import { type AppConfig, type AppConfigShape, MAX_RESPONSE_BYTES, type TransportConfig } from "../../src/config.js";
+import type { FioApiShape } from "../../src/fio-api.js";
 import { DEFAULT_PAYMENT_LIMITS } from "../../src/payment-limits.js";
 import { RateLimiter } from "../../src/rate-limiter.js";
 import { Redactor } from "../../src/redaction.js";
@@ -55,9 +56,10 @@ export const testServices = <E = never, R = never>(
   config: AppConfigShape,
   release: Deferred.Deferred<void>,
   accounts: Layer.Layer<Accounts, E, R | Redactor | AppConfig> = Accounts.Default,
+  fio: Partial<FioApiShape> = {},
 ) =>
   Transactions.Disabled.pipe(
-    Layer.provideMerge(slotHoldingFio(release)),
+    Layer.provideMerge(slotHoldingFio(release, fio)),
     Layer.provideMerge(Layer.mergeAll(accounts, RateLimiter.Default)),
     Layer.provideMerge(Redactor.Default),
     Layer.provideMerge(seededConfig(config)),

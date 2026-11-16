@@ -3,7 +3,9 @@ import { Cookies, HttpServerRequest, HttpServerResponse } from "effect/http";
 import type { IpNetwork } from "effect/net";
 import { type Account, Accounts } from "../accounts.js";
 import { AdminPassword } from "../admin/password.js";
+import { AppConfig } from "../config.js";
 import { SCOPE_PAYMENTS, SCOPE_READ, SCOPES } from "../mcp/permissions.js";
+import { type PaymentFormValues, parsePaymentForm, paymentFormValues, readPaymentForm } from "../payment-form.js";
 import { DEFAULT_GRANT_PAYMENTS } from "../payment-limits.js";
 import { AuthUnavailable, Unauthorized } from "../transport/auth-errors.js";
 import { clientAddress } from "../transport/client-address.js";
@@ -90,6 +92,12 @@ const CORS_PATHS = [
 ] as const;
 
 /** The admin password and its sign-in throttling come from `AdminPassword` (src/admin/password.ts). */
+/** The consent form's payments box and settings as the owner submitted them. */
+interface ConsentPayments {
+  readonly checked: boolean;
+  readonly values: PaymentFormValues;
+}
+
 export interface OAuthSettings {
   readonly publicUrl: string;
   /** Proxies whose X-Forwarded-For names the client address (see clientAddress). */
@@ -218,6 +226,8 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
   const accounts = yield* Accounts;
   const sessions = yield* makeSessions();
   const password = yield* AdminPassword;
+  // Server defaults and ceilings of grant payment limits (SEC-26).
+  const { paymentLimits } = yield* AppConfig;
   const issuer = settings.publicUrl;
   const resource = `${issuer}${MCP_RESOURCE_PATH}`;
   const resourceMetadataUrl = `${issuer}${PROTECTED_RESOURCE_PATH}${MCP_RESOURCE_PATH}`;
@@ -530,12 +540,17 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
       extra,
     );
 
-  /** The consent page for the accounts configured now; the session remembers what this form showed. */
+  /**
+   * The consent page for the accounts configured now; the session remembers
+   * what this form showed. `payments` is the owner's own submission when the
+   * page is shown again after an error: the box is ticked only if it was.
+   */
   const renderConsent = Effect.fnUntraced(function* (
     session: AuthSession,
     configured: ReadonlyArray<Account>,
     status = 200,
     error?: string,
+    payments?: ConsentPayments,
   ) {
     const formId = yield* randomId("");
     session.consentForms.set(formId, new Map(configured.map((account) => [account.name, account.tokenFingerprint])));
@@ -550,6 +565,9 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
         redirectUri: session.request.redirectUri,
         csrf: Redacted.value(session.csrf),
         paymentsRequested: session.request.requestedScopes.includes(SCOPE_PAYMENTS),
+        paymentsChecked: payments?.checked ?? false,
+        payments: payments?.values ?? paymentFormValues(DEFAULT_GRANT_PAYMENTS, paymentLimits),
+        paymentCeiling: paymentLimits,
         accounts: configured.map((account) => account.name),
         error,
       }),
@@ -613,6 +631,11 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
         expiredCookie,
       );
     }
+    // Payments only when the owner ticked the box; their settings as typed, for a re-render.
+    const payments: ConsentPayments = {
+      checked: form.getAll("scope").includes(SCOPE_PAYMENTS),
+      values: readPaymentForm(form),
+    };
     // The form carries names for display; the grant binds the tokens behind them.
     const chosen = form.getAll("account");
     const configured = yield* accounts.list;
@@ -629,6 +652,7 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
         configured,
         409,
         "The accounts changed while this page was open. Review the selection and approve again.",
+        payments,
       );
     }
     const chosenAccounts = configured.filter((account) => chosen.includes(account.name));
@@ -638,9 +662,15 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
         configured,
         400,
         configured.length === 0 ? "No FIO accounts are configured yet. Add one at /admin first." : "Select at least one account.",
+        payments,
       );
     }
-    const scopes = form.getAll("scope").includes(SCOPE_PAYMENTS) ? [SCOPE_READ, SCOPE_PAYMENTS] : [SCOPE_READ];
+    // Explicit limits and allowlist as submitted, never above the ceilings (SEC-26, SEC-27).
+    const grantPayments = payments.checked ? parsePaymentForm(payments.values, paymentLimits) : Result.succeed(DEFAULT_GRANT_PAYMENTS);
+    if (Result.isFailure(grantPayments)) {
+      return yield* renderConsent(session, configured, 400, `Payment settings: ${grantPayments.failure}`, payments);
+    }
+    const scopes = payments.checked ? [SCOPE_READ, SCOPE_PAYMENTS] : [SCOPE_READ];
     const client = yield* store.client(pending.clientId).pipe(Effect.orElseSucceed(() => Option.none<Client>()));
     if (Option.isNone(client)) {
       yield* sessions.end(session);
@@ -658,8 +688,8 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
       scopes,
       accountFingerprints: [...new Set(chosenAccounts.map((account) => account.tokenFingerprint))],
       resource: pending.resource,
-      // Server-default limits, allowlist off; the consent form sets these (SEC-04/26/27).
-      payments: DEFAULT_GRANT_PAYMENTS,
+      // Without fio:payments the settings are unused: server defaults, allowlist off.
+      payments: grantPayments.success,
     };
     yield* store
       .createGrant(

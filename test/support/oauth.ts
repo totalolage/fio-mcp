@@ -24,9 +24,14 @@ import { AdminLive } from "../../src/admin/server.js";
 import { SERVER_INFO, ToolsLive } from "../../src/app.js";
 import { SERVER_MIGRATIONS } from "../../src/cache/db.js";
 import { type AppConfigShape, accountSeedOf, type HttpAuthConfig } from "../../src/config.js";
+import type { FioApiShape } from "../../src/fio-api.js";
 import { hashPassword, type PasswordHash, parsePasswordHash } from "../../src/oauth/crypto.js";
 import type { ThrottlePolicy } from "../../src/oauth/login.js";
 import { makeOAuthStore, type OAuthStore } from "../../src/oauth/store.js";
+import { PaymentControls, type PaymentControlsShape } from "../../src/payment-controls.js";
+import { PAYMENT_FIELDS, paymentFormValues } from "../../src/payment-form.js";
+import { PaymentLedger } from "../../src/payment-ledger.js";
+import { DEFAULT_GRANT_PAYMENTS, DEFAULT_PAYMENT_LIMITS, type PaymentLimits } from "../../src/payment-limits.js";
 import { Auth } from "../../src/transport/auth.js";
 import { parseTrustedProxy } from "../../src/transport/client-address.js";
 import { type HttpTransportConfig, httpRouterApp } from "../../src/transport/http.js";
@@ -88,6 +93,12 @@ export interface OAuthHarness {
   readonly close: () => Promise<void>;
 }
 
+/** The in-process harness, which also reaches the server's payment controls. */
+export interface InProcessHarness extends OAuthHarness {
+  /** Runs an operation on the server's payment controls, on the harness clock. */
+  readonly payments: <A, E>(f: (controls: PaymentControlsShape) => Effect.Effect<A, E>) => Promise<A>;
+}
+
 /** Requests carrying this header appear to come from that socket peer address. */
 export const PEER_HEADER = "x-test-peer";
 
@@ -99,8 +110,12 @@ export async function startOAuth(
     dbPath?: string;
     /** The accounts FIO_TOKEN / FIO_ACCOUNTS would configure (default: main and savings). */
     configured?: AppConfigShape["accounts"];
+    /** Server payment defaults and ceilings (default DEFAULT_PAYMENT_LIMITS). */
+    paymentLimits?: PaymentLimits;
+    /** FioApi methods beyond the slot-holding fake (e.g. importXml for payment uploads). */
+    fio?: Partial<FioApiShape>;
   } = {},
-): Promise<OAuthHarness> {
+): Promise<InProcessHarness> {
   const hash = await passwordHash();
   const trustedProxies = (options.trustedProxies ?? []).flatMap((entry) => parseTrustedProxy(entry) ?? []);
   const accountSeed = accountSeedOf(options.configured ?? testConfig().accounts);
@@ -114,7 +129,7 @@ export async function startOAuth(
     allowedHosts: [],
     trustedProxies,
   };
-  const config = testConfig(transport);
+  const config = { ...testConfig(transport), paymentLimits: options.paymentLimits ?? DEFAULT_PAYMENT_LIMITS };
   const scope = await Effect.runPromise(Scope.make());
   const db: Context.Context<SqlClient.SqlClient> = await Effect.runPromise(
     Layer.buildWithScope(testDatabase(options.dbPath ?? ":memory:", SERVER_MIGRATIONS), scope),
@@ -136,6 +151,12 @@ export async function startOAuth(
       accounts = service;
     }),
   );
+  let controls: PaymentControlsShape | undefined;
+  const captureControls = Layer.effectDiscard(
+    Effect.map(Effect.service(PaymentControls), (service) => {
+      controls = service;
+    }),
+  );
   // Request handlers run with the router's context, not the layer's: clock and logger are provided per request.
   const captureLayer = Logger.layer([capture]);
   const withClock = HttpRouter.middleware(
@@ -150,8 +171,15 @@ export async function startOAuth(
       ),
     { global: true },
   );
-  const app = httpRouterApp(Layer.mergeAll(ToolsLive, withClock, AccountChangesLive, captureAccounts), oauth, SERVER_INFO, transport).pipe(
-    Layer.provide(testServices(config, release, Accounts.stored(DATA_KEY, accountSeed))),
+  const app = httpRouterApp(
+    Layer.mergeAll(ToolsLive, withClock, AccountChangesLive, captureAccounts, captureControls),
+    oauth,
+    SERVER_INFO,
+    transport,
+  ).pipe(
+    // One instance for the tools and /admin, as PaymentControls.Live shares it.
+    Layer.provide(PaymentControls.Default.pipe(Layer.provideMerge(PaymentLedger.Default))),
+    Layer.provide(testServices(config, release, Accounts.stored(DATA_KEY, accountSeed), options.fio)),
     Layer.provide(Layer.succeedContext(db)),
     Layer.provide(HttpServer.layerServices),
     Layer.provide(Logger.layer([capture])),
@@ -170,6 +198,10 @@ export async function startOAuth(
     accounts: () => {
       if (accounts === undefined) throw new Error("the app has not started yet (make a request first)");
       return accounts;
+    },
+    payments: (f) => {
+      if (controls === undefined) throw new Error("the app has not started yet (make a request first)");
+      return Effect.runPromise(f(controls).pipe(Effect.provideService(Clock.Clock, clock)));
     },
     close: async () => {
       await web.dispose();
@@ -237,8 +269,22 @@ export const csrfOf = async (response: Response) => {
 export interface Consent {
   readonly accounts?: ReadonlyArray<string>;
   readonly payments?: boolean;
+  /** Payment settings fields overriding the pre-filled server defaults (sent with `payments`). */
+  readonly paymentSettings?: Readonly<Record<string, string>>;
   readonly decision?: "approve" | "deny";
 }
+
+/** The consent page's payment settings as pre-filled from DEFAULT_PAYMENT_LIMITS. */
+export const DEFAULT_PAYMENT_FORM: Readonly<Record<string, string>> = (() => {
+  const values = paymentFormValues(DEFAULT_GRANT_PAYMENTS, DEFAULT_PAYMENT_LIMITS);
+  return {
+    [PAYMENT_FIELDS.maxPerOrder]: values.maxPerOrder,
+    [PAYMENT_FIELDS.maxPerDay]: values.maxPerDay,
+    [PAYMENT_FIELDS.maxOrdersPerDay]: values.maxOrdersPerDay,
+    [PAYMENT_FIELDS.mode]: values.mode,
+    [PAYMENT_FIELDS.allowlist]: values.allowlist,
+  };
+})();
 
 /** Drives /authorize → /login → /consent and returns the redirect back to the client. */
 export async function authorizeInBrowser(harness: OAuthHarness, authorizationUrl: string | URL, consent: Consent = {}) {
@@ -256,6 +302,9 @@ export async function authorizeInBrowser(harness: OAuthHarness, authorizationUrl
     decision: consent.decision ?? "approve",
     account: consent.accounts ?? ["main", "savings"],
     scope: consent.payments === true ? ["fio:payments"] : [],
+    // The fields a browser submits as pre-filled (hidden unless the box is ticked).
+    ...DEFAULT_PAYMENT_FORM,
+    ...consent.paymentSettings,
   });
   if (done.status !== 303) throw new Error(`consent answered ${done.status}: ${await done.text()}`);
   return new URL(done.headers.get("location") ?? "");

@@ -47,7 +47,7 @@ export class Auth extends Context.Service<Auth, AuthShape>()("fio-mcp/transport/
    */
   static readonly oauth = (
     settings: OAuthSettings,
-  ): Layer.Layer<Auth, never, HttpRouter.HttpRouter | SqlClient.SqlClient | Accounts | AdminPassword> =>
+  ): Layer.Layer<Auth, never, HttpRouter.HttpRouter | SqlClient.SqlClient | Accounts | AdminPassword | AppConfig> =>
     Layer.effect(
       Auth,
       Effect.gen(function* () {
