@@ -1,4 +1,4 @@
-import { Effect } from "effect";
+import { Cause, Effect, Exit } from "effect";
 import { describe, expect, it } from "vitest";
 import { XmlParseError } from "../src/errors.js";
 import { looksLikeMissingPaymentPermission, parseImportResponse } from "../src/import-response.js";
@@ -111,5 +111,18 @@ describe("permission refusal heuristic", () => {
       "</status><message>Orders must be authorized; permission required in Internetbanking</message>",
     );
     expect(looksLikeMissingPaymentPermission(parse(accepted))).toBe(false);
+  });
+
+  // The GHSA-474x-hrwr-fgx4 input shape (many "<a " with no ">"). With no
+  // stopNodes the validator rejects it, and the error excerpt must strip
+  // tags in linear time, not rescan the rest of the body from every "<".
+  it("rejects a 1 MB body of unterminated tags within 1 s", () => {
+    const xml = `<responseImport><result>${"<a ".repeat(Math.ceil(1_048_576 / 3))}`;
+    expect(xml.length).toBeGreaterThanOrEqual(1_048_576);
+    const started = performance.now();
+    const exit = Effect.runSyncExit(parseImportResponse(xml, excerpt));
+    const elapsed = performance.now() - started;
+    expect(elapsed).toBeLessThan(1000);
+    expect(Exit.isFailure(exit) && Cause.squash(exit.cause)).toBeInstanceOf(XmlParseError);
   });
 });

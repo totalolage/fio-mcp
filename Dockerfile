@@ -26,7 +26,13 @@ FROM ${NODE_IMAGE} AS deps
 COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
 WORKDIR /app
 COPY package.json bun.lock bunfig.toml ./
-RUN bun install --frozen-lockfile --production --ignore-scripts
+# --omit=peer keeps out redis and @redis/*, the peer of @effect/platform-node
+# that only its NodeRedis module loads. The source imports platform-node
+# subpaths, never the index that re-exports NodeRedis (biome.json enforces
+# it). The peers the server needs (effect) are direct dependencies.
+# peer = false in bunfig.toml would also drop vitest's vite from the dev
+# install.
+RUN bun install --frozen-lockfile --production --omit=peer --ignore-scripts
 
 FROM ${NODE_IMAGE}
 ENV NODE_ENV=production \

@@ -1,4 +1,4 @@
-import { NodeFileSystem } from "@effect/platform-node";
+import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem";
 import { ConfigProvider, Effect, Layer, Redacted } from "effect";
 import { type AccountConfig, type AppConfigShape, loadConfig, MAX_RESPONSE_BYTES } from "../src/config.js";
 

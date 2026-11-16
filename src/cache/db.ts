@@ -1,5 +1,5 @@
 import { dirname } from "node:path";
-import { NodeFileSystem } from "@effect/platform-node";
+import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem";
 import { SqliteClient, SqliteMigrator } from "@effect/sql-sqlite-node";
 import { Effect, FileSystem, Layer } from "effect";
 import { Migrator, SqlClient, type SqlError } from "effect/sql";

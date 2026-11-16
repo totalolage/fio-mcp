@@ -1,4 +1,6 @@
-import { NodeFileSystem, NodeStdio, NodeTerminal } from "@effect/platform-node";
+import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem";
+import * as NodeStdio from "@effect/platform-node/NodeStdio";
+import * as NodeTerminal from "@effect/platform-node/NodeTerminal";
 import { Effect, Layer } from "effect";
 import { McpProtocol } from "effect/ai";
 import { AccountChangesLive } from "./account-runtime.js";

@@ -2,7 +2,9 @@
 # Builds the linux/amd64 image from a clean checkout, tags it
 # fio-mcp:<package.json version>-<short git sha> and fio-mcp:<version>, and
 # streams it to a docker host over ssh (docker save | gzip | ssh ... docker
-# load). No registry is involved. It then checks that the remote image ID
+# load). No registry is involved. Before shipping (and in a dry run) it
+# checks that the image has no redis packages and that its compiled modules
+# other than main.js load. Afterwards it checks that the remote image ID
 # matches the local one.
 #
 # Usage: bun run ship:image -- [--dry-run] [--no-compress]
@@ -121,6 +123,21 @@ fi
 id=$(docker image inspect --format '{{.Id}}' "$tag")
 if ! printf '%s\n' "$id" | grep -Eqx 'sha256:[0-9a-f]{64}'; then
   echo "error: unexpected local image ID for $tag: '$id'" >&2
+  exit 1
+fi
+
+# The unused redis peer of @effect/platform-node must not reach the image
+# (the Dockerfile's deps stage installs with --omit=peer).
+if ! docker run --rm --network none --entrypoint sh "$tag" \
+  -c 'test ! -e /app/node_modules/redis && test ! -e /app/node_modules/@redis' >&2; then
+  echo "error: $tag contains node_modules/redis or node_modules/@redis" >&2
+  exit 1
+fi
+# Every compiled module except the entrypoint must still resolve without the
+# omitted peers. main.js is left out because importing it starts the server.
+if ! docker run --rm --network none --entrypoint node "$tag" --input-type=module \
+  -e 'for (const f of (await import("node:fs")).readdirSync("/app/dist", { recursive: true })) if (f.endsWith(".js") && f !== "main.js") await import(`/app/dist/${f}`);' >&2; then
+  echo "error: $tag cannot load its modules; a dependency is missing from node_modules" >&2
   exit 1
 fi
 
