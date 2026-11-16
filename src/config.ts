@@ -478,6 +478,15 @@ const loadNetworks = Effect.fn("config.loadNetworks")(function* (key: string) {
 
 const loadTrustedProxies = () => loadNetworks("FIO_MCP_TRUSTED_PROXIES");
 
+/** An empty allowlist allows everyone, so a set variable must name at least one network (not just commas). */
+const loadAdminAllowedNetworks = Effect.fn("config.loadAdminAllowedNetworks")(function* () {
+  const networks = yield* loadNetworks("FIO_MCP_ADMIN_ALLOWED_CIDRS");
+  if (networks.length === 0 && Option.isSome(yield* optionalVar("FIO_MCP_ADMIN_ALLOWED_CIDRS"))) {
+    return yield* fail("FIO_MCP_ADMIN_ALLOWED_CIDRS must name at least one IP address or CIDR network");
+  }
+  return networks;
+});
+
 /** Default bind address of the admin listener (FIO_MCP_ADMIN_HOST). */
 export const DEFAULT_ADMIN_HOST = "127.0.0.1";
 
@@ -515,7 +524,7 @@ const loadTransport = Effect.fn("config.loadTransport")(function* () {
     allowedOrigins: yield* listVar("FIO_MCP_ALLOWED_ORIGINS"),
     allowedHosts: (yield* listVar("FIO_MCP_ALLOWED_HOSTS")).map((h) => h.toLowerCase()),
     trustedProxies: yield* loadTrustedProxies(),
-    adminAllowedNetworks: yield* loadNetworks("FIO_MCP_ADMIN_ALLOWED_CIDRS"),
+    adminAllowedNetworks: yield* loadAdminAllowedNetworks(),
     adminListener: yield* loadAdminListener(port),
   } satisfies TransportConfig;
   if (transport.adminListener !== undefined && transport.auth.kind !== "oauth") {

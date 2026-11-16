@@ -68,6 +68,10 @@ describe("FIO_MCP_ADMIN_ALLOWED_CIDRS", () => {
       const message = yield* configError({ ...env, FIO_MCP_ADMIN_ALLOWED_CIDRS: "10.0.0.0/8,office-network" });
       assert.include(message, "FIO_MCP_ADMIN_ALLOWED_CIDRS entry 2 must be an IP address or a CIDR network");
       assert.notInclude(message, "office-network");
+      // Set but naming nothing would allow everyone: refused.
+      for (const value of [",", " , ,"]) {
+        assert.include(yield* configError({ ...env, FIO_MCP_ADMIN_ALLOWED_CIDRS: value }), "FIO_MCP_ADMIN_ALLOWED_CIDRS must name at least one");
+      }
     }),
   );
 });

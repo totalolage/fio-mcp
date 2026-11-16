@@ -425,6 +425,7 @@ describe("network allowlist (FIO_MCP_ADMIN_ALLOWED_CIDRS)", () => {
     const routes: ReadonlyArray<readonly [string, string]> = [
       ["GET", "/admin"],
       ["GET", "/admin/login"],
+      ["HEAD", "/admin/login"],
       ["GET", "/authorize"],
       ["GET", "/login"],
       ["POST", "/login"],
