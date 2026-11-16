@@ -128,12 +128,32 @@ export interface PendingBatch {
   readonly expiresAt: number;
 }
 
+/**
+ * A position in the audit log's newest-first order (`created_at DESC, id DESC`): the last row of
+ * the previous page. Rows can share a millisecond, so the id breaks ties.
+ */
+export interface AuditCursor {
+  readonly createdAt: number;
+  readonly id: string;
+}
+
 export interface AuditQuery {
   readonly grantId?: string;
   readonly limit: number;
-  /** Only rows created strictly before this epoch-millis (paging). */
-  readonly before?: number;
+  /** Only rows that come after this cursor in newest-first order (paging). */
+  readonly before?: AuditCursor;
 }
+
+/** `<epoch millis>_<audit id>`, the `?before=` value of /admin/payments. */
+export const formatAuditCursor = (cursor: AuditCursor): string => `${cursor.createdAt}_${cursor.id}`;
+
+const auditCursorPattern = /^(\d{1,15})_(pay_[0-9a-f]{1,64})$/;
+
+/** Parses {@link formatAuditCursor}'s output; anything else is `undefined`. */
+export const parseAuditCursor = (text: string): AuditCursor | undefined => {
+  const match = auditCursorPattern.exec(text);
+  return match?.[1] === undefined || match[2] === undefined ? undefined : { createdAt: Number(match[1]), id: match[2] };
+};
 
 export interface PaymentLedgerShape {
   /** Writes a new audit row and returns its id (`pay_<hex>`). */
@@ -381,7 +401,11 @@ export const makePaymentLedger = Effect.gen(function* () {
     sql<AuditDbRow>`
       SELECT * FROM payment_audit
       WHERE ${query.grantId === undefined ? sql`1 = 1` : sql`grant_id = ${query.grantId}`}
-        AND ${query.before === undefined ? sql`1 = 1` : sql`created_at < ${query.before}`}
+        AND ${
+          query.before === undefined
+            ? sql`1 = 1`
+            : sql`(created_at < ${query.before.createdAt} OR (created_at = ${query.before.createdAt} AND id < ${query.before.id}))`
+        }
       ORDER BY created_at DESC, id DESC
       LIMIT ${query.limit}
     `.pipe(
