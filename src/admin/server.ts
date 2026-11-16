@@ -14,6 +14,7 @@ import { makeWindowLimiter } from "../oauth/rate-limit.js";
 import { makeOAuthStore } from "../oauth/store.js";
 import { PaymentControls } from "../payment-controls.js";
 import { parsePaymentForm, paymentFormValues, readPaymentForm } from "../payment-form.js";
+import { formatAuditCursor, parseAuditCursor } from "../payment-ledger.js";
 import { unlistedPayees } from "../payment-limits.js";
 import { clientAddress } from "../transport/client-address.js";
 import { makeAccountAdmin, type RemovedCache } from "./accounts.js";
@@ -475,8 +476,8 @@ export const makeAdminServer = Effect.fn("AdminServer.make")(function* (settings
   const showPayments = (request: Request) => {
     const query = queryOf(request);
     const grant = query.get("grant") || undefined;
-    const beforeText = query.get("before") ?? "";
-    const before = /^\d{1,15}$/.test(beforeText) ? Number(beforeText) : undefined;
+    // A malformed or legacy cursor shows the first page.
+    const before = parseAuditCursor(query.get("before") ?? "");
     return page((session) =>
       payments.listAudit({ limit: AUDIT_PAGE_ROWS, ...(grant === undefined ? {} : { grantId: grant }), ...(before === undefined ? {} : { before }) }).pipe(
         Effect.map((rows) => {
@@ -484,7 +485,7 @@ export const makeAdminServer = Effect.fn("AdminServer.make")(function* (settings
           const older =
             rows.length < AUDIT_PAGE_ROWS || last === undefined
               ? undefined
-              : `${PAYMENTS}?${new URLSearchParams({ ...(grant === undefined ? {} : { grant }), before: String(last.createdAt) })}`;
+              : `${PAYMENTS}?${new URLSearchParams({ ...(grant === undefined ? {} : { grant }), before: formatAuditCursor(last) })}`;
           return html(paymentsPage({ csrf: Redacted.value(session.csrf), flash: takeFlash(session), rows, grant, older }));
         }),
         Effect.catch((error) =>
