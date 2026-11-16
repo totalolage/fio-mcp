@@ -10,6 +10,7 @@ import { pageHeaders } from "../oauth/pages.js";
 import { makeWindowLimiter } from "../oauth/rate-limit.js";
 import { makeOAuthStore } from "../oauth/store.js";
 import { clientAddress } from "../transport/client-address.js";
+import { restrictRoutes } from "../transport/restrict.js";
 import { makeAccountAdmin, type RemovedCache } from "./accounts.js";
 import {
   ADMIN_STYLE_HASH,
@@ -43,6 +44,8 @@ export interface AdminSettings {
   readonly publicUrl: string;
   readonly dataKey: Redacted.Redacted<Uint8Array>;
   readonly trustedProxies?: ReadonlyArray<IpNetwork.IpNetwork> | undefined;
+  /** FIO_MCP_ADMIN_ALLOWED_CIDRS: only these clients reach any /admin route (404 otherwise); empty allows all. */
+  readonly allowedNetworks?: ReadonlyArray<IpNetwork.IpNetwork> | undefined;
 }
 
 const MAX_FORM_BYTES = 16 * 1024;
@@ -448,14 +451,30 @@ export const makeAdminServer = Effect.fn("AdminServer.make")(function* (settings
   return { routes };
 });
 
-/** Registers the admin routes on the router (HTTP mode with OAuth). */
+/**
+ * Admin routes: every route `routes` adds to the router answers 404 to
+ * clients outside `settings.allowedNetworks` (FIO_MCP_ADMIN_ALLOWED_CIDRS).
+ * The restriction is route middleware over the whole layer, so a route
+ * registered here is covered without being listed anywhere.
+ */
+export const adminRoutes = <E, R>(settings: AdminSettings, routes: Layer.Layer<never, E, R>) =>
+  routes.pipe(
+    Layer.provide(
+      restrictRoutes({ allowedNetworks: settings.allowedNetworks ?? [], trustedProxies: settings.trustedProxies ?? [] }).layer,
+    ),
+  );
+
+/** Registers the admin routes on the router (HTTP mode with OAuth), behind `adminRoutes`. */
 export const AdminLive = (
   settings: AdminSettings,
 ): Layer.Layer<never, never, HttpRouter.HttpRouter | SqlClient.SqlClient | Accounts | AdminPassword | FioApi | Transactions> =>
-  Layer.effectDiscard(
-    Effect.gen(function* () {
-      const server = yield* makeAdminServer(settings);
-      const router = yield* HttpRouter.HttpRouter;
-      for (const route of server.routes) yield* router.add(route.method, route.path, route.handler);
-    }),
+  adminRoutes(
+    settings,
+    Layer.effectDiscard(
+      Effect.gen(function* () {
+        const server = yield* makeAdminServer(settings);
+        const router = yield* HttpRouter.HttpRouter;
+        for (const route of server.routes) yield* router.add(route.method, route.path, route.handler);
+      }),
+    ),
   );

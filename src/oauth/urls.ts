@@ -31,6 +31,24 @@ export function parsePublicUrl(raw: string): { readonly origin: string } | { rea
 }
 
 /**
+ * FIO_API_BASE_URL: an https URL whose host is fio.cz or ends in .fio.cz,
+ * without credentials, query or fragment. With `allowTest`
+ * (FIO_API_ALLOW_TEST_BASE_URL) http on 127.0.0.1, [::1] and localhost is
+ * accepted too. Returns the normalized URL without trailing slashes, or
+ * undefined; the caller's message must not echo the value.
+ */
+export function parseFioBaseUrl(raw: string, allowTest: boolean): string | undefined {
+  const url = parse(raw);
+  if (url === undefined) return undefined;
+  const onFio = url.protocol === "https:" && (url.hostname === "fio.cz" || url.hostname.endsWith(".fio.cz"));
+  const testServer = allowTest && url.protocol === "http:" && LOOPBACK_HOSTS.has(url.hostname);
+  if (!onFio && !testServer) return undefined;
+  if (url.username !== "" || url.password !== "") return undefined;
+  if (url.search !== "" || url.hash !== "" || raw.includes("?") || raw.includes("#")) return undefined;
+  return url.href.replace(/\/+$/, "");
+}
+
+/**
  * Whether `presented` names `resource` (RFC 8707). Scheme and host compare
  * case-insensitively and a trailing slash is ignored; no query or fragment.
  */

@@ -7,6 +7,7 @@ import { SCOPE_PAYMENTS, SCOPE_READ, SCOPES } from "../mcp/permissions.js";
 import { AuthUnavailable, Unauthorized } from "../transport/auth-errors.js";
 import { clientAddress } from "../transport/client-address.js";
 import type { Principal } from "../transport/principal.js";
+import { restrictTo } from "../transport/restrict.js";
 import { CODE_CHALLENGE, hashSecret, pkceMatches, randomId, randomSecret, safeEqual } from "./crypto.js";
 import {
   AccessDenied,
@@ -93,6 +94,8 @@ export interface OAuthSettings {
   readonly publicUrl: string;
   /** Proxies whose X-Forwarded-For names the client address (see clientAddress). */
   readonly trustedProxies?: ReadonlyArray<IpNetwork.IpNetwork> | undefined;
+  /** FIO_MCP_ADMIN_ALLOWED_CIDRS: only these clients reach /authorize, /login and /consent (404 otherwise); empty allows all. */
+  readonly allowedNetworks?: ReadonlyArray<IpNetwork.IpNetwork> | undefined;
 }
 
 const ACCESS_PREFIX = "fio_at_";
@@ -846,6 +849,9 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
     },
   });
 
+  // The browser sign-in routes answer 404 outside FIO_MCP_ADMIN_ALLOWED_CIDRS.
+  const restricted = restrictTo({ allowedNetworks: settings.allowedNetworks ?? [], trustedProxies });
+
   const routes: ReadonlyArray<Route> = [
     { method: "GET", path: PROTECTED_RESOURCE_PATH, handler: () => Effect.succeed(protectedResource) },
     { method: "GET", path: `${PROTECTED_RESOURCE_PATH}${MCP_RESOURCE_PATH}`, handler: () => Effect.succeed(protectedResource) },
@@ -853,11 +859,11 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
     { method: "POST", path: "/register", handler: jsonEndpoint(register) },
     { method: "POST", path: "/token", handler: jsonEndpoint(token) },
     { method: "POST", path: "/revoke", handler: jsonEndpoint(revoke) },
-    { method: "GET", path: "/authorize", handler: pageEndpoint(authorize) },
-    { method: "GET", path: "/login", handler: pageEndpoint(showLogin) },
-    { method: "POST", path: "/login", handler: pageEndpoint(submitLogin) },
-    { method: "GET", path: "/consent", handler: pageEndpoint(showConsent) },
-    { method: "POST", path: "/consent", handler: pageEndpoint(submitConsent) },
+    { method: "GET", path: "/authorize", handler: restricted(pageEndpoint(authorize)) },
+    { method: "GET", path: "/login", handler: restricted(pageEndpoint(showLogin)) },
+    { method: "POST", path: "/login", handler: restricted(pageEndpoint(submitLogin)) },
+    { method: "GET", path: "/consent", handler: restricted(pageEndpoint(showConsent)) },
+    { method: "POST", path: "/consent", handler: restricted(pageEndpoint(submitConsent)) },
     ...CORS_PATHS.map((path): Route => ({ method: "OPTIONS", path, handler: () => Effect.succeed(preflight) })),
   ];
 

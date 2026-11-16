@@ -1,7 +1,12 @@
 import { assert, describe, it } from "@effect/vitest";
-import { Option } from "effect";
+import { Effect, Logger, Option } from "effect";
 import { HttpServerRequest } from "effect/http";
-import { clientAddress, parseTrustedProxy } from "../src/transport/client-address.js";
+import {
+  clientAddress,
+  makeUntrustedForwardingCheck,
+  parseTrustedProxy,
+  UNTRUSTED_FORWARDING_WARNING,
+} from "../src/transport/client-address.js";
 
 const networks = (...entries: Array<string>) => entries.flatMap((entry) => parseTrustedProxy(entry) ?? []);
 
@@ -58,4 +63,44 @@ describe("parseTrustedProxy", () => {
     assert.isUndefined(parseTrustedProxy("::ffff:172.18.0.0/112"));
     assert.isDefined(parseTrustedProxy("::ffff:172.18.0.2"));
   });
+});
+
+describe("makeUntrustedForwardingCheck", () => {
+  const traefik = networks("172.18.0.0/16");
+  /** Runs the requests through one check with a test logger; returns the log lines. */
+  const logsOf = (requests: ReadonlyArray<HttpServerRequest.HttpServerRequest>) =>
+    Effect.gen(function* () {
+      const logs: Array<string> = [];
+      const capture = Logger.make<unknown, void>((entry) => {
+        logs.push(Logger.formatLogFmt.log(entry));
+      });
+      const check = makeUntrustedForwardingCheck(traefik);
+      yield* Effect.forEach(requests, check, { discard: true }).pipe(Effect.provide(Logger.layer([capture])));
+      return logs;
+    });
+
+  it.effect("warns exactly once, without addresses, about X-Forwarded-For from untrusted peers", () =>
+    Effect.gen(function* () {
+      const logs = yield* logsOf([
+        request("203.0.113.9"),
+        request("203.0.113.9", "198.51.100.7"),
+        request("203.0.113.10", "198.51.100.8"),
+        request("192.0.2.1", "198.51.100.9, 10.0.0.1"),
+      ]);
+      assert.strictEqual(logs.length, 1);
+      assert.include(logs[0], UNTRUSTED_FORWARDING_WARNING);
+      assert.notMatch(logs[0] ?? "", /203\.0\.113|198\.51\.100|192\.0\.2/);
+    }),
+  );
+
+  it.effect("stays silent for trusted proxies and requests without X-Forwarded-For", () =>
+    Effect.gen(function* () {
+      const logs = yield* logsOf([
+        request("172.18.0.2", "203.0.113.9"),
+        request("172.18.0.3", "198.51.100.7, 203.0.113.9"),
+        request("203.0.113.9"),
+      ]);
+      assert.deepStrictEqual(logs, []);
+    }),
+  );
 });
