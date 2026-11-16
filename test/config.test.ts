@@ -508,3 +508,81 @@ describe("loadConfig", () => {
     }),
   );
 });
+
+describe("payment limits", () => {
+  const PER_ORDER = "FIO_MCP_PAYMENT_MAX_PER_ORDER";
+  const PER_DAY = "FIO_MCP_PAYMENT_MAX_PER_DAY";
+  const ORDERS = "FIO_MCP_PAYMENT_MAX_ORDERS_PER_DAY";
+
+  it.effect("defaults to CZK:50000,EUR:2000 per order, CZK:100000,EUR:4000 per day and 20 orders", () =>
+    Effect.gen(function* () {
+      const config = yield* loadConfigFrom({ FIO_TOKEN: READ_TOKEN, [PER_ORDER]: "  ", [PER_DAY]: "" });
+      assert.deepStrictEqual(config.paymentLimits, {
+        maxPerOrder: { CZK: 50_000, EUR: 2_000 },
+        maxPerDay: { CZK: 100_000, EUR: 4_000 },
+        maxOrdersPerDay: 20,
+      });
+    }),
+  );
+
+  it.effect("reads custom values", () =>
+    Effect.gen(function* () {
+      const config = yield* loadConfigFrom({
+        FIO_TOKEN: READ_TOKEN,
+        [PER_ORDER]: " CZK:1000.5, USD:10 ",
+        [PER_DAY]: "USD:20,CZK:5000",
+        [ORDERS]: " 5 ",
+      });
+      assert.deepStrictEqual(config.paymentLimits, {
+        maxPerOrder: { CZK: 1000.5, USD: 10 },
+        maxPerDay: { USD: 20, CZK: 5000 },
+        maxOrdersPerDay: 5,
+      });
+    }),
+  );
+
+  for (const [key, value] of [
+    [PER_ORDER, "CZK:-12345"],
+    [PER_ORDER, "CZK:12.345"],
+    [PER_DAY, "czk:777777"],
+    [PER_DAY, "CZK:5,CZK:6"],
+    [PER_DAY, "CZK777777"],
+    [ORDERS, "0"],
+    [ORDERS, "2.5"],
+    [ORDERS, "lots"],
+  ] as const) {
+    it.effect(`fails on an invalid ${key}, naming the variable and not the value`, () =>
+      Effect.gen(function* () {
+        const message = yield* configError({ FIO_TOKEN: READ_TOKEN, [key]: value });
+        assert.include(message, key);
+        assert.notInclude(message, value);
+      }),
+    );
+  }
+
+  it.effect("fails when the two maps list different currencies", () =>
+    Effect.gen(function* () {
+      // Setting only one map keeps the other at its default (CZK and EUR).
+      const value = "CZK:1000";
+      const message = yield* configError({ FIO_TOKEN: READ_TOKEN, [PER_ORDER]: value });
+      assert.include(message, PER_ORDER);
+      assert.include(message, PER_DAY);
+      assert.include(message, "same currencies");
+      assert.notInclude(message, value);
+    }),
+  );
+
+  it.effect("fails when a per-order limit exceeds the daily limit", () =>
+    Effect.gen(function* () {
+      const message = yield* configError({
+        FIO_TOKEN: READ_TOKEN,
+        [PER_ORDER]: "CZK:654321,EUR:10",
+        [PER_DAY]: "CZK:123456,EUR:10",
+      });
+      assert.include(message, PER_ORDER);
+      assert.include(message, PER_DAY);
+      assert.notInclude(message, "654321");
+      assert.notInclude(message, "123456");
+    }),
+  );
+});

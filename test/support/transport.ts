@@ -2,6 +2,7 @@ import { type Deferred, Layer, Redacted } from "effect";
 import { Accounts } from "../../src/accounts.js";
 import { Transactions } from "../../src/cache/service.js";
 import { type AppConfig, type AppConfigShape, MAX_RESPONSE_BYTES, type TransportConfig } from "../../src/config.js";
+import { DEFAULT_PAYMENT_LIMITS } from "../../src/payment-limits.js";
 import { RateLimiter } from "../../src/rate-limiter.js";
 import { Redactor } from "../../src/redaction.js";
 import { seededConfig } from "./config.js";
@@ -41,6 +42,7 @@ export function testConfig(transport: TransportConfig = { kind: "stdio" }): AppC
       overlapDays: 10,
       maxAgeMinutes: 60,
     },
+    paymentLimits: DEFAULT_PAYMENT_LIMITS,
   };
 }
 
