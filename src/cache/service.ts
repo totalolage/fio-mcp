@@ -208,7 +208,7 @@ function cachedInfo(account: Option.Option<CachedAccount>, range: DayRange): Sta
 const makeTransactions = Effect.fn("Transactions.make")(function* () {
   const config = yield* AppConfig;
   const fio = yield* FioApi;
-  const store = yield* makeCacheStore();
+  const store = yield* makeCacheStore(config.cache);
   const sync = yield* makeCacheSync(store, fio, config);
   const { overlapDays, maxAgeMinutes } = config.cache;
 

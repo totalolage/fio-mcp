@@ -1,9 +1,19 @@
-import { Effect, Option, Schema } from "effect";
+import { Effect, Option, Result, Schema } from "effect";
 import { SqlClient } from "effect/sql";
 import { type CacheError, FioResponseError } from "../errors.js";
 import type { NormalizedStatement, StatementInfo, Transaction } from "../statement.js";
 import { type DayRange, eachDay, intersect } from "./dates.js";
 import { cacheFailure } from "./db.js";
+import {
+  CacheKeyMissing,
+  type CacheSealing,
+  openRow,
+  PLAINTEXT,
+  SEALED_ACCOUNT_COLUMNS,
+  SEALED_TRANSACTION_COLUMNS,
+  sealValue,
+  sealValues,
+} from "./encryption.js";
 
 /**
  * SQL access for the transaction cache. Cached rows belong to a bank account
@@ -159,6 +169,7 @@ const TRANSACTION_COLUMNS = [
   "instruction_id",
   "payer_reference",
   "raw_json",
+  "sealed",
   "updated_at",
 ] as const;
 
@@ -167,6 +178,7 @@ const UPSERT_TRANSACTION = `ON CONFLICT (account_key, movement_id) DO UPDATE SET
 ).join(", ")}`;
 
 interface TransactionRow {
+  readonly account_key: string;
   readonly movement_id: number;
   readonly date: string;
   readonly amount: number | null;
@@ -187,6 +199,8 @@ interface TransactionRow {
   readonly comment: string | null;
   readonly instruction_id: number | null;
   readonly payer_reference: string | null;
+  /** 1 when the SEALED_TRANSACTION_COLUMNS hold sealed values (FIO_CACHE_ENCRYPT). */
+  readonly sealed: number;
 }
 
 interface SyncStateRow {
@@ -267,6 +281,7 @@ function transactionRecord(accountKey: string, tx: Transaction & { id: number; d
     instruction_id: tx.instructionId,
     payer_reference: tx.payerReference,
     raw_json: JSON.stringify(tx),
+    sealed: 0,
     first_seen_at: now,
     updated_at: now,
   };
@@ -294,6 +309,37 @@ const cents = (value: number | null) => (value ?? 0) / 100;
 const escapeLike = (text: string) => `%${text.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
 
 /**
+ * The columns of the decrypted row source (`plaintextSource`): every
+ * TransactionRow column, in the order of its JSON arrays.
+ */
+const SOURCE_COLUMNS = [
+  "account_key",
+  "movement_id",
+  "date",
+  "amount",
+  "currency",
+  "counterparty_account",
+  "counterparty_bank_code",
+  "counterparty_bank_name",
+  "counterparty_name",
+  "counterparty_bic",
+  "constant_symbol",
+  "variable_symbol",
+  "specific_symbol",
+  "user_identification",
+  "message",
+  "type",
+  "executed_by",
+  "details",
+  "comment",
+  "instruction_id",
+  "payer_reference",
+  "sealed",
+] as const satisfies ReadonlyArray<keyof TransactionRow>;
+
+const SOURCE_SELECT = SOURCE_COLUMNS.map((column, index) => `json_extract(value, '$[${index}]') AS ${column}`).join(", ");
+
+/**
  * What `purgeTokens` did: how many bank accounts' data it deleted, the
  * kept tokens bound to the bank accounts whose data stayed, and how many
  * cached bank accounts no kept token is bound to afterwards (not touched:
@@ -306,8 +352,68 @@ export interface PurgeOutcome {
   readonly unattributed: number;
 }
 
-export const makeCacheStore = Effect.fn("CacheStore.make")(function* () {
+/**
+ * The store on the SqlClient in context. With `sealing.encrypt`
+ * (FIO_CACHE_ENCRYPT) it seals the SEALED_*_COLUMNS of what it writes; it
+ * opens sealed rows whenever it has the data key. The text filters
+ * (`counterparty`, `text`) and grouping by counterparty cannot run in SQL on
+ * sealed values: with encryption on, the rows the other filters select are
+ * decrypted in memory and the same SQL runs over them (`plaintextSource`).
+ */
+export const makeCacheStore = Effect.fn("CacheStore.make")(function* (sealing: CacheSealing = PLAINTEXT) {
   const sql = yield* SqlClient.SqlClient;
+  // The configuration requires the key with encryption on; reaching this is a bug.
+  if (sealing.encrypt && sealing.dataKey === undefined) return yield* Effect.die(new CacheKeyMissing());
+  const readKey = sealing.dataKey;
+  const writeKey = sealing.encrypt ? sealing.dataKey : undefined;
+
+  /** The row with its sealed values opened (CacheValueUnreadable when one does not decrypt). */
+  const openTransaction = <R extends TransactionRow>(row: R) =>
+    Result.match(openRow(readKey, "transactions", SEALED_TRANSACTION_COLUMNS, row.account_key, row.movement_id, row), {
+      onFailure: Effect.fail,
+      onSuccess: Effect.succeed,
+    });
+  const readTransactions = (rows: ReadonlyArray<TransactionRow>) =>
+    Effect.forEach(rows, (row) => Effect.map(openTransaction(row), toTransaction));
+
+  /** The row as stored: sealed when encryption is on. */
+  const storedRecord = Effect.fn("CacheStore.storedRecord")(function* (
+    accountKey: string,
+    tx: Transaction & { id: number; date: string },
+    now: number,
+  ) {
+    const record = transactionRecord(accountKey, tx, now);
+    if (writeKey === undefined) return record;
+    const values = Object.fromEntries(SEALED_TRANSACTION_COLUMNS.map((column) => [column, record[column]]));
+    const sealed = yield* sealValues(writeKey, "transactions", accountKey, tx.id, values);
+    return { ...record, ...sealed, sealed: 1 };
+  });
+
+  /** Whether `filters`/`groupBy` read sealed columns, which then need decrypted rows. */
+  const needsPlaintext = (filters: TransactionFilters, groupBy?: GroupBy) =>
+    sealing.encrypt && (filters.counterparty !== undefined || filters.text !== undefined || groupBy === "counterparty");
+
+  /**
+   * What the search and summary queries read FROM: the transactions table,
+   * or (when `needsPlaintext`) the rows the filters other than the text
+   * filters select, decrypted in memory and bound as one JSON parameter, so
+   * the text filters, grouping, ordering and paging run in the same SQL as
+   * without encryption. Every such call decrypts each of those rows.
+   */
+  const rowSource = Effect.fn("CacheStore.rowSource")(function* (
+    accountKey: string,
+    filters: TransactionFilters,
+    groupBy?: GroupBy,
+  ) {
+    if (!needsPlaintext(filters, groupBy)) return sql.literal("transactions");
+    const others = where(accountKey, { ...filters, counterparty: undefined, text: undefined });
+    const rows = yield* sql<TransactionRow>`
+      SELECT ${sql.literal(SOURCE_COLUMNS.join(", "))} FROM transactions WHERE ${others}
+    `;
+    const opened = yield* Effect.forEach(rows, openTransaction);
+    const json = JSON.stringify(opened.map((row) => SOURCE_COLUMNS.map((column) => row[column])));
+    return sql`(SELECT ${sql.literal(SOURCE_SELECT)} FROM json_each(${json}))`;
+  });
   /**
    * Tokens no account uses any more (removed or replaced at /admin). Writes
    * for them are dropped; the check runs inside each write's transaction,
@@ -365,11 +471,14 @@ export const makeCacheStore = Effect.fn("CacheStore.make")(function* () {
       currency: string | null;
       balance: number | null;
       balance_date: string | null;
+      sealed: number;
     }>`SELECT * FROM accounts WHERE account_key = ${accountKey}`.pipe(
-      Effect.map(([row]) =>
-        row === undefined
-          ? Option.none<CachedAccount>()
-          : Option.some<CachedAccount>({
+      Effect.flatMap(([stored]) => {
+        if (stored === undefined) return Effect.succeedNone;
+        return Result.match(openRow(readKey, "accounts", SEALED_ACCOUNT_COLUMNS, accountKey, undefined, stored), {
+          onFailure: Effect.fail,
+          onSuccess: (row) =>
+            Effect.succeedSome<CachedAccount>({
               accountKey,
               accountId: row.account_id,
               bankId: row.bank_id,
@@ -379,7 +488,8 @@ export const makeCacheStore = Effect.fn("CacheStore.make")(function* () {
               balance: row.balance,
               balanceDate: row.balance_date,
             }),
-      ),
+        });
+      }),
       cacheFailure("read the cached account"),
     );
 
@@ -471,7 +581,9 @@ export const makeCacheStore = Effect.fn("CacheStore.make")(function* () {
               account_key: accountKey,
               account_id: info.accountId,
               bank_id: info.bankId,
-              iban: info.iban,
+              iban:
+                writeKey === undefined ? info.iban : yield* sealValue(writeKey, "accounts", "iban", accountKey, undefined, info.iban),
+              sealed: writeKey === undefined ? 0 : 1,
               bic: info.bic,
               currency: info.currency,
               balance: info.closingBalance,
@@ -480,6 +592,7 @@ export const makeCacheStore = Effect.fn("CacheStore.make")(function* () {
             })}
             ON CONFLICT (account_key) DO UPDATE SET
               iban = COALESCE(excluded.iban, iban),
+              sealed = CASE WHEN excluded.iban IS NOT NULL THEN excluded.sealed ELSE sealed END,
               bic = COALESCE(excluded.bic, bic),
               currency = COALESCE(excluded.currency, currency),
               balance = CASE WHEN excluded.balance_date IS NOT NULL AND (balance_date IS NULL OR excluded.balance_date >= balance_date)
@@ -510,8 +623,9 @@ export const makeCacheStore = Effect.fn("CacheStore.make")(function* () {
             (tx): tx is Transaction & { id: number; date: string } => tx.id !== null && tx.date !== null,
           );
           for (const batch of chunks(rows, ROW_BATCH)) {
+            const records = yield* Effect.forEach(batch, (tx) => storedRecord(accountKey, tx, now));
             yield* sql`
-              INSERT INTO transactions ${sql.insert(batch.map((tx) => transactionRecord(accountKey, tx, now)))}
+              INSERT INTO transactions ${sql.insert(records)}
               ${sql.literal(UPSERT_TRANSACTION)}
             `;
           }
@@ -578,7 +692,7 @@ export const makeCacheStore = Effect.fn("CacheStore.make")(function* () {
       SELECT * FROM transactions
       WHERE account_key = ${accountKey} AND date >= ${range.from} AND date <= ${range.to}
       ORDER BY date, movement_id
-    `.pipe(Effect.map((rows) => rows.map(toTransaction)), cacheFailure("read cached transactions"));
+    `.pipe(Effect.flatMap(readTransactions), cacheFailure("read cached transactions"));
 
   const search = Effect.fn("CacheStore.search")(function* (
     accountKey: string,
@@ -586,12 +700,13 @@ export const makeCacheStore = Effect.fn("CacheStore.make")(function* () {
     page: { readonly limit: number; readonly offset: number; readonly order: "asc" | "desc" },
   ) {
       const condition = where(accountKey, filters);
-      const [count] = yield* sql<{ total: number }>`SELECT COUNT(*) AS total FROM transactions WHERE ${condition}`;
+      const source = yield* rowSource(accountKey, filters);
+      const [count] = yield* sql<{ total: number }>`SELECT COUNT(*) AS total FROM ${source} WHERE ${condition}`;
       const order = sql.literal(page.order === "asc" ? "date ASC, movement_id ASC" : "date DESC, movement_id DESC");
       const rows = yield* sql<TransactionRow>`
-        SELECT * FROM transactions WHERE ${condition} ORDER BY ${order} LIMIT ${page.limit} OFFSET ${page.offset}
+        SELECT * FROM ${source} WHERE ${condition} ORDER BY ${order} LIMIT ${page.limit} OFFSET ${page.offset}
       `;
-      return { total: count?.total ?? 0, transactions: rows.map(toTransaction) };
+      return { total: count?.total ?? 0, transactions: yield* readTransactions(rows) };
   }, cacheFailure("search cached transactions"));
 
   const GROUP_KEYS: Record<GroupBy, string> = {
@@ -608,6 +723,7 @@ export const makeCacheStore = Effect.fn("CacheStore.make")(function* () {
     page: { readonly limit: number; readonly offset: number },
   ) {
       const condition = where(accountKey, filters);
+      const source = yield* rowSource(accountKey, filters, groupBy);
       const key = sql.literal(GROUP_KEYS[groupBy]);
       const order = sql.literal(
         groupBy === "month" ? "key ASC, currency ASC" : "(income_cents + expense_cents) DESC, key ASC, currency ASC",
@@ -617,16 +733,16 @@ export const makeCacheStore = Effect.fn("CacheStore.make")(function* () {
         SUM(CASE WHEN amount < 0 THEN CAST(ROUND(-amount * 100) AS INTEGER) ELSE 0 END) AS expense_cents`);
       type SumRow = { key: string; currency: string; count: number; income_cents: number | null; expense_cents: number | null };
       const [groupCount] = yield* sql<{ total: number }>`
-        SELECT COUNT(*) AS total FROM (SELECT 1 FROM transactions WHERE ${condition} GROUP BY ${key}, COALESCE(currency, ''))
+        SELECT COUNT(*) AS total FROM (SELECT 1 FROM ${source} WHERE ${condition} GROUP BY ${key}, COALESCE(currency, ''))
       `;
       const groups = yield* sql<SumRow>`
         SELECT ${key} AS key, COALESCE(currency, '') AS currency, ${sums}
-        FROM transactions WHERE ${condition}
+        FROM ${source} WHERE ${condition}
         GROUP BY key, currency ORDER BY ${order} LIMIT ${page.limit} OFFSET ${page.offset}
       `;
       const totals = yield* sql<SumRow>`
         SELECT '' AS key, COALESCE(currency, '') AS currency, ${sums}
-        FROM transactions WHERE ${condition} GROUP BY currency ORDER BY currency
+        FROM ${source} WHERE ${condition} GROUP BY currency ORDER BY currency
       `;
       const toGroup = (row: SumRow): SummaryGroup => {
         const income = row.income_cents ?? 0;

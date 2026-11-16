@@ -7,6 +7,7 @@ import { ACCOUNT_MIGRATIONS } from "../account-migrations.js";
 import { AppConfig } from "../config.js";
 import { CacheError, InvalidInput } from "../errors.js";
 import { OAUTH_MIGRATIONS } from "../oauth/store.js";
+import { type CacheSealing, reconcileCacheEncryption } from "./encryption.js";
 
 /**
  * The server's SQLite file (FIO_DB_PATH). It holds the transaction cache,
@@ -131,6 +132,12 @@ export const CACHE_MIGRATIONS: Migrations = {
       )
     `;
   }),
+  // FIO_CACHE_ENCRYPT: whether a row's free-text and identifying values are sealed (src/cache/encryption.ts).
+  "0011_cache_sealed_rows": Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`ALTER TABLE transactions ADD COLUMN sealed INTEGER NOT NULL DEFAULT 0`;
+    yield* sql`ALTER TABLE accounts ADD COLUMN sealed INTEGER NOT NULL DEFAULT 0`;
+  }),
 };
 
 const MIGRATIONS_TABLE = "fio_mcp_migrations";
@@ -164,11 +171,14 @@ const configure = Effect.gen(function* () {
 
 /**
  * SqlClient (and SqliteClient) for `filename`, migrated. ":memory:" skips the
- * file preparation; tests use it.
+ * file preparation; tests use it. With `sealing` (FIO_CACHE_ENCRYPT and the
+ * data key) the cached rows are then sealed or opened to match it
+ * (`reconcileCacheEncryption`); without, they are left as they are.
  */
 const layer = (
   filename: string,
   migrations: Migrations = CACHE_MIGRATIONS,
+  sealing?: CacheSealing,
 ): Layer.Layer<SqlClient.SqlClient | SqliteClient.SqliteClient, CacheError, FileSystem.FileSystem> => {
   const client = SqliteClient.layer({ filename }).pipe(
     Layer.catch((cause) =>
@@ -179,7 +189,13 @@ const layer = (
       ),
     ),
   );
-  const ready = Layer.effectDiscard(Effect.andThen(configure, migrate(migrations))).pipe(Layer.provideMerge(client));
+  const reconcile =
+    sealing === undefined
+      ? Effect.void
+      : reconcileCacheEncryption(sealing).pipe(cacheFailure("apply FIO_CACHE_ENCRYPT to the cached rows"));
+  const ready = Layer.effectDiscard(configure.pipe(Effect.andThen(migrate(migrations)), Effect.andThen(reconcile))).pipe(
+    Layer.provideMerge(client),
+  );
   return filename === ":memory:"
     ? ready
     : ready.pipe(Layer.provideMerge(Layer.effectDiscard(prepareDatabaseFile(filename))));
@@ -196,8 +212,9 @@ export const Database = {
   layer,
   /**
    * The database at `AppConfig.cache.dbPath` (FIO_DB_PATH) with all
-   * migrations. Every user provides this same value, so one build (one
-   * connection) is shared: layers are memoized by reference.
+   * migrations, its cached rows sealed or opened per FIO_CACHE_ENCRYPT.
+   * Every user provides this same value, so one build (one connection) is
+   * shared: layers are memoized by reference.
    */
   Live: Layer.unwrap(
     Effect.gen(function* () {
@@ -205,7 +222,7 @@ export const Database = {
       if (config.cache.dbPath === "") {
         return yield* new CacheError({ operation: "locate the database (set FIO_DB_PATH)" });
       }
-      return layer(config.cache.dbPath, SERVER_MIGRATIONS);
+      return layer(config.cache.dbPath, SERVER_MIGRATIONS, config.cache);
     }),
   ).pipe(Layer.provide(NodeFileSystem.layer), Layer.provide(AppConfig.Live)),
 };
