@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { Context, Effect } from "effect";
+import type { StatementInfo, Transaction } from "../statement.js";
 
 /**
  * Nonce guards for text that comes from the bank (SEC-05).
@@ -32,8 +33,9 @@ const PREAMBLE_LEAD_IN = /treat\s*everything\s*between/gi;
 
 // Control (except \n and \t), format (zero-width, BOM, bidi embeddings and
 // isolates are all Cf), and line/paragraph separators.
-const STRIP_ALL = /[\p{Cc}\p{Cf}\u2028\u2029]/gu;
-const STRIP_KEEP_LAYOUT = /[\p{Cf}\u2028\u2029]|(?![\n\t])\p{Cc}/gu;
+// U+E000/U+E001 are the excerpt markers below: guarded text never carries one.
+const STRIP_ALL = /[\p{Cc}\p{Cf}\u2028\u2029\uE000\uE001]/gu;
+const STRIP_KEEP_LAYOUT = /[\p{Cf}\u2028\u2029\uE000\uE001]|(?![\n\t])\p{Cc}/gu;
 
 export interface SanitiseOptions {
   /** Keep `\n` and `\t`; only for raw export and statement content. */
@@ -79,6 +81,47 @@ export function containsGuardMarkers(value: string): boolean {
   );
 }
 
+// Excerpt markers. Error messages are composed from other errors' messages, so
+// a response excerpt is marked where it is taken (Redactor.excerpt) and the
+// marked segments become guarded blocks when the message leaves as a tool
+// result. Private-use code points, removed from the excerpt itself.
+const MARK_OPEN = String.fromCodePoint(0xe000);
+const MARK_CLOSE = String.fromCodePoint(0xe001);
+const MARKS = new RegExp(`[${MARK_OPEN}${MARK_CLOSE}]`, "g");
+
+/**
+ * Replaces each marked segment with `f(segment)` and drops the marks. Fails
+ * closed: an opening mark without a closing one guards everything to the end,
+ * and a mark inside a segment stays inside it. A stray closing mark outside a
+ * segment is dropped.
+ */
+function replaceMarked(text: string, f: (segment: string) => string): string {
+  let out = "";
+  let at = 0;
+  while (at < text.length) {
+    const open = text.indexOf(MARK_OPEN, at);
+    if (open === -1) {
+      out += text.slice(at).replace(MARKS, "");
+      break;
+    }
+    out += text.slice(at, open).replace(MARKS, "");
+    const close = text.indexOf(MARK_CLOSE, open + 1);
+    const end = close === -1 ? text.length : close;
+    out += f(text.slice(open + 1, end).replace(MARKS, ""));
+    at = end + 1;
+  }
+  return out;
+}
+
+/** Marks bank text inside a message so the tool output guards it. Empty stays empty. */
+export const markUntrusted = (value: string): string =>
+  value === "" ? "" : `${MARK_OPEN}${value.replace(MARKS, "")}${MARK_CLOSE}`;
+
+/** Removes excerpt markers (for logs and other non-tool output). */
+export const stripMarks = (text: string): string => text.replace(MARKS, "");
+
+export const hasMarks = (text: string): boolean => text.includes(MARK_OPEN);
+
 /** Source of nonce bytes; tests pin it with `Effect.provideService(Random, ...)`. */
 export const Random = Context.Reference<{ readonly bytes: (length: number) => Uint8Array }>("fio-mcp/mcp/Random", {
   defaultValue: () => ({ bytes: (length) => new Uint8Array(randomBytes(length)) }),
@@ -120,10 +163,12 @@ export const IBAN = /^[A-Z]{2}\d{2}[A-Z0-9]{11,30}$/;
 export const BIC = /^[A-Z]{6}[A-Z0-9]{2}([A-Z0-9]{3})?$/;
 
 /**
- * Where untrusted strings sit in a result. Strings at paths the spec does not
- * name are left as they are; non-string values at a guarded path too.
+ * Where untrusted strings sit in a result. At paths the spec does not name,
+ * only marked excerpts are guarded; non-string values at a guarded path are
+ * left as they are.
  */
 export type GuardSpec =
+  | { readonly _tag: "Marked" }
   | { readonly _tag: "Text"; readonly cap: number; readonly keepLayout: boolean }
   | { readonly _tag: "Identifier"; readonly pattern: RegExp }
   | { readonly _tag: "Array"; readonly item: GuardSpec }
@@ -131,6 +176,8 @@ export type GuardSpec =
   | { readonly _tag: "Keys"; readonly value: GuardSpec | undefined };
 
 export const G = {
+  /** Only the segments marked with `markUntrusted`, anywhere below this point. */
+  marked: (): GuardSpec => MARKED,
   /** Free text, capped at 1,000 code points unless `cap` says otherwise. */
   text: (cap: number = FREE_TEXT_CAP): GuardSpec => ({ _tag: "Text", cap, keepLayout: false }),
   /** Raw export or statement content: keeps `\n` and `\t`. */
@@ -143,12 +190,60 @@ export const G = {
   keys: (value?: GuardSpec): GuardSpec => ({ _tag: "Keys", value }),
 } as const;
 
+const MARKED: GuardSpec = { _tag: "Marked" };
+
+/** A counterparty account: Czech number or IBAN. */
+const ACCOUNT_OR_IBAN = /^(?:(\d{1,6}-)?\d{1,10}|[A-Z]{2}\d{2}[A-Z0-9]{11,30})$/;
+
+/** Bank text in a transaction; ids and amounts are numbers. */
+export const TRANSACTION_GUARD = G.struct({
+  date: G.id(DATE),
+  currency: G.id(CURRENCY),
+  counterpartyAccount: G.id(ACCOUNT_OR_IBAN),
+  counterpartyName: G.text(),
+  counterpartyBankCode: G.id(BANK_CODE),
+  counterpartyBankName: G.text(),
+  counterpartyBic: G.id(BIC),
+  constantSymbol: G.id(SYMBOL),
+  variableSymbol: G.id(SYMBOL),
+  specificSymbol: G.id(SYMBOL),
+  userIdentification: G.text(),
+  messageForRecipient: G.text(),
+  type: G.text(),
+  executedBy: G.text(),
+  details: G.text(),
+  comment: G.text(),
+  payerReference: G.text(),
+} satisfies Partial<Record<keyof Transaction, GuardSpec>>);
+
+const INFO_GUARD = G.struct({
+  accountId: G.id(CZECH_ACCOUNT),
+  bankId: G.id(BANK_CODE),
+  currency: G.id(CURRENCY),
+  iban: G.id(IBAN),
+  bic: G.id(BIC),
+  dateStart: G.id(DATE),
+  dateEnd: G.id(DATE),
+} satisfies Partial<Record<keyof StatementInfo, GuardSpec>>);
+
+/** A statement or a page of transactions (`info` and `transactions` where present). */
+export const STATEMENT_GUARD = G.struct({ info: INFO_GUARD, transactions: G.array(TRANSACTION_GUARD) });
+
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
 /** Rewrites every untrusted string the spec names with `f(sanitised)`; visits in a fixed order. */
 function rewrite(value: unknown, spec: GuardSpec, f: (sanitised: string) => string): unknown {
   switch (spec._tag) {
+    case "Marked":
+      if (typeof value === "string") {
+        return hasMarks(value)
+          ? replaceMarked(value, (segment) => f(sanitiseUntrusted(segment, FREE_TEXT_CAP)))
+          : value;
+      }
+      if (Array.isArray(value)) return value.map((item) => rewrite(item, MARKED, f));
+      if (!isRecord(value)) return value;
+      return Object.fromEntries(Object.entries(value).map(([key, field]) => [key, rewrite(field, MARKED, f)]));
     case "Text":
       return typeof value === "string" ? f(sanitiseUntrusted(value, spec.cap, { keepLayout: spec.keepLayout })) : value;
     case "Identifier":
@@ -160,7 +255,7 @@ function rewrite(value: unknown, spec: GuardSpec, f: (sanitised: string) => stri
       const next: Record<string, unknown> = {};
       for (const [key, field] of Object.entries(value)) {
         const fieldSpec = Object.hasOwn(spec.fields, key) ? spec.fields[key] : undefined;
-        next[key] = fieldSpec ? rewrite(field, fieldSpec, f) : field;
+        next[key] = rewrite(field, fieldSpec ?? MARKED, f);
       }
       return next;
     }
@@ -201,6 +296,15 @@ export const guardResult = <A extends Record<string, unknown>>(
     const guarded = rewrite(result, spec, () => guard.wrap(sanitised[next++] ?? "")) as A;
     return { untrustedDataNotice: guard.preamble, ...guarded };
   });
+
+/**
+ * Guards a message whose bank text was marked with `markUntrusted`: the
+ * preamble is the first line when anything was marked.
+ */
+export const guardMarked = (text: string): Effect.Effect<string> =>
+  hasMarks(text)
+    ? guardText((wrap) => replaceMarked(text, wrap))
+    : Effect.succeed(stripMarks(text));
 
 /**
  * Guards plain text built from trusted wording and untrusted parts (error

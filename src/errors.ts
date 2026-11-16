@@ -1,4 +1,5 @@
 import { Schema } from "effect";
+import { markUntrusted } from "./mcp/untrusted.js";
 
 /**
  * Expected failures. Every error's `message` is shown to the model as the
@@ -181,7 +182,8 @@ const PAYMENT_TOKEN_HINT =
 export { PAYMENT_TOKEN_HINT };
 
 function detail(excerpt: string): string {
-  return excerpt === "" ? "" : ` Response: ${excerpt}`;
+  // Marked as bank text: tool results guard it (SEC-05).
+  return excerpt === "" ? "" : ` Response: ${markUntrusted(excerpt)}`;
 }
 
 /**

@@ -1,6 +1,7 @@
 import { Effect, Predicate } from "effect";
 import { XMLParser, XMLValidator } from "fast-xml-parser";
 import { XmlParseError } from "./errors.js";
+import { markUntrusted } from "./mcp/untrusted.js";
 
 /** Import response (PDF §6, responseImportIB.xsd). */
 
@@ -90,7 +91,7 @@ function decimalOrNull(value: unknown): number | null {
  */
 export const parseImportResponse = Effect.fnUntraced(function* (body: string, excerpt: (body: string) => string) {
   const invalid = () =>
-    new XmlParseError({ detail: `FIO returned an import response that is not valid XML: ${excerpt(body)}` });
+    new XmlParseError({ detail: `FIO returned an import response that is not valid XML: ${markUntrusted(excerpt(body))}` });
   // Validate first: the parser alone accepts truncated XML, which could turn a
   // cut-off "accepted" response into an apparent rejection.
   if (XMLValidator.validate(body) !== true) return yield* invalid();
@@ -98,7 +99,9 @@ export const parseImportResponse = Effect.fnUntraced(function* (body: string, ex
   const root = isNode(doc) ? doc.responseImport : undefined;
   const result = isNode(root) ? root.result : undefined;
   if (!isNode(root) || !isNode(result)) {
-    return yield* new XmlParseError({ detail: `FIO returned an unexpected import response: ${excerpt(body)}` });
+    return yield* new XmlParseError({
+      detail: `FIO returned an unexpected import response: ${markUntrusted(excerpt(body))}`,
+    });
   }
 
   const status = textOf(result.status).trim().toLowerCase();
