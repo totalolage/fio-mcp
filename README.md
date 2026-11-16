@@ -274,6 +274,7 @@ Every expected failure is a typed error in the Effect error channel, never a thr
 | `FioResponseError` | A 2xx response that is not what the API documents (bad JSON, wrong shape, too large). |
 | `XmlParseError` | The payment import response is not valid XML. |
 | `UploadOutcomeUnknown` | A payment upload failed after it may have reached FIO; tells you to check Internetbanking. |
+| `UploadRefused` | A payment upload that created no batch: it was not sent (rate limit, FIO's 409, a network failure before sending) or FIO refused it. Its idempotency key never uploads again, so it says to use a new one instead of when to retry. |
 | `InvalidInput` | Arguments that pass the schema but don't make sense together, or a missing payer account number. |
 | `CacheError` | The local SQLite cache failed; details go to the server log. |
 | `ConfigError` | Startup only: invalid configuration, naming the variable but never its value. |
