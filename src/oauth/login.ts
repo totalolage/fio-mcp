@@ -72,20 +72,29 @@ export interface LoginGuard {
    * Like `attempt`; after a correct password, runs `accepted` with the
    * verified hash while still holding the check's permit (e.g. hashing a
    * new password, so it takes the same one-at-a-time scrypt slot).
-   * `secondFactor`, when given, runs in the same permit after a correct
-   * password; false makes the attempt a counted failure.
    */
   readonly attemptThen: <A, E>(
     address: string,
     password: Redacted.Redacted<string>,
     accepted: (verified: Redacted.Redacted<PasswordHash>) => Effect.Effect<A, E>,
-    secondFactor?: Effect.Effect<boolean>,
+    options?: AttemptOptions,
   ) => Effect.Effect<LoginResult<A>, E>;
   /**
    * A second factor on its own (no password), throttled, counted and
    * one-at-a-time like a sign-in: false is a counted failure.
    */
   readonly attemptFactor: (address: string, factor: Effect.Effect<boolean>) => Effect.Effect<LoginResult<void>>;
+}
+
+export interface AttemptOptions {
+  /** Runs in the same permit after a correct password; false makes the attempt a counted failure. */
+  readonly secondFactor?: Effect.Effect<boolean> | undefined;
+  /**
+   * Success leaves the address's failure count as it is: the check did not
+   * cover every factor (a password-only check while a second factor is on),
+   * so it must not wipe the failures the second factor collected.
+   */
+  readonly keepFailures?: boolean | undefined;
 }
 
 /** What a guarded check found; `Wrong` is counted as a failure. */
@@ -129,22 +138,23 @@ export const makeLoginGuard = Effect.fn("LoginGuard.make")(function* (
     return entry;
   };
 
-  /** Runs `verify` behind the address's throttle, counting `Wrong`; `accepted` follows a `Verified`. */
+  /** Runs `judge` behind the address's throttle, counting `Wrong`; `accepted` follows a `Verified`. */
   const check = Effect.fnUntraced(function* <V, A, E>(
     address: string,
-    verify: Effect.Effect<Verdict<V>>,
+    judge: Effect.Effect<Verdict<V>>,
     accepted: (value: V) => Effect.Effect<A, E>,
+    keepFailures: boolean,
   ): Effect.fn.Return<LoginResult<A>, E> {
     const before = yield* Clock.currentTimeMillis;
     const entry = current(address, before);
     if (entry !== undefined && entry.nextAllowedAt > before) {
       return { _tag: "Throttled", retryAfterSeconds: Math.ceil((entry.nextAllowedAt - before) / 1000) } satisfies LoginResult<A>;
     }
-    const verdict = yield* verify;
+    const verdict = yield* judge;
     if (verdict._tag === "Unavailable") return { _tag: "Unavailable" } satisfies LoginResult<A>;
     const now = yield* Clock.currentTimeMillis;
     if (verdict._tag === "Verified") {
-      failures.delete(address);
+      if (!keepFailures) failures.delete(address);
       return { _tag: "Accepted", value: yield* accepted(verdict.value) } satisfies LoginResult<A>;
     }
     const failed = recordFailure(address, now);
@@ -187,10 +197,11 @@ export const makeLoginGuard = Effect.fn("LoginGuard.make")(function* (
   // failure counted until it ends.
   const guarded = <V, A, E>(
     address: string,
-    verify: Effect.Effect<Verdict<V>>,
+    judge: Effect.Effect<Verdict<V>>,
     accepted: (value: V) => Effect.Effect<A, E>,
+    keepFailures = false,
   ): Effect.Effect<LoginResult<A>, E> =>
-    lock.withPermitsIfAvailable(1)(Effect.uninterruptible(check(address, verify, accepted))).pipe(
+    lock.withPermitsIfAvailable(1)(Effect.uninterruptible(check(address, judge, accepted, keepFailures))).pipe(
       Effect.map(Option.getOrElse(() => busy<A>())),
     );
 
@@ -198,8 +209,9 @@ export const makeLoginGuard = Effect.fn("LoginGuard.make")(function* (
     address: string,
     password: Redacted.Redacted<string>,
     accepted: (verified: Redacted.Redacted<PasswordHash>) => Effect.Effect<A, E>,
-    secondFactor?: Effect.Effect<boolean>,
-  ): Effect.Effect<LoginResult<A>, E> => guarded(address, verifyPasswordThen(password, secondFactor), accepted);
+    options: AttemptOptions = {},
+  ): Effect.Effect<LoginResult<A>, E> =>
+    guarded(address, verifyPasswordThen(password, options.secondFactor), accepted, options.keepFailures === true);
 
   const attempt = (address: string, password: Redacted.Redacted<string>): Effect.Effect<LoginResult> =>
     attemptThen(address, password, Effect.succeed);

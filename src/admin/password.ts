@@ -13,7 +13,7 @@ import {
   type ScryptParams,
 } from "../oauth/crypto.js";
 import { DEFAULT_THROTTLE, type LoginResult, makeLoginGuard, PasswordUnavailable, type ThrottlePolicy } from "../oauth/login.js";
-import { matchingTotpStep, TOTP_WINDOW, totpStep } from "./totp.js";
+import { matchingTotpSteps, TOTP_WINDOW, totpStep } from "./totp.js";
 
 /**
  * The admin password, shared by the OAuth sign-in (/login) and the admin UI
@@ -127,15 +127,19 @@ export const makeAdminPassword = Effect.fn("AdminPassword.make")(function* (
   /** Accepted TOTP steps, kept while they are inside the window; only read and written under the guard's permit. */
   const usedSteps = new Set<number>();
 
-  /** True for a current code whose step was not accepted before; that step is then used up. */
+  /**
+   * True for a current code none of whose matching steps was accepted
+   * before; every step it matches is then used up (adjacent steps can share
+   * digits, so recording one would let the same digits pass again).
+   */
   const acceptCode = (secret: Redacted.Redacted<Uint8Array>, code: string | undefined) =>
     Effect.map(Clock.currentTimeMillis, (millis) => {
       const seconds = Math.floor(millis / 1000);
       const oldest = totpStep(seconds) - TOTP_WINDOW;
       for (const step of usedSteps) if (step < oldest) usedSteps.delete(step);
-      const step = code === undefined ? undefined : matchingTotpStep(Redacted.value(secret), code, seconds);
-      if (step === undefined || usedSteps.has(step)) return false;
-      usedSteps.add(step);
+      const steps = code === undefined ? [] : matchingTotpSteps(Redacted.value(secret), code, seconds);
+      if (steps.length === 0 || steps.some((step) => usedSteps.has(step))) return false;
+      for (const step of steps) usedSteps.add(step);
       return true;
     });
 
@@ -144,7 +148,7 @@ export const makeAdminPassword = Effect.fn("AdminPassword.make")(function* (
       address,
       password,
       (verified) => Effect.succeed(stampOf(Redacted.value(verified))),
-      totpSecret === undefined ? undefined : acceptCode(totpSecret, code),
+      { secondFactor: totpSecret === undefined ? undefined : acceptCode(totpSecret, code) },
     );
 
   const verifyTotp = (address: string, code: string | undefined): Effect.Effect<LoginResult<void>> =>
@@ -162,7 +166,8 @@ export const makeAdminPassword = Effect.fn("AdminPassword.make")(function* (
     );
 
   const change = (address: string, password: Redacted.Redacted<string>, next: Redacted.Redacted<string>) =>
-    guard.attemptThen(address, password, () => store(next)).pipe(
+    // Password only: with TOTP on, it must not wipe the code failures counted for this address.
+    guard.attemptThen(address, password, () => store(next), { keepFailures: totpSecret !== undefined }).pipe(
       Effect.tap((result) => (result._tag === "Accepted" ? Effect.logInfo("admin password: changed at /admin") : Effect.void)),
     );
 

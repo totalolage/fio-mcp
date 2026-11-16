@@ -34,13 +34,17 @@ export const encodeBase32 = (bytes: Uint8Array): string => {
   return out;
 };
 
+/** Data characters left over after whole 8-character groups that RFC 4648 can produce. */
+const VALID_TAIL_LENGTHS = new Set([0, 2, 4, 5, 7]);
+
 /**
  * Decodes base32, accepting lowercase, spaces and trailing `=` padding.
- * Undefined for any other character, padding in the middle, or no data.
+ * Undefined for any other character, padding in the middle, a length no
+ * encoder produces, or no data.
  */
 export const decodeBase32 = (text: string): Uint8Array | undefined => {
   const cleaned = text.replace(/\s+/g, "").toUpperCase().replace(/=+$/, "");
-  if (cleaned === "") return undefined;
+  if (cleaned === "" || !VALID_TAIL_LENGTHS.has(cleaned.length % 8)) return undefined;
   const out: Array<number> = [];
   let buffer = 0;
   let bits = 0;
@@ -74,18 +78,18 @@ const hotp = (secret: Uint8Array, counter: number): string => {
 export const totpCode = (secret: Uint8Array, unixSeconds: number): string => hotp(secret, totpStep(unixSeconds));
 
 /**
- * The step within ±TOTP_WINDOW of `unixSeconds` whose code is `code`, or
- * undefined. Spaces in `code` are ignored. Every candidate is compared in
- * constant time and none is skipped once one matches.
+ * Every step within ±TOTP_WINDOW of `unixSeconds` whose code is `code`
+ * (usually none or one; adjacent steps can share digits). Spaces in `code`
+ * are ignored. Every candidate is compared in constant time.
  */
-export const matchingTotpStep = (secret: Uint8Array, code: string, unixSeconds: number): number | undefined => {
+export const matchingTotpSteps = (secret: Uint8Array, code: string, unixSeconds: number): ReadonlyArray<number> => {
   const entered = code.replace(/\s+/g, "");
-  if (!/^\d+$/.test(entered) || entered.length !== TOTP_DIGITS) return undefined;
+  if (!/^\d+$/.test(entered) || entered.length !== TOTP_DIGITS) return [];
   const given = Buffer.from(entered, "ascii");
   const current = totpStep(unixSeconds);
-  let matched: number | undefined;
+  const matched: Array<number> = [];
   for (let step = Math.max(0, current - TOTP_WINDOW); step <= current + TOTP_WINDOW; step++) {
-    if (timingSafeEqual(given, Buffer.from(hotp(secret, step), "ascii")) && matched === undefined) matched = step;
+    if (timingSafeEqual(given, Buffer.from(hotp(secret, step), "ascii"))) matched.push(step);
   }
   return matched;
 };

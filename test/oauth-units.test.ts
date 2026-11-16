@@ -7,7 +7,7 @@ import { TestClock } from "effect/testing";
 import { makeSettingsStore, SETTING } from "../src/account-store.js";
 import { Accounts } from "../src/accounts.js";
 import { AdminPassword, makeAdminPassword } from "../src/admin/password.js";
-import { decodeBase32, encodeBase32, matchingTotpStep, newTotpSecret, totpCode } from "../src/admin/totp.js";
+import { decodeBase32, encodeBase32, matchingTotpSteps, newTotpSecret, totpCode } from "../src/admin/totp.js";
 import { SERVER_MIGRATIONS } from "../src/cache/db.js";
 import {
   CommandFailed,
@@ -614,6 +614,9 @@ describe("TOTP (RFC 6238)", () => {
     assert.deepStrictEqual(decodeBase32("gezd gnbv gy3t qojq\ngezd gnbv gy3t qojq"), RFC_SECRET);
     assert.deepStrictEqual(decodeBase32("MZXW6===\n"), new TextEncoder().encode("foo"));
     for (const bad of ["", " = ", "MZXW1", "MZ=XW6", "MZXW6!"]) assert.isUndefined(decodeBase32(bad), JSON.stringify(bad));
+    // Lengths no encoder produces (1, 3 or 6 characters past a whole group) are refused, not truncated.
+    for (const length of [25, 27, 30, 33]) assert.isUndefined(decodeBase32("A".repeat(length)), `${length} characters`);
+    for (const length of [24, 26, 28, 29, 31, 32]) assert.isDefined(decodeBase32("A".repeat(length)), `${length} characters`);
     const random = newTotpSecret();
     assert.strictEqual(random.length, 20);
     assert.deepStrictEqual(decodeBase32(encodeBase32(random)), random);
@@ -623,13 +626,13 @@ describe("TOTP (RFC 6238)", () => {
     const now = 1111111111;
     const step = Math.floor(now / 30);
     for (const offset of [-1, 0, 1]) {
-      assert.strictEqual(matchingTotpStep(RFC_SECRET, totpCode(RFC_SECRET, now + offset * 30), now), step + offset);
+      assert.deepStrictEqual(matchingTotpSteps(RFC_SECRET, totpCode(RFC_SECRET, now + offset * 30), now), [step + offset]);
     }
-    for (const offset of [-2, 2]) assert.isUndefined(matchingTotpStep(RFC_SECRET, totpCode(RFC_SECRET, now + offset * 30), now));
-    assert.strictEqual(matchingTotpStep(RFC_SECRET, "050 471", now), step);
-    for (const bad of ["", "50471", "0504711", "05047a", "０５０４７１"]) assert.isUndefined(matchingTotpStep(RFC_SECRET, bad, now), bad);
+    for (const offset of [-2, 2]) assert.deepStrictEqual(matchingTotpSteps(RFC_SECRET, totpCode(RFC_SECRET, now + offset * 30), now), []);
+    assert.deepStrictEqual(matchingTotpSteps(RFC_SECRET, "050 471", now), [step]);
+    for (const bad of ["", "50471", "0504711", "05047a", "０５０４７１"]) assert.deepStrictEqual(matchingTotpSteps(RFC_SECRET, bad, now), [], bad);
     // Near the epoch there is no step -1 to compare.
-    assert.strictEqual(matchingTotpStep(RFC_SECRET, totpCode(RFC_SECRET, 0), 0), 0);
+    assert.deepStrictEqual(matchingTotpSteps(RFC_SECRET, totpCode(RFC_SECRET, 0), 0), [0]);
   });
 });
 
@@ -690,6 +693,18 @@ describe("admin TOTP second factor", () => {
       assert.strictEqual((yield* password.verifyTotp("10.0.0.1", undefined))._tag, "Rejected");
       yield* TestClock.adjust("2 seconds");
       assert.strictEqual((yield* password.verifyTotp("10.0.0.1", codeAt(T0 + 3000)))._tag, "Accepted");
+    }).pipe(Effect.provide(memoryDatabase(SERVER_MIGRATIONS))),
+  );
+
+  it.effect("a password change does not wipe the code failures counted for an address", () =>
+    Effect.gen(function* () {
+      const password = yield* adminPassword({ ...DEFAULT_THROTTLE, freeFailures: 1 }, true);
+      assert.strictEqual((yield* password.verifyTotp("10.0.0.1", wrongCodeAt(T0)))._tag, "Rejected");
+      const next = Redacted.make("the next admin password");
+      assert.strictEqual((yield* password.change("10.0.0.1", right, next))._tag, "Accepted");
+      // Still one failure on record: the next wrong code starts the backoff.
+      assert.strictEqual((yield* password.verifyTotp("10.0.0.1", wrongCodeAt(T0)))._tag, "Rejected");
+      assert.deepStrictEqual(yield* password.signIn("10.0.0.1", next, codeAt(T0)), { _tag: "Throttled", retryAfterSeconds: 1 });
     }).pipe(Effect.provide(memoryDatabase(SERVER_MIGRATIONS))),
   );
 
