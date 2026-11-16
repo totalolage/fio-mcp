@@ -114,9 +114,12 @@ export const CalendarDate = Schema.String.pipe(
 );
 export type CalendarDate = typeof CalendarDate.Type;
 
-/** xs:date ↔ CalendarDate. An optional timezone suffix (`Z`, `+01:00`) is dropped on decode. */
+/**
+ * xs:date ↔ CalendarDate. An optional timezone suffix (`Z`, `+01:00`) is validated (XML Schema
+ * Part 2 §3.2.7.3: at most ±14:00, minutes below 60) and then dropped on decode.
+ */
 const XsDate = Schema.String.pipe(
-  Schema.check(Schema.isPattern(/^\d{4}-\d{2}-\d{2}(Z|[+-]\d{2}:\d{2})?$/)),
+  Schema.check(Schema.isPattern(/^\d{4}-\d{2}-\d{2}(Z|[+-]((0\d|1[0-3]):[0-5]\d|14:00))?$/)),
   Schema.decodeTo(
     CalendarDate,
     SchemaTransformation.transform({ decode: (lexical) => lexical.slice(0, 10), encode: (date) => date }),

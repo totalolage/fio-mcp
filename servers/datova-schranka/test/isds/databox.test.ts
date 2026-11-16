@@ -83,6 +83,21 @@ describe("getOwnerInfo (GetOwnerInfoFromLogin)", () => {
     }),
   );
 
+  it.effect("accepts xs:date timezone offsets up to ±14:00 and rejects out-of-range ones", () =>
+    Effect.gen(function* () {
+      const withDate = (date: string) =>
+        ok(fixture("GetOwnerInfoFromLogin-person.xml").replace("1967-01-07+01:00", date));
+      for (const date of ["1967-01-07", "1967-01-07Z", "1967-01-07+14:00", "1967-01-07-14:00", "1967-01-07+13:59"]) {
+        const { result } = yield* run(getOwnerInfo(), withDate(date));
+        assert.strictEqual(result.biDate, "1967-01-07", date);
+      }
+      for (const date of ["1967-01-07+99:99", "1967-01-07+14:01", "1967-01-07+15:00", "1967-01-07+01:60", "1967-02-30"]) {
+        const { error } = yield* runFailing(getOwnerInfo(), withDate(date));
+        assert.strictEqual(error._tag, "IsdsInvalidResponse", date);
+      }
+    }),
+  );
+
   it.effect("an unknown dbType is an invalid response", () =>
     Effect.gen(function* () {
       const xml = fixture("GetOwnerInfoFromLogin.xml").replace("<p:dbType>PO</p:dbType>", "<p:dbType>XX</p:dbType>");
