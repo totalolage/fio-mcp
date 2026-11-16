@@ -1,5 +1,5 @@
 import { assert, describe, it } from "@effect/vitest";
-import { DateTime, Effect } from "effect";
+import { DateTime, Duration, Effect } from "effect";
 import {
   getMessageStateChanges,
   type ListMessagesInput,
@@ -90,6 +90,52 @@ describe("list requests", () => {
         assert.strictEqual(error._tag, "IsdsInvalidRequest");
         assert.strictEqual(transport.requests.length, 0);
       }
+    }),
+  );
+
+  it.effect("rejects bounds with no xs:dateTime form in every list operation before sending", () =>
+    Effect.gen(function* () {
+      const start = DateTime.makeUnsafe("2026-11-01T00:00:00Z");
+      const windows: ReadonlyArray<ListMessagesInput> = [
+        { from: DateTime.subtractDuration(start, Duration.infinity) },
+        { to: DateTime.addDuration(start, Duration.infinity) },
+        { from: DateTime.subtractDuration(start, Duration.infinity), to: DateTime.addDuration(start, Duration.infinity) },
+        { from: start, to: DateTime.addDuration(start, Duration.millis(1e16)) },
+        { from: start, to: DateTime.makeUnsafe("+010000-01-01T00:00:00Z") },
+        { from: DateTime.makeUnsafe("0000-12-31T23:59:59.999Z"), to: start },
+      ];
+      type ListError = Effect.Error<ReturnType<typeof listSentMessages>>;
+      const operations: ReadonlyArray<
+        (input: ListMessagesInput) => Effect.Effect<ReadonlyArray<object>, ListError, IsdsTransport>
+      > = [
+        listSentMessages,
+        listReceivedMessagesAndDeliver,
+        (input) => getMessageStateChanges({ from: input.from, to: input.to }),
+      ];
+      for (const operation of operations) {
+        for (const input of windows) {
+          const transport = fakeTransport(emptySent);
+          const error = yield* operation(input).pipe(Effect.provide(transport.layer), Effect.flip);
+          assert.strictEqual(error._tag, "IsdsInvalidRequest");
+          assert.include(error._tag === "IsdsInvalidRequest" ? error.detail : "", "xs:dateTime");
+          assert.strictEqual(transport.requests.length, 0);
+        }
+      }
+    }),
+  );
+
+  it.effect("sends the extreme representable bounds, years 0001 and 9999", () =>
+    Effect.gen(function* () {
+      const { requests } = yield* run(
+        listSentMessages({
+          from: DateTime.makeUnsafe("0001-01-01T00:00:00Z"),
+          to: DateTime.makeUnsafe("9999-12-31T23:59:59.999Z"),
+        }),
+        emptySent,
+      );
+      const body = bodyOf(requests[0]?.envelope);
+      assert.include(body, "<dmFromTime>0001-01-01T00:00:00.000Z</dmFromTime>");
+      assert.include(body, "<dmToTime>9999-12-31T23:59:59.999Z</dmToTime>");
     }),
   );
 });

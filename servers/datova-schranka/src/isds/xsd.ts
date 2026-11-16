@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { DateTime, Schema, SchemaTransformation } from "effect";
+import { DateTime, Option, Schema, SchemaTransformation } from "effect";
 import { findInvalidXmlChar } from "./xml.js";
 
 /**
@@ -74,8 +74,24 @@ export const XsBase64 = Schema.String.pipe(
   ),
 );
 
-/** Renders a DateTime for an xs:dateTime request element (UTC, ISO 8601). */
-export const formatXsDateTime = (value: DateTime.DateTime): string => DateTime.formatIso(value);
+/** 0001-01-01T00:00:00.000Z and 9999-12-31T23:59:59.999Z: the four-digit years xs:dateTime text can carry here. */
+const xsDateTimeMinMillis = -62_135_596_800_000;
+const xsDateTimeMaxMillis = 253_402_300_799_999;
+
+/**
+ * Renders a DateTime for an xs:dateTime request element (UTC, ISO 8601,
+ * `YYYY-MM-DDTHH:mm:ss.sssZ`), or None when it has no such form: a non-finite instant (e.g.
+ * `DateTime.addDuration(t, Duration.infinity)`, on which `DateTime.formatIso` throws a
+ * RangeError) or a UTC year outside 0001–9999 (`formatIso` would emit an expanded year such as
+ * `+010000-…` or `-000001-…`, which ISDS has no reason to accept). Every request date goes
+ * through here, so callers turn None into IsdsInvalidRequest instead of dying on a defect.
+ */
+export const formatXsDateTime = (value: DateTime.DateTime): Option.Option<string> => {
+  const millis = DateTime.toEpochMillis(value);
+  return Number.isFinite(millis) && millis >= xsDateTimeMinMillis && millis <= xsDateTimeMaxMillis
+    ? Option.some(DateTime.formatIso(value))
+    : Option.none();
+};
 
 /** A string XML 1.0 can carry: no C0 controls except tab/LF/CR, no lone surrogates. */
 export const XmlText = Schema.String.pipe(
