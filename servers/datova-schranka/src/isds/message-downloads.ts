@@ -130,9 +130,10 @@ export const ReturnedMessage = Schema.Struct({
 export type ReturnedMessage = typeof ReturnedMessage.Type;
 
 /**
- * tDelivery (dmBaseTypes.xsd:692-717): the delivery receipt data. tEventsArray declares one
- * dmEvent per sequence, but a receipt lists every event (acceptance, delivery, …), so dmEvent
- * is read as repeating; a single XSD-valid event decodes as a one-element array.
+ * tDelivery (dmBaseTypes.xsd:692-717): the delivery receipt data. tEventsArray repeats its
+ * sequence of one dmEvent `minOccurs="1" maxOccurs="unbounded"` (dmBaseTypes.xsd:182-185), so a
+ * receipt lists every event (acceptance, delivery, …); dmEvent is read as repeating and a single
+ * event decodes as a one-element array.
  */
 export const DeliveryInfo = Schema.Struct({
   dmDm: MessageEnvelope,
@@ -192,8 +193,11 @@ export const ping = Effect.fn("Isds.ping")(function* () {
 });
 
 /**
- * MessageEnvelopeDownload (dm_info.wsdl): the envelope of a sent or received message, without
- * its documents. Does not trigger delivery; a received message in state 4/5 fails with 1222.
+ * MessageEnvelopeDownload (dm_info.wsdl): the envelope of a received message, without its
+ * documents (PDF p. 67). Received messages only: "Číst obálku z jiné schránky nebo obálku zprávy
+ * odeslané skončí chybou 1211" (PDF p. 68); a sent message's envelope needs the separate
+ * SentMessageEnvelopeDownload operation (PDF p. 68), not implemented here. Does not trigger
+ * delivery; a received message in state 4/5 fails with 1222.
  */
 export const downloadMessageEnvelope = Effect.fn("Isds.downloadMessageEnvelope")(function* (input: MessageIdInput) {
   const operation = "MessageEnvelopeDownload";
@@ -210,8 +214,11 @@ export const downloadMessageEnvelope = Effect.fn("Isds.downloadMessageEnvelope")
 });
 
 /**
- * MessageDownload (dm_operations.wsdl): a received message with its documents decoded. Does not
- * trigger delivery; a received message in state 4/5 fails with 1222. Every document is a
+ * MessageDownload (dm_operations.wsdl): a received ("přijaté (došlé)", PDF p. 60) message with
+ * its documents decoded. Sent messages are downloaded with the separate SignedSentMessageDownload
+ * operation (PDF p. 66), not implemented here; the PDF names no status code for calling this one
+ * on a sent message. Does not trigger delivery; a received message in state 4/5 fails with 1222.
+ * Every document is a
  * `MessageFile`; even a single dmFile decodes as a one-element array.
  */
 export const downloadMessage = Effect.fn("Isds.downloadMessage")(function* (input: MessageIdInput) {
@@ -233,7 +240,8 @@ export const downloadMessage = Effect.fn("Isds.downloadMessage")(function* (inpu
 const withoutTimestampCode = "0005";
 
 /**
- * SignedMessageDownload (dm_operations.wsdl): a received message as the signed ZFO (CMS), the
+ * SignedMessageDownload (dm_operations.wsdl): a received message ("došlé do vlastní schránky",
+ * PDF p. 63; sent ones need SignedSentMessageDownload, p. 66) as the signed ZFO (CMS), the
  * legally valid form for archiving. The bytes are returned exactly as received, never parsed.
  * Does not trigger delivery; a received message in state 4/5 fails with 1222. Status 0005 is a
  * success, reported as `withoutQualifiedTimestamp`; any other code besides 0000 fails.
