@@ -32,23 +32,6 @@ const Base64Bytes = Schema.String.pipe(
   ),
 );
 
-/**
- * tHash (dmBaseTypes.xsd:160-170): the `algorithm` attribute is optional, and an element
- * without attributes parses as plain text, which the shared `MessageHash` (expecting
- * `#text`) does not accept. Both forms decode to the same `{ value, algorithm? }`.
- */
-const ReturnedHash = Schema.Union([
-  MessageHash,
-  Schema.String.pipe(
-    Schema.decodeTo(
-      Schema.toType(MessageHash),
-      SchemaTransformation.transform({
-        decode: (value: string) => ({ value }),
-        encode: (hash: MessageHash) => hash.value,
-      }),
-    ),
-  ),
-]);
 
 /**
  * tDmType (dmBaseTypes.xsd:904-914): a one-character message type code. In responses: K
@@ -118,7 +101,7 @@ const repeating: ReadonlySet<string> = new Set(["dmFile", "dmEvent"]);
  */
 export const ReturnedMessageEnvelope = Schema.Struct({
   dmDm: MessageEnvelope,
-  dmHash: ReturnedHash,
+  dmHash: MessageHash,
   /** The qualified timestamp token (RFC 3161, DER), as received. */
   dmQTimestamp: Base64Bytes,
   dmDeliveryTime: Schema.optional(XsDateTime),
@@ -137,7 +120,7 @@ export type ReturnedMessageEnvelope = typeof ReturnedMessageEnvelope.Type;
 /** tReturnedMessage (dmBaseTypes.xsd:557-610): the complete message with decoded documents. */
 export const ReturnedMessage = Schema.Struct({
   dmDm: Schema.Struct({ ...MessageEnvelope.fields, dmFiles: xmlList("dmFile", MessageFile) }),
-  dmHash: ReturnedHash,
+  dmHash: MessageHash,
   /** The qualified timestamp token (RFC 3161, DER); nillable in tReturnedMessage. */
   dmQTimestamp: Schema.optional(Base64Bytes),
   dmDeliveryTime: Schema.optional(XsDateTime),
@@ -157,7 +140,7 @@ export type ReturnedMessage = typeof ReturnedMessage.Type;
  */
 export const DeliveryInfo = Schema.Struct({
   dmDm: MessageEnvelope,
-  dmHash: ReturnedHash,
+  dmHash: MessageHash,
   /** The qualified timestamp token (RFC 3161, DER), as received. */
   dmQTimestamp: Base64Bytes,
   dmDeliveryTime: Schema.optional(XsDateTime),

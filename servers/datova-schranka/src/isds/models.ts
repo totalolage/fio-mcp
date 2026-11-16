@@ -87,8 +87,8 @@ export const MessageEnvelope = Schema.Struct({
 });
 export type MessageEnvelope = typeof MessageEnvelope.Type;
 
-/** tHash: base64 digest text with an optional `algorithm` attribute (dmBaseTypes.xsd:160-170). */
-export const MessageHash = Schema.Struct({
+/** tHash with its `algorithm` attribute: the parser puts the digest under `#text`. */
+const MessageHashWithAlgorithm = Schema.Struct({
   "#text": Schema.String,
   algorithm: Schema.optional(Schema.String),
 }).pipe(
@@ -102,4 +102,21 @@ export const MessageHash = Schema.Struct({
     }),
   ),
 );
+
+/**
+ * tHash: base64 digest text with an optional `algorithm` attribute (dmBaseTypes.xsd:160-170).
+ * Without attributes the element parses as plain text, so both forms decode to `{ value, algorithm? }`.
+ */
+export const MessageHash = Schema.Union([
+  MessageHashWithAlgorithm,
+  Schema.String.pipe(
+    Schema.decodeTo(
+      Schema.toType(MessageHashWithAlgorithm),
+      SchemaTransformation.transform({
+        decode: (value: string) => ({ value }),
+        encode: (hash: { readonly value: string }) => hash.value,
+      }),
+    ),
+  ),
+]);
 export type MessageHash = typeof MessageHash.Type;
