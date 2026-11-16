@@ -1021,8 +1021,13 @@ describe("payments at /admin", () => {
       expect((await admin.act("/admin/payments/pending/decline", { pending: pendingId })).message).toBe(
         "Declined the batch; nothing was sent to FIO.",
       );
-      expect((await admin.act(APPROVE, { pending: pendingId, totp: codeNow() })).message).toContain("Nothing was uploaded.");
+      expect((await admin.page("/admin/payments/pending")).html).not.toContain(pendingId);
+      // Even a fresh, valid code cannot approve it afterwards.
+      harness.clock.advance(30_000);
+      expect((await admin.act(APPROVE, { pending: pendingId, totp: codeNow() })).message).toContain("no longer awaiting");
       expect(uploads).toEqual([]);
+      const [row] = await audit();
+      expect(row?.reason).toBe("declined by admin");
     });
   });
 
