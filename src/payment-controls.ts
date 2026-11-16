@@ -257,7 +257,10 @@ export const makePaymentControls = Effect.gen(function* () {
 
   const uploadBatch = (account: Account, xml: string): Effect.Effect<UploadClassification> =>
     fio.importXml(account, xml).pipe(
-      Effect.flatMap((body) => parseImportResponse(body, redactor.excerpt)),
+      // FIO's status, batch IDs and messages are bank text stored in the audit
+      // columns and the recorded response: redact the body before parsing,
+      // since parsing lowercases the status and the redactor matches case.
+      Effect.flatMap((body) => parseImportResponse(redactor.redact(body), redactor.excerpt)),
       Effect.map((result): UploadClassification => {
         if (looksLikeMissingPaymentPermission(result)) {
           return {
