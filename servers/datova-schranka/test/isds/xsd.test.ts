@@ -19,11 +19,14 @@ describe("XsBase64", () => {
 
   it.effect("rejects text outside the base64 alphabet or with broken padding", () =>
     Effect.gen(function* () {
-      for (const text of ["QQ=", "Q===", "QQ==QQ==", "QQ-_", "QQ==\u0000", "Q Q"]) {
+      for (const text of ["QQ=", "Q===", "QQ==QQ==", "QQ-_", "QQ==\u0000", "Q Q", "AB==", "QR==", "AAB=", "QUJ=", "=QQQ"]) {
         const result = yield* Effect.exit(decodeBase64(text));
         assert.isTrue(result._tag === "Failure", text);
       }
       assert.deepStrictEqual(yield* decodeBase64(""), new Uint8Array());
+      assert.deepStrictEqual(yield* decodeBase64("QQ=="), new TextEncoder().encode("A"));
+      assert.deepStrictEqual(yield* decodeBase64("QUI="), new TextEncoder().encode("AB"));
+      assert.deepStrictEqual(yield* decodeBase64("QUJD"), new TextEncoder().encode("ABC"));
     }),
   );
 });

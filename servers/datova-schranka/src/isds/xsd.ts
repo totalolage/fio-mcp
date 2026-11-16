@@ -47,11 +47,26 @@ export const XsInteger = Schema.String.pipe(
   ),
 );
 
-/** Canonical base64 text: whole quanta of the standard alphabet with at most two `=` of padding. */
+const base64Quanta = /^[A-Za-z0-9+/]*$/;
+/**
+ * The last quantum: four alphabet characters, or padding whose unused bits are zero, as XSD
+ * Part 2 §3.2.16 requires (B04 before "==", B16 before "=").
+ */
+const base64FinalQuantum = /^(?:[A-Za-z0-9+/]{4}|[A-Za-z0-9+/][AQgw]==|[A-Za-z0-9+/]{2}[AEIMQUYcgkosw048]=)$/;
+
+/**
+ * Base64 text in the xs:base64Binary lexical space (whitespace already removed): whole quanta of
+ * the standard alphabet, padding only at the end and with zero padding bits, so "AB==" and
+ * "AAB=" are rejected. The final quantum is checked apart so the regex stays linear on
+ * attachments of tens of megabytes.
+ */
 const Base64Text = Schema.String.pipe(
   Schema.check(
     Schema.makeFilter((text: string) =>
-      text.length % 4 === 0 && /^[A-Za-z0-9+/]*={0,2}$/.test(text) ? undefined : "Expected base64 text",
+      text.length % 4 === 0 &&
+      (text.length === 0 || (base64Quanta.test(text.slice(0, -4)) && base64FinalQuantum.test(text.slice(-4))))
+        ? undefined
+        : "Expected base64 text",
     ),
   ),
 );

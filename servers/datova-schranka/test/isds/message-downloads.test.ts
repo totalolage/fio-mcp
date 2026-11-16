@@ -155,6 +155,13 @@ describe("downloadMessageEnvelope", () => {
         `<p:dmHash algorithm="SHA-256">not-base64!</p:dmHash>`,
         `<p:dmHash>not-base64!</p:dmHash>`,
         `<p:dmHash>QUJD=</p:dmHash>`,
+        // Non-zero padding bits (XSD Part 2 §3.2.16 B04 / B16).
+        `<p:dmHash algorithm="SHA-256">AB==</p:dmHash>`,
+        `<p:dmHash>AB==</p:dmHash>`,
+        `<p:dmHash algorithm="SHA-256">AAB=</p:dmHash>`,
+        `<p:dmHash>AAB=</p:dmHash>`,
+        `<p:dmHash>A===</p:dmHash>`,
+        `<p:dmHash>QQ==QQ==</p:dmHash>`,
       ]) {
         const { error } = yield* fails(downloadMessageEnvelope({ dmID: "8765432" }), ok(original.replace(hash, replacement)));
         assert.strictEqual(error._tag, "IsdsInvalidResponse", replacement);
