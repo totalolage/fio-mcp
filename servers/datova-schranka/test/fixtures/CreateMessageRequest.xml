@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <CreateMessage xmlns="http://isds.czechpoint.cz/v20">
+      <dmEnvelope dmType="K">
+        <dmSenderOrgUnit xsi:nil="true" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"/>
+        <dmSenderOrgUnitNum xsi:nil="true" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"/>
+        <dbIDRecipient>abc2def</dbIDRecipient>
+        <dmRecipientOrgUnit>Podatelna</dmRecipientOrgUnit>
+        <dmRecipientOrgUnitNum>42</dmRecipientOrgUnitNum>
+        <dmToHands>Jan Novák</dmToHands>
+        <dmAnnotation>Žádost o informace</dmAnnotation>
+        <dmRecipientRefNumber xsi:nil="true" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"/>
+        <dmSenderRefNumber>2026/0001</dmSenderRefNumber>
+        <dmRecipientIdent xsi:nil="true" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"/>
+        <dmSenderIdent>SPIS-7</dmSenderIdent>
+        <dmLegalTitleLaw>106</dmLegalTitleLaw>
+        <dmLegalTitleYear>1999</dmLegalTitleYear>
+        <dmLegalTitleSect>14</dmLegalTitleSect>
+        <dmLegalTitlePar xsi:nil="true" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"/>
+        <dmLegalTitlePoint xsi:nil="true" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"/>
+        <dmPersonalDelivery>false</dmPersonalDelivery>
+        <dmAllowSubstDelivery>true</dmAllowSubstDelivery>
+        <dmOVM>false</dmOVM>
+        <dmPublishOwnID IdLevel="3">true</dmPublishOwnID>
+      </dmEnvelope>
+      <dmFiles>
+        <dmFile dmMimeType="application/pdf" dmFileMetaType="main" dmFileGuid="g-1" dmFileDescr="zadost.pdf">
+          <dmEncodedContent>SGVsbG8=</dmEncodedContent>
+        </dmFile>
+        <dmFile dmMimeType="application/octet-stream" dmFileMetaType="enclosure" dmUpFileGuid="g-1" dmFileDescr="priloha.bin" dmFormat="f1">
+          <dmEncodedContent>AAEC/w==</dmEncodedContent>
+        </dmFile>
+      </dmFiles>
+    </CreateMessage>
+  </soap:Body>
+</soap:Envelope>

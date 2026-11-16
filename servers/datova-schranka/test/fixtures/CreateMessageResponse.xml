@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/">
+  <SOAP-ENV:Body>
+    <p:CreateMessageResponse xmlns:p="http://isds.czechpoint.cz/v20" xmlns="http://isds.czechpoint.cz/v20">
+      <p:dmID>1234567</p:dmID>
+      <p:dmStatus>
+        <p:dmStatusCode>0000</p:dmStatusCode>
+        <p:dmStatusMessage>Provedeno úspěšně.</p:dmStatusMessage>
+      </p:dmStatus>
+    </p:CreateMessageResponse>
+  </SOAP-ENV:Body>
+</SOAP-ENV:Envelope>
