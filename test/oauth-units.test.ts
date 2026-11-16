@@ -7,8 +7,16 @@ import { TestClock } from "effect/testing";
 import { makeSettingsStore, SETTING } from "../src/account-store.js";
 import { Accounts } from "../src/accounts.js";
 import { AdminPassword, makeAdminPassword } from "../src/admin/password.js";
+import { decodeBase32, encodeBase32, matchingTotpSteps, newTotpSecret, totpCode } from "../src/admin/totp.js";
 import { SERVER_MIGRATIONS } from "../src/cache/db.js";
-import { CommandFailed, hashPasswordCommand, listClientsCommand, revokeAllTokensCommand, revokeClientCommand } from "../src/oauth/cli.js";
+import {
+  CommandFailed,
+  hashPasswordCommand,
+  listClientsCommand,
+  revokeAllTokensCommand,
+  revokeClientCommand,
+  totpInitCommand,
+} from "../src/oauth/cli.js";
 import {
   hashPassword,
   hashSecret,
@@ -25,6 +33,8 @@ import { makeOAuthServer } from "../src/oauth/server.js";
 import { MAX_SESSIONS, makeSessions, type PendingAuthorization } from "../src/oauth/sessions.js";
 import { makeOAuthStore } from "../src/oauth/store.js";
 import { isResource, parsePublicUrl, redirectUriMatches, redirectUriProblem } from "../src/oauth/urls.js";
+import { paymentFormValues } from "../src/payment-form.js";
+import { DEFAULT_GRANT_PAYMENTS, DEFAULT_PAYMENT_LIMITS } from "../src/payment-limits.js";
 import { testConfig } from "./fixtures.js";
 import { seededConfig } from "./support/config.js";
 import { memoryDatabase } from "./support/database.js";
@@ -88,6 +98,9 @@ describe("URL rules", () => {
       redirectUri: "http://127.0.0.1:45678/callback",
       csrf: "csrf",
       paymentsRequested: false,
+      paymentsChecked: false,
+      payments: paymentFormValues(DEFAULT_GRANT_PAYMENTS, DEFAULT_PAYMENT_LIMITS),
+      paymentCeiling: DEFAULT_PAYMENT_LIMITS,
       accounts: ["<b>&"],
       error: undefined,
     });
@@ -99,7 +112,7 @@ describe("URL rules", () => {
 describe("authorization endpoint request target", () => {
   const services = Layer.mergeAll(
     memoryDatabase(SERVER_MIGRATIONS),
-    Accounts.Default.pipe(Layer.provide(seededConfig(testConfig([])))),
+    Accounts.Default.pipe(Layer.provideMerge(seededConfig(testConfig([])))),
   );
 
   it.effect("shows an error page for an absolute-form target that is not a URL", () =>
@@ -427,7 +440,7 @@ describe("admin commands", () => {
       const now = yield* Clock.currentTimeMillis;
       const setup = Effect.fnUntraced(function* (clientId: string) {
         yield* store.insertClient({ clientId, clientName: null, redirectUris: ["https://a.example/cb"], createdAt: now, lastUsedAt: null }, 10);
-        const grant = { grantId: `grant_${clientId}`, clientId, scopes: ["fio:read"], accountFingerprints: ["main"], resource: "https://fio.example.test/mcp" };
+        const grant = { grantId: `grant_${clientId}`, clientId, scopes: ["fio:read"], accountFingerprints: ["main"], resource: "https://fio.example.test/mcp", payments: DEFAULT_GRANT_PAYMENTS };
         yield* store.createGrant(grant, { codeHash: `c_${clientId}`, clientId, redirectUri: "https://a.example/cb", codeChallenge: "x", expiresAt: now + 60_000 }, now);
         yield* store.insertTokens(grant.grantId, pair(clientId, 0));
         return grant;
@@ -461,7 +474,7 @@ describe("admin commands", () => {
         yield* store.insertClient({ clientId, clientName: `App ${clientId}`, redirectUris: ["https://a.example/cb"], createdAt: now, lastUsedAt: null }, 10);
         const grantId = `grant_${clientId}`;
         yield* store.createGrant(
-          { grantId, clientId, scopes: ["fio:read"], accountFingerprints: ["main"], resource: "https://fio.example.test/mcp" },
+          { grantId, clientId, scopes: ["fio:read"], accountFingerprints: ["main"], resource: "https://fio.example.test/mcp", payments: DEFAULT_GRANT_PAYMENTS },
           { codeHash: `code_${clientId}`, clientId, redirectUri: "https://a.example/cb", codeChallenge: "x", expiresAt: now + 60_000 },
           now,
         );
@@ -544,6 +557,192 @@ describe("sign-in scrypt bound", () => {
       // Once the check ends, the next sign-in is checked.
       assert.strictEqual((yield* guard.attempt("10.0.0.99", wrong))._tag, "Rejected");
       assert.strictEqual(peak, 1);
+    }),
+  );
+});
+
+describe("sign-in busy (SEC-09)", () => {
+  it.effect("turns a concurrent attempt away as busy without counting it as a failure", () =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let checks = 0;
+      const verify = (password: Redacted.Redacted<string>) =>
+        Effect.gen(function* () {
+          checks++;
+          if (checks === 1) {
+            yield* Deferred.succeed(entered, undefined);
+            yield* Deferred.await(release);
+          }
+          return Redacted.value(password) === "the right password";
+        });
+      // One free failure: a second counted failure starts the backoff.
+      const throttle = { ...DEFAULT_THROTTLE, freeFailures: 1 };
+      const guard = yield* makeLoginGuard(Effect.succeed(Redacted.make(UNCHECKED_HASH)), throttle, verify);
+      const wrong = Redacted.make("the wrong password");
+      const held = yield* Effect.forkChild(guard.attempt("10.0.0.1", wrong), { startImmediately: true });
+      yield* Deferred.await(entered);
+      assert.deepStrictEqual(yield* guard.attempt("10.0.0.1", wrong), { _tag: "Throttled", retryAfterSeconds: 1, busy: true });
+      yield* Deferred.succeed(release, undefined);
+      assert.strictEqual((yield* Fiber.join(held))._tag, "Rejected");
+      assert.strictEqual(checks, 1);
+      // Only the held attempt was counted: the next one is still checked...
+      assert.strictEqual((yield* guard.attempt("10.0.0.1", wrong))._tag, "Rejected");
+      // ...and is the second failure, which starts the backoff.
+      assert.deepStrictEqual(yield* guard.attempt("10.0.0.1", Redacted.make("the right password")), {
+        _tag: "Throttled",
+        retryAfterSeconds: 1,
+      });
+      assert.strictEqual(checks, 2);
+    }),
+  );
+});
+
+/** RFC 6238 appendix B's SHA-1 seed. */
+const RFC_SECRET = new TextEncoder().encode("12345678901234567890");
+
+describe("TOTP (RFC 6238)", () => {
+  it("matches the RFC 6238 SHA-1 test vectors, truncated to 6 digits", () => {
+    const vectors: ReadonlyArray<readonly [number, string]> = [
+      [59, "287082"],
+      [1111111109, "081804"],
+      [1111111111, "050471"],
+      [1234567890, "005924"],
+      [2000000000, "279037"],
+      [20000000000, "353130"],
+    ];
+    for (const [seconds, code] of vectors) assert.strictEqual(totpCode(RFC_SECRET, seconds), code, `T = ${seconds}`);
+  });
+
+  it("decodes base32 with lowercase, spaces and padding, and refuses anything else", () => {
+    assert.strictEqual(encodeBase32(RFC_SECRET), "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ");
+    assert.deepStrictEqual(decodeBase32("gezd gnbv gy3t qojq\ngezd gnbv gy3t qojq"), RFC_SECRET);
+    assert.deepStrictEqual(decodeBase32("MZXW6===\n"), new TextEncoder().encode("foo"));
+    for (const bad of ["", " = ", "MZXW1", "MZ=XW6", "MZXW6!"]) assert.isUndefined(decodeBase32(bad), JSON.stringify(bad));
+    // Lengths no encoder produces (1, 3 or 6 characters past a whole group) are refused, not truncated.
+    for (const length of [25, 27, 30, 33]) assert.isUndefined(decodeBase32("A".repeat(length)), `${length} characters`);
+    for (const length of [24, 26, 28, 29, 31, 32]) assert.isDefined(decodeBase32("A".repeat(length)), `${length} characters`);
+    const random = newTotpSecret();
+    assert.strictEqual(random.length, 20);
+    assert.deepStrictEqual(decodeBase32(encodeBase32(random)), random);
+  });
+
+  it("accepts one step of drift either way and nothing further", () => {
+    const now = 1111111111;
+    const step = Math.floor(now / 30);
+    for (const offset of [-1, 0, 1]) {
+      assert.deepStrictEqual(matchingTotpSteps(RFC_SECRET, totpCode(RFC_SECRET, now + offset * 30), now), [step + offset]);
+    }
+    for (const offset of [-2, 2]) assert.deepStrictEqual(matchingTotpSteps(RFC_SECRET, totpCode(RFC_SECRET, now + offset * 30), now), []);
+    assert.deepStrictEqual(matchingTotpSteps(RFC_SECRET, "050 471", now), [step]);
+    for (const bad of ["", "50471", "0504711", "05047a", "０５０４７１"]) assert.deepStrictEqual(matchingTotpSteps(RFC_SECRET, bad, now), [], bad);
+    // Near the epoch there is no step -1 to compare.
+    assert.deepStrictEqual(matchingTotpSteps(RFC_SECRET, totpCode(RFC_SECRET, 0), 0), [0]);
+  });
+});
+
+describe("admin TOTP second factor", () => {
+  /** A step boundary; the TestClock starts here. */
+  const T0 = 1_700_000_010_000;
+  const codeAt = (millis: number) => totpCode(RFC_SECRET, Math.floor(millis / 1000));
+  /** A 6-digit code that is none of the three accepted at `millis`. */
+  const wrongCodeAt = (millis: number) => {
+    const valid = new Set([-30_000, 0, 30_000].map((offset) => codeAt(millis + offset)));
+    return ["000000", "111111", "222222", "333333"].find((code) => !valid.has(code)) ?? "444444";
+  };
+  const right = Redacted.make("the right password");
+  const adminPassword = (throttle: typeof DEFAULT_THROTTLE, totp: boolean) =>
+    Effect.gen(function* () {
+      const bootstrap = parsePasswordHash(yield* hashPassword(right, FAST));
+      if (bootstrap instanceof PasswordHashError) return yield* Effect.die("hash did not parse");
+      yield* TestClock.setTime(T0);
+      return yield* makeAdminPassword(Redacted.make(bootstrap), throttle, FAST, totp ? Redacted.make(RFC_SECRET) : undefined);
+    });
+
+  it.effect("needs the code with the password, counts a wrong or missing one, and refuses a replay", () =>
+    Effect.gen(function* () {
+      const password = yield* adminPassword({ ...DEFAULT_THROTTLE, freeFailures: 1 }, true);
+      assert.isTrue(password.totpEnabled);
+      assert.strictEqual((yield* password.signIn("10.0.0.1", right))._tag, "Rejected");
+      assert.strictEqual((yield* password.signIn("10.0.0.1", right, wrongCodeAt(T0)))._tag, "Rejected");
+      // Both were counted: the second failure started the backoff, even for a correct code.
+      assert.deepStrictEqual(yield* password.signIn("10.0.0.1", right, codeAt(T0)), { _tag: "Throttled", retryAfterSeconds: 1 });
+      yield* TestClock.adjust("1 second");
+      const now = T0 + 1000;
+      assert.strictEqual((yield* password.signIn("10.0.0.1", right, codeAt(now)))._tag, "Accepted");
+      // Replayed, from anywhere, in sign-in or on its own: refused.
+      assert.strictEqual((yield* password.signIn("10.0.0.2", right, codeAt(now)))._tag, "Rejected");
+      assert.strictEqual((yield* password.verifyTotp("10.0.0.3", codeAt(now)))._tag, "Rejected");
+      // The next step's code is still good once, and then used up for sign-in too.
+      assert.strictEqual((yield* password.verifyTotp("10.0.0.3", codeAt(now + 30_000)))._tag, "Accepted");
+      assert.strictEqual((yield* password.verifyTotp("10.0.0.3", codeAt(now + 30_000)))._tag, "Rejected");
+      assert.strictEqual((yield* password.signIn("10.0.0.4", right, codeAt(now + 30_000)))._tag, "Rejected");
+      // A wrong password does not use up the code it came with.
+      assert.strictEqual((yield* password.signIn("10.0.0.5", Redacted.make("wrong password"), codeAt(now - 30_000)))._tag, "Rejected");
+      assert.strictEqual((yield* password.signIn("10.0.0.5", right, codeAt(now - 30_000)))._tag, "Accepted");
+      // Two steps off is outside the window.
+      assert.strictEqual((yield* password.signIn("10.0.0.6", right, codeAt(now - 60_000)))._tag, "Rejected");
+      // Codes are spent per step: once a minute has passed, a fresh code works again.
+      yield* TestClock.adjust("90 seconds");
+      assert.strictEqual((yield* password.signIn("10.0.0.6", right, codeAt(now + 90_000)))._tag, "Accepted");
+    }).pipe(Effect.provide(memoryDatabase(SERVER_MIGRATIONS))),
+  );
+
+  it.effect("verifyTotp is throttled and counted in the sign-in guard", () =>
+    Effect.gen(function* () {
+      const password = yield* adminPassword({ ...DEFAULT_THROTTLE, freeFailures: 0 }, true);
+      assert.strictEqual((yield* password.verifyTotp("10.0.0.1", wrongCodeAt(T0)))._tag, "Rejected");
+      assert.deepStrictEqual(yield* password.signIn("10.0.0.1", right, codeAt(T0)), { _tag: "Throttled", retryAfterSeconds: 1 });
+      assert.deepStrictEqual(yield* password.verifyTotp("10.0.0.1", codeAt(T0)), { _tag: "Throttled", retryAfterSeconds: 1 });
+      yield* TestClock.adjust("1 second");
+      assert.strictEqual((yield* password.verifyTotp("10.0.0.1", undefined))._tag, "Rejected");
+      yield* TestClock.adjust("2 seconds");
+      assert.strictEqual((yield* password.verifyTotp("10.0.0.1", codeAt(T0 + 3000)))._tag, "Accepted");
+    }).pipe(Effect.provide(memoryDatabase(SERVER_MIGRATIONS))),
+  );
+
+  it.effect("a password change does not wipe the code failures counted for an address", () =>
+    Effect.gen(function* () {
+      const password = yield* adminPassword({ ...DEFAULT_THROTTLE, freeFailures: 1 }, true);
+      assert.strictEqual((yield* password.verifyTotp("10.0.0.1", wrongCodeAt(T0)))._tag, "Rejected");
+      const next = Redacted.make("the next admin password");
+      assert.strictEqual((yield* password.change("10.0.0.1", right, next))._tag, "Accepted");
+      // Still one failure on record: the next wrong code starts the backoff.
+      assert.strictEqual((yield* password.verifyTotp("10.0.0.1", wrongCodeAt(T0)))._tag, "Rejected");
+      assert.deepStrictEqual(yield* password.signIn("10.0.0.1", next, codeAt(T0)), { _tag: "Throttled", retryAfterSeconds: 1 });
+    }).pipe(Effect.provide(memoryDatabase(SERVER_MIGRATIONS))),
+  );
+
+  it.effect("without a secret, sign-in ignores the code and verifyTotp accepts at once", () =>
+    Effect.gen(function* () {
+      const password = yield* adminPassword({ ...DEFAULT_THROTTLE, freeFailures: 0 }, false);
+      assert.isFalse(password.totpEnabled);
+      for (let i = 0; i < 3; i++) assert.deepStrictEqual(yield* password.verifyTotp("10.0.0.1", "nonsense"), { _tag: "Accepted", value: undefined });
+      assert.strictEqual((yield* password.signIn("10.0.0.1", right))._tag, "Accepted");
+      assert.strictEqual((yield* password.signIn("10.0.0.1", right, "nonsense"))._tag, "Accepted");
+    }).pipe(Effect.provide(memoryDatabase(SERVER_MIGRATIONS))),
+  );
+});
+
+describe("totp-init output", () => {
+  const run = Effect.gen(function* () {
+    const io = fakeStdio("", false);
+    yield* totpInitCommand().pipe(Effect.provide(io.layer));
+    return io;
+  });
+
+  it.effect("prints a new base32 secret and its otpauth URI on stdout, and stores nothing", () =>
+    Effect.gen(function* () {
+      const io = yield* run;
+      const [secret = "", uri = "", ...rest] = io.out.join("").split("\n");
+      assert.deepStrictEqual(rest, [""]);
+      assert.match(secret, /^[A-Z2-7]{32}$/);
+      assert.strictEqual(decodeBase32(secret)?.length, 20);
+      assert.strictEqual(uri, `otpauth://totp/fio-mcp:admin?secret=${secret}&issuer=fio-mcp&algorithm=SHA1&digits=6&period=30`);
+      assert.include(io.err.join(""), "Nothing was stored.");
+      assert.notInclude(io.err.join(""), secret);
+      const again = yield* run;
+      assert.notStrictEqual(again.out.join("").split("\n")[0], secret);
     }),
   );
 });

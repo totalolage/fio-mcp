@@ -1,4 +1,4 @@
-import { Schema } from "effect";
+import { Effect, Schema } from "effect";
 import { Tool } from "effect/ai";
 import {
   CacheError,
@@ -8,13 +8,16 @@ import {
   FioTransportError,
   HistoryAuthorizationRequired,
   InvalidInput,
+  PaymentAuditError,
   PermissionDenied,
   RateLimited,
   TokenRejected,
   TooManyItems,
   UploadOutcomeUnknown,
+  UploadRefused,
   XmlParseError,
 } from "../errors.js";
+import { type GuardSpec, guardMarked, guardResult, hasMarks } from "./untrusted.js";
 
 /** Tool results are JSON objects; their shape is described in each tool's description. */
 export const JsonObject = Schema.Record(Schema.String, Schema.Unknown);
@@ -36,8 +39,39 @@ export const ToolFailure = Schema.Union([
   XmlParseError,
   InvalidInput,
   UploadOutcomeUnknown,
+  UploadRefused,
   CacheError,
+  PaymentAuditError,
 ]);
+
+/**
+ * Guards the bank text an error message carries (marked excerpts, SEC-05).
+ * The copy keeps the error's class and fields; only its message differs.
+ */
+export const guardFailure = <E>(error: E): Effect.Effect<E> => {
+  if (!(error instanceof Error) || !hasMarks(error.message)) return Effect.succeed(error);
+  return Effect.map(guardMarked(error.message), (message) => {
+    const copy: E = Object.assign(Object.create(Object.getPrototypeOf(error)), error);
+    Object.defineProperty(copy, "message", { value: message, enumerable: false, configurable: true });
+    return copy;
+  });
+};
+
+/**
+ * The output path of every tool: redact, guard bank text (SEC-05), redact
+ * again. Guarding runs inside redaction, so a token in bank text is still
+ * `***` inside its guard; redaction never touches guard tags.
+ */
+export const guardedOutput =
+  (redactDeep: <T>(value: T) => T) =>
+  <A extends Record<string, unknown>, E, R>(effect: Effect.Effect<A, E, R>, spec: GuardSpec = MARKED_ONLY) =>
+    effect.pipe(
+      Effect.flatMap((result) => guardResult(redactDeep(result), spec)),
+      Effect.map(redactDeep),
+      Effect.catch((error) => Effect.flatMap(guardFailure(error), Effect.fail)),
+    );
+
+const MARKED_ONLY: GuardSpec = { _tag: "Marked" };
 
 export const DateParam = (what: string) =>
   Schema.String.check(Schema.isPattern(/^\d{4}-\d{2}-\d{2}$/, { message: "must be YYYY-MM-DD" })).annotate({

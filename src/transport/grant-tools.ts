@@ -1,7 +1,8 @@
-import { Effect, Predicate } from "effect";
+import { Effect, Option, Predicate } from "effect";
 import { type McpProtocol, McpSchema } from "effect/ai";
 import type { Account } from "../accounts.js";
-import { ACCOUNTLESS_TOOLS, coveredAccounts, holdsScopes, toolScopes } from "../mcp/permissions.js";
+import { AppConfig, type MarkerTools } from "../config.js";
+import { ACCOUNTLESS_TOOLS, coveredAccounts, holdsScopes, MARKER_TOOLS, toolScopes } from "../mcp/permissions.js";
 import { CurrentPrincipal, type Principal } from "./principal.js";
 import type { ServerInfo } from "./server-info.js";
 
@@ -36,10 +37,21 @@ const isToolsCore = (core: unknown): core is ToolsCore =>
   Predicate.hasProperty(core.tools, "list") &&
   Predicate.isFunction(core.tools.list);
 
-/** The tools `principal` may see, with `account` enums narrowed to its accounts. */
-export function grantedTools(tools: ToolList, principal: Principal, accounts: ReadonlyArray<Account>): ToolList {
+/**
+ * The tools `principal` may see, with `account` enums narrowed to its
+ * accounts. With FIO_MCP_MARKER_TOOLS=disabled the marker tools are hidden
+ * from every grant; they stay registered so a call by name gets the same
+ * PermissionDenied as any other hidden tool (SEC-10).
+ */
+export function grantedTools(
+  tools: ToolList,
+  principal: Principal,
+  accounts: ReadonlyArray<Account>,
+  markerTools: MarkerTools = "enabled",
+): ToolList {
   const granted = new Set(coveredAccounts(principal, accounts).map((account) => account.name));
   return tools.flatMap((tool) => {
+    if (markerTools === "disabled" && MARKER_TOOLS.has(tool.name)) return [];
     if (!holdsScopes(principal, toolScopes(tool.name))) return [];
     if (ACCOUNTLESS_TOOLS.has(tool.name)) return [tool];
     if (granted.size === 0) return [];
@@ -64,7 +76,13 @@ const grantCore = (core: ToolsCore, accounts: CurrentAccounts): ToolsCore => ({
     ...core.tools,
     list: (profile) =>
       Effect.flatMap(core.tools.list(profile), (tools) =>
-        Effect.flatMap(CurrentPrincipal, (principal) => Effect.map(accounts, (list) => grantedTools(tools, principal, list))),
+        Effect.flatMap(CurrentPrincipal, (principal) =>
+          Effect.flatMap(Effect.serviceOption(AppConfig), (config) =>
+            Effect.map(accounts, (list) =>
+              grantedTools(tools, principal, list, Option.match(config, { onNone: () => "enabled", onSome: (c) => c.markerTools ?? "enabled" })),
+            ),
+          ),
+        ),
       ),
   },
 });

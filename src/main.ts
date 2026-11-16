@@ -1,5 +1,7 @@
 #!/usr/bin/env node
-import { NodeRuntime, NodeStdio, NodeTerminal } from "@effect/platform-node";
+import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
+import * as NodeStdio from "@effect/platform-node/NodeStdio";
+import * as NodeTerminal from "@effect/platform-node/NodeTerminal";
 import { Effect, Layer, Logger } from "effect";
 import {
   AppLive,
@@ -12,21 +14,27 @@ import {
   revokeAllTokens,
   revokeClient,
 } from "./app.js";
+import { serveLeased } from "./instance-lease.js";
+import { totpInitCommand } from "./oauth/cli.js";
+import { PURGE_USAGE, parsePurgeArgs, purgePayments } from "./payment-cli.js";
 import { makeRedactor, stderrLogger } from "./redaction.js";
 
 const USAGE = [
   "usage: fio-mcp                      serve MCP (FIO_MCP_TRANSPORT=stdio|http)",
   "       fio-mcp backup <dest>        copy the database to <dest>",
   "       fio-mcp hash-password        read the admin password (no echo), print its hash",
+  "       fio-mcp totp-init            print a new admin TOTP secret and its otpauth:// URI (stores nothing)",
   "       fio-mcp clients list         list registered OAuth clients",
   "       fio-mcp clients revoke <id>  remove a client and revoke its tokens",
   "       fio-mcp tokens revoke-all    revoke every OAuth grant",
   "       fio-mcp reset-admin-password [--set]",
   "                                    drop the password set at /admin (the hash file applies again),",
   "                                    or with --set store a new one read like hash-password",
+  `       ${PURGE_USAGE}`,
+  "                                    delete payment audit rows of days before the date (kept 365 days at least)",
 ].join("\n");
 
-const serve = Layer.launch(AppLive);
+const serve = serveLeased(AppLive);
 
 const backupTo = (dest: string) =>
   backup(dest).pipe(
@@ -45,6 +53,7 @@ const configured = (
       | Effect.Error<typeof listClients>
       | Effect.Error<typeof revokeAllTokens>
       | Effect.Error<ReturnType<typeof resetAdminPassword>>
+      | Effect.Error<ReturnType<typeof purgePayments>>
       | CommandFailed
     >
   | undefined => {
@@ -56,6 +65,10 @@ const configured = (
   if (name === "tokens" && arg === "revoke-all" && rest.length === 0) return revokeAllTokens;
   if (name === "reset-admin-password" && arg === undefined) return resetAdminPassword(false);
   if (name === "reset-admin-password" && arg === "--set" && rest.length === 0) return resetAdminPassword(true);
+  if (name === "payments") {
+    const before = parsePurgeArgs(args.slice(1));
+    return before === undefined ? undefined : purgePayments(before);
+  }
   return undefined;
 };
 
@@ -64,6 +77,10 @@ const command = (args: ReadonlyArray<string>) => {
   if (args.length === 1 && args[0] === "hash-password") {
     // Needs no configuration: the hash is created before the server is set up.
     return hashPasswordCommand().pipe(Effect.provide(Layer.mergeAll(NodeStdio.layer, NodeTerminal.layer)));
+  }
+  if (args.length === 1 && args[0] === "totp-init") {
+    // Needs no configuration, like hash-password.
+    return totpInitCommand().pipe(Effect.provide(NodeStdio.layer));
   }
   const run = configured(args);
   return run === undefined ? Effect.fail(new CommandFailed({ message: USAGE })) : run.pipe(Effect.provide(AppLoggerLive));

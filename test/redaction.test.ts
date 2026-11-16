@@ -1,5 +1,7 @@
 import { assert, describe, it } from "@effect/vitest";
 import { ConfigProvider, Effect, Layer, Logger } from "effect";
+import { FioBadRequest } from "../src/errors.js";
+import { makeGuard, markUntrusted, preambleFor } from "../src/mcp/untrusted.js";
 import { makeRedactor, Redactor, stderrLogger } from "../src/redaction.js";
 import { PAY_TOKEN, READ_TOKEN } from "./fixtures.js";
 
@@ -121,6 +123,56 @@ describe("tokens added at runtime", () => {
       );
       assert.isDefined(outer);
       assert.strictEqual(inner, outer);
+    }),
+  );
+});
+
+describe("redaction and guard tags (SEC-05)", () => {
+  it.effect("no redaction pattern matches a guard tag or the preamble", () =>
+    Effect.gen(function* () {
+      const { redact, redactDeep } = makeRedactor([READ_TOKEN, PAY_TOKEN]);
+      for (let i = 0; i < 200; i++) {
+        const guard = yield* makeGuard;
+        for (const sample of [guard.preamble, guard.wrap("plain"), guard.wrap(""), guard.wrap("/last"), guard.wrap("a/periods/")]) {
+          assert.strictEqual(redact(sample), sample);
+        }
+        const result = { untrustedDataNotice: guard.preamble, rows: [{ comment: guard.wrap("x") }] };
+        assert.deepStrictEqual(redactDeep(result), result);
+        // A token path inside a guard is redacted up to the closing tag, never into it.
+        assert.strictEqual(redact(guard.wrap("/last/abc")), guard.wrap("/last/***"));
+        assert.strictEqual(redact(guard.wrap(`x ${READ_TOKEN}`)), guard.wrap("x ***"));
+      }
+      assert.strictEqual(redact(preambleFor("f".repeat(32))), preambleFor("f".repeat(32)));
+    }),
+  );
+
+  it("token-path redaction stops at excerpt marks", () => {
+    const { redact } = makeRedactor([]);
+    assert.strictEqual(redact(`x ${markUntrusted("/last/abc")} y`), `x ${markUntrusted("/last/***")} y`);
+  });
+
+  it.effect("the stderr log line of an error with an excerpt carries no excerpt mark", () =>
+    Effect.gen(function* () {
+      const written: Array<string> = [];
+      const original = process.stderr.write.bind(process.stderr);
+      process.stderr.write = ((chunk: string) => {
+        written.push(String(chunk));
+        return true;
+      }) as typeof process.stderr.write;
+      const error = new FioBadRequest({ excerpt: `bad parameter /last/${READ_TOKEN}` });
+      assert.match(error.message, /[\uE000\uE001]/);
+      yield* Effect.logError(error.message).pipe(
+        Effect.provide(Logger.layer([stderrLogger(makeRedactor([READ_TOKEN]))])),
+        Effect.ensuring(
+          Effect.sync(() => {
+            process.stderr.write = original;
+          }),
+        ),
+      );
+      assert.strictEqual(written.length, 1);
+      assert.notMatch(written[0] ?? "", /[\uE000\uE001]/);
+      assert.include(written[0], "bad parameter /last/***");
+      assert.notInclude(written[0], READ_TOKEN);
     }),
   );
 });

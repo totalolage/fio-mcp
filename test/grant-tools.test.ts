@@ -10,6 +10,7 @@ import { McpProtocol, McpSchema } from "effect/ai";
 import { HttpServer } from "effect/http";
 import { toAccount, tokenFingerprint } from "../src/accounts.js";
 import { MCP_PROTOCOLS, SERVER_INFO, ToolsLive } from "../src/app.js";
+import type { AppConfigShape } from "../src/config.js";
 import { makeCacheToolkit } from "../src/mcp/cache-tools.js";
 import { makeFioToolkit } from "../src/mcp/fio-tools.js";
 import { ACCOUNTLESS_TOOLS, PAYMENT_TOOLS, SCOPE_PAYMENTS, SCOPE_READ } from "../src/mcp/permissions.js";
@@ -52,9 +53,11 @@ const config: HttpTransportConfig = {
   trustedProxies: [],
 };
 
-const startServer = Effect.fnUntraced(function* () {
+const startServer = Effect.fnUntraced(function* (overrides: Partial<AppConfigShape> = {}) {
   const release = yield* Deferred.make<void>();
-  const app = serveHttp(ToolsLive, FakeAuth, SERVER_INFO, config).pipe(Layer.provide(testServices(testConfig(config), release)));
+  const app = serveHttp(ToolsLive, FakeAuth, SERVER_INFO, config).pipe(
+    Layer.provide(testServices({ ...testConfig(config), ...overrides }, release)),
+  );
   const context = yield* Layer.build(app);
   const address = Context.get(context, HttpServer.HttpServer).address;
   const port = "port" in address ? address.port : 0;
@@ -166,7 +169,7 @@ describe("tools/list follows the HTTP session's grant", () => {
       const bob = yield* connect(base, "bob");
       const calls = {
         preview_payment_orders: { account: "main", orders: [ORDER] },
-        submit_payment_orders: { account: "main", orders: [ORDER], confirm: true },
+        submit_payment_orders: { account: "main", orders: [ORDER], confirm: true, idempotencyKey: "grant-test-key-0001" },
       };
       assert.deepStrictEqual(Object.keys(calls).sort(), [...PAYMENT_TOOLS].sort());
       for (const [name, args] of Object.entries(calls)) {
@@ -208,7 +211,7 @@ describe("tools/list follows the HTTP session's grant", () => {
             assert.deepStrictEqual(tool.inputSchema.properties?.account, { type: "string", enum: ["main"], description: "Name of the account to use." }, tool.name);
           }
         }
-        const hidden = yield* call(alice.client, "submit_payment_orders", { account: "main", orders: [ORDER], confirm: true });
+        const hidden = yield* call(alice.client, "submit_payment_orders", { account: "main", orders: [ORDER], confirm: true, idempotencyKey: "grant-test-key-0001" });
         assert.isTrue(hidden.isError);
         assert.match(hidden.text, DENIED);
         const bob = yield* connect(base, "bob", protocol.protocolVersion);
@@ -216,6 +219,39 @@ describe("tools/list follows the HTTP session's grant", () => {
       }).pipe(Effect.scoped),
     );
   }
+});
+
+describe("FIO_MCP_MARKER_TOOLS (SEC-10)", () => {
+  const MARKER = ["get_new_transactions", "set_download_marker"];
+
+  it.live("disabled: the marker tools are listed for no grant, and a call by name is refused", () =>
+    Effect.gen(function* () {
+      const base = yield* startServer({ markerTools: "disabled" });
+      const bob = yield* connect(base, "bob");
+      const listed = namesOf(yield* list(bob.client));
+      assert.deepStrictEqual(
+        listed,
+        ALL_TOOLS.filter((name) => !MARKER.includes(name)),
+      );
+      for (const [name, args] of [
+        ["get_new_transactions", { account: "main" }],
+        ["set_download_marker", { account: "main", movementId: 1 }],
+      ] as const) {
+        const denied = yield* call(bob.client, name, args);
+        assert.isTrue(denied.isError, name);
+        assert.match(denied.text, DENIED, name);
+      }
+    }).pipe(Effect.scoped),
+  );
+
+  it.live("enabled (the default): both marker tools are listed", () =>
+    Effect.gen(function* () {
+      const base = yield* startServer();
+      const alice = yield* connect(base, "alice");
+      const listed = namesOf(yield* list(alice.client));
+      for (const name of MARKER) assert.include(listed, name);
+    }).pipe(Effect.scoped),
+  );
 });
 
 describe("grantedTools", () => {

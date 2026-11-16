@@ -44,8 +44,11 @@ export const DEFAULT_THROTTLE: ThrottlePolicy = {
 export type LoginResult<A = Redacted.Redacted<PasswordHash>> =
   | { readonly _tag: "Accepted"; readonly value: A }
   | { readonly _tag: "Rejected" }
-  /** Too many failures from this address, or another check is running; try again later. */
-  | { readonly _tag: "Throttled"; readonly retryAfterSeconds: number }
+  /**
+   * Too many failures from this address, or (`busy`) another check is
+   * running; try again later. A busy attempt is not counted as a failure.
+   */
+  | { readonly _tag: "Throttled"; readonly retryAfterSeconds: number; readonly busy?: true }
   /** The expected hash could not be read (logged); nothing was checked or counted. */
   | { readonly _tag: "Unavailable" };
 
@@ -74,8 +77,31 @@ export interface LoginGuard {
     address: string,
     password: Redacted.Redacted<string>,
     accepted: (verified: Redacted.Redacted<PasswordHash>) => Effect.Effect<A, E>,
+    options?: AttemptOptions,
   ) => Effect.Effect<LoginResult<A>, E>;
+  /**
+   * A second factor on its own (no password), throttled, counted and
+   * one-at-a-time like a sign-in: false is a counted failure.
+   */
+  readonly attemptFactor: (address: string, factor: Effect.Effect<boolean>) => Effect.Effect<LoginResult<void>>;
 }
+
+export interface AttemptOptions {
+  /** Runs in the same permit after a correct password; false makes the attempt a counted failure. */
+  readonly secondFactor?: Effect.Effect<boolean> | undefined;
+  /**
+   * Success leaves the address's failure count as it is: the check did not
+   * cover every factor (a password-only check while a second factor is on),
+   * so it must not wipe the failures the second factor collected.
+   */
+  readonly keepFailures?: boolean | undefined;
+}
+
+/** What a guarded check found; `Wrong` is counted as a failure. */
+type Verdict<V> =
+  | { readonly _tag: "Verified"; readonly value: V }
+  | { readonly _tag: "Wrong"; readonly secondFactor: boolean }
+  | { readonly _tag: "Unavailable" };
 
 /**
  * `expected` is read for every check: the admin password can change while
@@ -112,30 +138,30 @@ export const makeLoginGuard = Effect.fn("LoginGuard.make")(function* (
     return entry;
   };
 
-  const check = Effect.fnUntraced(function* <A, E>(
+  /** Runs `judge` behind the address's throttle, counting `Wrong`; `accepted` follows a `Verified`. */
+  const check = Effect.fnUntraced(function* <V, A, E>(
     address: string,
-    password: Redacted.Redacted<string>,
-    accepted: (verified: Redacted.Redacted<PasswordHash>) => Effect.Effect<A, E>,
+    judge: Effect.Effect<Verdict<V>>,
+    accepted: (value: V) => Effect.Effect<A, E>,
+    keepFailures: boolean,
   ): Effect.fn.Return<LoginResult<A>, E> {
     const before = yield* Clock.currentTimeMillis;
     const entry = current(address, before);
     if (entry !== undefined && entry.nextAllowedAt > before) {
       return { _tag: "Throttled", retryAfterSeconds: Math.ceil((entry.nextAllowedAt - before) / 1000) } satisfies LoginResult<A>;
     }
-    const hash = yield* Effect.result(expected);
-    if (Result.isFailure(hash)) {
-      yield* Effect.logError("admin password: the expected hash could not be read; sign-in is refused until it is fixed");
-      return { _tag: "Unavailable" } satisfies LoginResult<A>;
-    }
-    const ok = yield* verify(password, Redacted.value(hash.success)).pipe(Effect.orElseSucceed(() => false));
+    const verdict = yield* judge;
+    if (verdict._tag === "Unavailable") return { _tag: "Unavailable" } satisfies LoginResult<A>;
     const now = yield* Clock.currentTimeMillis;
-    if (ok) {
-      failures.delete(address);
-      return { _tag: "Accepted", value: yield* accepted(hash.success) } satisfies LoginResult<A>;
+    if (verdict._tag === "Verified") {
+      if (!keepFailures) failures.delete(address);
+      return { _tag: "Accepted", value: yield* accepted(verdict.value) } satisfies LoginResult<A>;
     }
     const failed = recordFailure(address, now);
     const wait = failed.nextAllowedAt - now;
     const tracked = failures.size;
+    // A wrong code after a right password means the password is known: say so (no address, no code).
+    if (verdict.secondFactor) yield* Effect.logWarning("oauth: admin second-factor code wrong, missing or reused");
     yield* failed.count >= policy.lockoutFailures
       ? Effect.logWarning(
           `oauth: admin login failed ${failed.count} times in a row from one address; it is locked out for ${Math.ceil(wait / 1000)} s (${tracked} addresses with recent failures)`,
@@ -146,20 +172,56 @@ export const makeLoginGuard = Effect.fn("LoginGuard.make")(function* (
     return { _tag: "Rejected" } satisfies LoginResult<A>;
   });
 
+  /** The password against the expected hash, then `secondFactor` if given. */
+  const verifyPasswordThen = (
+    password: Redacted.Redacted<string>,
+    secondFactor: Effect.Effect<boolean> | undefined,
+  ): Effect.Effect<Verdict<Redacted.Redacted<PasswordHash>>> =>
+    Effect.gen(function* () {
+      const hash = yield* Effect.result(expected);
+      if (Result.isFailure(hash)) {
+        yield* Effect.logError("admin password: the expected hash could not be read; sign-in is refused until it is fixed");
+        return { _tag: "Unavailable" } as const;
+      }
+      const ok = yield* verify(password, Redacted.value(hash.success)).pipe(Effect.orElseSucceed(() => false));
+      if (!ok) return { _tag: "Wrong", secondFactor: false } as const;
+      if (secondFactor !== undefined && !(yield* secondFactor)) return { _tag: "Wrong", secondFactor: true } as const;
+      return { _tag: "Verified", value: hash.success } as const;
+    });
+
+  /** Another check holds the permit: turned away at once, not counted. */
+  const busy = <A>(): LoginResult<A> => ({ _tag: "Throttled", retryAfterSeconds: 1, busy: true });
+
   // Uninterruptible once admitted: scrypt keeps running natively after an
   // interruption (a dropped connection), so the permit is held and the
   // failure counted until it ends.
+  const guarded = <V, A, E>(
+    address: string,
+    judge: Effect.Effect<Verdict<V>>,
+    accepted: (value: V) => Effect.Effect<A, E>,
+    keepFailures = false,
+  ): Effect.Effect<LoginResult<A>, E> =>
+    lock.withPermitsIfAvailable(1)(Effect.uninterruptible(check(address, judge, accepted, keepFailures))).pipe(
+      Effect.map(Option.getOrElse(() => busy<A>())),
+    );
+
   const attemptThen = <A, E>(
     address: string,
     password: Redacted.Redacted<string>,
     accepted: (verified: Redacted.Redacted<PasswordHash>) => Effect.Effect<A, E>,
+    options: AttemptOptions = {},
   ): Effect.Effect<LoginResult<A>, E> =>
-    lock.withPermitsIfAvailable(1)(Effect.uninterruptible(check(address, password, accepted))).pipe(
-      Effect.map(Option.getOrElse((): LoginResult<A> => ({ _tag: "Throttled", retryAfterSeconds: 1 }))),
-    );
+    guarded(address, verifyPasswordThen(password, options.secondFactor), accepted, options.keepFailures === true);
 
   const attempt = (address: string, password: Redacted.Redacted<string>): Effect.Effect<LoginResult> =>
     attemptThen(address, password, Effect.succeed);
 
-  return { attempt, attemptThen } satisfies LoginGuard;
+  const attemptFactor = (address: string, factor: Effect.Effect<boolean>): Effect.Effect<LoginResult<void>> =>
+    guarded(
+      address,
+      Effect.map(factor, (ok): Verdict<void> => (ok ? { _tag: "Verified", value: undefined } : { _tag: "Wrong", secondFactor: true })),
+      () => Effect.void,
+    );
+
+  return { attempt, attemptThen, attemptFactor } satisfies LoginGuard;
 });

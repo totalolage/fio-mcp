@@ -4,9 +4,12 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { Clock, Effect, Option, Redacted } from "effect";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { tokenFingerprint } from "../src/accounts.js";
+import { totpCode } from "../src/admin/totp.js";
 import { hashSecret, randomSecret } from "../src/oauth/crypto.js";
 import { DEFAULT_THROTTLE } from "../src/oauth/login.js";
 import { LIMITS } from "../src/oauth/server.js";
+import { DEFAULT_GRANT_PAYMENTS } from "../src/payment-limits.js";
+import { TRUSTED_PROXIES_EMPTY_WARNING } from "../src/transport/auth.js";
 import { MAX_BODY_BYTES, MAX_CONCURRENT_REQUESTS, SESSION_LIMITS } from "../src/transport/http.js";
 import {
   authorizationUrl,
@@ -14,6 +17,7 @@ import {
   Browser,
   codeFor,
   csrfOf,
+  DEFAULT_PAYMENT_FORM,
   LOOPBACK_REDIRECT,
   type OAuthHarness,
   PASSWORD,
@@ -122,7 +126,7 @@ describe("OAuth end to end with the MCP SDK client", () => {
     expect(text(preview)).toContain("fio:payments");
     const submit = (await client.callTool({
       name: "submit_payment_orders",
-      arguments: { account: "main", orders: [ORDER], confirm: true },
+      arguments: { account: "main", orders: [ORDER], confirm: true, idempotencyKey: "oauth-test-key-0001" },
     })) as CallToolResult;
     expect(submit.isError).toBe(true);
     expect(text(submit)).toMatch(/^You don't have permissions to do that\./);
@@ -236,6 +240,7 @@ describe("metadata and the /mcp challenge", () => {
           scopes: ["fio:read"],
           accountFingerprints: ["main"],
           resource: "https://other.example.test/mcp",
+          payments: DEFAULT_GRANT_PAYMENTS,
         };
         yield* store.createGrant(
           grant,
@@ -391,6 +396,124 @@ describe("metadata and the /mcp challenge", () => {
     });
     const fresh = String(refreshed.body.access_token);
     expect((await postMcp(harness, { authorization: `Bearer ${fresh}` })).status).toBe(200);
+  });
+});
+
+describe("network allowlist (FIO_MCP_ADMIN_ALLOWED_CIDRS)", () => {
+  const OUTSIDE = "192.0.2.1";
+  const INSIDE = "10.1.2.3";
+  /** The harness as seen from one client: these headers go with every request. */
+  const from = (headers: Record<string, string>): OAuthHarness => ({
+    ...harness,
+    fetch: (input, init) => {
+      const request = new Request(input, init);
+      for (const [name, value] of Object.entries(headers)) request.headers.set(name, value);
+      return harness.fetch(request);
+    },
+  });
+  const restart = async (options: Parameters<typeof startOAuth>[0]) => {
+    await harness.close();
+    harness = await startOAuth(options);
+  };
+  const send = (client: OAuthHarness, method: string, path: string) =>
+    client.fetch(`${PUBLIC_URL}${path}`, method === "POST" ? { method, headers: { "content-type": "application/x-www-form-urlencoded" }, body: "" } : { method });
+  const expectHidden = async (response: Response) => {
+    expect(response.status).toBe(404);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(await response.text()).toBe("");
+  };
+
+  it("answers 404 without a body to clients outside the list on /admin and the sign-in pages, in every spelling", async () => {
+    await restart({ allowedNetworks: ["10.0.0.0/8"] });
+    const outside = from({ [PEER_HEADER]: OUTSIDE });
+    const routes: ReadonlyArray<readonly [string, string]> = [
+      ["GET", "/admin"],
+      ["GET", "/admin/login"],
+      ["HEAD", "/admin/login"],
+      ["GET", "/authorize"],
+      ["GET", "/login"],
+      ["POST", "/login"],
+      ["GET", "/consent"],
+      ["POST", "/consent"],
+      ["GET", "/ADMIN"],
+      ["GET", "//admin"],
+      ["GET", "/%61dmin"],
+    ];
+    for (const [method, path] of routes) await expectHidden(await send(outside, method, path));
+    // The same spellings reach the admin UI from inside, so the route itself refused them.
+    const inside = from({ [PEER_HEADER]: INSIDE });
+    for (const path of ["/admin", "/ADMIN", "//admin", "/%61dmin"]) {
+      const response = await send(inside, "GET", path);
+      expect(response.status, path).toBe(303);
+      expect(response.headers.get("location")).toBe("/admin/login");
+    }
+    // Without a known peer address the client is outside.
+    await expectHidden(await send(harness, "GET", "/admin/login"));
+  });
+
+  it("never affects /mcp, /token, /register, /revoke, metadata or /healthz", async () => {
+    await restart({ allowedNetworks: ["10.0.0.0/8"] });
+    const outside = from({ [PEER_HEADER]: OUTSIDE });
+    const mcp = await postMcp(outside);
+    expect(mcp.status).toBe(401);
+    expect(mcp.headers.get("www-authenticate")).toBe(CHALLENGE);
+    expect((await register(outside, [LOOPBACK_REDIRECT])).response.status).toBe(201);
+    // The token endpoint answers (invalid_client), not 404.
+    expect((await tokenRequest(outside, { grant_type: "authorization_code" })).response.status).toBe(401);
+    const revoke = await outside.fetch(`${PUBLIC_URL}/revoke`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: "token=unknown",
+    });
+    expect(revoke.status).not.toBe(404);
+    expect((await send(outside, "GET", "/.well-known/oauth-authorization-server")).status).toBe(200);
+    expect((await send(outside, "GET", "/.well-known/oauth-protected-resource/mcp")).status).toBe(200);
+    expect((await send(outside, "GET", "/healthz")).status).toBe(200);
+  });
+
+  it("lets clients inside the list through the whole sign-in flow and logs only the number of networks", async () => {
+    await restart({ allowedNetworks: ["10.0.0.0/8", "198.51.100.7"] });
+    const inside = from({ [PEER_HEADER]: INSIDE });
+    const { access } = await tokensFor(inside);
+    expect((await postMcp(inside, { authorization: `Bearer ${access}` })).status).toBe(200);
+    const logged = harness.logs.join("\n");
+    expect(logged).toContain("FIO_MCP_ADMIN_ALLOWED_CIDRS: /admin and the sign-in pages accept 2 network(s)");
+    expect(logged).not.toContain("10.0.0.0");
+    expect(logged).not.toContain("198.51.100.7");
+  });
+
+  it("follows a trusted proxy's X-Forwarded-For, never a forged leftmost entry or an untrusted peer's", async () => {
+    await restart({ allowedNetworks: ["10.0.0.0/8"], trustedProxies: ["172.18.0.0/16"] });
+    const via = (peer: string, forwardedFor: string) => from({ [PEER_HEADER]: peer, "x-forwarded-for": forwardedFor });
+    expect((await send(via("172.18.0.2", INSIDE), "GET", "/admin/login")).status).toBe(200);
+    expect((await send(via("172.18.0.2", `${OUTSIDE}, 172.18.0.3`), "GET", "/admin/login")).status).toBe(404);
+    // The client wrote the leftmost entry; the proxy appended the real address.
+    await expectHidden(await send(via("172.18.0.2", `${INSIDE}, ${OUTSIDE}`), "GET", "/admin/login"));
+    await expectHidden(await send(via("172.18.0.2", `${INSIDE}, ${OUTSIDE}`), "GET", "/login"));
+    // An untrusted peer's header is ignored.
+    await expectHidden(await send(via(OUTSIDE, INSIDE), "GET", "/admin/login"));
+  });
+});
+
+describe("trusted proxy startup warning", () => {
+  it("warns when FIO_MCP_TRUSTED_PROXIES is empty and not when it is set", async () => {
+    expect((await harness.fetch(`${PUBLIC_URL}/healthz`)).status).toBe(200);
+    expect(harness.logs.join("\n")).toContain(TRUSTED_PROXIES_EMPTY_WARNING);
+    await harness.close();
+    harness = await startOAuth({ trustedProxies: ["172.18.0.0/16"] });
+    expect((await harness.fetch(`${PUBLIC_URL}/healthz`)).status).toBe(200);
+    expect(harness.logs.join("\n")).not.toContain("FIO_MCP_TRUSTED_PROXIES is empty");
+  });
+
+  it("warns once per listener about X-Forwarded-For from an untrusted peer", async () => {
+    const forwarded = (peer: string) =>
+      harness.fetch(`${PUBLIC_URL}/.well-known/oauth-authorization-server`, {
+        headers: { [PEER_HEADER]: peer, "x-forwarded-for": "198.51.100.7" },
+      });
+    for (const peer of ["203.0.113.9", "203.0.113.10", "203.0.113.11"]) expect((await forwarded(peer)).status).toBe(200);
+    const warnings = harness.logs.filter((line) => line.includes("X-Forwarded-For received from an untrusted peer"));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).not.toMatch(/203\.0\.113|198\.51\.100/);
   });
 });
 
@@ -679,6 +802,152 @@ describe("login and consent pages", () => {
     expect(await login(via("10.9.9.9", "192.0.2.3"), PASSWORD)).toBe(429);
     expect(harness.logs.join("\n")).not.toMatch(/203\.0\.113\.9|10\.9\.9\.9|172\.18\./);
   });
+
+  /** A signed-in consent page for a new client asking for `scope`. */
+  const consentFor = async (scope: string) => {
+    const { body } = await register(harness, [LOOPBACK_REDIRECT]);
+    const clientId = String(body.client_id);
+    const { verifier, challenge } = pkcePair();
+    const browser = new Browser(harness);
+    await browser.get(
+      authorizationUrl({
+        response_type: "code",
+        client_id: clientId,
+        redirect_uri: LOOPBACK_REDIRECT,
+        code_challenge: challenge,
+        code_challenge_method: "S256",
+        resource: RESOURCE,
+        state: "s",
+        scope,
+      }),
+    );
+    const csrf = await csrfOf(await browser.get("/login"));
+    expect((await browser.post("/login", { csrf, password: PASSWORD })).status).toBe(303);
+    const html = await (await browser.get("/consent")).text();
+    return { browser, clientId, verifier, html };
+  };
+
+  type ConsentFlow = Awaited<ReturnType<typeof consentFor>>;
+
+  /** Approves the form last shown (`html`) with both accounts and `fields`. */
+  const approve = (flow: ConsentFlow, html: string, fields: Record<string, string | ReadonlyArray<string>>) =>
+    flow.browser.post("/consent", {
+      csrf: /name="csrf" value="([^"]+)"/.exec(html)?.[1] ?? "",
+      form: /name="form" value="([^"]+)"/.exec(html)?.[1] ?? "",
+      decision: "approve",
+      account: ["main", "savings"],
+      ...DEFAULT_PAYMENT_FORM,
+      ...fields,
+    });
+
+  /** The granted scope after redeeming the code the consent redirect carries. */
+  const grantedScope = async (flow: ConsentFlow, response: Response) => {
+    expect(response.status).toBe(303);
+    const code = new URL(response.headers.get("location") ?? "").searchParams.get("code") ?? "";
+    const { body } = await tokenRequest(harness, {
+      grant_type: "authorization_code",
+      client_id: flow.clientId,
+      code,
+      redirect_uri: LOOPBACK_REDIRECT,
+      code_verifier: flow.verifier,
+      resource: RESOURCE,
+    });
+    return body.scope;
+  };
+
+  const grantOf = async (clientId: string) => {
+    const grants = await harness.store((store) => store.listGrants(harness.clock.currentTimeMillisUnsafe()));
+    return grants.find((grant) => grant.clientId === clientId);
+  };
+
+  /** The payments checkbox tag. */
+  const paymentsBox = (html: string) => /<input[^>]*value="fio:payments"[^>]*>/.exec(html)?.[0] ?? "";
+
+  it("never pre-ticks payments and explains them when the client asks for them", async () => {
+    const flow = await consentFor("fio:read fio:payments");
+    expect(paymentsBox(flow.html)).not.toBe("");
+    expect(paymentsBox(flow.html)).not.toContain("checked");
+    expect(flow.html).toContain("create real batches at FIO that must still be signed in Internetbanking");
+    expect(flow.html).toContain("payment limits and payee allowlist");
+    // The settings are pre-filled with the server defaults; enforce is recommended.
+    expect(flow.html).toContain('name="payMaxPerOrder" value="CZK:50000,EUR:2000"');
+    expect(flow.html).toContain('name="payMaxPerDay" value="CZK:100000,EUR:4000"');
+    expect(flow.html).toContain('name="payMaxOrdersPerDay" value="20"');
+    expect(flow.html).toMatch(/name="payAllowlistMode" value="off" checked/);
+    expect(flow.html).toContain("Recommended for AI agents");
+    // Without the request there is no notice, and the box can still be ticked.
+    const plain = await consentFor("fio:read");
+    expect(plain.html).not.toContain("create real batches at FIO");
+    expect(paymentsBox(plain.html)).not.toContain("checked");
+    expect(paymentsBox(plain.html)).not.toContain("disabled");
+  });
+
+  it("grants fio:payments only when the box is ticked", async () => {
+    const flow = await consentFor("fio:read fio:payments");
+    expect(await grantedScope(flow, await approve(flow, flow.html, {}))).toBe("fio:read");
+    expect((await grantOf(flow.clientId))?.payments).toEqual(DEFAULT_GRANT_PAYMENTS);
+  });
+
+  it("stores the limits and allowlist submitted with the ticked box", async () => {
+    const flow = await consentFor("fio:read fio:payments");
+    const response = await approve(flow, flow.html, {
+      scope: "fio:payments",
+      payMaxPerOrder: "CZK:1000",
+      payMaxPerDay: " CZK:5000.50 ",
+      payMaxOrdersPerDay: "3",
+      payAllowlistMode: "enforce",
+      payAllowlist: "de89 3704 0044 0532 0130 00, Supplier\n000123-0000456/0800",
+    });
+    expect(await grantedScope(flow, response)).toBe("fio:read fio:payments");
+    expect((await grantOf(flow.clientId))?.payments).toEqual({
+      limits: { maxPerOrder: { CZK: 1000 }, maxPerDay: { CZK: 5000.5 }, maxOrdersPerDay: 3 },
+      allowlist: {
+        mode: "enforce",
+        entries: [{ account: "DE89370400440532013000", label: "Supplier" }, { account: "123-456/0800" }],
+      },
+    });
+  });
+
+  it("refuses payment limits above the ceiling or invalid, keeping the owner's values", async () => {
+    const flow = await consentFor("fio:read fio:payments");
+    const above = await approve(flow, flow.html, { scope: "fio:payments", payMaxPerOrder: "CZK:60000" });
+    expect(above.status).toBe(400);
+    const html = await above.text();
+    expect(html).toContain("above the server ceiling");
+    expect(html).toContain('name="payMaxPerOrder" value="CZK:60000"');
+    expect(paymentsBox(html)).toContain("checked");
+    const invalid = await approve(flow, html, { scope: "fio:payments", payMaxOrdersPerDay: "0", payAllowlist: "not an account" });
+    expect(invalid.status).toBe(400);
+    const second = await invalid.text();
+    expect(second).toContain("Maximum orders per day");
+    expect(second).toContain("Line 1");
+    // Nothing was granted; the corrected form goes through.
+    expect(await grantOf(flow.clientId)).toBeUndefined();
+    const fixed = await approve(flow, second, { scope: "fio:payments", payMaxPerOrder: "EUR:100", payMaxPerDay: "EUR:100" });
+    expect(await grantedScope(flow, fixed)).toBe("fio:read fio:payments");
+    expect((await grantOf(flow.clientId))?.payments.limits?.maxPerOrder).toEqual({ EUR: 100 });
+  });
+
+  it("keeps the owner's own payments choice on a re-render after a conflict", async () => {
+    const flow = await consentFor("fio:read fio:payments");
+    // A form id the session never showed reads as changed accounts: 409.
+    const unticked = await approve(flow, flow.html.replace(/name="form" value="[^"]+"/, 'name="form" value="stale"'), {});
+    expect(unticked.status).toBe(409);
+    const untickedHtml = await unticked.text();
+    expect(paymentsBox(untickedHtml)).not.toContain("checked");
+    const ticked = await approve(flow, untickedHtml.replace(/name="form" value="[^"]+"/, 'name="form" value="stale"'), {
+      scope: "fio:payments",
+      payMaxOrdersPerDay: "7",
+    });
+    expect(ticked.status).toBe(409);
+    const tickedHtml = await ticked.text();
+    expect(paymentsBox(tickedHtml)).toContain("checked");
+    expect(tickedHtml).toContain('name="payMaxOrdersPerDay" value="7"');
+    // No accounts selected (400) keeps the choice as well.
+    const none = await approve(flow, tickedHtml, { account: [] });
+    expect(none.status).toBe(400);
+    expect(paymentsBox(await none.text())).not.toContain("checked");
+  });
 });
 
 describe("token endpoint", () => {
@@ -853,5 +1122,81 @@ describe("token endpoint", () => {
     expect((await revoke(owner.clientId, "fio_rt_unknown")).status).toBe(200);
     expect((await revoke(owner.clientId, owner.refresh)).status).toBe(200);
     expect((await postMcp(harness, { authorization: `Bearer ${owner.access}` })).status).toBe(401);
+  });
+});
+
+describe("admin TOTP second factor at /login (SEC-03)", () => {
+  const SECRET = new TextEncoder().encode("12345678901234567890");
+  /** The code for the server clock's current step, `steps` away. */
+  const codeNow = (steps = 0) => totpCode(SECRET, Math.floor(harness.clock.currentTimeMillisUnsafe() / 1000) + steps * 30);
+  /** A 6-digit code none of the accepted steps has. */
+  const wrongCode = () => {
+    const valid = new Set([codeNow(-1), codeNow(), codeNow(1)]);
+    return ["000000", "111111", "222222", "333333"].find((code) => !valid.has(code)) ?? "444444";
+  };
+  const loginForm = async () => {
+    const { body } = await register(harness, [LOOPBACK_REDIRECT], "TOTP client");
+    const browser = new Browser(harness);
+    await browser.get(
+      authorizationUrl({
+        response_type: "code",
+        client_id: String(body.client_id),
+        redirect_uri: LOOPBACK_REDIRECT,
+        code_challenge: pkcePair().challenge,
+        code_challenge_method: "S256",
+        resource: RESOURCE,
+      }),
+    );
+    const page = await browser.get("/login");
+    const html = await page.text();
+    const csrf = /name="csrf" value="([^"]+)"/.exec(html)?.[1] ?? "";
+    return { browser, csrf, html };
+  };
+
+  it("shows no code field when the secret is not configured", async () => {
+    const { html } = await loginForm();
+    expect(html).not.toContain('name="totp"');
+  });
+
+  it("needs a current, unused code with the password and counts a wrong or missing one", async () => {
+    await harness.close();
+    harness = await startOAuth({ throttle: { ...DEFAULT_THROTTLE, freeFailures: 1 }, totpSecret: Redacted.make(SECRET) });
+    const { browser, csrf, html } = await loginForm();
+    expect(html).toContain('name="totp"');
+    expect(html).toContain('autocomplete="one-time-code"');
+
+    const missing = await browser.post("/login", { csrf, password: PASSWORD });
+    expect(missing.status).toBe(401);
+    expect(await missing.text()).toContain("Wrong password or code.");
+    expect((await browser.post("/login", { csrf, password: PASSWORD, totp: wrongCode() })).status).toBe(401);
+    // Both counted: the second failure started the backoff, even for a correct code.
+    const throttled = await browser.post("/login", { csrf, password: PASSWORD, totp: codeNow() });
+    expect(throttled.status).toBe(429);
+    expect(await throttled.text()).toContain("Too many failed attempts");
+    harness.clock.advance(1000);
+
+    const code = codeNow();
+    expect((await browser.post("/login", { csrf, password: PASSWORD, totp: code })).status).toBe(303);
+    // The same code again, in another sign-in: refused.
+    const other = await loginForm();
+    expect((await other.browser.post("/login", { csrf: other.csrf, password: PASSWORD, totp: code })).status).toBe(401);
+    expect(harness.logs.join("\n")).toContain("second-factor code wrong, missing or reused");
+    expect(harness.logs.join("\n")).not.toContain(code);
+  });
+
+  it("answers a sign-in that finds another check running as busy, with retry-after 1 (SEC-09)", async () => {
+    await harness.close();
+    // Nothing is locked out here: every 429 must be the busy answer.
+    harness = await startOAuth({ throttle: { ...DEFAULT_THROTTLE, freeFailures: 100, lockoutFailures: 200 } });
+    const forms = await Promise.all(Array.from({ length: 8 }, () => loginForm()));
+    let busy: Response | undefined;
+    for (let round = 0; round < 5 && busy === undefined; round++) {
+      const responses = await Promise.all(forms.map(({ browser, csrf }) => browser.post("/login", { csrf, password: "wrong password!" })));
+      for (const response of responses) expect([401, 429]).toContain(response.status);
+      busy = responses.find((response) => response.status === 429);
+    }
+    if (busy === undefined) throw new Error("no sign-in was turned away as busy in 5 rounds");
+    expect(busy.headers.get("retry-after")).toBe("1");
+    expect(await busy.text()).toContain("Sign-in busy, try again.");
   });
 });

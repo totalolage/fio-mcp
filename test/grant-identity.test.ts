@@ -6,6 +6,7 @@ import { type Account, toAccount } from "../src/accounts.js";
 import { migrate, SERVER_MIGRATIONS } from "../src/cache/db.js";
 import { requireAccount, visibleAccounts } from "../src/mcp/permissions.js";
 import { makeOAuthStore } from "../src/oauth/store.js";
+import { DEFAULT_GRANT_PAYMENTS } from "../src/payment-limits.js";
 import { CurrentPrincipal, type Principal } from "../src/transport/principal.js";
 import { PAY_TOKEN, READ_TOKEN } from "./fixtures.js";
 import { memoryDatabase } from "./support/database.js";
@@ -36,6 +37,7 @@ const grantFor = Effect.fnUntraced(function* (accounts: ReadonlyArray<Account>) 
     scopes: ["fio:read"],
     accountFingerprints: accounts.map((a) => a.tokenFingerprint),
     resource: RESOURCE,
+    payments: DEFAULT_GRANT_PAYMENTS,
   };
   yield* store.createGrant(grant, { codeHash: "code_identity", clientId, redirectUri: "https://a.example/cb", codeChallenge: "x", expiresAt: now + 60_000 }, now);
   yield* store.insertTokens(grant.grantId, {

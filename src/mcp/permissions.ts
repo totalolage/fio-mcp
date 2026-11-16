@@ -33,6 +33,23 @@ export const PAYMENTS: ReadonlyArray<string> = [SCOPE_READ, SCOPE_PAYMENTS];
 /** Tools that need fio:payments; their handlers check PAYMENTS. */
 export const PAYMENT_TOOLS: ReadonlySet<string> = new Set(["preview_payment_orders", "submit_payment_orders"]);
 
+/**
+ * Tools that move the token's download marker in the bank (state shared with
+ * any other program using the token). FIO_MCP_MARKER_TOOLS=disabled leaves
+ * them out (SEC-10); a call by name then fails with PermissionDenied.
+ */
+export const MARKER_TOOLS: ReadonlySet<string> = new Set(["get_new_transactions", "set_download_marker"]);
+
+/** Fails when FIO_MCP_MARKER_TOOLS=disabled. */
+export const requireMarkerTools = (config: { readonly markerTools?: "enabled" | "disabled" }) =>
+  config.markerTools === "disabled"
+    ? Effect.fail(
+        new PermissionDenied({
+          detail: "The download-marker tools are disabled on this server (FIO_MCP_MARKER_TOOLS=disabled).",
+        }),
+      )
+    : Effect.void;
+
 /** Tools that act on no single account. Every other tool takes one. */
 export const ACCOUNTLESS_TOOLS: ReadonlySet<string> = new Set(["get_server_status", "get_cache_status"]);
 

@@ -19,14 +19,19 @@ import { HttpRouter, HttpServer, HttpServerRequest } from "effect/http";
 import type { SqlClient } from "effect/sql";
 import { AccountChangesLive } from "../../src/account-runtime.js";
 import { Accounts, type AccountsShape } from "../../src/accounts.js";
-import { AdminPassword } from "../../src/admin/password.js";
-import { AdminLive } from "../../src/admin/server.js";
+import { AdminPassword, type AdminPasswordShape } from "../../src/admin/password.js";
+import { AdminLive, adminRoutes, type SecondFactorCheck } from "../../src/admin/server.js";
 import { SERVER_INFO, ToolsLive } from "../../src/app.js";
 import { SERVER_MIGRATIONS } from "../../src/cache/db.js";
 import { type AppConfigShape, accountSeedOf, type HttpAuthConfig } from "../../src/config.js";
+import type { FioApiShape } from "../../src/fio-api.js";
 import { hashPassword, type PasswordHash, parsePasswordHash } from "../../src/oauth/crypto.js";
 import type { ThrottlePolicy } from "../../src/oauth/login.js";
 import { makeOAuthStore, type OAuthStore } from "../../src/oauth/store.js";
+import { PaymentControls, type PaymentControlsShape } from "../../src/payment-controls.js";
+import { PAYMENT_FIELDS, paymentFormValues } from "../../src/payment-form.js";
+import { PaymentLedger } from "../../src/payment-ledger.js";
+import { DEFAULT_GRANT_PAYMENTS, DEFAULT_PAYMENT_LIMITS, type PaymentLimits } from "../../src/payment-limits.js";
 import { Auth } from "../../src/transport/auth.js";
 import { parseTrustedProxy } from "../../src/transport/client-address.js";
 import { type HttpTransportConfig, httpRouterApp } from "../../src/transport/http.js";
@@ -88,23 +93,65 @@ export interface OAuthHarness {
   readonly close: () => Promise<void>;
 }
 
+/** The in-process harness, which also reaches the server's payment controls. */
+export interface InProcessHarness extends OAuthHarness {
+  /** Runs an operation on the server's payment controls, on the harness clock. */
+  readonly payments: <A, E>(f: (controls: PaymentControlsShape) => Effect.Effect<A, E>) => Promise<A>;
+}
+
 /** Requests carrying this header appear to come from that socket peer address. */
 export const PEER_HEADER = "x-test-peer";
+
+const adminPasswordLayer = <E, R>(
+  real: Layer.Layer<AdminPassword, E, R>,
+  wrap: ((real: AdminPasswordShape) => AdminPasswordShape) | undefined,
+): Layer.Layer<AdminPassword, E, R> =>
+  wrap === undefined
+    ? real
+    : Layer.effect(
+        AdminPassword,
+        Effect.gen(function* () {
+          return AdminPassword.of(wrap(yield* AdminPassword));
+        }),
+      ).pipe(Layer.provide(real));
 
 export async function startOAuth(
   options: {
     throttle?: ThrottlePolicy;
     trustedProxies?: ReadonlyArray<string>;
+    /** FIO_MCP_ADMIN_ALLOWED_CIDRS entries. */
+    allowedNetworks?: ReadonlyArray<string>;
+    /** More admin routes, registered behind the same restriction as AdminLive's (adminRoutes). */
+    extraAdminRoutes?: Layer.Layer<never, never, HttpRouter.HttpRouter>;
     /** A database file instead of memory (survives `close`, for restart tests). */
     dbPath?: string;
     /** The accounts FIO_TOKEN / FIO_ACCOUNTS would configure (default: main and savings). */
     configured?: AppConfigShape["accounts"];
+    /** FIO_MCP_ADMIN_TOTP_SECRET_FILE's secret: sign-ins then need a code too. */
+    totpSecret?: Redacted.Redacted<Uint8Array>;
+    /** Replaces parts of the real AdminPassword, for outcomes a test cannot reach by timing (e.g. busy). */
+    adminPassword?: (real: AdminPasswordShape) => AdminPasswordShape;
+    /** Server payment defaults and ceilings (default DEFAULT_PAYMENT_LIMITS). */
+    paymentLimits?: PaymentLimits;
+    /** FioApi methods beyond the slot-holding fake (e.g. importXml for payment uploads). */
+    fio?: Partial<FioApiShape>;
+    /** Replaces the admin's second-factor check of payment approvals. */
+    secondFactor?: SecondFactorCheck;
   } = {},
-): Promise<OAuthHarness> {
+): Promise<InProcessHarness> {
   const hash = await passwordHash();
   const trustedProxies = (options.trustedProxies ?? []).flatMap((entry) => parseTrustedProxy(entry) ?? []);
+  const allowedNetworks = (options.allowedNetworks ?? []).flatMap((entry) => parseTrustedProxy(entry) ?? []);
+  const adminSettings = { publicUrl: PUBLIC_URL, dataKey: DATA_KEY, trustedProxies, allowedNetworks };
   const accountSeed = accountSeedOf(options.configured ?? testConfig().accounts);
-  const auth: HttpAuthConfig = { kind: "oauth", publicUrl: PUBLIC_URL, passwordHash: Redacted.make(hash), dataKey: DATA_KEY, accountSeed };
+  const auth: HttpAuthConfig = {
+    kind: "oauth",
+    publicUrl: PUBLIC_URL,
+    passwordHash: Redacted.make(hash),
+    dataKey: DATA_KEY,
+    accountSeed,
+    totpSecret: options.totpSecret,
+  };
   const transport: HttpTransportConfig = {
     kind: "http",
     host: "127.0.0.1",
@@ -113,8 +160,9 @@ export async function startOAuth(
     allowedOrigins: [],
     allowedHosts: [],
     trustedProxies,
+    adminAllowedNetworks: allowedNetworks,
   };
-  const config = testConfig(transport);
+  const config = { ...testConfig(transport), paymentLimits: options.paymentLimits ?? DEFAULT_PAYMENT_LIMITS };
   const scope = await Effect.runPromise(Scope.make());
   const db: Context.Context<SqlClient.SqlClient> = await Effect.runPromise(
     Layer.buildWithScope(testDatabase(options.dbPath ?? ":memory:", SERVER_MIGRATIONS), scope),
@@ -127,13 +175,20 @@ export async function startOAuth(
   });
   // As Auth.Live builds it, with the test's throttling and scrypt parameters.
   const oauth = Layer.mergeAll(
-    Auth.oauth({ publicUrl: PUBLIC_URL, trustedProxies }),
-    AdminLive({ publicUrl: PUBLIC_URL, dataKey: DATA_KEY, trustedProxies }),
-  ).pipe(Layer.provide(AdminPassword.layer(Redacted.make(hash), options.throttle, FAST_SCRYPT)));
+    Auth.oauth({ publicUrl: PUBLIC_URL, trustedProxies, allowedNetworks }),
+    AdminLive({ ...adminSettings, secondFactor: options.secondFactor }),
+    options.extraAdminRoutes === undefined ? Layer.empty : adminRoutes(adminSettings, options.extraAdminRoutes),
+  ).pipe(Layer.provide(adminPasswordLayer(AdminPassword.layer(Redacted.make(hash), options.throttle, FAST_SCRYPT, options.totpSecret), options.adminPassword)));
   let accounts: AccountsShape | undefined;
   const captureAccounts = Layer.effectDiscard(
     Effect.map(Effect.service(Accounts), (service) => {
       accounts = service;
+    }),
+  );
+  let controls: PaymentControlsShape | undefined;
+  const captureControls = Layer.effectDiscard(
+    Effect.map(Effect.service(PaymentControls), (service) => {
+      controls = service;
     }),
   );
   // Request handlers run with the router's context, not the layer's: clock and logger are provided per request.
@@ -150,8 +205,22 @@ export async function startOAuth(
       ),
     { global: true },
   );
-  const app = httpRouterApp(Layer.mergeAll(ToolsLive, withClock, AccountChangesLive, captureAccounts), oauth, SERVER_INFO, transport).pipe(
-    Layer.provide(testServices(config, release, Accounts.stored(DATA_KEY, accountSeed))),
+  const app = httpRouterApp(
+    Layer.mergeAll(ToolsLive, withClock, AccountChangesLive, captureAccounts, captureControls),
+    oauth,
+    SERVER_INFO,
+    transport,
+  ).pipe(
+    // One instance for the tools and /admin, on the server database, as PaymentControls.Live shares it.
+    Layer.provide(
+      testServices(
+        config,
+        release,
+        Accounts.stored(DATA_KEY, accountSeed),
+        options.fio,
+        PaymentControls.Default.pipe(Layer.provideMerge(PaymentLedger.Default)),
+      ),
+    ),
     Layer.provide(Layer.succeedContext(db)),
     Layer.provide(HttpServer.layerServices),
     Layer.provide(Logger.layer([capture])),
@@ -170,6 +239,10 @@ export async function startOAuth(
     accounts: () => {
       if (accounts === undefined) throw new Error("the app has not started yet (make a request first)");
       return accounts;
+    },
+    payments: (f) => {
+      if (controls === undefined) throw new Error("the app has not started yet (make a request first)");
+      return Effect.runPromise(f(controls).pipe(Effect.provideService(Clock.Clock, clock)));
     },
     close: async () => {
       await web.dispose();
@@ -237,8 +310,24 @@ export const csrfOf = async (response: Response) => {
 export interface Consent {
   readonly accounts?: ReadonlyArray<string>;
   readonly payments?: boolean;
+  /** Payment settings fields overriding the pre-filled server defaults (sent with `payments`). */
+  readonly paymentSettings?: Readonly<Record<string, string>>;
   readonly decision?: "approve" | "deny";
+  /** The authentication code for /login, when the harness has a TOTP secret. */
+  readonly totp?: string;
 }
+
+/** The consent page's payment settings as pre-filled from DEFAULT_PAYMENT_LIMITS. */
+export const DEFAULT_PAYMENT_FORM: Readonly<Record<string, string>> = (() => {
+  const values = paymentFormValues(DEFAULT_GRANT_PAYMENTS, DEFAULT_PAYMENT_LIMITS);
+  return {
+    [PAYMENT_FIELDS.maxPerOrder]: values.maxPerOrder,
+    [PAYMENT_FIELDS.maxPerDay]: values.maxPerDay,
+    [PAYMENT_FIELDS.maxOrdersPerDay]: values.maxOrdersPerDay,
+    [PAYMENT_FIELDS.mode]: values.mode,
+    [PAYMENT_FIELDS.allowlist]: values.allowlist,
+  };
+})();
 
 /** Drives /authorize → /login → /consent and returns the redirect back to the client. */
 export async function authorizeInBrowser(harness: OAuthHarness, authorizationUrl: string | URL, consent: Consent = {}) {
@@ -248,7 +337,7 @@ export async function authorizeInBrowser(harness: OAuthHarness, authorizationUrl
     throw new Error(`authorize answered ${start.status} ${start.headers.get("location")}: ${await start.text()}`);
   }
   const csrf = await csrfOf(await browser.get("/login"));
-  const login = await browser.post("/login", { csrf, password: PASSWORD });
+  const login = await browser.post("/login", { csrf, password: PASSWORD, ...(consent.totp === undefined ? {} : { totp: consent.totp }) });
   if (login.status !== 303) throw new Error(`login answered ${login.status}`);
   const consentForm = await consentFormOf(await browser.get("/consent"));
   const done = await browser.post("/consent", {
@@ -256,6 +345,9 @@ export async function authorizeInBrowser(harness: OAuthHarness, authorizationUrl
     decision: consent.decision ?? "approve",
     account: consent.accounts ?? ["main", "savings"],
     scope: consent.payments === true ? ["fio:payments"] : [],
+    // The fields a browser submits as pre-filled (hidden unless the box is ticked).
+    ...DEFAULT_PAYMENT_FORM,
+    ...consent.paymentSettings,
   });
   if (done.status !== 303) throw new Error(`consent answered ${done.status}: ${await done.text()}`);
   return new URL(done.headers.get("location") ?? "");

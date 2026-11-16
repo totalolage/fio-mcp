@@ -6,6 +6,7 @@ import { makeCachedData, Transactions } from "../cache/service.js";
 import { ACCOUNT_NUMBER, CURRENCY, FIELD_RULES, TOKEN, validAccountName } from "../config.js";
 import type { CacheError, FioRequestError } from "../errors.js";
 import { FioApi } from "../fio-api.js";
+import { stripMarks } from "../mcp/untrusted.js";
 import { parseLastStatement } from "../statement.js";
 
 /**
@@ -218,7 +219,7 @@ export const makeAccountAdmin = Effect.fn("AccountAdmin.make")(function* (key: R
   const test = Effect.fn("AccountAdmin.test")(function* (accountId: string) {
     const account = yield* find(accountId);
     const body = yield* fio.lastStatement(account).pipe(
-      Effect.mapError((error: FioRequestError) => new TokenTestFailed({ reason: error.message })),
+      Effect.mapError((error: FioRequestError) => new TokenTestFailed({ reason: stripMarks(error.message) })),
     );
     const latest = parseLastStatement(body);
     return {

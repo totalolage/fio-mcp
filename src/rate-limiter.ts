@@ -99,6 +99,10 @@ interface TokenLimiter {
 const CONFLICT_REASON = "FIO returned HTTP 409 (the token was used elsewhere within the last 30 s).";
 const SECOND_CONFLICT_REASON = "FIO returned HTTP 409 twice; another client is probably using this token.";
 
+/** True when FIO itself refused the call with HTTP 409 (it processed nothing), not when the limiter held it back. */
+export const isConflictRefusal = (error: RateLimited): boolean =>
+  error.reason === CONFLICT_REASON || error.reason === SECOND_CONFLICT_REASON;
+
 export interface RateLimiterShape {
   /**
    * Runs `request` in the token's next slot. A `TokenBusy` failure (HTTP 409)

@@ -1,15 +1,14 @@
 import { Buffer } from "node:buffer";
 import { createServer } from "node:http";
-import { NodeHttpServer } from "@effect/platform-node";
-import { ByteSize, Clock, Context, Effect, Exit, Fiber, Layer, Predicate, Result, Schema, type Scope, Stream, type Types } from "effect";
+import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
+import { ByteSize, Clock, Effect, Exit, Fiber, Layer, Predicate, Result, Schema, type Scope, type Types } from "effect";
 import { McpServer } from "effect/ai";
-import { Headers, HttpBody, HttpEffect, HttpMiddleware, HttpRouter, type HttpServerError, HttpServerRequest, HttpServerResponse } from "effect/http";
+import { Headers, HttpEffect, HttpMiddleware, HttpRouter, type HttpServerError, HttpServerRequest, HttpServerResponse } from "effect/http";
 import { Accounts } from "../accounts.js";
 import type { TransportConfig } from "../config.js";
-import { Redactor } from "../redaction.js";
 import { Auth } from "./auth.js";
-import { type FrameRedactor, makeFrameRedactor } from "./frame-redaction.js";
 import { grantProtocols } from "./grant-tools.js";
+import { guard, HEALTH_PATH, InternalRequest } from "./guard.js";
 import { CurrentPrincipal, type Principal } from "./principal.js";
 import type { ServerInfo } from "./server-info.js";
 
@@ -28,8 +27,9 @@ import type { ServerInfo } from "./server-info.js";
 
 export type HttpTransportConfig = Extract<TransportConfig, { readonly kind: "http" }>;
 
+export { HEALTH_PATH, isAllowedHost, redactResponse } from "./guard.js";
+
 export const MCP_PATH = "/mcp";
-export const HEALTH_PATH = "/healthz";
 
 const HealthRoute = HttpRouter.add(
   "GET",
@@ -37,55 +37,8 @@ const HealthRoute = HttpRouter.add(
   HttpMiddleware.withLoggerDisabled(Effect.succeed(HttpServerResponse.jsonUnsafe({ status: "ok" }))),
 );
 
-// `host` or `host:port`, with IPv6 literals in brackets.
-const HOST_HEADER = /^(\[[^\]]*\]|[^:]*)(?::\d*)?$/;
-
-/**
- * An empty allowlist accepts any Host. An entry without a port accepts that
- * host on any port; an entry with a port accepts only that port.
- */
-export function isAllowedHost(allowedHosts: ReadonlyArray<string>, header: string | undefined): boolean {
-  if (allowedHosts.length === 0) return true;
-  if (header === undefined) return false;
-  const host = header.trim().toLowerCase();
-  return allowedHosts.includes(host) || allowedHosts.includes(HOST_HEADER.exec(host)?.[1] ?? host);
-}
-
-/**
- * Redacts a response body. McpServer answers with byte bodies (JSON or a
- * complete SSE body) or byte streams (one SSE event per chunk); both are
- * whole frames per chunk. Raw bodies only occur for strings here.
- */
-export function redactResponse(
-  frames: FrameRedactor,
-  response: HttpServerResponse.HttpServerResponse,
-): HttpServerResponse.HttpServerResponse {
-  const body = response.body;
-  switch (body._tag) {
-    case "Uint8Array": {
-      const redacted = frames.chunk(body.body);
-      return redacted === body.body
-        ? response
-        : HttpServerResponse.setBody(response, HttpBody.uint8Array(redacted, body.contentType));
-    }
-    case "Stream":
-      // Chunk sizes may change, so any declared length is dropped.
-      return HttpServerResponse.setBody(response, HttpBody.stream(Stream.map(body.stream, (chunk) => frames.chunk(chunk)), body.contentType));
-    case "Raw":
-      return typeof body.body === "string"
-        ? HttpServerResponse.setBody(response, HttpBody.text(frames.text(body.body), body.contentType))
-        : response;
-    default:
-      return response;
-  }
-}
-
-const pathOf = (url: string) => url.split("?", 1)[0];
-
 const unauthorized = (challenge: string) =>
   HttpServerResponse.empty({ status: 401, headers: { "www-authenticate": challenge } });
-
-const forbidden = HttpServerResponse.empty({ status: 403 });
 
 const unavailable = HttpServerResponse.empty({ status: 503, headers: { "retry-after": "5" } });
 
@@ -298,36 +251,6 @@ const mayInitialize = (text: string) => {
   return Array.isArray(value) || (Predicate.hasProperty(value, "method") && value.method === "initialize");
 };
 
-/**
- * Set on requests this module dispatches itself (ending a session through
- * McpServer's DELETE handling); they skip the Host allowlist and `Auth`.
- * Only code in this module can set it.
- */
-const InternalRequest = Context.Reference<boolean>("fio-mcp/transport/http/InternalRequest", {
-  defaultValue: () => false,
-});
-
-/**
- * Every route: response redaction, and (except /healthz) the Host allowlist.
- * Paths are compared literally; any other spelling of /healthz is checked.
- */
-const guard = (allowedHosts: ReadonlyArray<string>) =>
-  HttpRouter.middleware(
-    Effect.gen(function* () {
-      const frames = makeFrameRedactor(yield* Redactor);
-      return Effect.fnUntraced(function* (
-        httpEffect: Effect.Effect<HttpServerResponse.HttpServerResponse, Types.unhandled>,
-      ) {
-        const request = yield* HttpServerRequest.HttpServerRequest;
-        const internal = yield* InternalRequest;
-        if (!internal && pathOf(request.url) !== HEALTH_PATH && !isAllowedHost(allowedHosts, request.headers.host)) {
-          return forbidden;
-        }
-        return redactResponse(frames, yield* httpEffect);
-      });
-    }),
-    { global: true },
-  );
 
 /**
  * Authentication and limits for every route McpServer registers. Route
@@ -502,7 +425,7 @@ export const httpRouterApp = <A, E, R, EA, RA>(
   info: ServerInfo,
   config: HttpTransportConfig,
 ) =>
-  Layer.mergeAll(app, HealthRoute, guard(config.allowedHosts)).pipe(
+  Layer.mergeAll(app, HealthRoute, guard(config.allowedHosts, config.trustedProxies)).pipe(
     Layer.provideMerge(
       Layer.unwrap(
         Effect.gen(function* () {

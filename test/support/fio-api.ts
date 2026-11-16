@@ -67,9 +67,10 @@ export const LAST_STATEMENT = '{"year":2026,"id":7}';
  * A FioApi whose `periods` goes through the real RateLimiter and holds its
  * slot until `release` completes, then answers STATEMENT, and whose
  * `lastStatement` answers LAST_STATEMENT through the rate limiter. Nothing
- * else is implemented (in particular nothing that moves the `last` marker).
+ * else is implemented (in particular nothing that moves the `last` marker)
+ * unless `extra` supplies it.
  */
-export const slotHoldingFio = (release: Deferred.Deferred<void>) =>
+export const slotHoldingFio = (release: Deferred.Deferred<void>, extra: Partial<FioApiShape> = {}) =>
   Layer.unwrap(
     Effect.gen(function* () {
       const limiter = yield* RateLimiter;
@@ -77,6 +78,7 @@ export const slotHoldingFio = (release: Deferred.Deferred<void>) =>
         periods: (account, _from, _to, priority) =>
           limiter.run(account.tokenFingerprint, priority ?? "interactive", Effect.as(Deferred.await(release), STATEMENT)),
         lastStatement: (account) => limiter.run(account.tokenFingerprint, "interactive", Effect.succeed(LAST_STATEMENT)),
+        ...extra,
       });
     }),
   );

@@ -1,5 +1,6 @@
 import { Context, Effect, Layer, Logger, Redacted } from "effect";
 import { AppConfig } from "./config.js";
+import { stripMarks } from "./mcp/untrusted.js";
 
 /**
  * Token redaction. FIO puts read tokens in the URL path and upload tokens in
@@ -14,7 +15,10 @@ export const REDACTED = "***";
 const EXCERPT_LENGTH = 300;
 
 // Path segments that are immediately followed by a token in FIO's REST API.
-const TOKEN_PATH = /\/(periods|by-id|last|set-last-id|set-last-date|merchant|lastStatement)\/[^/\s?#"'<>]+/g;
+// The segment stops at the excerpt markers (U+E000, U+E001, src/mcp/untrusted.ts)
+// so redaction never removes one.
+const TOKEN_PATH =
+  /\/(periods|by-id|last|set-last-id|set-last-date|merchant|lastStatement)\/[^/\s?#"'<>\uE000\uE001]+/g;
 
 function escapeXmlText(value: string): string {
   return value
@@ -80,7 +84,7 @@ export function makeRedactor(initial: ReadonlyArray<string>): RedactorShape {
     // leave a token prefix that redact no longer recognizes.
     const text = redact(
       redact(body)
-        .replace(/<[^>]+>/g, " ")
+        .replace(/<[^<>]*>/g, " ")
         .replace(/\s+/g, " ")
         .trim(),
     );
@@ -125,7 +129,7 @@ export class Redactor extends Context.Service<Redactor, RedactorShape>()("fio-mc
 /** Writes logfmt lines to stderr (stdout is the MCP stdio channel), redacted. */
 export const stderrLogger = (redactor: RedactorShape) =>
   Logger.make<unknown, void>((options) => {
-    process.stderr.write(`${redactor.redact(Logger.formatLogFmt.log(options))}\n`);
+    process.stderr.write(`${redactor.redact(stripMarks(Logger.formatLogFmt.log(options)))}\n`);
   });
 
 /** Replaces the default (stdout) logger with the redacting stderr logger. */

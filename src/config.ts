@@ -1,9 +1,18 @@
-import { NodeFileSystem } from "@effect/platform-node";
-import { Config, Context, Effect, FileSystem, Layer, Option, Predicate, Redacted, Schema } from "effect";
+import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem";
+import { Config, Context, Effect, FileSystem, Layer, Option, Predicate, Redacted, Result, Schema } from "effect";
 import type { IpNetwork } from "effect/net";
+import { decodeBase32, MIN_TOTP_SECRET_BYTES } from "./admin/totp.js";
 import { ConfigError } from "./errors.js";
 import { type PasswordHash, PasswordHashError, parsePasswordHash } from "./oauth/crypto.js";
-import { parsePublicUrl } from "./oauth/urls.js";
+import { parseFioBaseUrl, parsePublicUrl } from "./oauth/urls.js";
+import {
+  type CurrencyAmounts,
+  DEFAULT_PAYMENT_LIMITS,
+  type PaymentLimits,
+  parseLimitMap,
+  parseOrdersPerDay,
+  toCents,
+} from "./payment-limits.js";
 import { parseDataKey } from "./token-crypto.js";
 import { parseTrustedProxy } from "./transport/client-address.js";
 
@@ -48,6 +57,29 @@ export type TransportConfig =
        * login and authorization throttling. Empty trusts no one.
        */
       readonly trustedProxies: ReadonlyArray<IpNetwork.IpNetwork>;
+      /**
+       * FIO_MCP_ADMIN_ALLOWED_CIDRS (optional, comma-separated, the syntax of
+       * FIO_MCP_TRUSTED_PROXIES): client networks allowed to reach /admin and
+       * everything below it and the OAuth sign-in pages (GET /authorize,
+       * GET|POST /login, GET|POST /consent). Other clients get 404. The client
+       * address follows the trusted-proxy rules. Empty or unset: no
+       * restriction. Never affects /mcp, /token, /register, /revoke,
+       * /.well-known/* or /healthz.
+       */
+      readonly adminAllowedNetworks?: ReadonlyArray<IpNetwork.IpNetwork> | undefined;
+      /**
+       * FIO_MCP_ADMIN_PORT (optional, 1-65535) and FIO_MCP_ADMIN_HOST
+       * (default 127.0.0.1, only with the port): a second listener that alone
+       * serves /admin (OAuth mode only); the main listener then answers 404
+       * there. The OAuth sign-in pages stay on the main listener, where the
+       * issuer points. The admin session cookie is `Secure` with
+       * `Path=/admin`, so browsers only send it over https: the admin listener
+       * must also sit behind a TLS-terminating proxy, reached at the public
+       * origin (the admin forms check Origin against FIO_MCP_PUBLIC_URL, and
+       * FIO_MCP_ALLOWED_HOSTS applies here too). Unset: /admin is served on
+       * the main listener.
+       */
+      readonly adminListener?: { readonly host: string; readonly port: number } | undefined;
     };
 
 /**
@@ -66,8 +98,17 @@ export type HttpAuthConfig =
       readonly dataKey: Redacted.Redacted<Uint8Array>;
       /** FIO_TOKEN / FIO_ACCOUNTS, read only if the database needs them. */
       readonly accountSeed: AccountSeed;
+      /** FIO_MCP_ADMIN_TOTP_SECRET_FILE: the admin second factor's secret; absent when TOTP is off. */
+      readonly totpSecret?: Redacted.Redacted<Uint8Array>;
     }
-  | { readonly kind: "unauthenticated" };
+  | {
+      readonly kind: "unauthenticated";
+      /**
+       * FIO_MCP_ALLOW_UNAUTHENTICATED_ON_NETWORK=true: the host is not a
+       * loopback address, and the warning repeats every 10 minutes.
+       */
+      readonly onNetwork?: boolean | undefined;
+    };
 
 /**
  * The accounts FIO_TOKEN / FIO_ACCOUNTS (or their _FILE variants) would
@@ -101,6 +142,14 @@ export interface CacheConfig {
   readonly overlapDays: number;
   /** A cached day fetched less than this long ago counts as fresh. */
   readonly maxAgeMinutes: number;
+  /** FIO_CACHE_ENCRYPT: seal the cached free-text and identifying columns with `dataKey` (src/cache/encryption.ts). */
+  readonly encrypt: boolean;
+  /**
+   * The data key (FIO_MCP_DATA_KEY_FILE) the cache seals with, or opens rows
+   * sealed earlier with. Always set when `encrypt` is; undefined when the
+   * variable is not set.
+   */
+  readonly dataKey: Redacted.Redacted<Uint8Array> | undefined;
 }
 
 export interface AppConfigShape {
@@ -123,7 +172,20 @@ export interface AppConfigShape {
   readonly maxResponseBytes: number;
   readonly transport: TransportConfig;
   readonly cache: CacheConfig;
+  /**
+   * FIO_MCP_MARKER_TOOLS (SEC-10). `disabled` leaves out get_new_transactions
+   * and set_download_marker, the tools that move the token's download marker
+   * in the bank. Absent means `enabled`.
+   */
+  readonly markerTools?: MarkerTools;
+  /**
+   * FIO_MCP_PAYMENT_*: the limits of grants that follow the server defaults,
+   * and the ceiling no grant may exceed (SEC-26).
+   */
+  readonly paymentLimits: PaymentLimits;
 }
+
+export type MarkerTools = "enabled" | "disabled";
 
 export const DEFAULT_BASE_URL = "https://fioapi.fio.cz/v1/rest";
 export const DEFAULT_RATE_LIMIT_INTERVAL_MS = 30_000;
@@ -346,13 +408,35 @@ const loadAccounts = Effect.fn("config.loadAccounts")(function* (optional: boole
 const HTTP_AUTH_REQUIRED =
   "HTTP mode requires FIO_MCP_PUBLIC_URL and FIO_MCP_ADMIN_PASSWORD_HASH_FILE (create the hash with `fio-mcp hash-password`). To run without authentication on a trusted network, set FIO_MCP_ALLOW_UNAUTHENTICATED=true";
 
-const loadHttpAuth = Effect.fn("config.loadHttpAuth")(function* () {
+/** Bind addresses unauthenticated mode accepts without FIO_MCP_ALLOW_UNAUTHENTICATED_ON_NETWORK. */
+const LOOPBACK_BIND_HOSTS: ReadonlySet<string> = new Set(["127.0.0.1", "::1", "localhost"]);
+
+/**
+ * FIO_MCP_ALLOW_UNAUTHENTICATED=true (optional, default false) starts
+ * without authentication, only on a loopback FIO_MCP_HOST (127.0.0.1, ::1,
+ * localhost) unless FIO_MCP_ALLOW_UNAUTHENTICATED_ON_NETWORK=true (optional,
+ * default false) is also set; it cannot be combined with the OAuth
+ * variables.
+ */
+const loadHttpAuth = Effect.fn("config.loadHttpAuth")(function* (host: string) {
   const publicUrl = yield* optionalVar("FIO_MCP_PUBLIC_URL");
   const hashFile = yield* optionalVar("FIO_MCP_ADMIN_PASSWORD_HASH_FILE");
   const allowUnauthenticated = yield* boolVar("FIO_MCP_ALLOW_UNAUTHENTICATED", false);
+  const onNetwork = yield* boolVar("FIO_MCP_ALLOW_UNAUTHENTICATED_ON_NETWORK", false);
+  if (allowUnauthenticated && (Option.isSome(publicUrl) || Option.isSome(hashFile))) {
+    return yield* fail(
+      "FIO_MCP_ALLOW_UNAUTHENTICATED=true cannot be combined with FIO_MCP_PUBLIC_URL or FIO_MCP_ADMIN_PASSWORD_HASH_FILE; unset FIO_MCP_ALLOW_UNAUTHENTICATED to use OAuth",
+    );
+  }
   if (Option.isNone(publicUrl) && Option.isNone(hashFile)) {
-    if (allowUnauthenticated) return { kind: "unauthenticated" } satisfies HttpAuthConfig;
-    return yield* fail(HTTP_AUTH_REQUIRED);
+    if (!allowUnauthenticated) return yield* fail(HTTP_AUTH_REQUIRED);
+    if (LOOPBACK_BIND_HOSTS.has(host)) return { kind: "unauthenticated" } satisfies HttpAuthConfig;
+    if (!onNetwork) {
+      return yield* fail(
+        "FIO_MCP_ALLOW_UNAUTHENTICATED=true requires FIO_MCP_HOST to be a loopback address (127.0.0.1, ::1 or localhost). To serve without authentication on a network anyway, also set FIO_MCP_ALLOW_UNAUTHENTICATED_ON_NETWORK=true",
+      );
+    }
+    return { kind: "unauthenticated", onNetwork: true } satisfies HttpAuthConfig;
   }
   if (Option.isNone(publicUrl)) return yield* fail(`FIO_MCP_ADMIN_PASSWORD_HASH_FILE is set but FIO_MCP_PUBLIC_URL is not. ${HTTP_AUTH_REQUIRED}`);
   if (Option.isNone(hashFile)) return yield* fail(`FIO_MCP_PUBLIC_URL is set but FIO_MCP_ADMIN_PASSWORD_HASH_FILE is not. ${HTTP_AUTH_REQUIRED}`);
@@ -377,6 +461,7 @@ const loadHttpAuth = Effect.fn("config.loadHttpAuth")(function* () {
     passwordHash: Redacted.make(hash),
     dataKey,
     accountSeed: yield* loadAccountSeed(),
+    totpSecret: yield* loadTotpSecret(),
   } satisfies HttpAuthConfig;
 });
 
@@ -392,14 +477,12 @@ const loadAccountSeed = Effect.fn("config.loadAccountSeed")(function* () {
 
 const DATA_KEY_HELP = "create one with `openssl rand -hex 32 > fio_mcp_data_key` and keep a copy outside the database backups";
 
-/** FIO_MCP_DATA_KEY_FILE: 32 bytes as 64 hex digits or base64. Never echoes the content. */
-const loadDataKey = Effect.fn("config.loadDataKey")(function* () {
+const OAUTH_DATA_KEY_REQUIRED = `HTTP mode with OAuth requires FIO_MCP_DATA_KEY_FILE, the key that encrypts the FIO tokens in the database; ${DATA_KEY_HELP}`;
+
+/** FIO_MCP_DATA_KEY_FILE: 32 bytes as 64 hex digits or base64. Never echoes the content. Fails with `missing` when unset. */
+const loadDataKey = Effect.fn("config.loadDataKey")(function* (missing: string = OAUTH_DATA_KEY_REQUIRED) {
   const file = yield* optionalVar("FIO_MCP_DATA_KEY_FILE");
-  if (Option.isNone(file)) {
-    return yield* fail(
-      `HTTP mode with OAuth requires FIO_MCP_DATA_KEY_FILE, the key that encrypts the FIO tokens in the database; ${DATA_KEY_HELP}`,
-    );
-  }
+  if (Option.isNone(file)) return yield* fail(missing);
   const fs = yield* FileSystem.FileSystem;
   const content = yield* fs
     .readFileString(file.value)
@@ -411,18 +494,78 @@ const loadDataKey = Effect.fn("config.loadDataKey")(function* () {
   return key;
 });
 
-const loadTrustedProxies = Effect.fn("config.loadTrustedProxies")(function* () {
+const TOTP_HELP = "create one with `fio-mcp totp-init`";
+
+/**
+ * FIO_MCP_ADMIN_TOTP_SECRET_FILE (optional): a file holding the base32
+ * RFC 6238 secret (SHA-1, 6 digits, 30 s) of the admin second factor.
+ * When set, /login and /admin/login also need the authenticator code.
+ * Lowercase, spaces and `=` padding are accepted; at least 16 bytes
+ * (128 bits). Never echoes the content.
+ */
+const loadTotpSecret = Effect.fn("config.loadTotpSecret")(function* () {
+  const file = yield* optionalVar("FIO_MCP_ADMIN_TOTP_SECRET_FILE");
+  if (Option.isNone(file)) return undefined;
+  const fs = yield* FileSystem.FileSystem;
+  const content = yield* fs
+    .readFileString(file.value)
+    .pipe(Effect.mapError(() => new ConfigError({ detail: "FIO_MCP_ADMIN_TOTP_SECRET_FILE: file not readable" })));
+  const secret = decodeBase32(content);
+  if (secret === undefined) {
+    return yield* fail(`FIO_MCP_ADMIN_TOTP_SECRET_FILE: file must contain a base32 secret; ${TOTP_HELP}`);
+  }
+  if (secret.length < MIN_TOTP_SECRET_BYTES) {
+    return yield* fail(
+      `FIO_MCP_ADMIN_TOTP_SECRET_FILE: the secret must be at least ${MIN_TOTP_SECRET_BYTES} bytes (${Math.ceil((MIN_TOTP_SECRET_BYTES * 8) / 5)} base32 characters); ${TOTP_HELP}`,
+    );
+  }
+  return Redacted.make(secret);
+});
+
+/** A comma-separated list of IP addresses and CIDR networks (parseTrustedProxy). */
+const loadNetworks = Effect.fn("config.loadNetworks")(function* (key: string) {
   const networks: Array<IpNetwork.IpNetwork> = [];
-  for (const [index, entry] of (yield* listVar("FIO_MCP_TRUSTED_PROXIES")).entries()) {
+  for (const [index, entry] of (yield* listVar(key)).entries()) {
     const network = parseTrustedProxy(entry);
     if (network === undefined) {
-      return yield* fail(
-        `FIO_MCP_TRUSTED_PROXIES entry ${index + 1} must be an IP address or a CIDR network such as 172.18.0.0/16`,
-      );
+      return yield* fail(`${key} entry ${index + 1} must be an IP address or a CIDR network such as 172.18.0.0/16`);
     }
     networks.push(network);
   }
   return networks;
+});
+
+const loadTrustedProxies = () => loadNetworks("FIO_MCP_TRUSTED_PROXIES");
+
+/** An empty allowlist allows everyone, so a set variable must name at least one network (not just commas). */
+const loadAdminAllowedNetworks = Effect.fn("config.loadAdminAllowedNetworks")(function* () {
+  const networks = yield* loadNetworks("FIO_MCP_ADMIN_ALLOWED_CIDRS");
+  if (networks.length === 0 && Option.isSome(yield* optionalVar("FIO_MCP_ADMIN_ALLOWED_CIDRS"))) {
+    return yield* fail("FIO_MCP_ADMIN_ALLOWED_CIDRS must name at least one IP address or CIDR network");
+  }
+  return networks;
+});
+
+/** Default bind address of the admin listener (FIO_MCP_ADMIN_HOST). */
+export const DEFAULT_ADMIN_HOST = "127.0.0.1";
+
+/** FIO_MCP_ADMIN_HOST / FIO_MCP_ADMIN_PORT; see `TransportConfig.adminListener`. */
+const loadAdminListener = Effect.fn("config.loadAdminListener")(function* (port: number) {
+  const adminHost = yield* optionalVar("FIO_MCP_ADMIN_HOST");
+  const rawPort = yield* optionalVar("FIO_MCP_ADMIN_PORT");
+  if (Option.isNone(rawPort)) {
+    if (Option.isSome(adminHost)) return yield* fail("FIO_MCP_ADMIN_HOST is set but FIO_MCP_ADMIN_PORT is not");
+    return undefined;
+  }
+  const adminPort = Number(rawPort.value);
+  if (!Number.isInteger(adminPort) || adminPort < 1 || adminPort > 65_535) {
+    return yield* fail("FIO_MCP_ADMIN_PORT must be an integer from 1 to 65535");
+  }
+  const listener = { host: Option.getOrElse(adminHost, () => DEFAULT_ADMIN_HOST), port: adminPort };
+  if (listener.port === port) {
+    return yield* fail("FIO_MCP_ADMIN_PORT must differ from FIO_MCP_PORT");
+  }
+  return listener;
 });
 
 const loadTransport = Effect.fn("config.loadTransport")(function* () {
@@ -432,18 +575,39 @@ const loadTransport = Effect.fn("config.loadTransport")(function* () {
   const host = Option.getOrElse(yield* optionalVar("FIO_MCP_HOST"), () => DEFAULT_HTTP_HOST);
   const port = yield* intVar("FIO_MCP_PORT", DEFAULT_HTTP_PORT, 1);
   if (port > 65_535) return yield* fail("FIO_MCP_PORT must be an integer from 1 to 65535");
-  return {
+  const transport = {
     kind: "http",
     host,
     port,
-    auth: yield* loadHttpAuth(),
+    auth: yield* loadHttpAuth(host),
     allowedOrigins: yield* listVar("FIO_MCP_ALLOWED_ORIGINS"),
     allowedHosts: (yield* listVar("FIO_MCP_ALLOWED_HOSTS")).map((h) => h.toLowerCase()),
     trustedProxies: yield* loadTrustedProxies(),
+    adminAllowedNetworks: yield* loadAdminAllowedNetworks(),
+    adminListener: yield* loadAdminListener(port),
   } satisfies TransportConfig;
+  if (transport.adminListener !== undefined && transport.auth.kind !== "oauth") {
+    return yield* fail("FIO_MCP_ADMIN_PORT needs OAuth (FIO_MCP_PUBLIC_URL); without authentication there is no admin UI");
+  }
+  return transport;
 });
 
-const loadCache = Effect.fn("config.loadCache")(function* () {
+const CACHE_DATA_KEY_REQUIRED = `FIO_CACHE_ENCRYPT is on but FIO_MCP_DATA_KEY_FILE is not set; the cache is encrypted with that key; ${DATA_KEY_HELP}`;
+
+/**
+ * FIO_CACHE_ENCRYPT and the key it uses: with OAuth the data key loaded for
+ * the FIO tokens; otherwise FIO_MCP_DATA_KEY_FILE, required when encryption
+ * is on and read whenever it is set (it opens rows sealed earlier when
+ * encryption has been turned off).
+ */
+const loadCacheEncryption = Effect.fn("config.loadCacheEncryption")(function* (transport: TransportConfig) {
+  const encrypt = yield* boolVar("FIO_CACHE_ENCRYPT", false);
+  if (transport.kind === "http" && transport.auth.kind === "oauth") return { encrypt, dataKey: transport.auth.dataKey };
+  const keyFileSet = Option.isSome(yield* optionalVar("FIO_MCP_DATA_KEY_FILE"));
+  return { encrypt, dataKey: encrypt || keyFileSet ? yield* loadDataKey(CACHE_DATA_KEY_REQUIRED) : undefined };
+});
+
+const loadCache = Effect.fn("config.loadCache")(function* (transport: TransportConfig) {
   const enabled = yield* boolVar("FIO_CACHE_ENABLED", true);
   const explicitPath = yield* optionalVar("FIO_DB_PATH");
   const xdg = yield* optionalVar("XDG_DATA_HOME");
@@ -469,15 +633,76 @@ const loadCache = Effect.fn("config.loadCache")(function* () {
     backfillFrom,
     overlapDays: yield* intVar("FIO_SYNC_OVERLAP_DAYS", DEFAULT_OVERLAP_DAYS, 1),
     maxAgeMinutes: yield* intVar("FIO_CACHE_MAX_AGE_MINUTES", DEFAULT_CACHE_MAX_AGE_MINUTES, 0),
+    ...(yield* loadCacheEncryption(transport)),
   } satisfies CacheConfig;
+});
+
+const loadMarkerTools = Effect.fn("config.loadMarkerTools")(function* () {
+  const value = Option.getOrElse(yield* optionalVar("FIO_MCP_MARKER_TOOLS"), () => "enabled").toLowerCase();
+  if (value !== "enabled" && value !== "disabled") return yield* fail("FIO_MCP_MARKER_TOOLS must be enabled or disabled");
+  return value satisfies MarkerTools;
+});
+
+/**
+ * FIO_API_BASE_URL (optional, default DEFAULT_BASE_URL): an https URL on
+ * fio.cz or a subdomain, without credentials, query or fragment; every FIO
+ * token is sent under it. FIO_API_ALLOW_TEST_BASE_URL=true (optional,
+ * default false; tests only) also accepts http on 127.0.0.1, [::1] and
+ * localhost, and logs a warning.
+ */
+const loadBaseUrl = Effect.fn("config.loadBaseUrl")(function* () {
+  const raw = yield* optionalVar("FIO_API_BASE_URL");
+  const allowTest = yield* boolVar("FIO_API_ALLOW_TEST_BASE_URL", false);
+  if (allowTest) {
+    yield* Effect.logWarning(
+      "FIO_API_ALLOW_TEST_BASE_URL=true: FIO_API_BASE_URL may name an http test server on a loopback address. Never set this in production.",
+    );
+  }
+  const parsed = parseFioBaseUrl(Option.getOrElse(raw, () => DEFAULT_BASE_URL), allowTest);
+  if (parsed === undefined) return yield* fail("FIO_API_BASE_URL must be an https URL on fio.cz");
+  return parsed;
+});
+
+const PER_ORDER_VAR = "FIO_MCP_PAYMENT_MAX_PER_ORDER";
+const PER_DAY_VAR = "FIO_MCP_PAYMENT_MAX_PER_DAY";
+
+/** A `CUR:amount,...` limit map. Never echoes the value on failure. */
+const limitMapVar = Effect.fn("config.limitMapVar")(function* (key: string, fallback: CurrencyAmounts) {
+  const raw = yield* optionalVar(key);
+  if (Option.isNone(raw)) return fallback;
+  const parsed = parseLimitMap(raw.value);
+  if (Result.isFailure(parsed)) return yield* fail(`${key}: ${parsed.failure} (format: CZK:50000,EUR:2000)`);
+  return parsed.success;
+});
+
+const loadPaymentLimits = Effect.fn("config.loadPaymentLimits")(function* () {
+  const maxPerOrder = yield* limitMapVar(PER_ORDER_VAR, DEFAULT_PAYMENT_LIMITS.maxPerOrder);
+  const maxPerDay = yield* limitMapVar(PER_DAY_VAR, DEFAULT_PAYMENT_LIMITS.maxPerDay);
+  const ordersKey = "FIO_MCP_PAYMENT_MAX_ORDERS_PER_DAY";
+  const ordersRaw = yield* optionalVar(ordersKey);
+  let maxOrdersPerDay = DEFAULT_PAYMENT_LIMITS.maxOrdersPerDay;
+  if (Option.isSome(ordersRaw)) {
+    const parsed = parseOrdersPerDay(ordersRaw.value);
+    if (Result.isFailure(parsed)) return yield* fail(`${ordersKey} ${parsed.failure}`);
+    maxOrdersPerDay = parsed.success;
+  }
+  // The messages name the variables only: currencies and amounts are values.
+  const orderCurrencies = Object.keys(maxPerOrder).sort().join();
+  if (orderCurrencies !== Object.keys(maxPerDay).sort().join()) {
+    return yield* fail(`${PER_ORDER_VAR} and ${PER_DAY_VAR} must list the same currencies`);
+  }
+  if (Object.keys(maxPerOrder).some((c) => toCents(maxPerOrder[c] ?? 0) > toCents(maxPerDay[c] ?? 0))) {
+    return yield* fail(`Each ${PER_ORDER_VAR} amount must be at most the ${PER_DAY_VAR} amount for its currency`);
+  }
+  return { maxPerOrder, maxPerDay, maxOrdersPerDay } satisfies PaymentLimits;
 });
 
 /** Reads and validates the whole configuration. */
 export const loadConfig = Effect.fn("config.load")(function* () {
   const transport = yield* loadTransport();
   const accounts = transport.kind === "http" && transport.auth.kind === "oauth" ? [] : yield* loadAccounts(false);
-  const baseUrl = Option.getOrElse(yield* optionalVar("FIO_API_BASE_URL"), () => DEFAULT_BASE_URL).replace(/\/+$/, "");
-  const cache = yield* loadCache();
+  const baseUrl = yield* loadBaseUrl();
+  const cache = yield* loadCache(transport);
   if (transport.kind === "http" && transport.auth.kind === "oauth" && cache.dbPath === "") {
     return yield* fail(
       "FIO_DB_PATH is not set and neither XDG_DATA_HOME nor HOME is, so the OAuth clients and tokens have no location",
@@ -498,6 +723,8 @@ export const loadConfig = Effect.fn("config.load")(function* () {
     maxResponseBytes: MAX_RESPONSE_BYTES,
     transport,
     cache,
+    markerTools: yield* loadMarkerTools(),
+    paymentLimits: yield* loadPaymentLimits(),
   };
   return config;
 });
