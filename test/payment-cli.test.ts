@@ -4,8 +4,8 @@ import { TestClock } from "effect/testing";
 import { Accounts } from "../src/accounts.js";
 import { SERVER_MIGRATIONS } from "../src/cache/db.js";
 import { FioApi } from "../src/fio-api.js";
-import { AUDIT_RETENTION_DAYS, PaymentControls } from "../src/payment-controls.js";
 import { parsePurgeArgs, purgePaymentsCommand } from "../src/payment-cli.js";
+import { AUDIT_RETENTION_DAYS, PaymentControls } from "../src/payment-controls.js";
 import { type NewAuditRow, PaymentLedger } from "../src/payment-ledger.js";
 import { Redactor } from "../src/redaction.js";
 import { seededConfig } from "./support/config.js";
@@ -16,11 +16,11 @@ const DAY = 24 * 60 * 60 * 1000;
 
 const out: Array<string> = [];
 const decoder = new TextDecoder();
-const collect = Sink.forEach((chunk: string | Uint8Array) =>
+const append = (chunk: string | Uint8Array) =>
   Effect.sync(() => {
     out.push(typeof chunk === "string" ? chunk : decoder.decode(chunk));
-  }),
-);
+  });
+const collect = Sink.forEach(append);
 
 const testLayer = Layer.mergeAll(
   PaymentControls.Default.pipe(
