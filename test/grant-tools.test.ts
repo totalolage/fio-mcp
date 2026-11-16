@@ -224,7 +224,7 @@ describe("tools/list follows the HTTP session's grant", () => {
 describe("FIO_MCP_MARKER_TOOLS (SEC-10)", () => {
   const MARKER = ["get_new_transactions", "set_download_marker"];
 
-  it.live("disabled: the marker tools are not listed for any grant and cannot be called", () =>
+  it.live("disabled: the marker tools are listed for no grant, and a call by name is refused", () =>
     Effect.gen(function* () {
       const base = yield* startServer({ markerTools: "disabled" });
       const bob = yield* connect(base, "bob");
@@ -237,11 +237,9 @@ describe("FIO_MCP_MARKER_TOOLS (SEC-10)", () => {
         ["get_new_transactions", { account: "main" }],
         ["set_download_marker", { account: "main", movementId: 1 }],
       ] as const) {
-        const error = yield* Effect.tryPromise({
-          try: () => bob.client.callTool({ name, arguments: args }),
-          catch: (cause) => String(cause),
-        }).pipe(Effect.flip);
-        assert.match(error, /not found/, name);
+        const denied = yield* call(bob.client, name, args);
+        assert.isTrue(denied.isError, name);
+        assert.match(denied.text, DENIED, name);
       }
     }).pipe(Effect.scoped),
   );

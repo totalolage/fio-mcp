@@ -67,11 +67,28 @@ const domesticOrder = {
 };
 
 describe("tool set", () => {
-  it("leaves out the marker tools with FIO_MCP_MARKER_TOOLS=disabled (SEC-10)", async () => {
-    const { names, call, fetched } = await connect([readAccount()], ok(STATEMENT_JSON), { markerTools: "disabled" });
+  it("hides the marker tools over HTTP with FIO_MCP_MARKER_TOOLS=disabled and refuses them by name (SEC-10)", async () => {
+    const { names, call, fetched } = await connect([readAccount()], ok(STATEMENT_JSON), {
+      markerTools: "disabled",
+      transport: {
+        kind: "http",
+        host: "127.0.0.1",
+        port: 0,
+        auth: { kind: "unauthenticated" },
+        allowedOrigins: [],
+        allowedHosts: [],
+        trustedProxies: [],
+      },
+    });
     expect(await names()).toEqual(ALL_TOOLS.filter((n) => n !== "get_new_transactions" && n !== "set_download_marker"));
-    await expect(call("get_new_transactions", {})).rejects.toThrow(/not found/);
-    await expect(call("set_download_marker", { movementId: 1 })).rejects.toThrow(/not found/);
+    for (const [name, args] of [
+      ["get_new_transactions", {}],
+      ["set_download_marker", { movementId: 1 }],
+    ] as const) {
+      const result = await call(name, args);
+      expect(result.isError, name).toBe(true);
+      expect(text(result).split("\n")[0]).toBe(PERMISSION_DENIED);
+    }
     expect(await fetched()).toBe(0);
   });
 

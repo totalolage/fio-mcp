@@ -122,6 +122,21 @@ export const stripMarks = (text: string): string => text.replace(MARKS, "");
 
 export const hasMarks = (text: string): boolean => text.includes(MARK_OPEN);
 
+const EXCERPT_LEAD = " Response: ";
+
+/**
+ * Marks the excerpt of an error message persisted before excerpts were
+ * marked (a sync's `lastError` from an older version): everything after
+ * " Response: " (src/errors.ts) is bank text. Fails closed to the end.
+ */
+export const markLegacyExcerpt = (text: string): string => {
+  if (hasMarks(text)) return text;
+  const at = text.indexOf(EXCERPT_LEAD);
+  if (at === -1) return text;
+  const start = at + EXCERPT_LEAD.length;
+  return text.slice(0, start) + markUntrusted(text.slice(start));
+};
+
 /** Source of nonce bytes; tests pin it with `Effect.provideService(Random, ...)`. */
 export const Random = Context.Reference<{ readonly bytes: (length: number) => Uint8Array }>("fio-mcp/mcp/Random", {
   defaultValue: () => ({ bytes: (length) => new Uint8Array(randomBytes(length)) }),

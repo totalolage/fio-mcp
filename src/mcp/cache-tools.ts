@@ -15,7 +15,7 @@ import { Redactor } from "../redaction.js";
 import { annotateTool, DateParam, guardedOutput, JsonObject, ToolFailure, withAccount } from "./common.js";
 import { permittedAccount, READ, requireScopes, visibleAccounts } from "./permissions.js";
 import { toolsForAccounts } from "./registration.js";
-import { CURRENCY, G, type GuardSpec, STATEMENT_GUARD } from "./untrusted.js";
+import { CURRENCY, G, type GuardSpec, markLegacyExcerpt, STATEMENT_GUARD } from "./untrusted.js";
 
 /**
  * Tools answered from the local cache only. They never call FIO, so they
@@ -34,6 +34,18 @@ const summaryGuard = (key: GuardSpec) =>
   });
 const MONTH_SUMMARY_GUARD = summaryGuard(G.id(/^\d{4}-\d{2}$/));
 const TEXT_SUMMARY_GUARD = summaryGuard(G.text());
+
+/** Marks the excerpts of persisted `lastError` values written before SEC-05, wherever they sit. */
+const markLegacyErrors = (value: unknown): unknown => {
+  if (Array.isArray(value)) return value.map(markLegacyErrors);
+  if (typeof value !== "object" || value === null) return value;
+  return Object.fromEntries(
+    Object.entries(value).map(([key, field]) => [
+      key,
+      key === "lastError" && typeof field === "string" ? markLegacyExcerpt(field) : markLegacyErrors(field),
+    ]),
+  );
+};
 
 const MAX_LIMIT = 1000;
 const DEFAULT_LIMIT = 100;
@@ -197,7 +209,7 @@ export const makeCacheHandlers = Effect.fn("CacheTools.handlers")(function* (too
       out(
         Effect.gen(function* () {
           yield* requireScopes(READ);
-          const statuses = yield* cache.status(yield* visibleAccounts(yield* accounts.list));
+          const statuses = markLegacyErrors(yield* cache.status(yield* visibleAccounts(yield* accounts.list)));
           return {
             dbPath: config.cache.dbPath,
             settings: {

@@ -387,9 +387,12 @@ export const FioToolsLive = toolsForAccounts(
   Effect.fn("FioTools.register")(function* (names: ReadonlyArray<string>) {
     const config = yield* AppConfig;
     const toolkit = makeFioToolkit(names);
-    // FIO_MCP_MARKER_TOOLS=disabled: the marker tools are neither registered nor listed (SEC-10).
+    // FIO_MCP_MARKER_TOOLS=disabled (SEC-10). stdio has no tools/list filter, so
+    // the marker tools are not registered there (a call gets "Tool not found").
+    // HTTP keeps them registered and hides them in its grant filter
+    // (src/transport/grant-tools.ts); a call by name gets PermissionDenied.
     const registered =
-      config.markerTools === "disabled"
+      config.markerTools === "disabled" && config.transport.kind === "stdio"
         ? Toolkit.make(...Object.values(toolkit.tools).filter((tool) => !MARKER_TOOLS.has(tool.name)))
         : toolkit;
     yield* McpServer.registerToolkit(registered).pipe(Effect.provide(toolkit.toLayer(makeFioHandlers(toolkit))));
