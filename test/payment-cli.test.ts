@@ -1,5 +1,5 @@
 import { assert, describe, it } from "@effect/vitest";
-import { Effect, Exit, Layer, Sink, Stdio, Stream } from "effect";
+import { Effect, Exit, Layer, Sink, Stdio } from "effect";
 import { TestClock } from "effect/testing";
 import { Accounts } from "../src/accounts.js";
 import { SERVER_MIGRATIONS } from "../src/cache/db.js";
