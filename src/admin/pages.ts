@@ -1,5 +1,8 @@
 import { DateTime } from "effect";
-import { escapeHtml, styleHash } from "../oauth/pages.js";
+import { escapeHtml, paymentSettingsFields, styleHash } from "../oauth/pages.js";
+import type { PaymentFormValues } from "../payment-form.js";
+import type { AuditRow } from "../payment-ledger.js";
+import { formatCents, type PaymentLimits } from "../payment-limits.js";
 
 /**
  * Server-rendered admin pages. Every interpolated value goes through
@@ -17,7 +20,10 @@ const STYLE =
   "button{font-size:.95rem;padding:.3rem .9rem;margin:.2rem .4rem .2rem 0}details{margin:.2rem 0}summary{cursor:pointer;color:#0b4f8a}" +
   ".ok{background:#e7f6e7;border:1px solid #7cbf7c;padding:.5rem .75rem;border-radius:6px}" +
   ".error{background:#fde8e8;border:1px solid #d77;padding:.5rem .75rem;border-radius:6px}" +
-  ".muted{color:#555;font-size:.9rem}code{word-break:break-all}.danger{color:#a40000}";
+  ".muted{color:#555;font-size:.9rem}code{word-break:break-all}.danger{color:#a40000}" +
+  "textarea{width:100%;max-width:28rem;padding:.35rem;font-size:.95rem;box-sizing:border-box}" +
+  "pre{white-space:pre-wrap;word-break:break-all;background:#f6f6f6;border:1px solid #ddd;padding:.5rem;max-height:24rem;overflow:auto;font-size:.85rem}" +
+  ".unlisted{color:#a40000;font-weight:600}";
 
 export const ADMIN_STYLE_HASH = styleHash(STYLE);
 
@@ -41,11 +47,12 @@ const flashBlock = (flash: Flash | undefined) =>
     ? ""
     : `<p class="${flash.kind === "ok" ? "ok" : "error"}" role="${flash.kind === "ok" ? "status" : "alert"}">${escapeHtml(flash.text)}</p>`;
 
-export type AdminTab = "accounts" | "clients" | "password";
+export type AdminTab = "accounts" | "clients" | "payments" | "password";
 
 const TABS: ReadonlyArray<readonly [AdminTab, string, string]> = [
   ["accounts", "/admin", "Accounts"],
   ["clients", "/admin/clients", "Connected clients"],
+  ["payments", "/admin/payments", "Payments"],
   ["password", "/admin/password", "Admin password"],
 ];
 
@@ -156,6 +163,14 @@ export interface GrantRow {
   readonly staleTokens: number;
   readonly createdAt: number;
   readonly lastUsedAt: number | null;
+  /** The payment settings form, for a grant with fio:payments. */
+  readonly payments: GrantPaymentsRow | undefined;
+}
+
+export interface GrantPaymentsRow {
+  readonly values: PaymentFormValues;
+  /** The stored limits are null: the grant follows the server defaults. */
+  readonly followsDefaults: boolean;
 }
 
 export interface ClientRow {
@@ -174,15 +189,23 @@ const grantAccounts = (grant: GrantRow) => {
   return names === "" && stale === "" ? "none" : `${names}${stale}`;
 };
 
-const grantRow = (csrf: string, grant: GrantRow) => `<tr>
+const grantRow = (csrf: string, grant: GrantRow, ceiling: PaymentLimits) => `<tr>
 <td>${grant.scopes.map((scope) => `<code>${escapeHtml(scope)}</code>`).join(" ")}</td>
 <td>${grantAccounts(grant)}</td>
 <td>${formatTime(grant.createdAt)}</td>
 <td>${formatTime(grant.lastUsedAt)}</td>
 <td><form method="post" action="/admin/grants/revoke">${csrfField(csrf)}${hidden("grant", grant.grantId)}<button type="submit">Revoke</button></form></td>
-</tr>`;
+</tr>${grant.payments === undefined ? "" : grantPaymentsRow(csrf, grant.grantId, grant.payments, ceiling)}`;
 
-const clientBlock = (csrf: string, client: ClientRow) => `<section>
+const grantPaymentsRow = (csrf: string, grantId: string, payments: GrantPaymentsRow, ceiling: PaymentLimits) => `
+<tr><td colspan="5"><details><summary>Payment limits and payee allowlist (${escapeHtml(payments.values.mode)}${payments.followsDefaults ? ", limits follow the server defaults" : ""})</summary>
+<p class="muted">Grant <code>${escapeHtml(grantId)}</code>. Saving stores these limits for this grant; they never exceed the server ceilings.</p>
+<form method="post" action="/admin/grants/payments">${csrfField(csrf)}${hidden("grant", grantId)}
+${paymentSettingsFields(payments.values, ceiling)}
+<button type="submit">Save payment settings</button></form>
+<p><a href="/admin/payments?grant=${encodeURIComponent(grantId)}">Payment audit of this grant</a></p></details></td></tr>`;
+
+const clientBlock = (csrf: string, client: ClientRow, ceiling: PaymentLimits) => `<section>
 <h2>${client.clientName === null ? "Unnamed client" : `“${escapeHtml(client.clientName)}”`}</h2>
 <p class="muted">The name is supplied by the client and not verified. Client ID <code>${escapeHtml(client.clientId)}</code>. Registered ${formatTime(client.createdAt)}, last authorized ${formatTime(client.lastUsedAt)}.<br>
 Redirects to ${client.redirectUris.map((uri) => `<code>${escapeHtml(uri)}</code>`).join(", ")}</p>
@@ -190,7 +213,7 @@ ${
   client.grants.length === 0
     ? "<p>No active authorization.</p>"
     : `<table><thead><tr><th>Scopes</th><th>Accounts</th><th>Authorized</th><th>Last used</th><th></th></tr></thead><tbody>
-${client.grants.map((grant) => grantRow(csrf, grant)).join("\n")}
+${client.grants.map((grant) => grantRow(csrf, grant, ceiling)).join("\n")}
 </tbody></table>`
 }
 <form method="post" action="/admin/clients/revoke">${csrfField(csrf)}${hidden("client", client.clientId)}<button type="submit">Remove client and revoke its access</button></form>
@@ -200,6 +223,7 @@ export interface ClientsPage {
   readonly csrf: string;
   readonly flash: Flash | undefined;
   readonly clients: ReadonlyArray<ClientRow>;
+  readonly paymentCeiling: PaymentLimits;
 }
 
 export const clientsPage = (page: ClientsPage): string =>
@@ -209,7 +233,7 @@ export const clientsPage = (page: ClientsPage): string =>
     page.flash,
     `<h1>Connected clients</h1>
 <p class="muted">Revoking ends the client's tokens at once; it can connect again only through the sign-in and consent pages.</p>
-${page.clients.length === 0 ? "<p>No registered clients.</p>" : page.clients.map((client) => clientBlock(page.csrf, client)).join("\n")}
+${page.clients.length === 0 ? "<p>No registered clients.</p>" : page.clients.map((client) => clientBlock(page.csrf, client, page.paymentCeiling)).join("\n")}
 <h2>Revoke everything</h2>
 <form method="post" action="/admin/clients/revoke-all">${csrfField(page.csrf)}
 <label><input type="checkbox" name="confirm" value="yes" required> Revoke every client's authorization</label>
@@ -235,4 +259,117 @@ ${csrfField(page.csrf)}
 <label>Repeat the new password <input type="password" name="confirm" autocomplete="new-password" minlength="12" required></label>
 <p><button type="submit">Change password</button></p>
 </form>`,
+  );
+
+const totalsText = (totals: Readonly<Record<string, number>>) =>
+  Object.keys(totals)
+    .sort()
+    .map((currency) => `${formatCents(totals[currency] ?? 0)} ${escapeHtml(currency)}`)
+    .join(", ") || "none";
+
+const payeeText = (payee: AuditRow["payees"][number]) =>
+  `<code>${escapeHtml(payee.payee)}</code>${payee.bankCode === null ? "" : ` (bank ${escapeHtml(payee.bankCode)})`}${
+    payee.bic === null ? "" : ` (BIC ${escapeHtml(payee.bic)})`
+  }: ${escapeHtml(payee.amount.toFixed(2))} ${escapeHtml(payee.currency)}${payee.vs === null ? "" : `, VS ${escapeHtml(payee.vs)}`}`;
+
+const auditRow = (row: AuditRow) => `<tr>
+<td>${formatTime(row.createdAt)}<br><span class="muted">${escapeHtml(row.pragueDay)} (Prague)</span></td>
+<td><a href="/admin/payments?grant=${encodeURIComponent(row.grantId)}"><code>${escapeHtml(row.grantId)}</code></a>${
+  row.clientId === null ? "" : `<br><span class="muted">client <code>${escapeHtml(row.clientId)}</code></span>`
+}</td>
+<td>${row.accountName === null ? "" : escapeHtml(row.accountName)}</td>
+<td><strong>${escapeHtml(row.outcome)}</strong>${row.reason === null ? "" : `<br><span class="muted">${escapeHtml(row.reason)}</span>`}${
+  row.fioErrorCode === null ? "" : `<br><span class="muted">${escapeHtml(row.fioErrorCode)}</span>`
+}</td>
+<td>${row.orderCount}<br>${totalsText(row.totals)}</td>
+<td>${row.payees.map(payeeText).join("<br>")}</td>
+<td>${row.batchIds.map((id) => `<code>${escapeHtml(id)}</code>`).join(", ")}${
+  row.idempotencyKey === null ? "" : `<br><span class="muted">key <code>${escapeHtml(row.idempotencyKey)}</code></span>`
+}</td>
+</tr>`;
+
+export interface PaymentsPage {
+  readonly csrf: string;
+  readonly flash: Flash | undefined;
+  /** Newest first. */
+  readonly rows: ReadonlyArray<AuditRow>;
+  /** The grant filter, if any. */
+  readonly grant: string | undefined;
+  /** The link to the next (older) page, when this one is full. */
+  readonly older: string | undefined;
+}
+
+export const paymentsPage = (page: PaymentsPage): string =>
+  signedIn(
+    "payments",
+    page.csrf,
+    page.flash,
+    `<h1>Payment audit</h1>
+<p>Batches held for approval: <a href="/admin/payments/pending">pending payments</a>.</p>
+<p class="muted">Every <code>submit_payment_orders</code> call that passed validation, newest first. Accepted, unknown and held batches count towards the daily limits. Rows are kept at least 365 days; <code>fio-mcp payments purge --before YYYY-MM-DD</code> deletes older ones.</p>
+${page.grant === undefined ? "" : `<p>Showing grant <code>${escapeHtml(page.grant)}</code> only. <a href="/admin/payments">Show all</a></p>`}
+${
+  page.rows.length === 0
+    ? "<p>No payment submissions.</p>"
+    : `<table><thead><tr><th>Submitted</th><th>Grant</th><th>Account</th><th>Outcome</th><th>Orders</th><th>Payees</th><th>Batch</th></tr></thead><tbody>
+${page.rows.map(auditRow).join("\n")}
+</tbody></table>`
+}
+${page.older === undefined ? "" : `<p><a href="${escapeHtml(page.older)}">Older submissions</a></p>`}`,
+  );
+
+export interface PendingRow {
+  readonly pendingId: string;
+  readonly accountName: string | null;
+  readonly xml: string;
+  readonly xmlSha256: string;
+  readonly expiresAt: number;
+  readonly audit: AuditRow;
+  /** Payees not on the grant's allowlist; undefined when the grant is no longer active. */
+  readonly unlisted: ReadonlyArray<string> | undefined;
+}
+
+export interface PendingPage {
+  readonly csrf: string;
+  readonly flash: Flash | undefined;
+  readonly rows: ReadonlyArray<PendingRow>;
+  /** Approving asks for the admin's authentication code (SEC-03). */
+  readonly secondFactor: boolean;
+}
+
+const payeeMark = (unlisted: ReadonlyArray<string> | undefined, payee: string) => {
+  if (unlisted === undefined) return "";
+  return unlisted.includes(payee) ? ` <span class="unlisted">not on the allowlist</span>` : ` <span class="muted">listed</span>`;
+};
+
+const pendingPayee = (row: PendingRow, payee: AuditRow["payees"][number]) =>
+  `<li>${payeeText(payee)}${payeeMark(row.unlisted, payee.payee)}</li>`;
+
+const pendingBlock = (csrf: string, secondFactor: boolean, row: PendingRow) => `<section>
+<h2>Batch <code>${escapeHtml(row.pendingId)}</code></h2>
+<p>Account ${row.accountName === null ? "(unnamed)" : `“${escapeHtml(row.accountName)}”`}; grant <code>${escapeHtml(row.audit.grantId)}</code>${
+  row.audit.clientId === null ? "" : `, client <code>${escapeHtml(row.audit.clientId)}</code>`
+}; submitted ${formatTime(row.audit.createdAt)}; dropped unless approved by <strong>${formatTime(row.expiresAt)}</strong>.</p>
+${row.unlisted === undefined ? `<p class="error">The authorization that submitted this batch is no longer active.</p>` : ""}
+<p>${row.audit.orderCount} orders, total ${totalsText(row.audit.totals)}.</p>
+<ul>${row.audit.payees.map((payee) => pendingPayee(row, payee)).join("")}</ul>
+<p>SHA-256 of the XML uploaded on approval: <code>${escapeHtml(row.xmlSha256)}</code></p>
+<details><summary>Exact XML</summary><pre>${escapeHtml(row.xml)}</pre></details>
+<form method="post" action="/admin/payments/pending/approve">${csrfField(csrf)}${hidden("pending", row.pendingId)}${
+  secondFactor
+    ? `<label>Authentication code <input type="text" name="totp" inputmode="numeric" autocomplete="one-time-code" required></label>`
+    : ""
+}<button type="submit">Approve and upload to FIO</button></form>
+<form method="post" action="/admin/payments/pending/decline">${csrfField(csrf)}${hidden("pending", row.pendingId)}<button type="submit">Decline</button></form>
+</section>`;
+
+export const pendingPage = (page: PendingPage): string =>
+  signedIn(
+    "payments",
+    page.csrf,
+    page.flash,
+    `<h1>Pending payments</h1>
+<p><a href="/admin/payments">Payment audit</a></p>
+<p class="muted">Batches from grants whose payee allowlist is in confirm mode wait here for approval. Approving uploads exactly the XML shown; the batch must then still be signed in FIO Internetbanking. Batches not approved within 24 hours are dropped.</p>
+${page.rows.length === 0 ? "<p>No batches are waiting.</p>" : page.rows.map((row) => pendingBlock(page.csrf, page.secondFactor, row)).join("\n")}`,
   );
