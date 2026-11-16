@@ -225,7 +225,7 @@ const TRANSACTION_SELECT = `rowid AS row_id, account_key, movement_id, sealed, $
  * the caller's transaction. Transactions are read in rowid batches, so the
  * whole pass reads each row once.
  */
-const convertAll = Effect.fn("Cache.convertRows")(function* (key: Redacted.Redacted<Uint8Array>, encrypt: boolean) {
+const convertAll = Effect.fn("Cache.convertAll")(function* (key: Redacted.Redacted<Uint8Array>, encrypt: boolean) {
   const sql = yield* SqlClient.SqlClient;
   const from = encrypt ? 0 : 1;
   let converted = 0;
@@ -268,19 +268,42 @@ const convertAll = Effect.fn("Cache.convertRows")(function* (key: Redacted.Redac
 /**
  * After sealing: rebuilds the database file (VACUUM) and truncates the
  * write-ahead log, so the plaintext the rows held before is not left in
- * free pages or old log frames. Another connection holding the database
- * open (a running CLI command) can keep the log from being truncated; that
- * is logged, and the next checkpoint overwrites it.
+ * free pages or old log frames. The sealing transaction records that this
+ * is pending (`cache_plaintext_remnants`); the record is cleared only once
+ * both steps completed, so a crash in between, or another connection
+ * keeping the log from being truncated (logged), makes the next startup
+ * run it again.
  */
 const dropPlaintextRemnants = Effect.fn("Cache.dropPlaintextRemnants")(function* () {
   const sql = yield* SqlClient.SqlClient;
   yield* sql`VACUUM`;
   const [checkpoint] = yield* sql<{ busy: number }>`PRAGMA wal_checkpoint(TRUNCATE)`;
   if ((checkpoint?.busy ?? 0) !== 0) {
-    yield* Effect.logWarning(
-      "cache: the database is open elsewhere, so its write-ahead log was not truncated after encrypting the cache; it may hold earlier plaintext until the next checkpoint",
+    return yield* Effect.logWarning(
+      "cache: the database is open elsewhere, so its write-ahead log was not truncated after encrypting the cache; it may hold earlier plaintext until the next startup repeats this",
     );
   }
+  yield* sql`DELETE FROM cache_plaintext_remnants`;
+});
+
+/**
+ * The conversion step of `reconcileCacheEncryption`, without the key check
+ * and the cleanup after it: one transaction that converts every row and,
+ * when sealing, records the cleanup as pending. Exported so tests can stop
+ * where a crash before the cleanup would.
+ */
+export const convertRows = Effect.fn("Cache.convertRows")(function* (key: Redacted.Redacted<Uint8Array>, encrypt: boolean) {
+  const sql = yield* SqlClient.SqlClient;
+  const converted = yield* sql.withTransaction(
+    Effect.tap(convertAll(key, encrypt), () =>
+      encrypt ? sql`INSERT OR IGNORE INTO cache_plaintext_remnants (pending) VALUES (1)` : sql`DELETE FROM cache_plaintext_remnants`,
+    ),
+  );
+  yield* Effect.logInfo(
+    encrypt
+      ? `cache: encrypted ${converted} cached rows (FIO_CACHE_ENCRYPT is on)`
+      : `cache: decrypted ${converted} cached rows (FIO_CACHE_ENCRYPT is off)`,
+  );
 });
 
 /**
@@ -288,8 +311,8 @@ const dropPlaintextRemnants = Effect.fn("Cache.dropPlaintextRemnants")(function*
  * it seals every plaintext row and then drops the plaintext's remnants from
  * the file; off, it opens every sealed row (which needs the data key). The
  * conversion is one transaction, so an interrupted run leaves the tables as
- * they were and the next startup repeats it; a run with nothing to convert
- * changes nothing. Fails when the key is missing or does not open what was
+ * they were and the next startup repeats it; the cleanup after sealing is
+ * repeated until it completes; a run with nothing to do changes nothing. Fails when the key is missing or does not open what was
  * sealed earlier, and when a sealed row does not decrypt.
  */
 export const reconcileCacheEncryption = Effect.fn("Cache.reconcileEncryption")(function* (sealing: CacheSealing) {
@@ -298,19 +321,23 @@ export const reconcileCacheEncryption = Effect.fn("Cache.reconcileEncryption")(f
     SELECT (SELECT COUNT(*) FROM transactions WHERE sealed = ${sealing.encrypt ? 0 : 1})
       + (SELECT COUNT(*) FROM accounts WHERE sealed = ${sealing.encrypt ? 0 : 1}) AS n
   `;
+  const [remnants] = yield* sql<{ n: number }>`SELECT COUNT(*) AS n FROM cache_plaintext_remnants`;
+  const cleanupPending = (remnants?.n ?? 0) > 0;
   const key = sealing.dataKey;
   if (key === undefined) {
     // Off without a key: nothing may be sealed. On without a key is a configuration error caught earlier.
     if (sealing.encrypt || (pending?.n ?? 0) > 0) return yield* new CacheKeyMissing();
+    // Off, the cache is plaintext by choice: an unfinished cleanup no longer matters.
+    if (cleanupPending) yield* sql`DELETE FROM cache_plaintext_remnants`;
     return;
   }
   yield* checkKey(key);
-  if ((pending?.n ?? 0) === 0) return;
-  const converted = yield* sql.withTransaction(convertAll(key, sealing.encrypt));
-  if (sealing.encrypt) yield* dropPlaintextRemnants();
-  yield* Effect.logInfo(
-    sealing.encrypt
-      ? `cache: encrypted ${converted} cached rows (FIO_CACHE_ENCRYPT is on)`
-      : `cache: decrypted ${converted} cached rows (FIO_CACHE_ENCRYPT is off)`,
-  );
+  if ((pending?.n ?? 0) > 0) {
+    yield* convertRows(key, sealing.encrypt);
+    if (sealing.encrypt) yield* dropPlaintextRemnants();
+  } else if (sealing.encrypt && cleanupPending) {
+    yield* dropPlaintextRemnants();
+  } else if (cleanupPending) {
+    yield* sql`DELETE FROM cache_plaintext_remnants`;
+  }
 });

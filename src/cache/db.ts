@@ -138,6 +138,8 @@ export const CACHE_MIGRATIONS: Migrations = {
     yield* sql`ALTER TABLE accounts ADD COLUMN sealed INTEGER NOT NULL DEFAULT 0 CHECK (sealed IN (0, 1))`;
     // Answers "does this account have sealed rows?" without a scan while encryption is off (and the index is empty).
     yield* sql`CREATE INDEX transactions_sealed ON transactions (account_key) WHERE sealed = 1`;
+    // A row while plaintext from before sealing may remain in free pages or the write-ahead log.
+    yield* sql`CREATE TABLE cache_plaintext_remnants (pending INTEGER PRIMARY KEY CHECK (pending = 1))`;
   }),
 };
 

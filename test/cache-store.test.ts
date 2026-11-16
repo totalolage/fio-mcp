@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { NodeFileSystem } from "@effect/platform-node";
@@ -12,6 +12,7 @@ import {
   type CacheSealing,
   CacheValueUnreadable,
   cacheAad,
+  convertRows,
   openValue,
   PLAINTEXT,
   reconcileCacheEncryption,
@@ -491,6 +492,8 @@ describe("cache encryption (FIO_CACHE_ENCRYPT)", () => {
         const store = yield* fromStartup(ON);
         const rows = yield* rawRows;
         assertSealed(rows);
+        const sql = yield* SqlClient.SqlClient;
+        assert.deepStrictEqual(yield* sql<{ n: number }>`SELECT COUNT(*) AS n FROM cache_plaintext_remnants`, [{ n: 0 }]);
         assert.deepStrictEqual(yield* queryAll(store), expected);
         return rows;
       }).pipe(onDisk);
@@ -519,6 +522,31 @@ describe("cache encryption (FIO_CACHE_ENCRYPT)", () => {
         return yield* queryAll(store);
       }).pipe(onDisk);
       assert.deepStrictEqual(reopened, expected);
+    }),
+  );
+
+  it.effect("a cleanup after sealing that does not complete is repeated by the next startup", () =>
+    Effect.gen(function* () {
+      const path = join(tempDir(), "fio.sqlite");
+      const onDisk = Effect.provide(testDatabase(path, CACHE_MIGRATIONS));
+      const holdsPlaintext = () =>
+        [path, `${path}-wal`].some((file) => existsSync(file) && readFileSync(file).indexOf(Buffer.from("Rent October", "utf8")) !== -1);
+      const pendingCleanup = Effect.flatMap(SqlClient.SqlClient, (sql) => sql<{ n: number }>`SELECT COUNT(*) AS n FROM cache_plaintext_remnants`);
+      yield* Effect.flatMap(makeCacheStore(), commitMovements).pipe(onDisk);
+      assert.isTrue(holdsPlaintext());
+      // Sealing commits, then the process stops before the cleanup.
+      yield* convertRows(KEY, true).pipe(onDisk);
+      yield* Effect.gen(function* () {
+        assertSealed(yield* rawRows);
+        assert.deepStrictEqual(yield* pendingCleanup, [{ n: 1 }]);
+      }).pipe(onDisk);
+      assert.isTrue(holdsPlaintext(), "the interrupted cleanup left plaintext behind");
+      // Nothing left to seal, but the next startup finishes the cleanup.
+      yield* Effect.gen(function* () {
+        yield* reconcileCacheEncryption(ON);
+        assert.deepStrictEqual(yield* pendingCleanup, [{ n: 0 }]);
+      }).pipe(onDisk);
+      assert.isFalse(holdsPlaintext());
     }),
   );
 
