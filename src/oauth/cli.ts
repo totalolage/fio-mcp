@@ -1,10 +1,11 @@
 import { Clock, DateTime, Effect, Queue, Redacted, Schema, Stdio, Stream, Terminal } from "effect";
 import { makeSettingsStore, SETTING } from "../account-store.js";
+import { encodeBase32, newTotpSecret, otpauthUri } from "../admin/totp.js";
 import { hashPassword, type ScryptParams } from "./crypto.js";
 import { makeOAuthStore } from "./store.js";
 
 /**
- * Admin commands: `hash-password` (needs no configuration) and the OAuth
+ * Admin commands: `hash-password` and `totp-init` (need no configuration) and the OAuth
  * client and token commands, which work on the server's database while the
  * server runs (revocations take effect on the next request).
  */
@@ -61,6 +62,20 @@ const readPiped = Effect.flatMap(Stdio.Stdio, (stdio) =>
 export const hashPasswordCommand = Effect.fn("cli.hashPassword")(function* (params?: ScryptParams) {
   const hash = yield* readNewPasswordHash(params);
   yield* write("stdout", `${hash}\n`);
+});
+
+/**
+ * `fio-mcp totp-init`: prints a new random TOTP secret (base32, line 1) for
+ * FIO_MCP_ADMIN_TOTP_SECRET_FILE and its `otpauth://` URI (line 2) for an
+ * authenticator app, on standard output. Stores nothing.
+ */
+export const totpInitCommand = Effect.fn("cli.totpInit")(function* () {
+  const secret = yield* Effect.sync(newTotpSecret);
+  yield* write("stdout", `${encodeBase32(secret)}\n${otpauthUri(secret)}\n`);
+  yield* write(
+    "stderr",
+    "Line 1 is the secret: store it in the file FIO_MCP_ADMIN_TOTP_SECRET_FILE names (e.g. `fio-mcp totp-init | head -n 1 > totp_secret`).\nLine 2 is the URI to add to an authenticator app (as a QR code or by hand). Nothing was stored.\n",
+  );
 });
 
 /** Reads a new admin password (twice on a terminal) and returns its scrypt hash line. */

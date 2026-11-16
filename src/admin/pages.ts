@@ -1,5 +1,5 @@
 import { DateTime } from "effect";
-import { escapeHtml, styleHash } from "../oauth/pages.js";
+import { escapeHtml, styleHash, TOTP_FIELD } from "../oauth/pages.js";
 
 /**
  * Server-rendered admin pages. Every interpolated value goes through
@@ -62,6 +62,8 @@ ${body}`,
 export interface AdminLoginPage {
   readonly csrf: string;
   readonly error: string | undefined;
+  /** Ask for the authenticator code too (FIO_MCP_ADMIN_TOTP_SECRET_FILE is set). */
+  readonly totp?: boolean;
 }
 
 export const adminLoginPage = (page: AdminLoginPage): string =>
@@ -73,7 +75,7 @@ ${page.error === undefined ? "" : `<p class="error" role="alert">${escapeHtml(pa
 ${csrfField(page.csrf)}
 <label for="password">Admin password</label>
 <input id="password" type="password" name="password" autocomplete="current-password" required autofocus>
-<p><button type="submit">Sign in</button></p>
+${page.totp === true ? TOTP_FIELD : ""}<p><button type="submit">Sign in</button></p>
 </form>
 <p class="muted">Signed-in sessions end after 15 minutes without activity.</p>`,
   );

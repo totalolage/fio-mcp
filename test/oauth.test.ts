@@ -4,6 +4,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { Clock, Effect, Option, Redacted } from "effect";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { tokenFingerprint } from "../src/accounts.js";
+import { totpCode } from "../src/admin/totp.js";
 import { hashSecret, randomSecret } from "../src/oauth/crypto.js";
 import { DEFAULT_THROTTLE } from "../src/oauth/login.js";
 import { LIMITS } from "../src/oauth/server.js";
@@ -853,5 +854,81 @@ describe("token endpoint", () => {
     expect((await revoke(owner.clientId, "fio_rt_unknown")).status).toBe(200);
     expect((await revoke(owner.clientId, owner.refresh)).status).toBe(200);
     expect((await postMcp(harness, { authorization: `Bearer ${owner.access}` })).status).toBe(401);
+  });
+});
+
+describe("admin TOTP second factor at /login (SEC-03)", () => {
+  const SECRET = new TextEncoder().encode("12345678901234567890");
+  /** The code for the server clock's current step, `steps` away. */
+  const codeNow = (steps = 0) => totpCode(SECRET, Math.floor(harness.clock.currentTimeMillisUnsafe() / 1000) + steps * 30);
+  /** A 6-digit code none of the accepted steps has. */
+  const wrongCode = () => {
+    const valid = new Set([codeNow(-1), codeNow(), codeNow(1)]);
+    return ["000000", "111111", "222222", "333333"].find((code) => !valid.has(code)) ?? "444444";
+  };
+  const loginForm = async () => {
+    const { body } = await register(harness, [LOOPBACK_REDIRECT], "TOTP client");
+    const browser = new Browser(harness);
+    await browser.get(
+      authorizationUrl({
+        response_type: "code",
+        client_id: String(body.client_id),
+        redirect_uri: LOOPBACK_REDIRECT,
+        code_challenge: pkcePair().challenge,
+        code_challenge_method: "S256",
+        resource: RESOURCE,
+      }),
+    );
+    const page = await browser.get("/login");
+    const html = await page.text();
+    const csrf = /name="csrf" value="([^"]+)"/.exec(html)?.[1] ?? "";
+    return { browser, csrf, html };
+  };
+
+  it("shows no code field when the secret is not configured", async () => {
+    const { html } = await loginForm();
+    expect(html).not.toContain('name="totp"');
+  });
+
+  it("needs a current, unused code with the password and counts a wrong or missing one", async () => {
+    await harness.close();
+    harness = await startOAuth({ throttle: { ...DEFAULT_THROTTLE, freeFailures: 1 }, totpSecret: Redacted.make(SECRET) });
+    const { browser, csrf, html } = await loginForm();
+    expect(html).toContain('name="totp"');
+    expect(html).toContain('autocomplete="one-time-code"');
+
+    const missing = await browser.post("/login", { csrf, password: PASSWORD });
+    expect(missing.status).toBe(401);
+    expect(await missing.text()).toContain("Wrong password or code.");
+    expect((await browser.post("/login", { csrf, password: PASSWORD, totp: wrongCode() })).status).toBe(401);
+    // Both counted: the second failure started the backoff, even for a correct code.
+    const throttled = await browser.post("/login", { csrf, password: PASSWORD, totp: codeNow() });
+    expect(throttled.status).toBe(429);
+    expect(await throttled.text()).toContain("Too many failed attempts");
+    harness.clock.advance(1000);
+
+    const code = codeNow();
+    expect((await browser.post("/login", { csrf, password: PASSWORD, totp: code })).status).toBe(303);
+    // The same code again, in another sign-in: refused.
+    const other = await loginForm();
+    expect((await other.browser.post("/login", { csrf: other.csrf, password: PASSWORD, totp: code })).status).toBe(401);
+    expect(harness.logs.join("\n")).toContain("second-factor code wrong, missing or reused");
+    expect(harness.logs.join("\n")).not.toContain(code);
+  });
+
+  it("answers a sign-in that finds another check running as busy, with retry-after 1 (SEC-09)", async () => {
+    await harness.close();
+    // Nothing is locked out here: every 429 must be the busy answer.
+    harness = await startOAuth({ throttle: { ...DEFAULT_THROTTLE, freeFailures: 100, lockoutFailures: 200 } });
+    const forms = await Promise.all(Array.from({ length: 8 }, () => loginForm()));
+    let busy: Response | undefined;
+    for (let round = 0; round < 5 && busy === undefined; round++) {
+      const responses = await Promise.all(forms.map(({ browser, csrf }) => browser.post("/login", { csrf, password: "wrong password!" })));
+      for (const response of responses) expect([401, 429]).toContain(response.status);
+      busy = responses.find((response) => response.status === 429);
+    }
+    if (busy === undefined) throw new Error("no sign-in was turned away as busy in 5 rounds");
+    expect(busy.headers.get("retry-after")).toBe("1");
+    expect(await busy.text()).toContain("Sign-in busy, try again.");
   });
 });

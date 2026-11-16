@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { Context, Effect, Layer, Option, Redacted, Schema } from "effect";
+import { Clock, Context, Effect, Layer, Option, Redacted, Schema } from "effect";
 import type { SqlClient } from "effect/sql";
 import { makeSettingsStore, SETTING } from "../account-store.js";
 import { MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH } from "../oauth/cli.js";
@@ -13,6 +13,7 @@ import {
   type ScryptParams,
 } from "../oauth/crypto.js";
 import { DEFAULT_THROTTLE, type LoginResult, makeLoginGuard, PasswordUnavailable, type ThrottlePolicy } from "../oauth/login.js";
+import { matchingTotpStep, TOTP_WINDOW, totpStep } from "./totp.js";
 
 /**
  * The admin password, shared by the OAuth sign-in (/login) and the admin UI
@@ -27,6 +28,11 @@ import { DEFAULT_THROTTLE, type LoginResult, makeLoginGuard, PasswordUnavailable
  * `stamp` identifies the current hash. Signed-in sessions (admin and OAuth)
  * remember it and end when it changes: changing the password signs out
  * every other session.
+ *
+ * With FIO_MCP_ADMIN_TOTP_SECRET_FILE set, a sign-in also needs the current
+ * RFC 6238 code, checked in the same permit right after the password. A
+ * wrong or missing code is a counted failure, and an accepted code (its
+ * 30 s step) is never accepted again by `signIn` or `verifyTotp`.
  */
 
 export class InvalidNewPassword extends Schema.TaggedError<InvalidNewPassword>()("InvalidNewPassword", {
@@ -45,8 +51,12 @@ export class PasswordChangeFailed extends Schema.TaggedError<PasswordChangeFaile
 }
 
 export interface AdminPasswordShape {
-  /** A sign-in check (throttled, counted); Accepted carries the stamp of the hash the password matched. */
-  readonly signIn: (address: string, password: Redacted.Redacted<string>) => Effect.Effect<LoginResult<string>>;
+  /**
+   * A sign-in check (throttled, counted); Accepted carries the stamp of the
+   * hash the password matched. With TOTP enabled, `code` must be a current,
+   * unused code; it is ignored otherwise.
+   */
+  readonly signIn: (address: string, password: Redacted.Redacted<string>, code?: string) => Effect.Effect<LoginResult<string>>;
   /** Identifies the current hash; changes with the password. */
   readonly stamp: Effect.Effect<string, PasswordUnavailable>;
   /**
@@ -60,6 +70,16 @@ export interface AdminPasswordShape {
     current: Redacted.Redacted<string>,
     next: Redacted.Redacted<string>,
   ) => Effect.Effect<LoginResult<string>, PasswordChangeFailed>;
+  /** True when FIO_MCP_ADMIN_TOTP_SECRET_FILE is configured. */
+  readonly totpEnabled: boolean;
+  /**
+   * Second factor on its own, for an already signed-in admin action.
+   * Throttled and counted per `address` in the same LoginGuard as sign-ins.
+   * A wrong or missing code counts as a failed attempt. An accepted code is
+   * single-use, and this replay memory is shared with sign-in.
+   * When TOTP is disabled, it returns Accepted at once and counts nothing.
+   */
+  readonly verifyTotp: (address: string, code: string | undefined) => Effect.Effect<LoginResult<void>>;
 }
 
 /** 12 to 1024 characters, as `hash-password` requires. */
@@ -75,11 +95,15 @@ export const checkNewPassword = (next: string, confirm: string): InvalidNewPassw
 const stampOfLine = (line: string) => createHash("sha256").update(line).digest("hex").slice(0, 32);
 const stampOf = (hash: PasswordHash) => stampOfLine(formatPasswordHash(hash));
 
-/** `scrypt` hashes a changed password; tests pass cheaper parameters. */
+/**
+ * `scrypt` hashes a changed password; tests pass cheaper parameters.
+ * `totpSecret` (FIO_MCP_ADMIN_TOTP_SECRET_FILE) turns on the second factor.
+ */
 export const makeAdminPassword = Effect.fn("AdminPassword.make")(function* (
   bootstrap: Redacted.Redacted<PasswordHash>,
   throttle: ThrottlePolicy = DEFAULT_THROTTLE,
   scrypt: ScryptParams = DEFAULT_SCRYPT,
+  totpSecret?: Redacted.Redacted<Uint8Array>,
 ) {
   const settings = yield* makeSettingsStore();
 
@@ -100,8 +124,33 @@ export const makeAdminPassword = Effect.fn("AdminPassword.make")(function* (
 
   const stamp = Effect.map(current, (hash) => stampOf(Redacted.value(hash)));
 
-  const signIn = (address: string, password: Redacted.Redacted<string>) =>
-    guard.attemptThen(address, password, (verified) => Effect.succeed(stampOf(Redacted.value(verified))));
+  /** Accepted TOTP steps, kept while they are inside the window; only read and written under the guard's permit. */
+  const usedSteps = new Set<number>();
+
+  /** True for a current code whose step was not accepted before; that step is then used up. */
+  const acceptCode = (secret: Redacted.Redacted<Uint8Array>, code: string | undefined) =>
+    Effect.map(Clock.currentTimeMillis, (millis) => {
+      const seconds = Math.floor(millis / 1000);
+      const oldest = totpStep(seconds) - TOTP_WINDOW;
+      for (const step of usedSteps) if (step < oldest) usedSteps.delete(step);
+      const step = code === undefined ? undefined : matchingTotpStep(Redacted.value(secret), code, seconds);
+      if (step === undefined || usedSteps.has(step)) return false;
+      usedSteps.add(step);
+      return true;
+    });
+
+  const signIn = (address: string, password: Redacted.Redacted<string>, code?: string) =>
+    guard.attemptThen(
+      address,
+      password,
+      (verified) => Effect.succeed(stampOf(Redacted.value(verified))),
+      totpSecret === undefined ? undefined : acceptCode(totpSecret, code),
+    );
+
+  const verifyTotp = (address: string, code: string | undefined): Effect.Effect<LoginResult<void>> =>
+    totpSecret === undefined
+      ? Effect.succeed({ _tag: "Accepted", value: undefined })
+      : guard.attemptFactor(address, acceptCode(totpSecret, code));
 
   /** Hashes and stores `next`; returns its stamp. */
   const store = (next: Redacted.Redacted<string>) =>
@@ -117,7 +166,7 @@ export const makeAdminPassword = Effect.fn("AdminPassword.make")(function* (
       Effect.tap((result) => (result._tag === "Accepted" ? Effect.logInfo("admin password: changed at /admin") : Effect.void)),
     );
 
-  return { signIn, stamp, change } satisfies AdminPasswordShape;
+  return { signIn, stamp, change, totpEnabled: totpSecret !== undefined, verifyTotp } satisfies AdminPasswordShape;
 });
 
 export class AdminPassword extends Context.Service<AdminPassword, AdminPasswordShape>()("fio-mcp/admin/AdminPassword") {
@@ -125,6 +174,7 @@ export class AdminPassword extends Context.Service<AdminPassword, AdminPasswordS
     bootstrap: Redacted.Redacted<PasswordHash>,
     throttle?: ThrottlePolicy,
     scrypt?: ScryptParams,
+    totpSecret?: Redacted.Redacted<Uint8Array>,
   ): Layer.Layer<AdminPassword, never, SqlClient.SqlClient> =>
-    Layer.effect(AdminPassword, Effect.map(makeAdminPassword(bootstrap, throttle, scrypt), AdminPassword.of));
+    Layer.effect(AdminPassword, Effect.map(makeAdminPassword(bootstrap, throttle, scrypt, totpSecret), AdminPassword.of));
 }

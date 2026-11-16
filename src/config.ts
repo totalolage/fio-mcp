@@ -1,6 +1,7 @@
 import { NodeFileSystem } from "@effect/platform-node";
 import { Config, Context, Effect, FileSystem, Layer, Option, Predicate, Redacted, Schema } from "effect";
 import type { IpNetwork } from "effect/net";
+import { decodeBase32, MIN_TOTP_SECRET_BYTES } from "./admin/totp.js";
 import { ConfigError } from "./errors.js";
 import { type PasswordHash, PasswordHashError, parsePasswordHash } from "./oauth/crypto.js";
 import { parsePublicUrl } from "./oauth/urls.js";
@@ -66,6 +67,8 @@ export type HttpAuthConfig =
       readonly dataKey: Redacted.Redacted<Uint8Array>;
       /** FIO_TOKEN / FIO_ACCOUNTS, read only if the database needs them. */
       readonly accountSeed: AccountSeed;
+      /** FIO_MCP_ADMIN_TOTP_SECRET_FILE: the admin second factor's secret; absent when TOTP is off. */
+      readonly totpSecret?: Redacted.Redacted<Uint8Array>;
     }
   | { readonly kind: "unauthenticated" };
 
@@ -377,6 +380,7 @@ const loadHttpAuth = Effect.fn("config.loadHttpAuth")(function* () {
     passwordHash: Redacted.make(hash),
     dataKey,
     accountSeed: yield* loadAccountSeed(),
+    totpSecret: yield* loadTotpSecret(),
   } satisfies HttpAuthConfig;
 });
 
@@ -409,6 +413,34 @@ const loadDataKey = Effect.fn("config.loadDataKey")(function* () {
     return yield* fail(`FIO_MCP_DATA_KEY_FILE: file must contain 32 bytes as 64 hex digits or base64; ${DATA_KEY_HELP}`);
   }
   return key;
+});
+
+const TOTP_HELP = "create one with `fio-mcp totp-init`";
+
+/**
+ * FIO_MCP_ADMIN_TOTP_SECRET_FILE (optional): a file holding the base32
+ * RFC 6238 secret (SHA-1, 6 digits, 30 s) of the admin second factor.
+ * When set, /login and /admin/login also need the authenticator code.
+ * Lowercase, spaces and `=` padding are accepted; at least 16 bytes
+ * (128 bits). Never echoes the content.
+ */
+const loadTotpSecret = Effect.fn("config.loadTotpSecret")(function* () {
+  const file = yield* optionalVar("FIO_MCP_ADMIN_TOTP_SECRET_FILE");
+  if (Option.isNone(file)) return undefined;
+  const fs = yield* FileSystem.FileSystem;
+  const content = yield* fs
+    .readFileString(file.value)
+    .pipe(Effect.mapError(() => new ConfigError({ detail: "FIO_MCP_ADMIN_TOTP_SECRET_FILE: file not readable" })));
+  const secret = decodeBase32(content);
+  if (secret === undefined) {
+    return yield* fail(`FIO_MCP_ADMIN_TOTP_SECRET_FILE: file must contain a base32 secret; ${TOTP_HELP}`);
+  }
+  if (secret.length < MIN_TOTP_SECRET_BYTES) {
+    return yield* fail(
+      `FIO_MCP_ADMIN_TOTP_SECRET_FILE: the secret must be at least ${MIN_TOTP_SECRET_BYTES} bytes (${Math.ceil((MIN_TOTP_SECRET_BYTES * 8) / 5)} base32 characters); ${TOTP_HELP}`,
+    );
+  }
+  return Redacted.make(secret);
 });
 
 const loadTrustedProxies = Effect.fn("config.loadTrustedProxies")(function* () {

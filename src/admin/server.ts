@@ -165,7 +165,7 @@ export const makeAdminServer = Effect.fn("AdminServer.make")(function* (settings
     error?: string,
     extra: Record<string, string> = {},
     cookies?: Cookies.Cookies,
-  ) => html(adminLoginPage({ csrf: Redacted.value(csrf), error }), status, extra, cookies);
+  ) => html(adminLoginPage({ csrf: Redacted.value(csrf), error, totp: password.totpEnabled }), status, extra, cookies);
 
   const showLogin = Effect.fnUntraced(function* (request: Request) {
     if (Option.isSome(yield* signedIn(request))) return redirect(ADMIN_PATH);
@@ -192,7 +192,7 @@ export const makeAdminServer = Effect.fn("AdminServer.make")(function* (settings
     const session = found.value;
     if (form._tag === "Invalid" || !verified(request, session, form.params)) return refused;
     const entered = Redacted.make(field(form.params, "password") ?? "");
-    const result = yield* password.signIn(clientAddress(request, trustedProxies), entered);
+    const result = yield* password.signIn(clientAddress(request, trustedProxies), entered, field(form.params, "totp"));
     switch (result._tag) {
       case "Accepted": {
         // Bound to the hash the password matched: a change in between ends this session.
@@ -201,8 +201,10 @@ export const makeAdminServer = Effect.fn("AdminServer.make")(function* (settings
         return redirect(ADMIN_PATH, sessionCookie(Redacted.value(next.cookie), ADMIN_ABSOLUTE_MS));
       }
       case "Rejected":
-        return renderLogin(session.csrf, 401, "Wrong password.");
+        return renderLogin(session.csrf, 401, password.totpEnabled ? "Wrong password or code." : "Wrong password.");
       case "Throttled":
+        // Busy: another check is running; this attempt was not counted.
+        if (result.busy === true) return renderLogin(session.csrf, 429, "Sign-in busy, try again.", { "retry-after": "1" });
         return renderLogin(session.csrf, 429, `Too many failed attempts. Try again in ${result.retryAfterSeconds} s.`, {
           "retry-after": String(result.retryAfterSeconds),
         });
