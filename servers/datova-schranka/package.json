@@ -8,7 +8,8 @@
     "node": ">=22.13"
   },
   "scripts": {
-    "build": "tsc -b tsconfig.build.json"
+    "build": "tsc -b tsconfig.build.json",
+    "start": "node dist/main.js"
   },
   "dependencies": {
     "@effect/platform-node": "4.0.6",
