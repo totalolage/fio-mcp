@@ -156,7 +156,7 @@ const make = Effect.gen(function* () {
 
 export class BoxClients extends Context.Service<BoxClients, BoxClientsShape>()("datova-schranka/BoxClients") {
   /** Clients built lazily per box, each transport in a scope the layer owns. */
-  static readonly layer: Layer.Layer<BoxClients, never, BoxRegistry | IsdsTransports | DomainConfig> = Layer.effect(
+  static readonly Default: Layer.Layer<BoxClients, never, BoxRegistry | IsdsTransports | DomainConfig> = Layer.effect(
     BoxClients,
     make,
   );

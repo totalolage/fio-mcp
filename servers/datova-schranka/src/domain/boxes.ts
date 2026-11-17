@@ -541,7 +541,7 @@ export class BoxRegistry extends Context.Service<BoxRegistry, BoxRegistryShape>(
    * Each change runs its own transaction and publishes once it commits, so
    * do not call one inside an outer `withTransaction`.
    */
-  static readonly layer: Layer.Layer<
+  static readonly Default: Layer.Layer<
     BoxRegistry,
     BoxCredentialsUnreadable | DomainStoreError,
     SqlClient.SqlClient | DataKey | DomainConfig | IsdsTransports | Redactor

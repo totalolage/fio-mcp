@@ -23,7 +23,7 @@ interface SetupOptions extends FakeIsdsOptions {
 }
 
 /**
- * BoxClients.layer over a fake registry and fake transports, built in a scope the test closes
+ * BoxClients.Default over a fake registry and fake transports, built in a scope the test closes
  * (`closeLayer`). Every transport's scope close is recorded in `closed` and offered to `closes`.
  */
 const setup = Effect.fn("setup")(function* (entries: ReadonlyArray<FakeBoxEntry>, options: SetupOptions = {}) {
@@ -51,7 +51,7 @@ const setup = Effect.fn("setup")(function* (entries: ReadonlyArray<FakeBoxEntry>
   const scope = yield* Scope.make();
   yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
   const context = yield* Layer.buildWithScope(
-    BoxClients.layer.pipe(
+    BoxClients.Default.pipe(
       Layer.provide(Layer.mergeAll(registry.layer, tracked, DomainConfig.layer({ dataDir: "/unused" }))),
     ),
     scope,

@@ -13,7 +13,7 @@ describe("BoxClients over BoxRegistry", () => {
       const { registry, context, isds } = yield* startRegistry({ logins: { alice: "aaa1111", "alice-again": "aaa1111" } });
       const clients = Context.get(
         yield* Layer.build(
-          BoxClients.layer.pipe(
+          BoxClients.Default.pipe(
             Layer.provide(Layer.succeedContext(context)),
             Layer.provide(isds.layer),
             Layer.provide(DomainConfig.layer({ dataDir: "/nonexistent", requestTimeout: Duration.seconds(7) })),
