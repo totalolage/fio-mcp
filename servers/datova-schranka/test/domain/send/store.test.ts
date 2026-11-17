@@ -372,6 +372,23 @@ describe("FilingStore transitions", () => {
     ),
   );
 
+  it.effect("report a lost CAS, not DmIdTaken, when the filing already left the expected state", () =>
+    withStore((store) =>
+      Effect.gen(function* () {
+        yield* inserted(store, dispatching("a"));
+        yield* inserted(store, dispatching("b"));
+        expectTag(yield* store.transition("a", ["dispatching"], "sent", { dmId: "100" }), "Won");
+        yield* patchRawFiling("b", { state: "not_sent" });
+        const before = yield* rawRow("b");
+        const lostCas = expectTag(yield* store.transition("b", ["dispatching"], "sent", { dmId: "100" }), "Lost");
+        assert.strictEqual(Option.getOrThrow(lostCas.current).state, "not_sent");
+        assert.deepStrictEqual(yield* rawRow("b"), before);
+        const missing = expectTag(yield* store.transition("nope", ["dispatching"], "sent", { dmId: "100" }), "Lost");
+        assert.isTrue(Option.isNone(missing.current));
+      }),
+    ),
+  );
+
   it.effect("burn the filing's unused nonces only when the transition wins", () =>
     withStore((store) =>
       Effect.gen(function* () {
@@ -591,6 +608,17 @@ describe("FilingStore dmID and competitor lookups", () => {
           "self",
           "upper-edge",
         ]);
+      }),
+    ),
+  );
+
+  it.effect("count an in-flight filing without submitted_at as competing, whatever the window", () =>
+    withStore((store) =>
+      Effect.gen(function* () {
+        yield* inserted(store, dispatching("self", T0));
+        yield* inserted(store, dispatching("untimed", T0 + 60 * MINUTE));
+        yield* patchRawFiling("untimed", { submitted_at: null });
+        assert.deepStrictEqual(yield* store.competitors("box_1", "rcpt123", T0, MINUTE, "self"), ["untimed"]);
       }),
     ),
   );

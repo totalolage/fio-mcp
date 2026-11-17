@@ -13,6 +13,10 @@ import type { FilingPreview, IsdsStatusSummary, SendResult } from "./api.js";
  * outcome: wrap exactly that section (D-d), starting right after the claim wins. A failure,
  * defect or interruption while any window is open is audited as "uncertain"; a window closes
  * only when its effect succeeds, so the mark cannot be left set by mistake or cleared early.
+ *
+ * `whileClaimed` does not mask interruption itself. Run the claim and its window in one
+ * uninterruptible region (D-d): an interruption after the claim commits but before the window
+ * opens would be audited "error" and leave the filing 'dispatching' until startup recovery.
  */
 export interface ClaimSignal {
   readonly whileClaimed: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;

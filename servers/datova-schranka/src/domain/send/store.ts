@@ -262,7 +262,11 @@ export interface FilingStore {
   readonly payload: (id: string) => Effect.Effect<Option.Option<string>, DomainStoreError>;
   /** Inserts a filing (and, for awaiting_approval, its nonce) in one transaction. */
   readonly insert: (filing: NewFiling) => Effect.Effect<InsertResult, DomainStoreError>;
-  /** Compare-and-set `from` → `to` with `patch`; `from` empty always loses. */
+  /**
+   * Compare-and-set `from` → `to` with `patch`; `from` empty always loses. With a dmID in
+   * the patch, a filing no longer in `from` loses before the dmID is checked (DmIdTaken
+   * only when the CAS could otherwise win).
+   */
   readonly transition: (
     id: string,
     from: ReadonlyArray<FilingState>,
@@ -296,7 +300,8 @@ export interface FilingStore {
   /**
    * Ids (sorted) of other filings on `boxId` to `recipientDbId`, in
    * dispatching or outcome_unknown, with submitted_at in
-   * [submittedAt − windowMs, submittedAt + windowMs] (both edges included).
+   * [submittedAt − windowMs, submittedAt + windowMs] (both edges included), or with
+   * no submitted_at at all (it could have been sent at any time).
    */
   readonly competitors: (
     boxId: string,
@@ -433,6 +438,12 @@ export const makeFilingStore = Effect.gen(function* () {
       return yield* lost(id);
     }
     if (patch.dmId !== undefined) {
+      // State first: a filing that already left `from` (or is gone) reports the lost CAS,
+      // not a dmID conflict with some other filing.
+      const current = yield* selectById(id);
+      if (Option.isNone(current) || !from.includes(current.value.state)) {
+        return FilingWrite.Lost({ current });
+      }
       const owner = yield* ownerOf(patch.dmId, id);
       if (Option.isSome(owner)) {
         return FilingWrite.DmIdTaken({ dmId: patch.dmId, filingId: owner.value });
@@ -584,7 +595,8 @@ export const makeFilingStore = Effect.gen(function* () {
     const within =
       submittedAt === undefined
         ? sql``
-        : sql`AND submitted_at BETWEEN ${submittedAt - windowMs} AND ${submittedAt + windowMs}`;
+        : // An in-flight filing without submitted_at could have sent at any time: count it.
+          sql`AND (submitted_at IS NULL OR submitted_at BETWEEN ${submittedAt - windowMs} AND ${submittedAt + windowMs})`;
     return Effect.map(
       sql<{ id: string }>`
         SELECT id FROM filings
