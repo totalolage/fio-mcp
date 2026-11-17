@@ -2,8 +2,9 @@
 # Runs test/e2e/live.test.ts: the composed datova-schranka HTTP app, in-process, against the ISDS
 # PUBLIC TEST environment (datovka-test.gov.cz). The box is added through the admin action with
 # credentials from the Secret Service keyring (service "mcps-isds-test"). Credentials reach the
-# test only as /dev/fd pipes (process substitution); they are never written to disk, printed,
-# logged or passed in argv.
+# test only as /dev/fd pipes (process substitution); this script never writes them to a file,
+# prints, logs or passes them in argv. The app under test stores the box's credentials sealed with
+# a throwaway data key in a temp database that the test removes at the end.
 #
 # Usage: servers/datova-schranka/scripts/datova-schranka-live-smoke.sh [--route password|certificate]
 #

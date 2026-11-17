@@ -2,7 +2,9 @@
  * Opt-in live smoke test of the composed app against the ISDS PUBLIC TEST environment
  * (datovka-test.gov.cz). Skipped unless DS_LIVE_SMOKE=true. Run it with
  * scripts/datova-schranka-live-smoke.sh, which reads credentials from the keyring and passes them
- * as /dev/fd pipes; nothing is written to disk.
+ * as /dev/fd pipes, never as files. The app under test keeps what an app keeps: the box's
+ * credentials sealed with the throwaway data key in its temp database, and the downloaded ZFO in
+ * its temp data dir; the harness removes that dir at close.
  *
  * The HTTP app runs in-process with a temp database, data dir, throwaway data key and admin
  * password hash, and the real ISDS transports for environment `test`. The box is added through
@@ -69,7 +71,10 @@ const loadCredentials = Effect.gen(function* () {
 
 const LABEL = "live-test";
 
-/** Above the app's ISDS request timeout (60 s), so a slow ISDS call ends as the app's own tool error. */
+/**
+ * Above the app's ISDS request timeout (60 s), so one slow ISDS call ends as the app's own tool
+ * error. download_message makes two ISDS calls in sequence, so two slow ones can still reach it.
+ */
 const MCP_REQUEST_TIMEOUT_MS = 90_000;
 
 type Json = Record<string, unknown>;
@@ -91,13 +96,22 @@ const countOf = (json: Json, field: string): number => {
   return typeof value === "number" ? value : -1;
 };
 
-/** The error tag of the newest box_add audit row (detail is JSON text; only the tag is reported). */
-const addErrorTag = async (admin: AdminSession): Promise<string> => {
-  const rows = await admin.auditRows();
-  const row = rows.find((candidate) => candidate.action === "box_add");
-  if (row === undefined) return "no box_add audit row";
+/** The outcome and error tag of the newest audit row of `action` (detail is JSON text; only the tag is reported). */
+const auditTag = async (admin: AdminSession, action: string): Promise<string> => {
+  const row = (await admin.auditRows()).find((candidate) => candidate.action === action);
+  if (row === undefined) return `no ${action} audit row`;
   const match = /"error"\s*:\s*"([A-Za-z]+)"/.exec(row.detail) ?? /\b([A-Z][A-Za-z]*Error)\b/.exec(row.detail);
-  return `${row.outcome}, error ${match?.[1] ?? "unknown"}`;
+  return `audit ${row.outcome}, error ${match?.[1] ?? "unknown"}`;
+};
+
+/** The id of the most recently delivered record (ISDS's list order is not guaranteed). */
+const newestId = (records: ReadonlyArray<Json>): string | undefined => {
+  const time = (record: Json) => Date.parse(String(record.dmDeliveryTime ?? ""));
+  const newest = records.reduce<Json | undefined>(
+    (best, record) => (best === undefined || time(record) > time(best) ? record : best),
+    undefined,
+  );
+  return typeof newest?.dmID === "string" ? newest.dmID : undefined;
 };
 
 describe.skipIf(!enabled)("datova-schranka app live (ISDS public test environment)", () => {
@@ -113,6 +127,7 @@ describe.skipIf(!enabled)("datova-schranka app live (ISDS public test environmen
       const record = (step: string, ok: boolean, outcome: string) => results.push({ step, ok, outcome });
       // Every text that leaves the app is checked here; only the verdict is recorded, never the text.
       const leaks: Array<string> = [];
+      // Texts the harness returns (admin pages, logs) are already scrubbed by it; tool results are raw.
       const checkNoSecret = (where: string, text: string | undefined) => {
         if (text !== undefined && secrets.some((secret) => secret.length > 0 && text.includes(secret))) {
           leaks.push(where);
@@ -120,7 +135,8 @@ describe.skipIf(!enabled)("datova-schranka app live (ISDS public test environmen
       };
 
       const app = await startE2eApp({ isds: "live" });
-      const runTools = async () => {
+      let completed = false;
+      const runTools = async (admin: AdminSession) => {
           const grant = await app.consent({ boxes: [LABEL], scopes: ["isds:read"], deliveryConsent: true });
           record("OAuth consent", true, "granted isds:read with delivery consent");
           const mcp = await app.mcp(grant.access, { requestTimeoutMs: MCP_REQUEST_TIMEOUT_MS });
@@ -129,8 +145,10 @@ describe.skipIf(!enabled)("datova-schranka app live (ISDS public test environmen
             const result = await mcp.call(name, args);
             const text = textOf(result);
             checkNoSecret(name, text);
+            checkNoSecret(name, JSON.stringify(result));
             if (result.isError === true) {
-              record(name, false, `isError: ${text.slice(0, 160)}`);
+              // The error text is not logged (it can quote ISDS or message data); the audit row's tag is.
+              record(name, false, `isError true, ${await auditTag(admin, name)}`);
               return Option.none<Json>();
             }
             const json = jsonOf(result);
@@ -150,11 +168,9 @@ describe.skipIf(!enabled)("datova-schranka app live (ISDS public test environmen
             (json) => `${countOf(json, "records")} records${json.note === undefined ? "" : ", with note"}`,
           );
 
-          const newest = Option.flatMap(received, (json) => {
-            const records = Array.isArray(json.records) ? (json.records as ReadonlyArray<Json>) : [];
-            const id = records[0]?.dmID;
-            return typeof id === "string" ? Option.some(id) : Option.none();
-          });
+          const newest = Option.flatMap(received, (json) =>
+            Option.fromNullishOr(newestId(Array.isArray(json.records) ? (json.records as ReadonlyArray<Json>) : [])),
+          );
           if (Option.isSome(newest)) {
             const messageId = newest.value;
             await call("get_message", { box: LABEL, messageId }, (json) => {
@@ -190,15 +206,18 @@ describe.skipIf(!enabled)("datova-schranka app live (ISDS public test environmen
               });
         checkNoSecret("add box page", added.text);
         if (!added.added) {
-          record(`add box (${credentials.route})`, false, `not added: status ${added.status}, ${await addErrorTag(admin)}`);
+          record(`add box (${credentials.route})`, false, `not added: status ${added.status}, ${await auditTag(admin, "box_add")}`);
         } else {
           record(`add box (${credentials.route})`, true, `added, status ${added.status}`);
-          await runTools();
+          await runTools(admin);
         }
-        for (const line of app.logs()) checkNoSecret("server log", line);
+        completed = true;
       } finally {
+        for (const line of app.logs()) checkNoSecret("server log", line);
+        const coverage = completed ? "clean" : "clean as far as the run got (it stopped early)";
+        const leakCheck = leaks.length > 0 ? `found in ${leaks.join(", ")}` : coverage;
         console.info(
-          `datova-schranka live results:\n${results.map((r) => `  ${r.step}: ${r.ok ? "ok" : "FAILED"}: ${r.outcome}`).join("\n")}\n  credential leak check: ${leaks.length === 0 ? "clean" : `found in ${leaks.join(", ")}`}`,
+          `datova-schranka live results:\n${results.map((r) => `  ${r.step}: ${r.ok ? "ok" : "FAILED"}: ${r.outcome}`).join("\n")}\n  credential leak check: ${leakCheck}`,
         );
         await app.close();
       }
