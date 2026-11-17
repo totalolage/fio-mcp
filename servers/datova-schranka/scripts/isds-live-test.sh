@@ -43,8 +43,8 @@ cd "$repo_root"
 
 # Worker threads share the process's file descriptors, so the /dev/fd pipes stay readable;
 # forked workers would not inherit them.
-vitest=(node_modules/.bin/vitest run --config servers/datova-schranka/vitest.config.ts
-  --pool=threads --maxWorkers=1 --silent=false --reporter=verbose test/isds/live.test.ts)
+vitest=(node_modules/.bin/vitest run --pool=threads --maxWorkers=1 --silent=false
+  --reporter=verbose servers/datova-schranka/test/isds/live.test.ts)
 
 export ISDS_LIVE_TEST=true ISDS_LIVE_TEST_ROUTE="$route" ISDS_TEST_ALLOW_DELIVERY="$allow_delivery"
 case "$route" in

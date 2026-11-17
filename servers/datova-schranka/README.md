@@ -13,12 +13,12 @@ ISDS (Czech data box, datová schránka) SOAP client on Effect, for the future d
 
 ## Checks
 
-From the repository root:
+The root `bun run check` typechecks, lints and tests this package with the rest of the workspace. To run only this package's checks, from the repository root:
 
 ```sh
 node_modules/.bin/tsc -p servers/datova-schranka/tsconfig.json --noEmit
 node_modules/.bin/biome check servers/datova-schranka
-node_modules/.bin/vitest run --config servers/datova-schranka/vitest.config.ts
+node_modules/.bin/vitest run servers/datova-schranka
 ```
 
 The transport tests generate a throwaway CA and certificates with the `openssl` CLI.
