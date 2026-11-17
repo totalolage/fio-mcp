@@ -1,3 +1,4 @@
+import { stripMarks } from "@mcps/core/mcp/untrusted.js";
 import {
   stderrLogger as coreStderrLogger,
   loggerLayer,
@@ -8,7 +9,6 @@ import {
 } from "@mcps/core/redaction.js";
 import { Effect, Layer, Redacted } from "effect";
 import { AppConfig } from "./config.js";
-import { stripMarks } from "./mcp/untrusted.js";
 
 /**
  * Token redaction. FIO puts read tokens in the URL path and upload tokens in
@@ -24,7 +24,7 @@ import { stripMarks } from "./mcp/untrusted.js";
 export { REDACTED, Redactor, type RedactorShape } from "@mcps/core/redaction.js";
 
 // Path segments that are immediately followed by a token in FIO's REST API.
-// The segment stops at the excerpt markers (U+E000, U+E001, src/mcp/untrusted.ts)
+// The segment stops at the excerpt markers (U+E000, U+E001, @mcps/core/mcp/untrusted.ts)
 // so redaction never removes one.
 const TOKEN_PATH =
   /\/(periods|by-id|last|set-last-id|set-last-date|merchant|lastStatement)\/[^/\s?#"'<>\uE000\uE001]+/g;
@@ -54,7 +54,7 @@ export const RedactorLive = RedactorDefault.pipe(Layer.provide(AppConfig.Live));
 
 /**
  * Writes logfmt lines to stderr, redacted. Excerpt markers (U+E000, U+E001,
- * src/mcp/untrusted.ts) are stripped first, so a log line never carries one.
+ * @mcps/core/mcp/untrusted.ts) are stripped first, so a log line never carries one.
  */
 export const stderrLogger = (redactor: RedactorShape) => coreStderrLogger(redactor, stripMarks);
 

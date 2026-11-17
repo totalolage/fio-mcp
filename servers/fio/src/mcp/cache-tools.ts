@@ -1,3 +1,4 @@
+import { G, type GuardSpec, guardedOutput } from "@mcps/core/mcp/untrusted.js";
 import { Effect, Schema } from "effect";
 import { McpServer, Tool, Toolkit } from "effect/ai";
 import { Accounts } from "../accounts.js";
@@ -12,9 +13,9 @@ import {
 import { AppConfig } from "../config.js";
 import { InvalidInput } from "../errors.js";
 import { Redactor } from "../redaction.js";
-import { annotateTool, DateParam, guardedOutput, JsonObject, ToolFailure, toolsForAccounts, withAccount } from "./common.js";
+import { annotateTool, DateParam, JsonObject, ToolFailure, toolsForAccounts, withAccount } from "./common.js";
 import { permittedAccount, READ, requireScopes, visibleAccounts } from "./permissions.js";
-import { CURRENCY, G, type GuardSpec, markLegacyExcerpt, STATEMENT_GUARD } from "./untrusted.js";
+import { CURRENCY, markLegacyExcerpt, STATEMENT_GUARD } from "./untrusted-policy.js";
 
 /**
  * Tools answered from the local cache only. They never call FIO, so they

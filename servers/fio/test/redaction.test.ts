@@ -1,7 +1,7 @@
 import { assert, describe, it } from "@effect/vitest";
+import { makeGuard, markUntrusted, preambleFor } from "@mcps/core/mcp/untrusted.js";
 import { ConfigProvider, Effect, Layer, Logger } from "effect";
 import { FioBadRequest } from "../src/errors.js";
-import { makeGuard, markUntrusted, preambleFor } from "../src/mcp/untrusted.js";
 import { makeRedactor, Redactor, RedactorLive, stderrLogger } from "../src/redaction.js";
 import { PAY_TOKEN, READ_TOKEN } from "./fixtures.js";
 

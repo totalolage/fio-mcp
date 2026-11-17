@@ -1,7 +1,7 @@
+import { markUntrusted } from "@mcps/core/mcp/untrusted.js";
 import { Effect, Predicate } from "effect";
 import { XMLParser, XMLValidator } from "fast-xml-parser";
 import { XmlParseError } from "./errors.js";
-import { markUntrusted } from "./mcp/untrusted.js";
 
 /** Import response (PDF §6, responseImportIB.xsd). */
 

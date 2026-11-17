@@ -1,5 +1,5 @@
+import { markUntrusted } from "@mcps/core/mcp/untrusted.js";
 import { Schema } from "effect";
-import { markUntrusted } from "./mcp/untrusted.js";
 
 /**
  * Expected failures. Every error's `message` is shown to the model as the

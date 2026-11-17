@@ -1,3 +1,4 @@
+import { stripMarks } from "@mcps/core/mcp/untrusted.js";
 import { Effect, Redacted, Schema, Semaphore } from "effect";
 import { SqlClient } from "effect/sql";
 import { AccountNotFound, AccountStoreError, makeAccountStore, type NewAccount } from "../account-store.js";
@@ -6,7 +7,6 @@ import { makeCachedData, Transactions } from "../cache/service.js";
 import { ACCOUNT_NUMBER, CURRENCY, FIELD_RULES, TOKEN, validAccountName } from "../config.js";
 import type { CacheError, FioRequestError } from "../errors.js";
 import { FioApi } from "../fio-api.js";
-import { stripMarks } from "../mcp/untrusted.js";
 import { parseLastStatement } from "../statement.js";
 
 /**

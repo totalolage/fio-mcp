@@ -1,5 +1,5 @@
+import { containsGuardMarkers, FREE_TEXT_CAP, sanitiseUntrusted } from "@mcps/core/mcp/untrusted.js";
 import { Result, Schema } from "effect";
-import { containsGuardMarkers, FREE_TEXT_CAP, sanitiseUntrusted } from "./mcp/untrusted.js";
 import { compact, isValidIban, MAX_AMOUNT, type PaymentOrder } from "./payments.js";
 
 /**

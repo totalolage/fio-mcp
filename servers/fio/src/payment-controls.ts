@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { markUntrusted } from "@mcps/core/mcp/untrusted.js";
 import type { Principal } from "@mcps/core/transport/principal.js";
 import { Clock, Context, Effect, Layer, Option, Schema, Semaphore } from "effect";
 import { type Account, Accounts } from "./accounts.js";
@@ -17,7 +18,6 @@ import {
 import { FioApi } from "./fio-api.js";
 import { type ImportResult, looksLikeMissingPaymentPermission, parseImportResponse } from "./import-response.js";
 import { ToolFailure } from "./mcp/common.js";
-import { markUntrusted } from "./mcp/untrusted.js";
 import { readGrantPayments } from "./oauth/grant-payments.js";
 import {
   type AuditOutcome,

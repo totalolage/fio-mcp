@@ -1,24 +1,27 @@
 import { randomBytes } from "node:crypto";
 import { Context, Effect } from "effect";
-import type { StatementInfo, Transaction } from "../statement.js";
 
 /**
- * Nonce guards for text that comes from the bank (SEC-05).
+ * Nonce guards for third-party text in tool output (SEC-05).
  *
- * Anyone can send a small payment with a message, so counterparty names,
- * messages, export content and Fio's own response text are third-party data.
- * Each tool response that carries such values wraps every one of them in
+ * A server's upstream data can carry text written by anyone (for Fio:
+ * counterparty names, payment messages, export content and the bank's own
+ * response text). Each tool response that carries such values wraps every one of them in
  * `<untrusted-{nonce}>…</untrusted-{nonce}>` and starts with one preamble
  * sentence telling the model to treat the wrapped text as data. The nonce is
  * fresh per response and comes from a CSPRNG after the values were sanitised,
  * so the data can neither predict nor forge a boundary.
  *
- * The guards reduce prompt-injection risk; they do not remove it. The payment
- * controls and Fio's Internetbanking signature are what act regardless of
- * what the model believes.
+ * The guards reduce prompt-injection risk; they do not remove it. Controls
+ * outside the model (for Fio: the payment controls and Internetbanking
+ * signature) are what act regardless of what the model believes.
+ *
+ * This module is the mechanism. Each server supplies its policy: the
+ * `GuardSpec` for each result, its identifier patterns, and where it marks
+ * excerpts with `markUntrusted`.
  */
 
-/** Cap for free-text bank fields, in code points. */
+/** Cap for free-text untrusted fields, in code points. */
 export const FREE_TEXT_CAP = 1000;
 
 export const TRUNCATION_MARKER = "…[truncated]";
@@ -68,8 +71,8 @@ function capCodePoints(value: string, cap: number): string {
 
 /**
  * True when the value carries anything guarded output is made of: a guard
- * tag (after NFKC), a removal marker, or the preamble lead-in. Payment orders
- * containing these were pasted from guarded bank text (SEC-28).
+ * tag (after NFKC), a removal marker, or the preamble lead-in. Input carrying
+ * these was pasted from guarded output (for Fio's payment orders: SEC-28).
  */
 export function containsGuardMarkers(value: string): boolean {
   const normalised = value.normalize("NFKC");
@@ -84,7 +87,8 @@ export function containsGuardMarkers(value: string): boolean {
 // Excerpt markers. Error messages are composed from other errors' messages, so
 // a response excerpt is marked where it is taken (Redactor.excerpt) and the
 // marked segments become guarded blocks when the message leaves as a tool
-// result. Private-use code points, removed from the excerpt itself.
+// result (see guardFailure). Private-use code points, removed from the
+// excerpt itself.
 const MARK_OPEN = String.fromCodePoint(0xe000);
 const MARK_CLOSE = String.fromCodePoint(0xe001);
 const MARKS = new RegExp(`[${MARK_OPEN}${MARK_CLOSE}]`, "g");
@@ -113,7 +117,7 @@ function replaceMarked(text: string, f: (segment: string) => string): string {
   return out;
 }
 
-/** Marks bank text inside a message so the tool output guards it. Empty stays empty. */
+/** Marks untrusted text inside a message so the tool output guards it. Empty stays empty. */
 export const markUntrusted = (value: string): string =>
   value === "" ? "" : `${MARK_OPEN}${value.replace(MARKS, "")}${MARK_CLOSE}`;
 
@@ -122,23 +126,8 @@ export const stripMarks = (text: string): string => text.replace(MARKS, "");
 
 export const hasMarks = (text: string): boolean => text.includes(MARK_OPEN);
 
-const EXCERPT_LEAD = " Response: ";
-
-/**
- * Marks the excerpt of an error message persisted before excerpts were
- * marked (a sync's `lastError` from an older version): everything after
- * " Response: " (src/errors.ts) is bank text. Fails closed to the end.
- */
-export const markLegacyExcerpt = (text: string): string => {
-  if (hasMarks(text)) return text;
-  const at = text.indexOf(EXCERPT_LEAD);
-  if (at === -1) return text;
-  const start = at + EXCERPT_LEAD.length;
-  return text.slice(0, start) + markUntrusted(text.slice(start));
-};
-
 /** Source of nonce bytes; tests pin it with `Effect.provideService(Random, ...)`. */
-export const Random = Context.Reference<{ readonly bytes: (length: number) => Uint8Array }>("fio-mcp/mcp/Random", {
+export const Random = Context.Reference<{ readonly bytes: (length: number) => Uint8Array }>("mcps/mcp/Random", {
   defaultValue: () => ({ bytes: (length) => new Uint8Array(randomBytes(length)) }),
 });
 
@@ -168,15 +157,6 @@ export const makeGuard: Effect.Effect<Guard> = Effect.gen(function* () {
   };
 });
 
-// Strict identifiers stay unguarded while they match their pattern.
-export const DATE = /^\d{4}-\d{2}-\d{2}$/;
-export const CURRENCY = /^[A-Z]{3}$/;
-export const SYMBOL = /^\d{1,10}$/;
-export const BANK_CODE = /^\d{4}$/;
-export const CZECH_ACCOUNT = /^(\d{1,6}-)?\d{1,10}$/;
-export const IBAN = /^[A-Z]{2}\d{2}[A-Z0-9]{11,30}$/;
-export const BIC = /^[A-Z]{6}[A-Z0-9]{2}([A-Z0-9]{3})?$/;
-
 /**
  * Where untrusted strings sit in a result. At paths the spec does not name,
  * only marked excerpts are guarded. An object or array where the spec expects
@@ -202,48 +182,11 @@ export const G = {
   id: (pattern: RegExp): GuardSpec => ({ _tag: "Identifier", pattern }),
   array: (item: GuardSpec): GuardSpec => ({ _tag: "Array", item }),
   struct: (fields: Readonly<Record<string, GuardSpec>>): GuardSpec => ({ _tag: "Struct", fields }),
-  /** An object whose keys are untrusted (for example counterparty group keys). */
+  /** An object whose keys are untrusted (for example Fio's counterparty group keys). */
   keys: (value?: GuardSpec): GuardSpec => ({ _tag: "Keys", value }),
 } as const;
 
 const MARKED: GuardSpec = { _tag: "Marked" };
-
-/** A counterparty account: Czech number or IBAN. */
-const ACCOUNT_OR_IBAN = /^(?:(\d{1,6}-)?\d{1,10}|[A-Z]{2}\d{2}[A-Z0-9]{11,30})$/;
-
-/** Bank text in a transaction; ids and amounts are numbers. */
-export const TRANSACTION_GUARD = G.struct({
-  date: G.id(DATE),
-  currency: G.id(CURRENCY),
-  counterpartyAccount: G.id(ACCOUNT_OR_IBAN),
-  counterpartyName: G.text(),
-  counterpartyBankCode: G.id(BANK_CODE),
-  counterpartyBankName: G.text(),
-  counterpartyBic: G.id(BIC),
-  constantSymbol: G.id(SYMBOL),
-  variableSymbol: G.id(SYMBOL),
-  specificSymbol: G.id(SYMBOL),
-  userIdentification: G.text(),
-  messageForRecipient: G.text(),
-  type: G.text(),
-  executedBy: G.text(),
-  details: G.text(),
-  comment: G.text(),
-  payerReference: G.text(),
-} satisfies Partial<Record<keyof Transaction, GuardSpec>>);
-
-const INFO_GUARD = G.struct({
-  accountId: G.id(CZECH_ACCOUNT),
-  bankId: G.id(BANK_CODE),
-  currency: G.id(CURRENCY),
-  iban: G.id(IBAN),
-  bic: G.id(BIC),
-  dateStart: G.id(DATE),
-  dateEnd: G.id(DATE),
-} satisfies Partial<Record<keyof StatementInfo, GuardSpec>>);
-
-/** A statement or a page of transactions (`info` and `transactions` where present). */
-export const STATEMENT_GUARD = G.struct({ info: INFO_GUARD, transactions: G.array(TRANSACTION_GUARD) });
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -324,7 +267,7 @@ export const guardResult = <A extends Record<string, unknown>>(
   });
 
 /**
- * Guards a message whose bank text was marked with `markUntrusted`: the
+ * Guards a message whose untrusted text was marked with `markUntrusted`: the
  * preamble is the first line when anything was marked.
  */
 export const guardMarked = (text: string): Effect.Effect<string> =>
@@ -352,3 +295,33 @@ export const guardText = (
     let next = 0;
     return `${guard.preamble}\n${render(() => guard.wrap(sanitised[next++] ?? ""))}`;
   });
+
+/**
+ * Guards the untrusted text an error message carries (marked excerpts). The
+ * copy keeps the error's class and fields; only its message differs. Values
+ * that are not an `Error` with marks come back unchanged.
+ */
+export const guardFailure = <E>(error: E): Effect.Effect<E> => {
+  if (!(error instanceof Error) || !hasMarks(error.message)) return Effect.succeed(error);
+  return Effect.map(guardMarked(error.message), (message) => {
+    const copy: E = Object.assign(Object.create(Object.getPrototypeOf(error)), error);
+    Object.defineProperty(copy, "message", { value: message, enumerable: false, configurable: true });
+    return copy;
+  });
+};
+
+/**
+ * The output path of every tool: redact, guard untrusted text, redact again.
+ * Guarding runs inside redaction, so a token in untrusted text is still `***`
+ * inside its guard; redaction never touches guard tags. Failures keep their
+ * type and have their marked excerpts guarded. Without a spec only marked
+ * excerpts are guarded.
+ */
+export const guardedOutput =
+  (redactDeep: <T>(value: T) => T) =>
+  <A extends Record<string, unknown>, E, R>(effect: Effect.Effect<A, E, R>, spec: GuardSpec = MARKED) =>
+    effect.pipe(
+      Effect.flatMap((result) => guardResult(redactDeep(result), spec)),
+      Effect.map(redactDeep),
+      Effect.catch((error) => Effect.flatMap(guardFailure(error), Effect.fail)),
+    );

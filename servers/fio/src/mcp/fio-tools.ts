@@ -1,3 +1,4 @@
+import { G, guardedOutput } from "@mcps/core/mcp/untrusted.js";
 import { CurrentPrincipal } from "@mcps/core/transport/principal.js";
 import { Effect, Schema } from "effect";
 import { McpServer, Tool, Toolkit } from "effect/ai";
@@ -11,7 +12,7 @@ import { buildImportXml, PaymentOrders, summarizeOrders } from "../payments.js";
 import { RateLimiter } from "../rate-limiter.js";
 import { Redactor } from "../redaction.js";
 import { parseLastStatement } from "../statement.js";
-import { annotateTool, DateParam, guardedOutput, JsonObject, ToolFailure, toolsForAccounts, withAccount } from "./common.js";
+import { annotateTool, DateParam, JsonObject, ToolFailure, toolsForAccounts, withAccount } from "./common.js";
 import {
   MARKER_TOOLS,
   PAYMENTS,
@@ -21,7 +22,7 @@ import {
   requireScopes,
   visibleAccounts,
 } from "./permissions.js";
-import { CURRENCY, G, STATEMENT_GUARD } from "./untrusted.js";
+import { CURRENCY, STATEMENT_GUARD } from "./untrusted-policy.js";
 
 /** SEC-28 provenance rule, shared by the payment tool descriptions and SERVER_INSTRUCTIONS. */
 const PROVENANCE_RULE =
