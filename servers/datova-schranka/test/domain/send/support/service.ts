@@ -7,7 +7,7 @@
  * database; `start` can run again to model a restart. `sendHarness` is the same, started.
  */
 import { makeRedactor, Redactor } from "@mcps/core/redaction.js";
-import { Context, Deferred, Effect, Layer, Option, type Scope } from "effect";
+import { Context, Deferred, Effect, Fiber, Layer, Option, type Scope } from "effect";
 import { SqlClient } from "effect/sql";
 import { TestClock } from "effect/testing";
 import type { AuditActor } from "../../../../src/domain/audit-log.js";
@@ -226,7 +226,7 @@ export const makeSendHarness = Effect.fn("makeSendHarness")(function* (options: 
     filings: provide(rawFilings).pipe(Effect.orDie) as Effect.Effect<ReadonlyArray<RawFilingRow>>,
     nonces: provide(rawNonces).pipe(Effect.orDie) as Effect.Effect<ReadonlyArray<RawNonceRow>>,
     patchFiling: (id: string, columns: Readonly<Record<string, unknown>>): Effect.Effect<void> =>
-      provide(patchRawFiling(id, columns)).pipe(Effect.orDie),
+      Object.keys(columns).length === 0 ? Effect.void : provide(patchRawFiling(id, columns)).pipe(Effect.orDie),
     /** Runs raw SQL (e.g. a trigger that makes a write fail). */
     exec: (statement: string): Effect.Effect<void> =>
       provide(
@@ -251,6 +251,32 @@ export const makeSendHarness = Effect.fn("makeSendHarness")(function* (options: 
         createOverride = override;
       }),
     advance: (millis: number): Effect.Effect<void> => TestClock.adjust(millis),
+    /**
+     * Takes the harness box's permit (BoxClients.use) and keeps it until the returned effect
+     * runs, so concurrent calls queue at the permit.
+     */
+    holdPermit: Effect.gen(function* () {
+      const acquired = yield* Deferred.make<void>();
+      const held = yield* Effect.forkDetach(
+        provide(
+          Effect.gen(function* () {
+            const clients = yield* BoxClients;
+            yield* clients.use(box.id, () => Effect.andThen(Deferred.succeed(acquired, undefined), Effect.never));
+          }),
+        ),
+      );
+      yield* Deferred.await(acquired);
+      return Fiber.interrupt(held);
+    }),
+    /** Yields until `condition` succeeds with true (dies after 10 000 yields). */
+    eventually: (condition: Effect.Effect<boolean>): Effect.Effect<void> =>
+      Effect.gen(function* () {
+        for (let turn = 0; turn < 10_000; turn++) {
+          if (yield* condition) return;
+          yield* Effect.yieldNow;
+        }
+        return yield* Effect.die("send harness: condition never held");
+      }),
   };
 });
 
@@ -261,4 +287,17 @@ export const sendHarness = Effect.fn("sendHarness")(function* (options: SendHarn
   const harness = yield* makeSendHarness(options);
   const service = yield* harness.start;
   return { ...harness, service };
+});
+
+export type StartedSendHarness = Effect.Success<ReturnType<typeof sendHarness>>;
+
+/** The approve flow's first call: its ApprovalRequired (dies on any other result). */
+export const askApproval = Effect.fn("askApproval")(function* (
+  h: StartedSendHarness,
+  overrides: Partial<SendMessageRequest> = {},
+  caller: SendCaller = CALLER,
+) {
+  const result = yield* h.service.sendMessage(caller, h.request(overrides));
+  if (result._tag !== "ApprovalRequired") return yield* Effect.die(`expected ApprovalRequired, got ${result._tag}`);
+  return result;
 });

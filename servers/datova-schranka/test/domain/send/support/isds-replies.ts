@@ -60,13 +60,12 @@ export const sentMessagesReply = (rows: ReadonlyArray<SentRow>): IsdsSoapRespons
     ),
   );
 
-const at = (service: "operations" | "search", operation: string) => ({ service, operation });
+const at = (service: "info" | "operations" | "search", operation: string) => ({ service, operation });
 const createMessage = at("operations", "CreateMessage");
 
 /** Every CreateMessage transport failure after which ISDS may have the message, by name. */
 export const ambiguousTransportFailures: Readonly<Record<string, () => IsdsTransportFailure>> = {
-  "IsdsTimeoutError (requestSent)": () =>
-    new IsdsTimeoutError({ ...createMessage, timeoutMillis: 30_000, requestSent: true }),
+  "IsdsTimeoutError (requestSent)": () => timeoutAfterSend(),
   "IsdsTransportError Tls": () => new IsdsTransportError({ ...createMessage, reason: "Tls", detail: "test" }),
   "IsdsTransportError Connection": () => new IsdsTransportError({ ...createMessage, reason: "Connection", detail: "test" }),
   "IsdsTransportError ResponseTooLarge": () =>
@@ -75,6 +74,14 @@ export const ambiguousTransportFailures: Readonly<Record<string, () => IsdsTrans
   IsdsAuthError: () => new IsdsAuthError({ ...createMessage, httpStatus: 401 }),
   IsdsMaintenanceError: () => new IsdsMaintenanceError({ ...createMessage, retryAfter: "60" }),
 };
+
+/** IsdsTimeoutError after the request went out (ISDS may have the message). */
+export const timeoutAfterSend = (): IsdsTransportFailure =>
+  new IsdsTimeoutError({ ...createMessage, timeoutMillis: 30_000, requestSent: true });
+
+/** A GetListOfSentMessages transport failure (the sent messages could not be checked). */
+export const sentListUnreachable = (): IsdsTransportFailure =>
+  new IsdsTransportError({ ...at("info", "GetListOfSentMessages"), reason: "Connection", detail: "test" });
 
 /** IsdsTimeoutError before the request went out (a proven pre-send failure). */
 export const timeoutBeforeSend = (): IsdsTransportFailure =>
