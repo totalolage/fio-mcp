@@ -5,6 +5,7 @@ A Bun workspace of [MCP](https://modelcontextprotocol.io) servers written with [
 | Path | Package | What it is |
 |---|---|---|
 | [`servers/fio`](servers/fio) | `fio-mcp` | MCP server for FIO Bank's REST API. Setup, configuration, deployment and its development notes: [servers/fio/README.md](servers/fio/README.md). |
+| [`servers/datova-schranka`](servers/datova-schranka) | `datova-schranka` | MCP server for Czech data boxes (datová schránka, ISDS). Setup, configuration, sending and its development notes: [servers/datova-schranka/README.md](servers/datova-schranka/README.md). |
 | [`packages/core`](packages/core) | `@mcps/core` (private) | Server-neutral parts: stdio and HTTP transports, OAuth, the admin shell and grant handling. Servers inject their own resources, scopes and pages. It must not import a server; the `core-import-boundary` lint rule enforces that. |
 
 The root holds what every workspace shares: `package.json` (workspaces, scripts, dev tools), one `bun.lock`, `bunfig.toml` (install policy), `tsconfig.base.json`, `vitest.config.ts`, `biome.json` with the Grit rules in `lint/`, and `scripts/ship-image.sh`.
