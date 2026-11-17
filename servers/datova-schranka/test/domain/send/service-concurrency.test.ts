@@ -57,8 +57,8 @@ describe("SendService concurrent claims", () => {
         assert.isTrue(
           results.some((result) => result._tag === "Sent" && result.filingId === first.filingId && result.dmID === dmIdOf(1)),
         );
-        // The loser either replays the stored Sent or finds the nonce already used.
-        for (const result of results) assert.include(["Sent", "Refused"], result._tag);
+        // The loser replays the stored Sent: a consumed nonce never hides the stored result (C2).
+        for (const result of results) assert.strictEqual(result._tag, "Sent");
         assert.strictEqual((yield* h.filings).length, 1);
       }).pipe(Effect.scoped),
     );

@@ -16,7 +16,7 @@
  * "Sent" means ISDS accepted the submission and assigned a dmID, not that it was delivered.
  */
 import { createHash, randomBytes } from "node:crypto";
-import { Cause, Clock, DateTime, Duration, Effect, Layer, Option, Redacted, Ref, Result, Schedule } from "effect";
+import { Cause, Clock, DateTime, Duration, Effect, Exit, Layer, Option, Redacted, Ref, Result, Schedule } from "effect";
 import { SqlClient } from "effect/sql";
 import type { IsdsClientShape } from "../../isds/client.js";
 import type { CreateMessageInput } from "../../isds/create-message.js";
@@ -25,7 +25,7 @@ import { type AuditActor, AuditLog } from "../audit-log.js";
 import { BoxClients } from "../box-clients.js";
 import { BoxRegistry } from "../boxes.js";
 import { DataKey, DomainConfig } from "../config.js";
-import type { DomainStoreError } from "../errors.js";
+import { DomainStoreError } from "../errors.js";
 import { newRowId } from "../ids.js";
 import type { FilingState } from "../migrations.js";
 import { type RecipientTier, RecipientTiers } from "../recipient-tiers.js";
@@ -168,6 +168,11 @@ type Step =
 
 const done = (result: SendResult, followUp = false): Step => ({ _tag: "Done", result, followUp });
 const moved = (current: Option.Option<Filing>): Step => ({ _tag: "Moved", current });
+
+/** What a claim transaction decided: the claim won, or another answer. */
+type Decision = { readonly _tag: "Claimed"; readonly filingId: string } | { readonly _tag: "Decided"; readonly step: Step };
+const claimed = (filingId: string): Decision => ({ _tag: "Claimed", filingId });
+const decided = (step: Step): Decision => ({ _tag: "Decided", step });
 
 /** A send_message answer plus what its audit detail is built from. */
 interface Answer {
@@ -336,7 +341,13 @@ export const makeSendService = Effect.gen(function* () {
     if (exit._tag === "Success") {
       const { dmID, status } = exit.value;
       const isdsStatus = { code: status.code, message: status.message, classification: classifyStatus("dm", status.code) };
-      const write = yield* persist(store.transition(filingId, ["dispatching"], "sent", { dmId: dmID, isdsStatus }));
+      const write = yield* persist(store.transition(filingId, ["dispatching"], "sent", { dmId: dmID, isdsStatus })).pipe(
+        Effect.tapError(() =>
+          Effect.logError("datova-schranka: ISDS accepted a message but its filing could not be updated").pipe(
+            Effect.annotateLogs({ filingId, dmID }),
+          ),
+        ),
+      );
       if (write._tag === "Won") return done(SendResult.Sent({ filingId, dmID }));
       if (write._tag === "DmIdTaken") {
         const at = yield* now;
@@ -373,20 +384,49 @@ export const makeSendService = Effect.gen(function* () {
     return done(SendResult.OutcomeUnknown({ filingId }), true);
   });
 
+  /** Runs `effect` in one transaction; a failure to begin or commit it is a DomainStoreError. */
+  const inTransaction = <A, E>(operation: string, effect: Effect.Effect<A, E>): Effect.Effect<A, E | DomainStoreError> =>
+    sql.withTransaction(effect).pipe(
+      Effect.catchTag("SqlError", (cause) =>
+        Effect.logError(`datova-schranka: failed to ${operation}`, cause).pipe(
+          Effect.andThen(Effect.fail(new DomainStoreError({ operation }))),
+        ),
+      ),
+    );
+
   /**
-   * The claim and its dispatch as one uninterruptible region (D-d, obligation 3): `claimEffect`
-   * returns the claimed filing id or none (lost); the audit window opens right after it wins.
+   * Whether the box row still exists. Read inside the claim's transaction: BoxRegistry.remove
+   * expires open filings and deletes the row in one transaction without the box permit, so only
+   * this read, serialised with the claim, keeps a removal from racing in before it (C4).
+   */
+  const boxRowExists = (boxId: string): Effect.Effect<boolean, DomainStoreError> =>
+    sql<{ readonly id: string }>`SELECT id FROM boxes WHERE id = ${boxId}`.pipe(
+      Effect.map((rows) => rows.length > 0),
+      Effect.catchTag("SqlError", (cause) =>
+        Effect.logError("datova-schranka: failed to read the data box row", cause).pipe(
+          Effect.andThen(Effect.fail(new DomainStoreError({ operation: "read the data box row" }))),
+        ),
+      ),
+    );
+
+  /**
+   * The claim and its dispatch as one uninterruptible region (D-d, obligation 3). `decide` runs
+   * in one transaction (box row, tier and expiry read together with the claim's write, so a
+   * removal or tier edit lands before or after it, never between) and returns either the
+   * claimed filing id or the step to answer instead. The audit window opens right after the
+   * claim commits.
    */
   const claimAndSend = <E>(
     claim: ClaimSignal,
     client: IsdsClientShape,
-    claimEffect: Effect.Effect<Option.Option<string>, E>,
+    decide: Effect.Effect<Decision, E>,
     createInput: CreateMessageInput,
-    lost: () => Effect.Effect<Step, E | DomainStoreError>,
   ): Effect.Effect<Step, E | DomainStoreError> =>
     Effect.uninterruptible(
-      Effect.flatMap(claimEffect, (claimed) =>
-        Option.isSome(claimed) ? claim.whileClaimed(sendClaimed(client, claimed.value, createInput)) : lost(),
+      Effect.flatMap(inTransaction("claim a filing for dispatch", decide), (decision) =>
+        decision._tag === "Claimed"
+          ? claim.whileClaimed(sendClaimed(client, decision.filingId, createInput))
+          : Effect.succeed(decision.step),
       ),
     );
 
@@ -432,37 +472,38 @@ export const makeSendService = Effect.gen(function* () {
         if (verdict !== "ok") return yield* hardRefuse(filing.id, from, `${AUTHORITY_REASONS[verdict]}`);
         const box = yield* Effect.option(registry.get(filing.boxId));
         if (Option.isNone(box)) return yield* hardRefuse(filing.id, from, "the data box was removed");
-        const current = yield* reread(filing.id);
-        if (Option.isNone(current) || current.value.state !== from) return moved(current);
-
-        if (plan.nonceHash !== undefined && (yield* tierOf(filing.boxId, filing.recipientDbId)) === "none") {
-          // The recipient's tier was lowered to none: the stricter flow wins (D-g).
-          const write = yield* store.transition(filing.id, ["awaiting_approval"], "pending_admin", {
-            burnNonces: true,
-            expiresAt: yield* pendingExpiry,
-          });
-          return write._tag === "Won"
-            ? done(SendResult.Queued({ filingId: filing.id }))
-            : moved(write._tag === "Lost" ? write.current : yield* store.byId(filing.id));
-        }
-
+        // C1: open and validate the payload before the claim clears it.
         const payload = yield* openPayload(filing.id);
         if (Result.isFailure(payload)) return yield* hardRefuse(filing.id, from, payload.failure);
 
         const nonceHash = plan.nonceHash;
-        const submittedAt = yield* now;
-        const claimEffect: Effect.Effect<Option.Option<string>, DomainStoreError> =
-          nonceHash !== undefined
-            ? Effect.map(store.claimWithNonce(filing.id, nonceHash, submittedAt), (write) =>
-                write._tag === "Won" ? Option.some(filing.id) : Option.none(),
-              )
-            : Effect.map(
-                store.transition(filing.id, ["pending_admin"], "dispatching", { submittedAt, clearPayload: true }),
-                (write) => (write._tag === "Won" ? Option.some(filing.id) : Option.none()),
-              );
-        return yield* claimAndSend(claim, client, claimEffect, payload.success, () =>
-          Effect.map(store.byId(filing.id), moved),
-        );
+        // Box row, expiry and tier are read in the claim's transaction (C4 order: box, expiry, tier, claim).
+        const decide = Effect.gen(function* () {
+          if (!(yield* boxRowExists(filing.boxId))) {
+            return decided(yield* hardRefuse(filing.id, from, "the data box was removed"));
+          }
+          const current = yield* reread(filing.id);
+          if (Option.isNone(current) || current.value.state !== from) return decided(moved(current));
+          if (nonceHash !== undefined && (yield* tierOf(filing.boxId, filing.recipientDbId)) === "none") {
+            // The recipient's tier was lowered to none: the stricter flow wins (D-g).
+            const write = yield* store.transition(filing.id, ["awaiting_approval"], "pending_admin", {
+              burnNonces: true,
+              expiresAt: yield* pendingExpiry,
+            });
+            return decided(
+              write._tag === "Won"
+                ? done(SendResult.Queued({ filingId: filing.id }))
+                : moved(write._tag === "Lost" ? write.current : yield* store.byId(filing.id)),
+            );
+          }
+          const submittedAt = yield* now;
+          const write =
+            nonceHash !== undefined
+              ? yield* store.claimWithNonce(filing.id, nonceHash, submittedAt)
+              : yield* store.transition(filing.id, ["pending_admin"], "dispatching", { submittedAt, clearPayload: true });
+          return write._tag === "Won" ? claimed(filing.id) : decided(moved(yield* store.byId(filing.id)));
+        });
+        return yield* claimAndSend(claim, client, decide, payload.success);
   });
 
   const dispatchExisting = (
@@ -645,8 +686,13 @@ export const makeSendService = Effect.gen(function* () {
           const refusal = yield* preflight(client, request.recipient);
           const verdict = yield* authority.check(caller.grantId, request.boxId);
           if (verdict !== "ok") return done(SendResult.Refused({ reason: AUTHORITY_REASONS[verdict] }));
-          const tier = yield* tierOf(request.boxId, request.recipient);
           const id = newRowId("fil");
+          // Box row, tier and insert in one transaction: a removal or tier edit lands before or after it (C4).
+          const decide = Effect.gen(function* () {
+          if (!(yield* boxRowExists(request.boxId))) {
+            return decided(done(SendResult.Refused({ reason: `no data box ${request.boxId} is configured` })));
+          }
+          const tier = yield* tierOf(request.boxId, request.recipient);
           const fields = {
             id,
             grantKey: caller.grantId,
@@ -665,7 +711,7 @@ export const makeSendService = Effect.gen(function* () {
           if (refusal !== undefined) {
             // C3: an authoritative "cannot receive" reserves the key with a terminal refusal.
             const write = yield* store.insert({ ...fields, state: "refused", reason: refusal });
-            return inserted(write, () => SendResult.Refused({ filingId: id, reason: refusal }));
+            return decided(inserted(write, () => SendResult.Refused({ filingId: id, reason: refusal })));
           }
           switch (tier) {
             case "none": {
@@ -675,7 +721,7 @@ export const makeSendService = Effect.gen(function* () {
                 payloadSealed: yield* sealPayload(id, message.createInput),
                 expiresAt: yield* pendingExpiry,
               });
-              return inserted(write, () => SendResult.Queued({ filingId: id }));
+              return decided(inserted(write, () => SendResult.Queued({ filingId: id })));
             }
             case "approve": {
               const expiresAt = yield* pendingExpiry;
@@ -687,29 +733,26 @@ export const makeSendService = Effect.gen(function* () {
                 expiresAt,
                 nonce: fresh.row,
               });
-              return inserted(write, () =>
-                SendResult.ApprovalRequired({
-                  filingId: id,
-                  nonce: fresh.nonce,
-                  preview: message.preview,
-                  expiresAt: fresh.row.expiresAt,
-                }),
+              return decided(
+                inserted(write, () =>
+                  SendResult.ApprovalRequired({
+                    filingId: id,
+                    nonce: fresh.nonce,
+                    preview: message.preview,
+                    expiresAt: fresh.row.expiresAt,
+                  }),
+                ),
               );
             }
             case "full": {
               // C1: the INSERT … 'dispatching' is the atomic claim; only its winner sends.
-              const submittedAt = yield* now;
-              let taken: Option.Option<Filing> = Option.none();
-              const claimEffect = Effect.map(store.insert({ ...fields, state: "dispatching", submittedAt }), (write) => {
-                if (write._tag === "Inserted") return Option.some(id);
-                taken = Option.some(write.existing);
-                return Option.none<string>();
-              });
-              return yield* claimAndSend(claim, client, claimEffect, message.createInput, () =>
-                Effect.succeed(moved(taken)),
-              );
+              const write = yield* store.insert({ ...fields, state: "dispatching", submittedAt: yield* now });
+              return write._tag === "Inserted" ? claimed(id) : decided(moved(Option.some(write.existing)));
             }
           }
+          });
+          // One uninterruptible transaction for every tier; only a full-tier claim goes on to send.
+          return yield* claimAndSend(claim, client, decide, message.createInput);
   });
 
   const newFiling = Effect.fn("SendService.newFiling")(function* (
@@ -760,16 +803,19 @@ export const makeSendService = Effect.gen(function* () {
     if (Result.isFailure(normalised)) return refused((normalised.failure satisfies InvalidSendRequest).reason);
     const message = normalised.success;
 
+    // The nonce row is read BEFORE the filing: a nonce consumed by a concurrent claim then
+    // always comes with the filing's moved state, so a nonce error never hides a stored
+    // same-content result (C2).
+    const nonceHash = request.approvalNonce === undefined ? undefined : sha256Hex(request.approvalNonce);
+    const nonce = nonceHash === undefined ? Option.none() : yield* store.nonceByHash(nonceHash);
     const loaded = yield* store.byKey(caller.grantId, request.boxId, request.idempotencyKey);
     // Obligation (1): a due open filing is expired before any nonce use or replacement.
     const existing = Option.isSome(loaded) ? Option.some(yield* expireIfDue(loaded.value)) : loaded;
     const sameContent = Option.isSome(existing) && existing.value.contentHash === message.contentHash;
 
-    if (request.approvalNonce !== undefined) {
+    if (nonceHash !== undefined) {
       // C2: a same-content filing past awaiting_approval answers its stored result, nonce unread.
       if (sameContent && existing.value.state !== "awaiting_approval") return yield* replay(existing.value, message.contentHash);
-      const nonceHash = sha256Hex(request.approvalNonce);
-      const nonce = yield* store.nonceByHash(nonceHash);
       if (Option.isNone(nonce)) return refused("unknown approvalNonce; call again without approvalNonce for a fresh one");
       const row = nonce.value;
       if (row.grantKey !== caller.grantId) return refused("the approvalNonce was not issued to this authorization");
@@ -847,6 +893,29 @@ export const makeSendService = Effect.gen(function* () {
     return { result: yield* finish(claim, step), preview: filing.preview } satisfies Answer;
   });
 
+  /**
+   * Keeps a call "claimed" from its first winning claim to its end. `whileClaimed` windows close
+   * when their effect succeeds, which leaves a gap between the dispatch window and the follow-up
+   * reconcile's (and after the last one) where an interruption would be audited "error" although
+   * ISDS may have the message. Once a claim has won, a call that ends without a value reopens a
+   * window that never closes, so its audit outcome is "uncertain" (R6).
+   */
+  const trackClaims = <A, E>(claim: ClaimSignal, body: (claim: ClaimSignal) => Effect.Effect<A, E>) =>
+    Effect.flatMap(Ref.make(false), (won) => {
+      const tracked: ClaimSignal = {
+        whileClaimed: (effect) => Effect.andThen(Ref.set(won, true), claim.whileClaimed(effect)),
+      };
+      return body(tracked).pipe(
+        Effect.onExit((exit) =>
+          Exit.isSuccess(exit)
+            ? Effect.void
+            : Effect.flatMap(Ref.get(won), (claimedInCall) =>
+                claimedInCall ? Effect.asVoid(Effect.exit(claim.whileClaimed(Effect.fail("unsettled" as const)))) : Effect.void,
+              ),
+        ),
+      );
+    });
+
   // The shape -------------------------------------------------------------------------------
 
   const phaseB = (operation: string) => Effect.die(`SendService.${operation}: implemented in phase B`);
@@ -867,7 +936,7 @@ export const makeSendService = Effect.gen(function* () {
           boxId: request.boxId,
           detail: start,
         },
-        (claim) => sendFlow(caller, request, claim),
+        (claim) => trackClaims(claim, (tracked) => sendFlow(caller, request, tracked)),
         {
           outcomeOf: (answer: Answer) => sendResultOutcome(answer.result),
           okDetail: (answer: Answer): SendDetail =>
@@ -917,7 +986,7 @@ export const makeSendService = Effect.gen(function* () {
             boxId: Option.isSome(found) ? found.value.boxId : undefined,
             detail: { filingId },
           },
-          (claim) => approveFlow(found, filingId, claim),
+          (claim) => trackClaims(claim, (tracked) => approveFlow(found, filingId, tracked)),
           {
             outcomeOf: (answer: Answer) => sendResultOutcome(answer.result),
             okDetail: (answer: Answer): SendDetail =>
