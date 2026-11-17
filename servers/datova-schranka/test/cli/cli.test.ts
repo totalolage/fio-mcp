@@ -398,6 +398,18 @@ describe("audit purge", () => {
       assert.deepStrictEqual(yield* remaining(env), ["old", "edge", "recent"]);
     }),
   );
+  it.effect("allows the latest date the retention floor permits and refuses the day after", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW);
+      const env = yield* serverEnv;
+      yield* seed(env);
+      const late = yield* failure(["audit", "purge", "--before", "2025-11-18"], env);
+      assert.include(late.error.message, "the cutoff can be 2025-11-17 at the latest");
+      const { out } = yield* success(["audit", "purge", "--before", "2025-11-17"], env);
+      assert.strictEqual(out, "Deleted 2 audit rows from before 2025-11-17 (UTC). Rows are kept at least 365 days.\n");
+      assert.deepStrictEqual(yield* remaining(env), ["recent"]);
+    }),
+  );
 });
 
 describe("backup", () => {

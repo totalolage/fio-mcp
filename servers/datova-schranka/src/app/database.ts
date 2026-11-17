@@ -3,7 +3,6 @@ import { sqliteDatabase } from "@mcps/core/sqlite.js";
 import { Clock, Effect, Layer, Redacted, Result } from "effect";
 import { SqlClient } from "effect/sql";
 import { AppConfig } from "../config.js";
-import { BoxRegistry } from "../domain/boxes.js";
 import { DataKey } from "../domain/config.js";
 import { storeFailure } from "../domain/errors.js";
 import { openText, sealText } from "../domain/sealed.js";
@@ -44,8 +43,9 @@ const describeStored = (value: string): string =>
  * environment to equal DATOVA_SCHRANKA_ISDS_ENVIRONMENT and the data key to
  * open the check value. Writes only what is absent (INSERT … DO NOTHING) and
  * verifies what is stored, so two first starts racing cannot bind the
- * database to two keys. Run it before anything opens sealed data (BoxRegistry
- * fails on credentials it cannot open, with a less helpful message).
+ * database to two keys. Run it before anything opens sealed data: BoxRegistry
+ * fails on credentials it cannot open, with a less helpful message. (Boxes of
+ * the other environment are reported by BoxRegistry's own startup warning.)
  */
 export const checkDatabaseBinding = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
@@ -90,21 +90,3 @@ export const checkDatabaseBinding = Effect.gen(function* () {
 
 /** The database checked against this configuration: anything built on it starts only after checkDatabaseBinding passed. */
 export const CheckedDatabaseLive = Layer.effectDiscard(checkDatabaseBinding).pipe(Layer.provideMerge(DatabaseLive));
-
-/**
- * One warning when boxes stored under another ISDS environment were not
- * loaded (R6), naming their labels and environments only.
- */
-export const warnSkippedBoxes = Effect.gen(function* () {
-  const registry = yield* BoxRegistry;
-  const skipped = yield* registry.skipped;
-  if (skipped.length === 0) return;
-  const config = yield* AppConfig;
-  const boxes = skipped.map((box) => `${JSON.stringify(box.label)} (${box.environment})`).join(", ");
-  yield* Effect.logWarning(
-    `${skipped.length === 1 ? "1 box was" : `${skipped.length} boxes were`} not loaded because ${ENVIRONMENT_VARIABLE} is ${config.domain.environment}: ${boxes}`,
-  );
-});
-
-/** warnSkippedBoxes as a layer, built once the BoxRegistry is. */
-export const SkippedBoxesWarningLive = Layer.effectDiscard(warnSkippedBoxes);

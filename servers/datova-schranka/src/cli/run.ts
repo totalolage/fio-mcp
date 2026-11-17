@@ -48,7 +48,7 @@ const DatabaseCli = DatabaseLive.pipe(Layer.provide(AppConfig.Default));
 
 const onDatabase = <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.provide(effect, DatabaseCli);
 
-/** AuditLog over the database; no secrets are loaded, so its redactor knows none. */
+/** AuditLog over the database. No box is loaded, so no box secret can reach it; its redactor knows none. */
 const AuditLogCli = AuditLog.Default.pipe(
   Layer.provideMerge(DatabaseCli),
   Layer.provide(Layer.succeed(Redactor, Redactor.of(makeRedactor([])))),

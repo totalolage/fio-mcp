@@ -3,6 +3,7 @@ import { join } from "node:path";
 import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem";
 import { assert, describe, it } from "@effect/vitest";
 import { ConfigError } from "@mcps/core/config/env.js";
+import { makeRedactor, Redactor } from "@mcps/core/redaction.js";
 import { Effect, Layer, Logger } from "effect";
 import { SqlClient } from "effect/sql";
 import {
@@ -10,11 +11,12 @@ import {
   DATA_KEY_CHECK_SETTING,
   DatabaseLive,
   ISDS_ENVIRONMENT_SETTING,
-  warnSkippedBoxes,
 } from "../../src/app/database.js";
 import { DomainLive } from "../../src/config.js";
-import { BoxRegistry, type SkippedBox } from "../../src/domain/boxes.js";
+import { BoxLocks } from "../../src/domain/box-locks.js";
+import { BoxCredentialsUnreadable, BoxRegistry } from "../../src/domain/boxes.js";
 import { appConfigFrom, OTHER_DATA_KEY_HEX, requiredEnv, secretFile, tempDir } from "../config/support.js";
+import { fakeIsdsTransports, loginResponder } from "../domain/support/fake-isds.js";
 
 const settingsRows = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
@@ -44,6 +46,10 @@ const stored = (env: Record<string, string>) =>
     settingsRows,
     DatabaseLive.pipe(Layer.provide(appConfigFrom(env)), Layer.provide(NodeFileSystem.layer)),
   );
+
+/** Runs `effect` on the database `env` names, without the checks. */
+const onDatabase = <A, E>(env: Record<string, string>, effect: Effect.Effect<A, E, SqlClient.SqlClient>) =>
+  Effect.provide(effect, DatabaseLive.pipe(Layer.provide(appConfigFrom(env)), Layer.provide(NodeFileSystem.layer)));
 
 describe("DatabaseLive", () => {
   it.effect("creates a private database file at DATOVA_SCHRANKA_DB_PATH with every app migration", () =>
@@ -157,43 +163,73 @@ describe("CheckedDatabaseLive", () => {
   );
 });
 
-describe("warnSkippedBoxes", () => {
-  const run = (skipped: ReadonlyArray<SkippedBox>) =>
-    Effect.gen(function* () {
-      const env = yield* requiredEnv;
-      const logs: Array<string> = [];
-      const capture = Logger.make<unknown, void>((entry) => void logs.push(Logger.formatLogFmt.log(entry)));
-      yield* warnSkippedBoxes.pipe(
-        Effect.provide(
-          Layer.mergeAll(
-            Layer.mock(BoxRegistry, { skipped: Effect.succeed(skipped) }),
-            appConfigFrom({ ...env, DATOVA_SCHRANKA_ISDS_ENVIRONMENT: "test" }),
-            Logger.layer([capture]),
-          ),
-        ),
-      );
-      return logs;
-    });
+/** A stored box whose sealed credentials no key opens. */
+const insertBox = (id: string, dbId: string, label: string, environment: "production" | "test") =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`INSERT INTO boxes ${sql.insert({
+      id,
+      db_id: dbId,
+      label,
+      label_key: label.toLowerCase(),
+      environment,
+      box_type: null,
+      auth_kind: "password",
+      owner_json: "{}",
+      credentials_sealed: "v1.not.sealed.here",
+      created_at: 1,
+      updated_at: 1,
+    })}`;
+  });
 
-  it.effect("logs one warning naming the labels and environments of boxes that were not loaded", () =>
+/** A server start up to the BoxRegistry, built on the checked database, with what it logged. */
+const startRegistry = (env: Record<string, string>) =>
+  Effect.gen(function* () {
+    const logs: Array<string> = [];
+    const capture = Logger.make<unknown, void>((entry) => void logs.push(Logger.formatLogFmt.log(entry)));
+    const layer = BoxRegistry.Default.pipe(
+      Layer.provide(fakeIsdsTransports(loginResponder({})).layer),
+      Layer.provide(Layer.succeed(Redactor, Redactor.of(makeRedactor([])))),
+      Layer.provide(BoxLocks.Default),
+      Layer.provide(DomainLive),
+      Layer.provide(checked(env)),
+      Layer.provide(appConfigFrom(env)),
+    );
+    const skipped = yield* Effect.gen(function* () {
+      return yield* (yield* BoxRegistry).skipped;
+    }).pipe(Effect.provide(layer.pipe(Layer.provide(Logger.layer([capture])))));
+    return { skipped, warnings: logs.filter((line) => line.includes("level=WARN")) };
+  });
+
+describe("startup with the BoxRegistry", () => {
+  it.effect("reports boxes of the other environment in one warning, through the registry", () =>
     Effect.gen(function* () {
-      const logs = yield* run([
-        { id: "box_a", dbId: "abc1234", label: "Firma", environment: "production" },
-        { id: "box_b", dbId: "def5678", label: "Osobní", environment: "production" },
-      ]);
-      assert.strictEqual(logs.length, 1);
-      const line = logs[0] ?? "";
-      assert.include(line, "level=WARN");
-      assert.include(line, "2 boxes were not loaded because DATOVA_SCHRANKA_ISDS_ENVIRONMENT is test");
-      assert.include(line, "Firma");
-      assert.include(line, "Osobn");
-      assert.include(line, "(production)");
+      const env = yield* freshEnv;
+      yield* start(env);
+      yield* onDatabase(env, insertBox("box_t", "abc1234", "Firma", "test"));
+      const { skipped, warnings } = yield* startRegistry(env);
+      assert.deepStrictEqual(
+        skipped.map((box) => [box.id, box.environment]),
+        [["box_t", "test"]],
+      );
+      assert.strictEqual(warnings.length, 1);
+      assert.include(warnings[0] ?? "", "are not loaded");
+      assert.include(warnings[0] ?? "", "box_t (abc1234, test)");
     }),
   );
 
-  it.effect("logs nothing when every box was loaded", () =>
+  it.effect("refuses a wrong data key before the registry tries to open box credentials", () =>
     Effect.gen(function* () {
-      assert.deepStrictEqual(yield* run([]), []);
+      const env = yield* freshEnv;
+      yield* start(env);
+      yield* onDatabase(env, insertBox("box_p", "abc1234", "Firma", "production"));
+      // The registry alone fails on credentials it cannot open, naming no cause.
+      const unreadable = yield* Effect.flip(startRegistry(env));
+      assert.instanceOf(unreadable, BoxCredentialsUnreadable);
+      const otherKey = { ...env, DATOVA_SCHRANKA_DATA_KEY_FILE: secretFile(OTHER_DATA_KEY_HEX) };
+      const error = yield* Effect.flip(startRegistry(otherKey));
+      assert.instanceOf(error, ConfigError);
+      assert.include(error.message, "the data key does not match this database");
     }),
   );
 });
