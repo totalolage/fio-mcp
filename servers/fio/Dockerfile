@@ -44,8 +44,10 @@ COPY servers/fio/package.json ./servers/fio/
 # subpaths, never the index that re-exports NodeRedis (biome.json enforces
 # it). The peers the server needs (effect) are direct dependencies.
 # peer = false in bunfig.toml would also drop vitest's vite from the dev
-# install.
-RUN bun install --frozen-lockfile --production --omit=peer --ignore-scripts --filter fio-mcp
+# install. --filter links the server's own workspace package as
+# node_modules/fio-mcp; nothing imports it, so it is removed.
+RUN bun install --frozen-lockfile --production --omit=peer --ignore-scripts --filter fio-mcp \
+ && rm node_modules/fio-mcp
 
 FROM ${NODE_IMAGE}
 ENV NODE_ENV=production \
