@@ -9,11 +9,27 @@ The official v3.11 WSDL/XSD the ISDS client follows are in `wsdl/`.
 ## Scopes and delivery consent
 
 - `isds:read`: list received messages, read envelopes and state changes, download messages and their attachments, list sent messages, read delivery info.
-- `isds:send`: send messages from a box.
+- `isds:send`: send messages from a box (`send_message`) and check what became of them (`get_filing_status`). See [Sending](#sending).
 
 **Listing received messages delivers them.** The list call logs in to the box, and ISDS treats every eligible received message as delivered by login (event EV13). Delivery starts the legal deadlines that run from it. Filters and limits on the call do not narrow this: one list delivers every eligible message in the box, including ones the response leaves out. Downloads and envelope reads do not deliver, but ISDS refuses them for a message that was not delivered yet.
 
 So a grant that includes `isds:read` needs a ticked checkbox on the consent page that states this. Without it the authorization fails. The audit log records the grant, the boxes, the time and the version of the consent wording. If you want to keep messages undelivered until you open them yourself, do not use this server with that box.
+
+## Sending
+
+Each sending box has a recipient list in /admin → Recipients. Every recipient dbID gets a tier there, and a recipient that is not listed has tier `none`:
+
+- `none` (default): the message is queued as a filing and waits in /admin → Filings. An administrator approves it, which sends it, or rejects it. Approval needs the TOTP code when TOTP is on. A queued filing expires after 7 days.
+- `approve`: the first call returns a preview and a single-use approval nonce, valid for 15 minutes. The client shows the preview to the user and, if the user agrees, calls again with the same arguments plus the nonce. The nonce works only for that grant, box and exact content. A call with different content burns it.
+- `full`: the message is sent at once.
+
+Each call carries an `idempotencyKey`. The same key with the same content returns the earlier result and never sends twice. The same key with different content is refused. Before a message is queued or sent, the recipient must pass CheckDataBox with state 1 (accessible).
+
+"Sent" means ISDS accepted the submission and assigned a dmID. It does not mean the recipient has the message.
+
+When ISDS does not answer clearly (a timeout after the request went out, a lost connection, an error page), the filing becomes **outcome unknown**. The server never retries a send on its own, because ISDS has no idempotency key and a retry could send the message twice. It looks for the message among the box's sent messages: one clear match marks the filing sent, and anything else leaves it unknown. `get_filing_status` repeats that search at most once a minute. In /admin → Filings an administrator can search again, mark the filing sent with its dmID, or confirm it was not sent. Marking and confirming need the TOTP code when TOTP is on. After "not sent", sending the message again needs a new `idempotencyKey`. A filing still in flight when the server stopped becomes outcome unknown at the next start.
+
+Every send call and every admin decision is written to the audit log. Approvers see the envelope and the attachments' names, sizes and SHA-256 hashes, never their content.
 
 ## Configuration
 
