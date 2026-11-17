@@ -1,10 +1,10 @@
-import { dirname } from "node:path";
 import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem";
-import { SqliteClient, SqliteMigrator } from "@effect/sql-sqlite-node";
-import type { Migrations } from "@mcps/core/migrations.js";
+import type { SqliteClient } from "@effect/sql-sqlite-node";
+import { type Migrations, runMigrations } from "@mcps/core/migrations.js";
 import { OAUTH_MIGRATIONS } from "@mcps/core/oauth/store.js";
+import { sqliteDatabase } from "@mcps/core/sqlite.js";
 import { Effect, FileSystem, Layer } from "effect";
-import { Migrator, SqlClient } from "effect/sql";
+import { SqlClient } from "effect/sql";
 import { ACCOUNT_MIGRATIONS } from "../account-migrations.js";
 import { AppConfig } from "../config.js";
 import { CacheError, InvalidInput } from "../errors.js";
@@ -148,32 +148,9 @@ export const CACHE_MIGRATIONS: Migrations = {
 
 const MIGRATIONS_TABLE = "fio_mcp_migrations";
 
-/**
- * Runs pending migrations; a no-op on an up-to-date database. Effect 4.0.5's
- * migrator dies with a MigrationError when a migration fails (after rolling
- * back), so that defect becomes a failure like the migrator's other errors.
- */
+/** Runs pending migrations; a no-op on an up-to-date database. */
 export const migrate = (migrations: Migrations = CACHE_MIGRATIONS) =>
-  SqliteMigrator.run({ loader: SqliteMigrator.fromRecord(migrations), table: MIGRATIONS_TABLE }).pipe(
-    Effect.catchDefect((defect) =>
-      defect instanceof Migrator.MigrationError ? Effect.fail(defect) : Effect.die(defect),
-    ),
-    cacheFailure("migrate the database"),
-  );
-
-/** Creates the parent directory (0700) and an empty database file (0600) unless they exist. */
-export const prepareDatabaseFile = Effect.fn("Cache.prepareFile")(function* (filename: string) {
-  const fs = yield* FileSystem.FileSystem;
-  yield* fs.makeDirectory(dirname(filename), { recursive: true, mode: 0o700 });
-  // "a" creates the file without truncating an existing database.
-  yield* fs.writeFileString(filename, "", { flag: "a", mode: 0o600 });
-  yield* fs.chmod(filename, 0o600);
-}, cacheFailure("create the database file"));
-
-const configure = Effect.gen(function* () {
-  const sql = yield* SqlClient.SqlClient;
-  yield* sql`PRAGMA temp_store = MEMORY`;
-}).pipe(cacheFailure("configure the database"));
+  runMigrations({ table: MIGRATIONS_TABLE, migrations }).pipe(cacheFailure("migrate the database"));
 
 /**
  * SqlClient (and SqliteClient) for `filename`, migrated. ":memory:" skips the
@@ -182,21 +159,8 @@ const configure = Effect.gen(function* () {
 const layer = (
   filename: string,
   migrations: Migrations = CACHE_MIGRATIONS,
-): Layer.Layer<SqlClient.SqlClient | SqliteClient.SqliteClient, CacheError, FileSystem.FileSystem> => {
-  const client = SqliteClient.layer({ filename }).pipe(
-    Layer.catch((cause) =>
-      Layer.effectContext<SqlClient.SqlClient | SqliteClient.SqliteClient, CacheError, never>(
-        Effect.logError("cache: failed to open the database", cause).pipe(
-          Effect.andThen(Effect.fail(new CacheError({ operation: "open the database" }))),
-        ),
-      ),
-    ),
-  );
-  const ready = Layer.effectDiscard(Effect.andThen(configure, migrate(migrations))).pipe(Layer.provideMerge(client));
-  return filename === ":memory:"
-    ? ready
-    : ready.pipe(Layer.provideMerge(Layer.effectDiscard(prepareDatabaseFile(filename))));
-};
+): Layer.Layer<SqlClient.SqlClient | SqliteClient.SqliteClient, CacheError, FileSystem.FileSystem> =>
+  sqliteDatabase({ filename, table: MIGRATIONS_TABLE, migrations, onFailure: cacheFailure });
 
 /** Every module's migrations, in one id sequence. */
 export const SERVER_MIGRATIONS: Migrations = {

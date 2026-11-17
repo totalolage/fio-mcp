@@ -1,5 +1,8 @@
+import type { Effect } from "effect";
+import type { SqlClient } from "effect/sql";
 import type { AppIdentity } from "../app-identity.js";
 import type { GrantSettings } from "./grant-settings.js";
+import type { Grant } from "./store.js";
 
 /**
  * What the authorization server needs from the app it guards: its identity,
@@ -12,7 +15,38 @@ export interface OAuthApp {
   readonly consent: ConsentRenderer;
   /** Per-grant settings the consent page collects; absent: grants carry none. */
   readonly grantSettings?: GrantSettings | undefined;
+  /** Runs with every approved consent, inside the transaction that stores its grant; absent: nothing runs. */
+  readonly afterConsent?: ConsentHook | undefined;
 }
+
+/** An approved consent: the grant it creates and when (epoch ms, the grant's created_at). */
+export interface Consent {
+  /**
+   * The grant as stored: its id, client, scopes, resource ids and audience;
+   * `settings` is the value GrantSettings.fromConsent made of the form, which
+   * `encode` stores and later grant reads `decode`.
+   */
+  readonly grant: Grant;
+  readonly at: number;
+}
+
+/**
+ * The app's part of storing a consent, e.g. its audit record. It runs after
+ * the grant and its authorization code are written, in the same transaction,
+ * so its writes through the provided SqlClient commit or roll back with them
+ * (keep them on that client and in this fiber). The transaction holds the
+ * database's write lock: no network or other slow work.
+ *
+ * Any failure or defect rolls the whole authorization back (no grant, no
+ * code, no redirect to the client) and is logged; the owner sees core's
+ * generic error page, never the failure, so it may carry internal detail
+ * (any error with a message fits, SqlError included). The owner may approve
+ * again after a failure, so the hook runs once per attempt; only the writes
+ * of the attempt that commits remain. It is called as a method of the app.
+ */
+export type ConsentHook = (
+  consent: Consent,
+) => Effect.Effect<void, { readonly message: string }, SqlClient.SqlClient>;
 
 /** The scopes a token can carry and how an approval grants them. */
 export interface ScopeCatalogue {

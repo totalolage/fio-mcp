@@ -153,9 +153,16 @@ export interface DemoServer {
   readonly close: () => Promise<void>;
 }
 
-/** demo-mcp, or `app` (e.g. DEMO_OAUTH_NOTES) on a database with `migrations` too. */
-export function startDemo(oauthApp: OAuthApp = DEMO_OAUTH, migrations: Migrations = {}): DemoServer {
-  const app = whoami.pipe(
+/**
+ * demo-mcp, or `app` (e.g. DEMO_OAUTH_NOTES) on a database with `migrations`
+ * too; `routes` adds the test's own routes on the same database.
+ */
+export function startDemo(
+  oauthApp: OAuthApp = DEMO_OAUTH,
+  migrations: Migrations = {},
+  routes: Layer.Layer<never, never, HttpRouter.HttpRouter | SqlClient.SqlClient> = Layer.empty,
+): DemoServer {
+  const app = Layer.mergeAll(whoami, routes).pipe(
     Layer.provideMerge(Auth.oauth(oauthApp, { publicUrl: PUBLIC_URL })),
     Layer.provide(Layer.mergeAll(boxes, password, demoDatabase(migrations))),
     Layer.provide(HttpServer.layerServices),

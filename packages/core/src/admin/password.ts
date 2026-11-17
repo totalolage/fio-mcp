@@ -11,6 +11,7 @@ import {
   type ScryptParams,
 } from "../oauth/crypto.js";
 import { DEFAULT_THROTTLE, type LoginResult, makeLoginGuard, PasswordUnavailable, type ThrottlePolicy } from "../oauth/login.js";
+import type { ServerSettings } from "../server-settings.js";
 import { matchingTotpSteps, TOTP_WINDOW, totpStep } from "./totp.js";
 
 /**
@@ -54,6 +55,21 @@ export interface PasswordStore {
   readonly get: Effect.Effect<Option.Option<string>, { readonly message: string }>;
   readonly put: (line: string) => Effect.Effect<void, { readonly message: string }>;
 }
+
+/** The `server_settings` key that `settingsPasswordStore` keeps the hash line under. */
+export const ADMIN_PASSWORD_HASH_KEY = "admin_password_hash";
+
+/**
+ * The PasswordStore over the app's `server_settings` table
+ * (server-settings.ts): the hash line is the `admin_password_hash` row.
+ * A reset command removes that row to restore the bootstrap hash.
+ */
+export const settingsPasswordStore = <F extends { readonly message: string }>(
+  settings: ServerSettings<F>,
+): PasswordStore => ({
+  get: settings.get(ADMIN_PASSWORD_HASH_KEY),
+  put: (line) => settings.put(ADMIN_PASSWORD_HASH_KEY, line),
+});
 
 export interface AdminPasswordOptions {
   readonly app: AppIdentity;
