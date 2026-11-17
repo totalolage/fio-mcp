@@ -28,6 +28,6 @@ bun run test:scripts     # tests scripts/ship-image.sh (stand-in docker and ssh)
 
 ## Images and CI
 
-Each server has its own Dockerfile and builds from the repository root, e.g. `docker build -f servers/fio/Dockerfile .`. `bun run ship:image` builds the fio-mcp image and streams it to a docker host over ssh; no registry is involved (see [Shipping the image](servers/fio/README.md#shipping-the-image-to-your-server)). The script only ships fio-mcp for now; another server needs it to take the server as an argument, or a script of its own.
+Each server has its own Dockerfile and builds from the repository root, e.g. `docker build -f servers/fio/Dockerfile .`. `bun run ship:image` builds the fio-mcp image and streams it to a docker host over ssh; no registry is involved (see [Shipping the image](servers/fio/README.md#shipping-the-image-to-your-server)). `bun run ship:image -- --server datova-schranka` does the same for another server: it builds `servers/<server>/Dockerfile` and tags the image with that workspace's package name and version, e.g. `datova-schranka:<version>-<sha>`.
 
 [CI](.github/workflows/ci.yml) runs the checks on pull requests and pushes to `main`. Each server has a job that runs when its own directory changes, and every job runs when `packages/core` or the shared root tooling changes. CI never builds or ships an image.
