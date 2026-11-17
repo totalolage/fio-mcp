@@ -114,7 +114,7 @@ export const MIN_BOX_SECRET_LENGTH = 8;
 /** The password or certificate passphrase is shorter than MIN_BOX_SECRET_LENGTH characters; refused before any ISDS call. */
 export class BoxSecretTooShort extends Schema.TaggedError<BoxSecretTooShort>()("BoxSecretTooShort", {
   secret: Schema.Literals(["password", "passphrase"]),
-  minimum: Schema.Number,
+  minimum: Schema.Finite,
 }) {
   override get message(): string {
     return this.secret === "password"
