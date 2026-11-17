@@ -1,6 +1,9 @@
 import { markUntrusted } from "@mcps/core/mcp/untrusted.js";
+import { Redactor } from "@mcps/core/redaction.js";
 import { DateTime, Effect, Schema } from "effect";
-import { Tool } from "effect/ai";
+import { Tool, Toolkit } from "effect/ai";
+import { AuditLog } from "../domain/audit-log.js";
+import { BoxRegistry } from "../domain/boxes.js";
 import {
   type FilingNotFound,
   type FilingRef,
@@ -10,9 +13,14 @@ import {
   type SendEnvelope,
   type SendFailure,
   SendResult,
+  SendService,
   type SendServiceShape,
 } from "../domain/send/api.js";
 import { createMessageMaxAttachmentBytes, createMessageMaxFiles, FileMetaType } from "../isds/create-message.js";
+import { boxParameter } from "./box-param.js";
+import { authorizedBoxCall, ToolError, toolOutput } from "./call.js";
+import { registerAuditedToolkit } from "./input-audit.js";
+import type { ToolGroup } from "./tool-group.js";
 
 /**
  * The send tools: send_message and get_filing_status (scope isds:send). This module holds
@@ -326,3 +334,77 @@ export const filingStatusHandler = (
     : service.filingStatus(caller, boxId, ref).pipe(Effect.map(filingStatusOutput), Effect.mapError(fail));
 };
 
+
+// ---------------------------------------------------------------------------------------------
+// Group
+
+const [SEND_MESSAGE_SPEC, FILING_STATUS_SPEC] = SEND_TOOL_SPECS;
+
+/** The toolkit of both send tools; the `box` enum lists `labels`. */
+export const makeSendToolkit = (labels: ReadonlyArray<string>) => {
+  const tools = makeSendTools(boxParameter(labels), ToolError);
+  return Toolkit.make(tools.send_message, tools.get_filing_status);
+};
+type SendToolkit = ReturnType<typeof makeSendToolkit>;
+
+const toToolError = (failure: SendToolFailure): ToolError => new ToolError({ text: failure.text });
+
+const AMBIGUOUS_REF = "Pass exactly one of filingId or idempotencyKey.";
+
+const makeSendHandlers = Effect.fn("SendTools.handlers")(function* (toolkit: SendToolkit) {
+  const service = yield* SendService;
+  const registry = yield* BoxRegistry;
+  const audit = yield* AuditLog;
+  const redactor = yield* Redactor;
+  // Handlers run with no services of their own: authorization and the output path get these.
+  const out = <E>(effect: Effect.Effect<SendToolOutput, E, AuditLog | BoxRegistry | Redactor>) =>
+    toolOutput(effect).pipe(
+      Effect.provideService(AuditLog, audit),
+      Effect.provideService(BoxRegistry, registry),
+      Effect.provideService(Redactor, redactor),
+    );
+
+  return toolkit.of({
+    send_message: (input) =>
+      out(
+        authorizedBoxCall(SEND_MESSAGE_SPEC, input, (_actor, boxId, caller) =>
+          // The service audits the call once (send_message), refusals included.
+          sendMessageHandler(service, caller, boxId, input).pipe(Effect.mapError(toToolError)),
+        ),
+      ),
+    get_filing_status: (input) =>
+      out(
+        authorizedBoxCall(FILING_STATUS_SPEC, input, (actor, boxId, caller) =>
+          (input.filingId === undefined) === (input.idempotencyKey === undefined)
+            ? // The service never sees this call, so its one audit row is written here.
+              audit
+                .record({
+                  actor,
+                  action: FILING_STATUS_SPEC.name,
+                  boxId,
+                  outcome: "refused",
+                  detail: { reason: "filing_ref" },
+                })
+                .pipe(
+                  Effect.matchEffect({
+                    onFailure: () =>
+                      Effect.fail(new ToolError({ text: "The refusal of this call could not be recorded; nothing was done." })),
+                    onSuccess: () => Effect.fail(new ToolError({ text: AMBIGUOUS_REF })),
+                  }),
+                )
+            : filingStatusHandler(service, caller, boxId, input).pipe(Effect.mapError(toToolError)),
+        ),
+      ),
+  });
+});
+
+export type SendToolServices = SendService | BoxRegistry | AuditLog | Redactor;
+
+/** The isds:send tools, registered for the box labels (again on every label change). */
+export const sendToolGroup: ToolGroup<SendToolServices> = {
+  specs: SEND_TOOL_SPECS,
+  register: Effect.fn("SendTools.register")(function* (labels: ReadonlyArray<string>) {
+    const toolkit = makeSendToolkit(labels);
+    yield* registerAuditedToolkit(toolkit).pipe(Effect.provide(toolkit.toLayer(makeSendHandlers(toolkit))));
+  }),
+};
