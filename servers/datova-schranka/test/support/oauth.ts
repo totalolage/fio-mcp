@@ -6,12 +6,17 @@
  * admin password from a fast scrypt hash; served through a web handler, with
  * a cookie-keeping "browser" and a clock the test can move.
  *
- * Extension hook (StartOptions.app, StartOptions.tools, StartOptions.wrapApp):
+ * Extension hook (StartOptions.app, StartOptions.tools, StartOptions.registry,
+ * StartOptions.wrapApp):
  * `app` is merged into the router app next to the OAuth routes and McpServer
  * and gets the harness services (HarnessServices) plus the router and
  * McpServer, so the app-composition phase passes its tool groups (registered
  * on McpServer) and admin routes here, with `tools` naming their ToolSpecs
- * for core's ToolPolicy; a live smoke test reuses the same entry point.
+ * for core's ToolPolicy; `registry` replaces the fake BoxRegistry with the
+ * app's real one (BoxRegistry.Default over the harness database and
+ * Redactor), so admin routes, tools and consent see one box list while the
+ * AuditLog stays on the one SqlClient the grant transaction uses. A live
+ * smoke test reuses the same entry point.
  * `wrapApp` replaces parts of the OAuthApp (e.g. a failing afterConsent).
  */
 
@@ -112,7 +117,7 @@ export type HarnessServices =
   | Resources
   | AdminPassword;
 
-/** Changes the fake box list (Resources streams the change to the server). */
+/** Changes the fake box list (Resources streams the change to the server); rejects when StartOptions.registry replaced it. */
 export interface HarnessBoxes {
   readonly add: (box: Box) => Promise<void>;
   readonly remove: (boxId: string) => Promise<void>;
@@ -139,6 +144,11 @@ export interface StartOptions {
   readonly allowedNetworks?: ReadonlyArray<string>;
   /** The boxes the fake BoxRegistry starts with (default DEFAULT_BOXES). */
   readonly boxes?: ReadonlyArray<Box>;
+  /**
+   * The app's BoxRegistry instead of the fake (then `boxes` is unused and
+   * HarnessBoxes rejects); built once, over the harness database and Redactor.
+   */
+  readonly registry?: Layer.Layer<BoxRegistry, { readonly message: string }, SqlClient.SqlClient | Redactor>;
   /**
    * Extension hook: more of the app, merged into the router app (tool
    * groups registering on McpServer, admin routes on HttpRouter, …). It gets
@@ -194,7 +204,7 @@ export async function startOAuth(options: StartOptions = {}): Promise<OAuthHarne
           scrypt: FAST_SCRYPT,
         }),
       ).pipe(
-        Layer.provideMerge(registry.layer),
+        Layer.provideMerge(options.registry ?? registry.layer),
         Layer.provideMerge(Redactor.layer(Effect.succeed([]))),
         Layer.provideMerge(memoryDatabase(APP_MIGRATIONS)),
       ),
@@ -246,8 +256,14 @@ export async function startOAuth(options: StartOptions = {}): Promise<OAuthHarne
     sql: run,
     run,
     boxes: {
-      add: (box) => Effect.runPromise(registry.add({ box, credentials: passwordCredentials(`user-${box.id}`) })),
-      remove: (boxId) => Effect.runPromise(registry.remove(boxId)),
+      add: (box) =>
+        options.registry === undefined
+          ? Effect.runPromise(registry.add({ box, credentials: passwordCredentials(`user-${box.id}`) }))
+          : Promise.reject(new Error("the harness runs the given registry: add boxes through it")),
+      remove: (boxId) =>
+        options.registry === undefined
+          ? Effect.runPromise(registry.remove(boxId))
+          : Promise.reject(new Error("the harness runs the given registry: remove boxes through it")),
     },
     close: async () => {
       await web.dispose();

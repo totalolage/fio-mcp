@@ -3,9 +3,14 @@ import { Effect, Layer } from "effect";
 import { HttpRouter, HttpServerResponse } from "effect/http";
 import { SqlClient } from "effect/sql";
 import { AuditLog } from "../../src/domain/audit-log.js";
+import { BoxLocks } from "../../src/domain/box-locks.js";
+import { BoxRegistry } from "../../src/domain/boxes.js";
+import { DataKey, DomainConfig } from "../../src/domain/config.js";
 import { READ_SCOPE, SEND_SCOPE } from "../../src/mcp/tool-group.js";
 import { CONSENT_ACTION } from "../../src/oauth/app.js";
 import { DELIVERY_CONSENT_SHA256, DELIVERY_CONSENT_VERSION, DELIVERY_CONSENT_WORDING } from "../../src/oauth/consent.js";
+import { fakeIsdsTransports, loginResponder, passwordCredentials } from "../domain/support/fake-isds.js";
+import { DATA_KEY } from "../domain/support/registry-harness.js";
 import {
   clientAuthorization,
   DEFAULT_BOXES,
@@ -128,6 +133,29 @@ describe("consent approval", () => {
     assert.deepStrictEqual(await state(h), { grants: [], codes: 0, audit: [] });
   });
 
+  it("judges the consent by the scopes ticked, not the scopes requested", async () => {
+    const h = await start();
+    // Asked for send only, read ticked without the consent: refused.
+    const send = await clientAuthorization(h, [SEND_SCOPE]);
+    const refused = await submitConsent(await openConsent(h, send.url), {
+      scopes: [READ_SCOPE, SEND_SCOPE],
+      deliveryConsent: false,
+    });
+    assert.strictEqual(refused.status, 400);
+    assert.include(await refused.text(), "Read access needs the delivery consent");
+    assert.deepStrictEqual(await state(h), { grants: [], codes: 0, audit: [] });
+    // Asked for read, only send ticked, no consent: a send-only grant.
+    const read = await clientAuthorization(h, [READ_SCOPE]);
+    const approved = await submitConsent(await openConsent(h, read.url), { scopes: [SEND_SCOPE], deliveryConsent: false });
+    assert.strictEqual(approved.status, 303);
+    const { grants, audit } = await state(h);
+    assert.deepStrictEqual(
+      grants.map((grant) => [grant.scopes, grant.delivery_consent_version]),
+      [[SEND_SCOPE, null]],
+    );
+    assert.strictEqual(audit.length, 1);
+  });
+
   it("refuses an approval without any scope and stores nothing", async () => {
     const h = await start();
     const { url } = await clientAuthorization(h);
@@ -225,6 +253,39 @@ describe("consent approval", () => {
     assert.notInclude(await response.text(), "hook failed");
     // The audit row the real hook wrote joined the grant's transaction, so it is gone too.
     assert.deepStrictEqual(await state(h), { grants: [], codes: 0, audit: [] });
+  });
+
+  it("rolls the audit row back with the grant over the app's real BoxRegistry", async () => {
+    const isds = fakeIsdsTransports(loginResponder({ owner: "abc2def" }));
+    const registry = BoxRegistry.Default.pipe(
+      Layer.provide(isds.layer),
+      Layer.provide(DataKey.layer(DATA_KEY)),
+      Layer.provide(DomainConfig.layer({ dataDir: "/nonexistent", environment: "production" })),
+      Layer.provide(BoxLocks.Default),
+    );
+    const failing = await start({
+      registry,
+      wrapApp: (real) => ({
+        ...real,
+        afterConsent: (consent) =>
+          (real.afterConsent?.(consent) ?? Effect.void).pipe(Effect.andThen(Effect.fail({ message: "hook failed" }))),
+      }),
+    });
+    await failing.run(
+      Effect.flatMap(Effect.service(BoxRegistry), (boxes) =>
+        boxes.add({ label: "Real", environment: "production", credentials: passwordCredentials("owner") }),
+      ),
+    );
+    const { url } = await clientAuthorization(failing);
+    const response = await submitConsent(await openConsent(failing, url), { boxes: ["Real"] });
+    assert.strictEqual(response.status, 500);
+    const after = await state(failing);
+    assert.deepStrictEqual({ grants: after.grants, codes: after.codes }, { grants: [], codes: 0 });
+    // Only the registry's own audit of the add remains, never a consent row.
+    assert.deepStrictEqual(
+      after.audit.filter((row) => row.action === CONSENT_ACTION),
+      [],
+    );
   });
 
   it("rolls the grant back when the consent audit row cannot be written", async () => {
