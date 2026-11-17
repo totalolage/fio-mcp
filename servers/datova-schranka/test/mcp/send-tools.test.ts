@@ -1,4 +1,5 @@
 import { assert, describe, it } from "@effect/vitest";
+import { markUntrusted } from "@mcps/core/mcp/untrusted.js";
 import { Context, Effect, Exit, Schema } from "effect";
 import { Tool } from "effect/ai";
 import { DomainStoreError } from "../../src/domain/errors.js";
@@ -231,9 +232,15 @@ describe("sendMessageHandler", () => {
   it.effect("refused: the reason, with the filing when there is one", () =>
     Effect.gen(function* () {
       const plain = yield* sendWith(SendResult.Refused({ reason: "recipient box is not active" }));
-      assert.deepStrictEqual(plain.output, { result: "refused", reason: "recipient box is not active" });
+      assert.deepStrictEqual(plain.output, { result: "refused", reason: markUntrusted("recipient box is not active") });
       const kept = yield* sendWith(SendResult.Refused({ reason: "different content", filingId: "filing_1" }));
-      assert.deepStrictEqual(kept.output, { result: "refused", reason: "different content", filingId: "filing_1" });
+      assert.deepStrictEqual(kept.output, {
+        result: "refused",
+        reason: markUntrusted("different content"),
+        filingId: "filing_1",
+      });
+      // The reason can quote ISDS or an administrator: marked, so the output guard wraps it.
+      assert.notStrictEqual(plain.output.reason, "recipient box is not active");
     }),
   );
 
@@ -330,7 +337,8 @@ describe("filingStatusHandler", () => {
       const fake = fakeSendService([], { filingStatus: Effect.succeed({ filing: rejected, guidance: "Use a new key." }) });
       const output = yield* filingStatusHandler(fake.service, CALLER, BOX_ID, { idempotencyKey: "key-filing_2" });
       assert.deepStrictEqual(fake.calls, [{ op: "filingStatus", args: [CALLER, BOX_ID, { idempotencyKey: "key-filing_2" }] }]);
-      assert.strictEqual(output.reason, "ISDS refused it");
+      assert.strictEqual(output.reason, markUntrusted("ISDS refused it"));
+      assert.notStrictEqual(output.reason, "ISDS refused it");
       assert.strictEqual(output.expiresAt, "2026-11-24T08:00:00.000Z");
       assert.strictEqual(output.reconciledAt, "2026-11-17T08:05:00.000Z");
       assert.include(String((output.isdsStatus as Record<string, unknown>).message), "Chyba");

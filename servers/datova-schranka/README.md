@@ -19,11 +19,13 @@ So a grant that includes `isds:read` needs a ticked checkbox on the consent page
 
 Each sending box has a recipient list in /admin → Recipients. Every recipient dbID gets a tier there, and a recipient that is not listed has tier `none`:
 
-- `none` (default): the message is queued as a filing and waits in /admin → Filings. An administrator approves it, which sends it, or rejects it. Approval needs the TOTP code when TOTP is on. A queued filing expires after 7 days.
-- `approve`: the first call returns a preview and a single-use approval nonce, valid for 15 minutes. The client shows the preview to the user and, if the user agrees, calls again with the same arguments plus the nonce. The nonce works only for that grant, box and exact content. Presenting it with different content burns it.
+- `none` (default): the message is queued as a filing and waits in /admin → Filings. An administrator approves it, which sends it, or rejects it. Approval needs the TOTP code when TOTP is on.
+- `approve`: the first call returns a preview and a single-use approval nonce. The client shows the preview to the user and, if the user agrees, calls again with the same arguments plus the nonce. The nonce works only for that grant, box and exact content. Presenting it with different content burns it. Repeating the first call while the nonce is valid returns the same nonce; after it expires, a fresh one.
 - `full`: the message is sent at once.
 
-Each call carries an `idempotencyKey`. The same key with the same content returns the earlier result and never sends twice. The same key with different content is refused. Before a message is queued or sent, the recipient must pass CheckDataBox with state 1 (accessible).
+A nonce is valid for 15 minutes (`DATOVA_SCHRANKA_APPROVAL_NONCE_TTL_MINUTES`). A filing that waits for the administrator or for the user's confirmation expires after 168 hours (`DATOVA_SCHRANKA_PENDING_TTL_HOURS`), and nothing is sent.
+
+Every `send_message` call carries an `idempotencyKey`. The same key with the same content returns the earlier result and never sends twice, whatever nonce comes with it once the filing is past the confirmation step. The same key with different content is refused. Before a message is queued or sent, the recipient must pass CheckDataBox with state 1 (accessible).
 
 "Sent" means ISDS accepted the submission and assigned a dmID. It does not mean the recipient has the message.
 

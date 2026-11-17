@@ -238,7 +238,8 @@ export const sendResultOutput: (result: SendResult) => SendToolOutput = SendResu
   }),
   InProgress: ({ filingId }) => ({ result: "in_progress", filingId, guidance: IN_PROGRESS_GUIDANCE }),
   OutcomeUnknown: ({ filingId }) => ({ result: "outcome_unknown", filingId, guidance: OUTCOME_UNKNOWN_GUIDANCE }),
-  Refused: ({ reason, filingId }) => defined({ result: "refused", reason, filingId }),
+  // A reason can quote ISDS or an administrator, so it is marked for the output guard.
+  Refused: ({ reason, filingId }) => defined({ result: "refused", reason: markUntrusted(reason), filingId }),
   IsdsRejected: ({ filingId, status }) => ({
     result: "isds_rejected",
     filingId,
@@ -259,7 +260,7 @@ export const filingStatusOutput = ({ filing, guidance }: FilingStatus): SendTool
     contentHash: filing.contentHash,
     dmID: filing.dmId,
     isdsStatus: filing.isdsStatus === undefined ? undefined : statusOutput(filing.isdsStatus),
-    reason: filing.reason,
+    reason: filing.reason === undefined ? undefined : markUntrusted(filing.reason),
     createdAt: iso(filing.createdAt),
     submittedAt: optionalIso(filing.submittedAt),
     updatedAt: iso(filing.updatedAt),
