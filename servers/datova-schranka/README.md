@@ -20,7 +20,7 @@ So a grant that includes `isds:read` needs a ticked checkbox on the consent page
 Each sending box has a recipient list in /admin → Recipients. Every recipient dbID gets a tier there, and a recipient that is not listed has tier `none`:
 
 - `none` (default): the message is queued as a filing and waits in /admin → Filings. An administrator approves it, which sends it, or rejects it. Approval needs the TOTP code when TOTP is on. A queued filing expires after 7 days.
-- `approve`: the first call returns a preview and a single-use approval nonce, valid for 15 minutes. The client shows the preview to the user and, if the user agrees, calls again with the same arguments plus the nonce. The nonce works only for that grant, box and exact content. A call with different content burns it.
+- `approve`: the first call returns a preview and a single-use approval nonce, valid for 15 minutes. The client shows the preview to the user and, if the user agrees, calls again with the same arguments plus the nonce. The nonce works only for that grant, box and exact content. Presenting it with different content burns it.
 - `full`: the message is sent at once.
 
 Each call carries an `idempotencyKey`. The same key with the same content returns the earlier result and never sends twice. The same key with different content is refused. Before a message is queued or sent, the recipient must pass CheckDataBox with state 1 (accessible).
