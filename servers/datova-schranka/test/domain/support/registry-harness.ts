@@ -35,7 +35,7 @@ export const startRegistry = Effect.fn("startRegistry")(function* (options: Star
   });
   const logs: Array<string> = [];
   const capture = Logger.make<unknown, void>((entry) => void logs.push(Logger.formatLogFmt.log(entry)));
-  const layer = BoxRegistry.layer.pipe(
+  const layer = BoxRegistry.Default.pipe(
     Layer.provide(isds.layer),
     Layer.provide(Layer.succeed(Redactor, redactor)),
     Layer.provide(DataKey.layer(DATA_KEY)),

@@ -153,7 +153,7 @@ export class RecipientTiers extends Context.Service<RecipientTiers, RecipientTie
   "datova-schranka/RecipientTiers",
 ) {
   /** The tier table in the domain database (migration 0102_recipient_tiers). */
-  static readonly layer: Layer.Layer<RecipientTiers, never, SqlClient.SqlClient> = Layer.effect(
+  static readonly Default: Layer.Layer<RecipientTiers, never, SqlClient.SqlClient> = Layer.effect(
     RecipientTiers,
     Effect.map(make, (shape) => RecipientTiers.of(shape)),
   );

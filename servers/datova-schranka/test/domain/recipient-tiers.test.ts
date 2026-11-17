@@ -21,7 +21,7 @@ const insertBox = (id: string, dbId: string) =>
     `;
   });
 
-const layer = RecipientTiers.layer.pipe(Layer.provideMerge(memoryDatabase()));
+const layer = RecipientTiers.Default.pipe(Layer.provideMerge(memoryDatabase()));
 
 const withBoxes = <A, E>(body: (tiers: RecipientTiers["Service"]) => Effect.Effect<A, E, SqlClient.SqlClient>) =>
   Effect.gen(function* () {

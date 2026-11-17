@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { Cause, Context, Effect, Exit, Layer, Option, Schema } from "effect";
+import { Context, Effect, Layer, Schema } from "effect";
 import type { IsdsClientShape } from "../isds/client.js";
 import type { CheckDataBoxResult, FindDataBoxesQuery, FindDataBoxesResult } from "../isds/databox.js";
 import { type IsdsCallError, type IsdsInvalidRequest, IsdsStatusError, IsdsTimeoutError } from "../isds/errors.js";
@@ -17,7 +17,7 @@ import type {
   MessageStateChangesInput,
 } from "../isds/message-lists.js";
 import type { MessageEnvelope } from "../isds/models.js";
-import { type AuditActor, type AuditFinalOutcome, AuditLog, type AuditLogShape } from "./audit-log.js";
+import { type AuditActor, AuditLog, type AuditLogShape, audited } from "./audit-log.js";
 import { type BoxClientError, BoxClients } from "./box-clients.js";
 import { BoxRegistry } from "./boxes.js";
 import { DomainConfig, type DomainConfigShape } from "./config.js";
@@ -153,31 +153,13 @@ const failureDetail = (error: Tagged): object => {
   return { error: error._tag };
 };
 
-/** A timeout after the request was sent may have taken effect: "uncertain". */
-const failureOutcome = (error: Tagged): AuditFinalOutcome =>
-  error instanceof IsdsTimeoutError && error.requestSent ? "uncertain" : "error";
-
-const outcomeOf = <A, E extends Tagged>(
-  exit: Exit.Exit<A, E>,
-  base: object,
-  okDetail: (value: A) => object,
-): readonly [AuditFinalOutcome, object] => {
-  if (Exit.isSuccess(exit)) return ["ok", { ...base, ...okDetail(exit.value) }];
-  const error = Cause.findErrorOption(exit.cause);
-  if (Option.isSome(error)) return [failureOutcome(error.value), { ...base, ...failureDetail(error.value) }];
-  if (Cause.hasDies(exit.cause)) return ["error", { ...base, error: "Defect" }];
-  return ["uncertain", { ...base, error: "Interrupted" }];
-};
-
 /**
- * Writes the intent (`detail`), runs `effect` only if that succeeded, then the outcome: the
- * detail merged with `okDetail` of the value, or with the failure's tag and status code. Only
- * `effect` is interruptible, so once the intent is written the outcome is written on every exit
- * (interruption → "uncertain"); a failing or defective outcome write is logged and the call's
- * own result kept (the row stays "started").
- * Local stand-in for audit-log.ts's `audited` (same semantics); consolidate once both land.
+ * `audited` (audit-log.ts) over the read service's AuditLog: the intent holds `detail`, the
+ * outcome holds it merged with `okDetail` of the value, or with the failure's tag and status
+ * code. A timeout after the request was sent is "uncertain"; a defect or interruption keeps
+ * the intent's detail.
  */
-const audited = <A, E extends Tagged>(
+const auditedRead = <A, E extends Tagged>(
   audit: AuditLogShape,
   actor: AuditActor,
   action: string,
@@ -186,22 +168,10 @@ const audited = <A, E extends Tagged>(
   effect: Effect.Effect<A, E>,
   okDetail: (value: A) => object,
 ): Effect.Effect<A, E | DomainStoreError> =>
-  Effect.uninterruptibleMask((restore) =>
-    Effect.flatMap(audit.start({ actor, action, boxId, detail }), (id) =>
-      restore(effect).pipe(
-        Effect.onExit((exit) =>
-          Effect.suspend(() => {
-            const [outcome, finalDetail] = outcomeOf(exit, detail, okDetail);
-            return audit.finish(id, outcome, finalDetail);
-          }).pipe(
-            Effect.catchCause((cause) =>
-              Effect.logWarning(`datova-schranka: outcome of audit entry ${id} not written`, cause),
-            ),
-          ),
-        ),
-      ),
-    ),
-  );
+  audited({ actor, action, boxId, detail }, effect, {
+    okDetail: (value) => ({ ...detail, ...okDetail(value) }),
+    errorDetail: (error) => ({ ...detail, ...failureDetail(error) }),
+  }).pipe(Effect.provideService(AuditLog, audit));
 
 const requireMessageId = (dmId: string): Effect.Effect<void, InvalidIdentifier> =>
   isMessageId(dmId) ? Effect.void : Effect.fail(new InvalidIdentifier({ kind: "messageId", rule: "1-20 digits" }));
@@ -305,7 +275,7 @@ const makeReadService = Effect.gen(function* () {
       boxId: string,
       input: ListMessagesInput,
     ) {
-      const records = yield* audited(
+      const records = yield* auditedRead(
         audit,
         actor,
         "list_received_messages",
@@ -321,7 +291,7 @@ const makeReadService = Effect.gen(function* () {
       boxId: string,
       input: ListMessagesInput,
     ) {
-      return yield* audited(
+      return yield* auditedRead(
         audit,
         actor,
         "list_sent_messages",
@@ -337,7 +307,7 @@ const makeReadService = Effect.gen(function* () {
       dmId: string,
     ) {
       yield* requireMessageId(dmId);
-      return yield* audited(
+      return yield* auditedRead(
         audit,
         actor,
         "get_message",
@@ -349,13 +319,13 @@ const makeReadService = Effect.gen(function* () {
     }),
     downloadMessage: Effect.fn("ReadService.downloadMessage")(function* (actor: AuditActor, boxId: string, dmId: string) {
       yield* requireMessageId(dmId);
-      return yield* audited(audit, actor, "download_message", boxId, { dmId }, download(boxId, dmId), downloadDetail).pipe(
+      return yield* auditedRead(audit, actor, "download_message", boxId, { dmId }, download(boxId, dmId), downloadDetail).pipe(
         notDeliveredYet(dmId),
       );
     }),
     getDeliveryInfo: Effect.fn("ReadService.getDeliveryInfo")(function* (actor: AuditActor, boxId: string, dmId: string) {
       yield* requireMessageId(dmId);
-      return yield* audited(
+      return yield* auditedRead(
         audit,
         actor,
         "get_delivery_info",
@@ -370,7 +340,7 @@ const makeReadService = Effect.gen(function* () {
       boxId: string,
       input: MessageStateChangesInput,
     ) {
-      return yield* audited(
+      return yield* auditedRead(
         audit,
         actor,
         "get_message_state_changes",
@@ -387,7 +357,7 @@ const makeReadService = Effect.gen(function* () {
     ) {
       yield* requireDataBoxId(query.dbID);
       yield* requireDataBoxId(query.dbUpperID);
-      return yield* audited(
+      return yield* auditedRead(
         audit,
         actor,
         "find_data_box",
@@ -399,7 +369,7 @@ const makeReadService = Effect.gen(function* () {
     }),
     checkDataBox: Effect.fn("ReadService.checkDataBox")(function* (actor: AuditActor, boxId: string, dbId: string) {
       yield* requireDataBoxId(dbId);
-      return yield* audited(
+      return yield* auditedRead(
         audit,
         actor,
         "check_data_box",
