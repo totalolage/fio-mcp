@@ -44,6 +44,16 @@ export interface HttpTransportConfig {
    * X-Forwarded-For from an untrusted peer (client-address.ts).
    */
   readonly trustedProxiesSetting?: string | undefined;
+  /**
+   * The largest /mcp request body in bytes; MAX_BODY_BYTES when absent.
+   * Each of a subject's MAX_CONCURRENT_REQUESTS requests may hold one.
+   */
+  readonly maxBodyBytes?: number | undefined;
+  /**
+   * Withholds a /mcp result with embedded resources when response redaction
+   * would change it (frame-redaction.ts). Off when absent.
+   */
+  readonly protectEmbeddedResources?: boolean | undefined;
 }
 
 export { HEALTH_PATH, isAllowedHost, redactResponse } from "./guard.js";
@@ -89,13 +99,13 @@ export const SESSION_LIMITS: SessionLimits = {
 };
 
 /**
- * Largest /mcp request body. The largest legitimate request, a 100-order
+ * Largest /mcp request body unless the app raises it (HttpTransportConfig.maxBodyBytes). The largest legitimate request, a 100-order
  * payment import, is around 100 KB of JSON.
  */
 export const MAX_BODY_BYTES = 1024 * 1024;
 /** Largest initialize request: McpServer keeps its client info for the session's lifetime. */
 export const MAX_INITIALIZE_BODY_BYTES = 64 * 1024;
-/** Requests (until their response is written) one subject may have at once; each may hold a body of MAX_BODY_BYTES. */
+/** Requests (until their response is written) one subject may have at once; each may hold a body of the largest size. */
 export const MAX_CONCURRENT_REQUESTS = 16;
 
 /** A session slot: the subject (OAuth grant) holding it and its use. */
@@ -237,19 +247,19 @@ const isBodyTooLarge = (reason: HttpServerError.HttpServerErrorReason): boolean 
   reason._tag === "RequestParseError" && reason.cause instanceof Error && reason.cause.message === "maxBytes exceeded";
 
 /**
- * Reads the body once, at most MAX_BODY_BYTES: a larger declared length is
+ * Reads the body once, at most `maxBytes`: a larger declared length is
  * refused unread, a longer body stops being read at the limit. McpServer
  * later reads the same cached body.
  */
-const readBody = (request: HttpServerRequest.HttpServerRequest): Effect.Effect<BodyRead> => {
+const readBody = (request: HttpServerRequest.HttpServerRequest, maxBytes: number): Effect.Effect<BodyRead> => {
   const declared = Number(request.headers["content-length"]);
-  if (declared > MAX_BODY_BYTES) return Effect.succeed({ _tag: "TooLarge" });
+  if (declared > maxBytes) return Effect.succeed({ _tag: "TooLarge" });
   return request.text.pipe(
-    Effect.provideService(HttpServerRequest.MaxBodySize, ByteSize.bytes(MAX_BODY_BYTES)),
+    Effect.provideService(HttpServerRequest.MaxBodySize, ByteSize.bytes(maxBytes)),
     Effect.map((text): BodyRead => {
       // Only the Node server enforces MaxBodySize while reading.
       const bytes = Buffer.byteLength(text);
-      return bytes > MAX_BODY_BYTES ? { _tag: "TooLarge" } : { _tag: "Read", text, bytes };
+      return bytes > maxBytes ? { _tag: "TooLarge" } : { _tag: "Read", text, bytes };
     }),
     Effect.catch((error) =>
       Effect.succeed<BodyRead>(isBodyTooLarge(error.reason) ? { _tag: "TooLarge" } : { _tag: "Unreadable" }),
@@ -278,7 +288,7 @@ const mayInitialize = (text: string) => {
  * as `CurrentPrincipal`.
  *
  * A subject (OAuth grant) may have MAX_CONCURRENT_REQUESTS requests in
- * flight (429 beyond). POST bodies are read at most MAX_BODY_BYTES (413
+ * flight (429 beyond). POST bodies are read at most `maxBodyBytes` (413
  * beyond), initialize requests at most MAX_INITIALIZE_BODY_BYTES.
  *
  * MCP sessions are bound to the subject that initialized them. McpServer
@@ -291,145 +301,146 @@ const mayInitialize = (text: string) => {
  * (its id answers 404 from then on). The server as a whole holds
  * SESSION_LIMITS.maxTracked sessions the same way (503 when full).
  */
-const mcpAuth = HttpRouter.middleware(
-  Effect.gen(function* () {
-    const auth = yield* Auth;
-    const router = yield* HttpRouter.HttpRouter;
-    const sessions = makeSessionOwners();
-    const inFlight = new Map<string, number>();
-    // The router's whole app, built on first use (after every route is added).
-    let routed:
-      | Effect.Effect<
-          Exit.Exit<HttpServerResponse.HttpServerResponse, unknown>,
-          never,
-          HttpServerRequest.HttpServerRequest | Scope.Scope
-        >
-      | undefined;
+const mcpAuth = (maxBodyBytes: number) =>
+  HttpRouter.middleware(
+    Effect.gen(function* () {
+      const auth = yield* Auth;
+      const router = yield* HttpRouter.HttpRouter;
+      const sessions = makeSessionOwners();
+      const inFlight = new Map<string, number>();
+      // The router's whole app, built on first use (after every route is added).
+      let routed:
+        | Effect.Effect<
+            Exit.Exit<HttpServerResponse.HttpServerResponse, unknown>,
+            never,
+            HttpServerRequest.HttpServerRequest | Scope.Scope
+          >
+        | undefined;
 
-    /** Ends `session` in McpServer through its own DELETE handling: 204 when ended, 404 when it was gone already. */
-    const terminate = (session: string, protocolVersion: string | undefined) => {
-      // @effect-diagnostics-next-line anyUnknownInErrorContext:off
-      routed ??= Effect.exit(router.asHttpEffect());
-      const request = HttpServerRequest.fromWeb(new Request(`http://mcps.internal${MCP_PATH}`, { method: "DELETE" })).modify({
-        headers: Headers.fromInput({
-          [MCP_SESSION_HEADER]: session,
-          ...(protocolVersion === undefined ? {} : { [MCP_PROTOCOL_VERSION_HEADER]: protocolVersion }),
-        }),
-      });
-      return routed.pipe(
-        Effect.provideService(HttpServerRequest.HttpServerRequest, request),
-        Effect.provideService(InternalRequest, true),
-        Effect.scoped,
-        Effect.map((exit) => (Exit.isSuccess(exit) ? exit.value.status : 500)),
-      );
-    };
-
-    /** Records the session id McpServer set on the final response (in a pre-response handler appended before this one). */
-    const settleOnResponse = (reservation: number | undefined, subject: string) =>
-      HttpEffect.appendPreResponseHandler((_request, final) =>
-        Effect.map(Clock.currentTimeMillis, (sent) => {
-          sessions.settle(reservation, subject, final.headers[MCP_SESSION_HEADER], final.headers[MCP_PROTOCOL_VERSION_HEADER], sent);
-          return final;
-        }),
-      );
-
-    const initialize = Effect.fnUntraced(function* (
-      subject: string,
-      handle: Effect.Effect<HttpServerResponse.HttpServerResponse, Types.unhandled>,
-    ) {
-      const admission = sessions.admit(subject, yield* Clock.currentTimeMillis);
-      if (admission._tag === "SubjectFull") return tooManySessions;
-      if (admission._tag === "ServerFull") return unavailable;
-      const { reservation, evicted } = admission;
-      if (evicted !== undefined) {
-        const status = yield* terminate(evicted.session, evicted.slot.protocolVersion);
-        const ok = status === 204 || status === 404;
-        sessions.ended(evicted, ok);
-        if (!ok) {
-          sessions.settle(reservation, subject, undefined, undefined, 0);
-          yield* Effect.logWarning(`mcp: an idle session could not be ended (status ${status}); a new session was refused`);
-          return unavailable;
-        }
-        if (status === 204) {
-          yield* Effect.logInfo(`mcp: ended an idle session to make room (${sessions.size()} sessions tracked)`);
-        }
-      }
-      // McpServer creates the session and sets its id in a pre-response
-      // handler. Run in a fiber of its own and joined uninterruptibly, a
-      // client that goes away cannot interrupt it in between; ours is then
-      // appended after McpServer's and runs even when the client is gone.
-      const fiber = yield* Effect.forkChild(handle);
-      return yield* Fiber.join(fiber).pipe(Effect.ensuring(settleOnResponse(reservation, subject)));
-    });
-
-    const serve = Effect.fnUntraced(function* (
-      request: HttpServerRequest.HttpServerRequest,
-      principal: Principal,
-      httpEffect: Effect.Effect<HttpServerResponse.HttpServerResponse, Types.unhandled>,
-    ) {
-      const subject = principal.subject;
-      const session = request.headers[MCP_SESSION_HEADER];
-      const handle = Effect.provideService(httpEffect, CurrentPrincipal, principal);
-      let initializes = false;
-      if (request.method === "POST") {
-        const body = yield* readBody(request);
-        if (body._tag === "TooLarge") return payloadTooLarge;
-        if (body._tag === "Read" && session === undefined) {
-          initializes = mayInitialize(body.text);
-          if (initializes && body.bytes > MAX_INITIALIZE_BODY_BYTES) return payloadTooLarge;
-        }
-      }
-      if (session !== undefined) {
-        // In use until the request scope closes, after a streamed response is written.
-        const slot = yield* Effect.acquireRelease(
-          Effect.map(Clock.currentTimeMillis, (now) => sessions.use(session, subject, now)),
-          (slot) => (slot === undefined ? Effect.void : Effect.map(Clock.currentTimeMillis, (now) => sessions.done(slot, now))),
+      /** Ends `session` in McpServer through its own DELETE handling: 204 when ended, 404 when it was gone already. */
+      const terminate = (session: string, protocolVersion: string | undefined) => {
+        // @effect-diagnostics-next-line anyUnknownInErrorContext:off
+        routed ??= Effect.exit(router.asHttpEffect());
+        const request = HttpServerRequest.fromWeb(new Request(`http://mcps.internal${MCP_PATH}`, { method: "DELETE" })).modify({
+          headers: Headers.fromInput({
+            [MCP_SESSION_HEADER]: session,
+            ...(protocolVersion === undefined ? {} : { [MCP_PROTOCOL_VERSION_HEADER]: protocolVersion }),
+          }),
+        });
+        return routed.pipe(
+          Effect.provideService(HttpServerRequest.HttpServerRequest, request),
+          Effect.provideService(InternalRequest, true),
+          Effect.scoped,
+          Effect.map((exit) => (Exit.isSuccess(exit) ? exit.value.status : 500)),
         );
-        if (slot === undefined) return unknownSession;
-        const response = yield* handle;
-        if (request.method === "DELETE" && response.status < 300) sessions.forget(session);
-        return response;
-      }
-      if (request.method !== "POST") return yield* handle;
-      // Uninterruptible from admission until the session id is recorded, so
-      // every session McpServer creates is counted.
-      if (initializes) return yield* Effect.uninterruptible(initialize(subject, handle));
-      return yield* handle.pipe(Effect.ensuring(settleOnResponse(undefined, subject)));
-    });
+      };
 
-    return Effect.fnUntraced(function* (
-      httpEffect: Effect.Effect<HttpServerResponse.HttpServerResponse, Types.unhandled>,
-    ) {
-      if (yield* InternalRequest) return yield* httpEffect;
-      const request = yield* HttpServerRequest.HttpServerRequest;
-      const principal = yield* Effect.result(auth.authenticate(request));
-      if (Result.isFailure(principal)) {
-        const failure = principal.failure;
-        return failure._tag === "AuthUnavailable" ? unavailable : unauthorized(failure.challenge);
-      }
-      const subject = principal.success.subject;
-      // Held until the request scope closes, after a streamed response is written.
-      const admitted = yield* Effect.acquireRelease(
-        Effect.sync(() => {
-          const running = inFlight.get(subject) ?? 0;
-          if (running >= MAX_CONCURRENT_REQUESTS) return false;
-          inFlight.set(subject, running + 1);
-          return true;
-        }),
-        (admitted) =>
-          admitted
-            ? Effect.sync(() => {
-                const left = (inFlight.get(subject) ?? 1) - 1;
-                if (left === 0) inFlight.delete(subject);
-                else inFlight.set(subject, left);
-              })
-            : Effect.void,
-      );
-      if (!admitted) return tooManyRequests;
-      return yield* serve(request, principal.success, httpEffect);
-    });
-  }),
-);
+      /** Records the session id McpServer set on the final response (in a pre-response handler appended before this one). */
+      const settleOnResponse = (reservation: number | undefined, subject: string) =>
+        HttpEffect.appendPreResponseHandler((_request, final) =>
+          Effect.map(Clock.currentTimeMillis, (sent) => {
+            sessions.settle(reservation, subject, final.headers[MCP_SESSION_HEADER], final.headers[MCP_PROTOCOL_VERSION_HEADER], sent);
+            return final;
+          }),
+        );
+
+      const initialize = Effect.fnUntraced(function* (
+        subject: string,
+        handle: Effect.Effect<HttpServerResponse.HttpServerResponse, Types.unhandled>,
+      ) {
+        const admission = sessions.admit(subject, yield* Clock.currentTimeMillis);
+        if (admission._tag === "SubjectFull") return tooManySessions;
+        if (admission._tag === "ServerFull") return unavailable;
+        const { reservation, evicted } = admission;
+        if (evicted !== undefined) {
+          const status = yield* terminate(evicted.session, evicted.slot.protocolVersion);
+          const ok = status === 204 || status === 404;
+          sessions.ended(evicted, ok);
+          if (!ok) {
+            sessions.settle(reservation, subject, undefined, undefined, 0);
+            yield* Effect.logWarning(`mcp: an idle session could not be ended (status ${status}); a new session was refused`);
+            return unavailable;
+          }
+          if (status === 204) {
+            yield* Effect.logInfo(`mcp: ended an idle session to make room (${sessions.size()} sessions tracked)`);
+          }
+        }
+        // McpServer creates the session and sets its id in a pre-response
+        // handler. Run in a fiber of its own and joined uninterruptibly, a
+        // client that goes away cannot interrupt it in between; ours is then
+        // appended after McpServer's and runs even when the client is gone.
+        const fiber = yield* Effect.forkChild(handle);
+        return yield* Fiber.join(fiber).pipe(Effect.ensuring(settleOnResponse(reservation, subject)));
+      });
+
+      const serve = Effect.fnUntraced(function* (
+        request: HttpServerRequest.HttpServerRequest,
+        principal: Principal,
+        httpEffect: Effect.Effect<HttpServerResponse.HttpServerResponse, Types.unhandled>,
+      ) {
+        const subject = principal.subject;
+        const session = request.headers[MCP_SESSION_HEADER];
+        const handle = Effect.provideService(httpEffect, CurrentPrincipal, principal);
+        let initializes = false;
+        if (request.method === "POST") {
+          const body = yield* readBody(request, maxBodyBytes);
+          if (body._tag === "TooLarge") return payloadTooLarge;
+          if (body._tag === "Read" && session === undefined) {
+            initializes = mayInitialize(body.text);
+            if (initializes && body.bytes > MAX_INITIALIZE_BODY_BYTES) return payloadTooLarge;
+          }
+        }
+        if (session !== undefined) {
+          // In use until the request scope closes, after a streamed response is written.
+          const slot = yield* Effect.acquireRelease(
+            Effect.map(Clock.currentTimeMillis, (now) => sessions.use(session, subject, now)),
+            (slot) => (slot === undefined ? Effect.void : Effect.map(Clock.currentTimeMillis, (now) => sessions.done(slot, now))),
+          );
+          if (slot === undefined) return unknownSession;
+          const response = yield* handle;
+          if (request.method === "DELETE" && response.status < 300) sessions.forget(session);
+          return response;
+        }
+        if (request.method !== "POST") return yield* handle;
+        // Uninterruptible from admission until the session id is recorded, so
+        // every session McpServer creates is counted.
+        if (initializes) return yield* Effect.uninterruptible(initialize(subject, handle));
+        return yield* handle.pipe(Effect.ensuring(settleOnResponse(undefined, subject)));
+      });
+
+      return Effect.fnUntraced(function* (
+        httpEffect: Effect.Effect<HttpServerResponse.HttpServerResponse, Types.unhandled>,
+      ) {
+        if (yield* InternalRequest) return yield* httpEffect;
+        const request = yield* HttpServerRequest.HttpServerRequest;
+        const principal = yield* Effect.result(auth.authenticate(request));
+        if (Result.isFailure(principal)) {
+          const failure = principal.failure;
+          return failure._tag === "AuthUnavailable" ? unavailable : unauthorized(failure.challenge);
+        }
+        const subject = principal.success.subject;
+        // Held until the request scope closes, after a streamed response is written.
+        const admitted = yield* Effect.acquireRelease(
+          Effect.sync(() => {
+            const running = inFlight.get(subject) ?? 0;
+            if (running >= MAX_CONCURRENT_REQUESTS) return false;
+            inFlight.set(subject, running + 1);
+            return true;
+          }),
+          (admitted) =>
+            admitted
+              ? Effect.sync(() => {
+                  const left = (inFlight.get(subject) ?? 1) - 1;
+                  if (left === 0) inFlight.delete(subject);
+                  else inFlight.set(subject, left);
+                })
+              : Effect.void,
+        );
+        if (!admitted) return tooManyRequests;
+        return yield* serve(request, principal.success, httpEffect);
+      });
+    }),
+  );
 
 /**
  * The router app: `app` (tool registrations and anything else that needs
@@ -445,7 +456,13 @@ export const httpRouterApp = <A, E, R, EA, RA>(
   info: ServerInfo,
   config: HttpTransportConfig,
 ) =>
-  Layer.mergeAll(app, HealthRoute, guard(config.allowedHosts, config.trustedProxies, config.trustedProxiesSetting)).pipe(
+  Layer.mergeAll(
+    app,
+    HealthRoute,
+    guard(config.allowedHosts, config.trustedProxies, config.trustedProxiesSetting, {
+      protectEmbeddedResources: config.protectEmbeddedResources,
+    }),
+  ).pipe(
     Layer.provideMerge(
       Layer.unwrap(
         Effect.gen(function* () {
@@ -457,7 +474,7 @@ export const httpRouterApp = <A, E, R, EA, RA>(
             path: MCP_PATH,
             allowedOrigins: config.allowedOrigins,
             allowSessionTermination: true,
-          }).pipe(Layer.provide(mcpAuth.layer));
+          }).pipe(Layer.provide(mcpAuth(config.maxBodyBytes ?? MAX_BODY_BYTES).layer));
         }),
       ),
     ),

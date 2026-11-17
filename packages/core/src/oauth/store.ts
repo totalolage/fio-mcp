@@ -316,8 +316,17 @@ export const makeOAuthStore = Effect.fn("OAuthStore.make")(function* (
       )
       .pipe(failure("revoke the client"));
 
-  /** Stores a consented grant and its authorization code. */
-  const createGrant = (grant: Grant, code: NewCode, now: number) =>
+  /**
+   * Stores a consented grant and its authorization code, then runs `also`
+   * (the app's ConsentHook) on this client in the same transaction: its
+   * failure or defect rolls everything back and fails like a store error.
+   */
+  const createGrant = (
+    grant: Grant,
+    code: NewCode,
+    now: number,
+    also?: Effect.Effect<void, { readonly message: string }, SqlClient.SqlClient>,
+  ) =>
     sql
       .withTransaction(
         Effect.gen(function* () {
@@ -345,6 +354,10 @@ export const makeOAuthStore = Effect.fn("OAuthStore.make")(function* (
             })}
           `;
           yield* sql`UPDATE oauth_clients SET last_used_at = ${now} WHERE client_id = ${grant.clientId}`;
+          if (also !== undefined) {
+            // Sandboxed: a defect fails the transaction (and is logged) like an error.
+            yield* also.pipe(Effect.provideService(SqlClient.SqlClient, sql), Effect.sandbox);
+          }
         }),
       )
       .pipe(failure("store the authorization"));

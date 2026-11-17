@@ -28,6 +28,7 @@ jobs:
     outputs:
       shared: ${{ steps.filter.outputs.shared }}
       fio: ${{ steps.filter.outputs.fio }}
+      datova-schranka: ${{ steps.filter.outputs.datova-schranka }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -44,6 +45,8 @@ jobs:
               - '!servers/**'
             fio:
               - 'servers/fio/**'
+            datova-schranka:
+              - 'servers/datova-schranka/**'
 
   fio:
     needs: changes
@@ -72,10 +75,33 @@ jobs:
       # The ship script and core boundary lint rule tests
       - run: bun run test:scripts
 
+  datova-schranka:
+    needs: changes
+    if: needs.changes.outputs.shared == 'true' || needs.changes.outputs.datova-schranka == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          # NODE_IMAGE in servers/fio/Dockerfile
+          node-version: 24.22.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          # The root packageManager field (bun@1.4.2)
+          bun-version-file: package.json
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun run lint
+      # The transport tests need the openssl CLI, which ubuntu runners ship.
+      - run: bun run test
+
   # The one check to require in branch protection: it fails when any server
   # job failed or was cancelled, and passes when they passed or were skipped.
   ci:
-    needs: [changes, fio]
+    needs: [changes, fio, datova-schranka]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5

@@ -1,4 +1,4 @@
-import { Redacted, Schema } from "effect";
+import { Schema } from "effect";
 
 /**
  * Encryption of FIO tokens at rest (HTTP mode keeps them in SQLite).
@@ -11,13 +11,12 @@ import { Redacted, Schema } from "effect";
  *
  * Errors never carry key material, tokens, or ciphertext.
  *
- * The cipher (seal/open) lives in @mcps/core; FIO owns the key file
- * format, the AAD strings, and the errors.
+ * The cipher (seal/open) and the key file format (parseDataKey) live in
+ * @mcps/core; FIO owns the AAD strings and the errors.
  */
 
+export { DATA_KEY_BYTES, parseDataKey } from "@mcps/core/config/secret-files.js";
 export { open, type Sealed, seal } from "@mcps/core/seal.js";
-
-export const DATA_KEY_BYTES = 32;
 
 /** The data key does not decrypt what the database holds: a different key file. */
 export class DataKeyMismatch extends Schema.TaggedError<DataKeyMismatch>()("DataKeyMismatch", {}) {
@@ -33,24 +32,6 @@ export class TokenDecryptionFailed extends Schema.TaggedError<TokenDecryptionFai
   override get message(): string {
     return `The stored FIO token of account ${this.accountId} could not be decrypted: the row was altered or copied from another row, or FIO_MCP_DATA_KEY_FILE changed. No account was dropped; fix the key file or replace the token in the admin UI after restoring the database.`;
   }
-}
-
-const HEX_KEY = /^[0-9a-fA-F]{64}$/;
-const BASE64_KEY = /^[A-Za-z0-9+/_-]{43}={0,1}$/;
-
-/**
- * The 32-byte key from the key file's text: 64 hex digits, or base64
- * (standard or URL-safe, padded or not). Undefined for anything else, so
- * the caller's message can stay value-free.
- */
-export function parseDataKey(text: string): Redacted.Redacted<Uint8Array> | undefined {
-  const trimmed = text.trim();
-  if (HEX_KEY.test(trimmed)) return Redacted.make(new Uint8Array(Buffer.from(trimmed, "hex")));
-  if (BASE64_KEY.test(trimmed)) {
-    const bytes = Buffer.from(trimmed.replace(/-/g, "+").replace(/_/g, "/"), "base64");
-    if (bytes.length === DATA_KEY_BYTES) return Redacted.make(new Uint8Array(bytes));
-  }
-  return undefined;
 }
 
 export const accountTokenAad = (accountId: string) => `fio-mcp:account-token:v1:${accountId}`;

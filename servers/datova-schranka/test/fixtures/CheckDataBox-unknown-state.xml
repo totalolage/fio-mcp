@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/">
+<SOAP-ENV:Body>
+<p:CheckDataBoxResponse xmlns:p="http://isds.czechpoint.cz/v20" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+<p:dbState>7</p:dbState>
+<p:dbStatus><p:dbStatusCode>0000</p:dbStatusCode><p:dbStatusMessage>Provedeno úspěšně.</p:dbStatusMessage></p:dbStatus>
+</p:CheckDataBoxResponse>
+</SOAP-ENV:Body>
+</SOAP-ENV:Envelope>

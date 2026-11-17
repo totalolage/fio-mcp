@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/">
+<SOAP-ENV:Body>
+<p:FindDataBox2Response xmlns:p="http://isds.czechpoint.cz/v20" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+<p:dbResults>
+<p:dbOwnerInfo>
+<p:dbID>r3q2txd</p:dbID>
+<p:aifoIsds>true</p:aifoIsds>
+<p:dbType>PFO_DANPOR</p:dbType>
+<p:ic>12312312</p:ic>
+<p:pnGivenNames>Jan</p:pnGivenNames>
+<p:pnLastName>Novák</p:pnLastName>
+<p:firmName>Ing. Novák - auditor</p:firmName>
+<p:biDate>1960-12-31</p:biDate>
+<p:biCity xsi:nil="true"/>
+<p:biCounty xsi:nil="true"/>
+<p:biState>CZ</p:biState>
+<p:adCode>321654</p:adCode>
+<p:adCity>Nýřany</p:adCity>
+<p:adDistrict>Olšov</p:adDistrict>
+<p:adStreet>Dvořákova</p:adStreet>
+<p:adNumberInStreet xsi:nil="true"/>
+<p:adNumberInMunicipality>201</p:adNumberInMunicipality>
+<p:adZipCode>33023</p:adZipCode>
+<p:adState>CZ</p:adState>
+<p:nationality>CZ</p:nationality>
+<p:dbIdOVM xsi:nil="true"/>
+<p:registryCode>KACR</p:registryCode>
+<p:dbState>1</p:dbState>
+<p:dbOpenAddressing>false</p:dbOpenAddressing>
+<p:dbUpperID xsi:nil="true"/>
+</p:dbOwnerInfo>
+<p:dbOwnerInfo>
+<p:dbID>k7m2pq4</p:dbID>
+<p:aifoIsds>true</p:aifoIsds>
+<p:dbType>PFO</p:dbType>
+<p:ic>87654321</p:ic>
+<p:pnGivenNames>Jana</p:pnGivenNames>
+<p:pnLastName>Nováková</p:pnLastName>
+<p:firmName>Nováková s.r.o.</p:firmName>
+<p:biDate>1960-12-31</p:biDate>
+<p:biCity xsi:nil="true"/>
+<p:biCounty xsi:nil="true"/>
+<p:biState>CZ</p:biState>
+<p:adCode>321654</p:adCode>
+<p:adCity>Nýřany</p:adCity>
+<p:adDistrict>Olšov</p:adDistrict>
+<p:adStreet>Dvořákova</p:adStreet>
+<p:adNumberInStreet xsi:nil="true"/>
+<p:adNumberInMunicipality>201</p:adNumberInMunicipality>
+<p:adZipCode>33023</p:adZipCode>
+<p:adState>CZ</p:adState>
+<p:nationality>CZ</p:nationality>
+<p:dbIdOVM xsi:nil="true"/>
+<p:registryCode>KACR</p:registryCode>
+<p:dbState>1</p:dbState>
+<p:dbOpenAddressing>false</p:dbOpenAddressing>
+<p:dbUpperID xsi:nil="true"/>
+</p:dbOwnerInfo>
+</p:dbResults>
+<p:dbStatus><p:dbStatusCode>0003</p:dbStatusCode><p:dbStatusMessage>Výsledek byl zkrácen na prvních 100 schránek.</p:dbStatusMessage></p:dbStatus>
+</p:FindDataBox2Response>
+</SOAP-ENV:Body>
+</SOAP-ENV:Envelope>

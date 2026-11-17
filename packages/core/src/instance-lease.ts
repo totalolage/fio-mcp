@@ -14,8 +14,10 @@ import { SqlClient } from "effect/sql";
  * Contract with the app: core adds no migration. The SqlClient the lease
  * layer gets must already have the table
  * `server_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)`
- * (the app's own migrations create it), and it should be the same database
- * the app serves from. The app decides which configurations take the lease
+ * (the app's own migrations create it, e.g. with `createServerSettings` /
+ * `SERVER_SETTINGS_DDL` from server-settings.ts, whose columns these are),
+ * and it should be the same database the app serves from. The lease row
+ * shares the table with the app's other settings. The app decides which configurations take the lease
  * (`InstanceLease.layer` or `InstanceLease.None`) and keeps its one-shot
  * commands off it.
  */

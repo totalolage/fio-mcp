@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/">
+<SOAP-ENV:Body>
+<p:GetOwnerInfoFromLoginResponse xmlns:p="http://isds.czechpoint.cz/v20" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+<p:dbOwnerInfo>
+<p:dbID>xyz9876</p:dbID>
+<p:dbType>FO</p:dbType>
+<p:ic xsi:nil="true"/>
+<p:pnFirstName>Jan</p:pnFirstName>
+<p:pnMiddleName>Petr</p:pnMiddleName>
+<p:pnLastName>Novák</p:pnLastName>
+<p:pnLastNameAtBirth>Dvořák</p:pnLastNameAtBirth>
+<p:firmName xsi:nil="true"/>
+<p:biDate>1967-01-07+01:00</p:biDate>
+<p:biCity>Náchod</p:biCity>
+<p:biCounty>Náchod</p:biCounty>
+<p:biState>CZ</p:biState>
+<p:adCity>Náchod</p:adCity>
+<p:adStreet>Pražská</p:adStreet>
+<p:adNumberInStreet xsi:nil="true"/>
+<p:adNumberInMunicipality>139</p:adNumberInMunicipality>
+<p:adZipCode>54701</p:adZipCode>
+<p:adState>CZ</p:adState>
+<p:nationality>CZ</p:nationality>
+<p:identifier xsi:nil="true"/>
+<p:registryCode xsi:nil="true"/>
+<p:dbState>1</p:dbState>
+<p:dbEffectiveOVM>false</p:dbEffectiveOVM>
+<p:dbOpenAddressing>false</p:dbOpenAddressing>
+</p:dbOwnerInfo>
+<p:dbStatus><p:dbStatusCode>0000</p:dbStatusCode><p:dbStatusMessage>Provedeno úspěšně.</p:dbStatusMessage></p:dbStatus>
+</p:GetOwnerInfoFromLoginResponse>
+</SOAP-ENV:Body>
+</SOAP-ENV:Envelope>
