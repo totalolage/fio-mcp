@@ -4,7 +4,8 @@
  * scripts/datova-schranka-live-smoke.sh, which reads credentials from the keyring and passes them
  * as /dev/fd pipes, never as files. The app under test keeps what an app keeps: the box's
  * credentials sealed with the throwaway data key in its temp database, and the downloaded ZFO in
- * its temp data dir; the harness removes that dir at close.
+ * its temp data dir; the harness removes that dir at close. The runner points TMPDIR at a tmpfs
+ * directory it removes on exit, so that dir never reaches a persistent disk.
  *
  * The HTTP app runs in-process with a temp database, data dir, throwaway data key and admin
  * password hash, and the real ISDS transports for environment `test`. The box is added through
@@ -21,6 +22,7 @@
  *
  * Each file is read once (pipes can't be re-read). Logged results are tool names, outcomes,
  * isError flags, counts, states and sizes: never credentials, message ids or message content.
+ * A tool output of the wrong shape fails its step with a fixed label, never with the output.
  */
 import { readFileSync } from "node:fs";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
@@ -83,17 +85,55 @@ type StepResult = { readonly step: string; readonly ok: boolean; readonly outcom
 const textOf = (result: CallToolResult): string =>
   result.content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("\n");
 
+/** A tool output of an unexpected shape; `what` is a fixed label, never output text. */
+class Malformed {
+  constructor(readonly what: string) {}
+}
+
+const isJson = (value: unknown): value is Json => typeof value === "object" && value !== null && !Array.isArray(value);
+
 /** The tool's JSON output: structured content, else the first text block. */
 const jsonOf = (result: CallToolResult): Json => {
-  if (result.structuredContent !== undefined) return result.structuredContent as Json;
+  if (result.structuredContent !== undefined) {
+    if (isJson(result.structuredContent)) return result.structuredContent;
+    throw new Malformed("structured content is not an object");
+  }
   const first = result.content.find((block) => block.type === "text");
-  return first?.type === "text" ? (JSON.parse(first.text) as Json) : {};
+  if (first?.type !== "text") throw new Malformed("no structured content or text");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(first.text);
+  } catch {
+    // The parse error quotes the text, so it is dropped.
+    throw new Malformed("text is not JSON");
+  }
+  if (isJson(parsed)) return parsed;
+  throw new Malformed("text is not a JSON object");
+};
+
+const objectOf = (json: Json, field: string): Json => {
+  const value = json[field];
+  if (isJson(value)) return value;
+  throw new Malformed(`${field} is not an object`);
+};
+
+const arrayOf = (json: Json, field: string): ReadonlyArray<unknown> => {
+  const value = json[field];
+  if (Array.isArray(value)) return value;
+  throw new Malformed(`${field} is not an array`);
 };
 
 const countOf = (json: Json, field: string): number => {
   const value = json[field];
-  if (Array.isArray(value)) return value.length;
-  return typeof value === "number" ? value : -1;
+  if (typeof value === "number") return value;
+  return arrayOf(json, field).length;
+};
+
+/** A short scalar (an enum value or a state number); anything else is malformed. */
+const scalarOf = (json: Json, field: string): string => {
+  const value = json[field];
+  if (typeof value === "number" || (typeof value === "string" && value.length <= 32)) return String(value);
+  throw new Malformed(`${field} is not a short scalar`);
 };
 
 /** The outcome and error tag of the newest audit row of `action` (detail is JSON text; only the tag is reported). */
@@ -105,13 +145,15 @@ const auditTag = async (admin: AdminSession, action: string): Promise<string> =>
 };
 
 /** The id of the most recently delivered record (ISDS's list order is not guaranteed). */
-const newestId = (records: ReadonlyArray<Json>): string | undefined => {
+const newestId = (records: ReadonlyArray<unknown>): string => {
   const time = (record: Json) => Date.parse(String(record.dmDeliveryTime ?? ""));
-  const newest = records.reduce<Json | undefined>(
-    (best, record) => (best === undefined || time(record) > time(best) ? record : best),
-    undefined,
-  );
-  return typeof newest?.dmID === "string" ? newest.dmID : undefined;
+  let newest: Json | undefined;
+  for (const record of records) {
+    if (!isJson(record)) throw new Malformed("a received record is not an object");
+    if (newest === undefined || time(record) > time(newest)) newest = record;
+  }
+  if (typeof newest?.dmID === "string" && newest.dmID !== "") return newest.dmID;
+  throw new Malformed("the newest received record has no dmID");
 };
 
 describe.skipIf(!enabled)("datova-schranka app live (ISDS public test environment)", () => {
@@ -125,9 +167,9 @@ describe.skipIf(!enabled)("datova-schranka app live (ISDS public test environmen
           : [credentials.passphrase, Buffer.from(credentials.pkcs12).toString("base64")];
       const results: Array<StepResult> = [];
       const record = (step: string, ok: boolean, outcome: string) => results.push({ step, ok, outcome });
-      // Every text that leaves the app is checked here; only the verdict is recorded, never the text.
+      // Tool results reach the test raw and are checked here; texts the harness returns (admin pages,
+      // messages, logs) are scrubbed by it and reported through app.scrubbed(). Only sites are recorded.
       const leaks: Array<string> = [];
-      // Texts the harness returns (admin pages, logs) are already scrubbed by it; tool results are raw.
       const checkNoSecret = (where: string, text: string | undefined) => {
         if (text !== undefined && secrets.some((secret) => secret.length > 0 && text.includes(secret))) {
           leaks.push(where);
@@ -151,15 +193,22 @@ describe.skipIf(!enabled)("datova-schranka app live (ISDS public test environmen
               record(name, false, `isError true, ${await auditTag(admin, name)}`);
               return Option.none<Json>();
             }
-            const json = jsonOf(result);
-            record(name, true, `isError false, ${summarize(json, result)}`);
-            return Option.some(json);
+            try {
+              const json = jsonOf(result);
+              record(name, true, `isError false, ${summarize(json, result)}`);
+              return Option.some(json);
+            } catch (error) {
+              if (!(error instanceof Malformed)) throw error;
+              record(name, false, `isError false, malformed output: ${error.what}`);
+              return Option.none<Json>();
+            }
           };
 
           await call("get_server_status", {}, (json) => {
-            const grantInfo = (json.grant ?? {}) as Json;
-            const scopes = Array.isArray(grantInfo.scopes) ? grantInfo.scopes.join(" ") : "?";
-            return `environment ${String(json.environment)}, ${countOf(json, "boxes")} boxes, scopes ${scopes}`;
+            const scopes = arrayOf(objectOf(json, "grant"), "scopes").map((scope) =>
+              typeof scope === "string" && scope.length <= 32 ? scope : "?",
+            );
+            return `environment ${scalarOf(json, "environment")}, ${countOf(json, "boxes")} boxes, scopes ${scopes.join(" ")}`;
           });
           await call("list_sent_messages", { box: LABEL }, (json) => `${countOf(json, "records")} records`);
           const received = await call(
@@ -168,15 +217,26 @@ describe.skipIf(!enabled)("datova-schranka app live (ISDS public test environmen
             (json) => `${countOf(json, "records")} records${json.note === undefined ? "" : ", with note"}`,
           );
 
-          const newest = Option.flatMap(received, (json) =>
-            Option.fromNullishOr(newestId(Array.isArray(json.records) ? (json.records as ReadonlyArray<Json>) : [])),
-          );
+          const pick = (json: Json): Option.Option<string> => {
+            const records = arrayOf(json, "records");
+            if (records.length === 0) return Option.none();
+            return Option.some(newestId(records));
+          };
+          let newest = Option.none<string>();
+          if (Option.isSome(received)) {
+            try {
+              newest = pick(received.value);
+              if (Option.isNone(newest)) {
+                record("get_message, download_message", true, "skipped: no received message in the window");
+              }
+            } catch (error) {
+              if (!(error instanceof Malformed)) throw error;
+              record("get_message, download_message", false, `skipped: malformed received records: ${error.what}`);
+            }
+          }
           if (Option.isSome(newest)) {
             const messageId = newest.value;
-            await call("get_message", { box: LABEL, messageId }, (json) => {
-              const message = (json.message ?? {}) as Json;
-              return `state ${String(message.dmMessageStatus ?? "?")}`;
-            });
+            await call("get_message", { box: LABEL, messageId }, (json) => `state ${scalarOf(objectOf(json, "message"), "dmMessageStatus")}`);
             await call("download_message", { box: LABEL, messageId }, (json, result) => {
               const blobs = result.content.flatMap((block) =>
                 block.type === "resource" && "blob" in block.resource ? [block.resource.blob] : [],
@@ -184,8 +244,6 @@ describe.skipIf(!enabled)("datova-schranka app live (ISDS public test environmen
               const bytes = blobs.reduce((sum, blob) => sum + Buffer.from(blob, "base64").length, 0);
               return `${countOf(json, "attachments")} attachments, ${blobs.length} inline (${bytes} bytes)`;
             });
-          } else {
-            record("get_message, download_message", true, "skipped: no received message in the window");
           }
           await call("get_message_state_changes", { box: LABEL }, (json) => `${countOf(json, "changes")} changes`);
       };
@@ -204,7 +262,6 @@ describe.skipIf(!enabled)("datova-schranka app live (ISDS public test environmen
                 pkcs12: credentials.pkcs12,
                 passphrase: credentials.passphrase,
               });
-        checkNoSecret("add box page", added.text);
         if (!added.added) {
           record(`add box (${credentials.route})`, false, `not added: status ${added.status}, ${await auditTag(admin, "box_add")}`);
         } else {
@@ -213,7 +270,7 @@ describe.skipIf(!enabled)("datova-schranka app live (ISDS public test environmen
         }
         completed = true;
       } finally {
-        for (const line of app.logs()) checkNoSecret("server log", line);
+        leaks.push(...app.scrubbed().map((site) => `${site} (scrubbed by the harness)`));
         const coverage = completed ? "clean" : "clean as far as the run got (it stopped early)";
         const leakCheck = leaks.length > 0 ? `found in ${leaks.join(", ")}` : coverage;
         console.info(

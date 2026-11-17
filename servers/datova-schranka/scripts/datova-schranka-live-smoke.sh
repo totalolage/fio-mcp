@@ -4,7 +4,9 @@
 # credentials from the Secret Service keyring (service "mcps-isds-test"). Credentials reach the
 # test only as /dev/fd pipes (process substitution); this script never writes them to a file,
 # prints, logs or passes them in argv. The app under test stores the box's credentials sealed with
-# a throwaway data key in a temp database that the test removes at the end.
+# a throwaway data key in a temp database; TMPDIR points at a private tmpfs directory (under
+# XDG_RUNTIME_DIR, else /dev/shm) that this script removes on exit, interrupt or termination, so
+# that database never reaches a persistent disk even if the test dies before its own cleanup.
 #
 # Usage: servers/datova-schranka/scripts/datova-schranka-live-smoke.sh [--route password|certificate]
 #
@@ -42,6 +44,14 @@ for account in "${accounts[@]}"; do
     exit 1
   fi
 done
+
+runtime_dir="${XDG_RUNTIME_DIR:-/dev/shm}"
+[[ -d "$runtime_dir" ]] || { echo "no tmpfs directory: set XDG_RUNTIME_DIR" >&2; exit 1; }
+scratch="$(mktemp -d "$runtime_dir/datova-schranka-live-smoke.XXXXXX")"
+trap 'rm -rf -- "$scratch"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+export TMPDIR="$scratch"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$repo_root"
