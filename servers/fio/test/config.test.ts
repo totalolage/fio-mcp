@@ -1,0 +1,946 @@
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { assert, describe, it } from "@effect/vitest";
+import { hashPassword } from "@mcps/core/oauth/crypto.js";
+import { ConfigProvider, Effect, Layer, Logger, Redacted, Result } from "effect";
+import { HttpRouter } from "effect/http";
+import { TestClock } from "effect/testing";
+import { type AppConfigShape, MIN_RATE_LIMIT_INTERVAL_MS } from "../src/config.js";
+import { ConfigError } from "../src/errors.js";
+import { type PaymentFormValues, parsePaymentForm } from "../src/payment-form.js";
+import { RedactorLive } from "../src/redaction.js";
+import { authFromConfig, UNAUTHENTICATED_WARNING, unauthenticatedWarning } from "../src/transport/auth.js";
+import { loadConfigFrom, PAY_TOKEN, READ_TOKEN } from "./fixtures.js";
+
+const configError = (env: Record<string, string>) =>
+  Effect.gen(function* () {
+    const error = yield* Effect.flip(loadConfigFrom(env));
+    assert.instanceOf(error, ConfigError);
+    return error.message;
+  });
+
+const secretFile = (content: string) => {
+  const dir = mkdtempSync(join(tmpdir(), "fio-mcp-config-"));
+  const path = join(dir, "secret");
+  writeFileSync(path, content, { mode: 0o440 });
+  return path;
+};
+
+describe("FIO_MCP_MARKER_TOOLS", () => {
+  it.effect("defaults to enabled and reads enabled or disabled, trimmed and case-insensitive", () =>
+    Effect.gen(function* () {
+      assert.strictEqual((yield* loadConfigFrom({ FIO_TOKEN: READ_TOKEN })).markerTools, "enabled");
+      assert.strictEqual((yield* loadConfigFrom({ FIO_TOKEN: READ_TOKEN, FIO_MCP_MARKER_TOOLS: "  " })).markerTools, "enabled");
+      const disabled = yield* loadConfigFrom({ FIO_TOKEN: READ_TOKEN, FIO_MCP_MARKER_TOOLS: " Disabled " });
+      assert.strictEqual(disabled.markerTools, "disabled");
+    }),
+  );
+
+  it.effect("fails startup on any other value without echoing it", () =>
+    Effect.gen(function* () {
+      const message = yield* configError({ FIO_TOKEN: READ_TOKEN, FIO_MCP_MARKER_TOOLS: "off-ish" });
+      assert.include(message, "FIO_MCP_MARKER_TOOLS");
+      assert.notInclude(message, "off-ish");
+    }),
+  );
+});
+
+/** Runs `effect` with a test logger; returns its result and the log lines. */
+const withLogs = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+  Effect.gen(function* () {
+    const logs: Array<string> = [];
+    const capture = Logger.make<unknown, void>((entry) => {
+      logs.push(Logger.formatLogFmt.log(entry));
+    });
+    const result = yield* effect.pipe(Effect.provide(Logger.layer([capture])));
+    return { result, logs };
+  });
+
+const oauthEnv = () =>
+  Effect.gen(function* () {
+    const hash = yield* hashPassword(Redacted.make("test-admin-password"), { ln: 14, r: 8, p: 1 });
+    return {
+      FIO_MCP_TRANSPORT: "http",
+      FIO_MCP_PUBLIC_URL: "https://fio.example.test",
+      FIO_MCP_ADMIN_PASSWORD_HASH_FILE: secretFile(`${hash}\n`),
+      FIO_MCP_DATA_KEY_FILE: secretFile(`${"ab".repeat(32)}\n`),
+    };
+  });
+
+const UNAUTHENTICATED = { FIO_TOKEN: READ_TOKEN, FIO_MCP_TRANSPORT: "http", FIO_MCP_ALLOW_UNAUTHENTICATED: "true" };
+
+describe("FIO_MCP_ADMIN_ALLOWED_CIDRS", () => {
+  const env = { ...UNAUTHENTICATED, FIO_MCP_HOST: "127.0.0.1" };
+
+  it.effect("parses a list of addresses and networks, and is empty when unset", () =>
+    Effect.gen(function* () {
+      const config = yield* loadConfigFrom({ ...env, FIO_MCP_ADMIN_ALLOWED_CIDRS: "10.0.0.0/8, 192.168.1.5,fd00::/8" });
+      if (config.transport.kind !== "http") return assert.fail("expected http");
+      assert.strictEqual(config.transport.adminAllowedNetworks?.length, 3);
+      const unset = yield* loadConfigFrom(env);
+      assert.deepStrictEqual(unset.transport.kind === "http" ? unset.transport.adminAllowedNetworks : undefined, []);
+    }),
+  );
+
+  it.effect("fails startup on an invalid entry without echoing it", () =>
+    Effect.gen(function* () {
+      const message = yield* configError({ ...env, FIO_MCP_ADMIN_ALLOWED_CIDRS: "10.0.0.0/8,office-network" });
+      assert.include(message, "FIO_MCP_ADMIN_ALLOWED_CIDRS entry 2 must be an IP address or a CIDR network");
+      assert.notInclude(message, "office-network");
+      // Set but naming nothing would allow everyone: refused.
+      for (const value of [",", " , ,"]) {
+        assert.include(yield* configError({ ...env, FIO_MCP_ADMIN_ALLOWED_CIDRS: value }), "FIO_MCP_ADMIN_ALLOWED_CIDRS must name at least one");
+      }
+    }),
+  );
+});
+
+describe("FIO_MCP_ADMIN_HOST / FIO_MCP_ADMIN_PORT", () => {
+  it.effect("adds an admin listener on 127.0.0.1 by default, and none when the port is unset", () =>
+    Effect.gen(function* () {
+      const oauth = yield* oauthEnv();
+      const off = yield* loadConfigFrom(oauth);
+      assert.strictEqual(off.transport.kind === "http" ? off.transport.adminListener : "stdio", undefined);
+      const on = yield* loadConfigFrom({ ...oauth, FIO_MCP_ADMIN_PORT: "3001" });
+      assert.deepStrictEqual(on.transport.kind === "http" ? on.transport.adminListener : undefined, { host: "127.0.0.1", port: 3001 });
+      const lan = yield* loadConfigFrom({ ...oauth, FIO_MCP_ADMIN_PORT: "3001", FIO_MCP_ADMIN_HOST: "192.168.1.2" });
+      assert.deepStrictEqual(lan.transport.kind === "http" ? lan.transport.adminListener : undefined, { host: "192.168.1.2", port: 3001 });
+    }),
+  );
+
+  it.effect("refuses a bad or clashing port, a host without a port, and the listener without OAuth", () =>
+    Effect.gen(function* () {
+      const oauth = yield* oauthEnv();
+      assert.include(yield* configError({ ...oauth, FIO_MCP_ADMIN_PORT: "70000" }), "FIO_MCP_ADMIN_PORT must be an integer from 1 to 65535");
+      assert.include(yield* configError({ ...oauth, FIO_MCP_ADMIN_PORT: "admin" }), "FIO_MCP_ADMIN_PORT must be an integer");
+      assert.include(yield* configError({ ...oauth, FIO_MCP_ADMIN_PORT: "3000" }), "FIO_MCP_ADMIN_PORT must differ from FIO_MCP_PORT");
+      assert.include(yield* configError({ ...oauth, FIO_MCP_ADMIN_HOST: "127.0.0.1" }), "FIO_MCP_ADMIN_HOST is set but FIO_MCP_ADMIN_PORT is not");
+      const open = { ...UNAUTHENTICATED, FIO_MCP_HOST: "127.0.0.1", FIO_MCP_ADMIN_PORT: "3001" };
+      assert.include(yield* configError(open), "FIO_MCP_ADMIN_PORT needs OAuth");
+    }),
+  );
+});
+
+describe("FIO_API_BASE_URL", () => {
+  const MESSAGE = "FIO_API_BASE_URL must be an https URL on fio.cz";
+  const baseUrl = (url: string | undefined, override = false) => ({
+    FIO_TOKEN: READ_TOKEN,
+    ...(url === undefined ? {} : { FIO_API_BASE_URL: url }),
+    ...(override ? { FIO_API_ALLOW_TEST_BASE_URL: "true" } : {}),
+  });
+
+  it.effect("accepts the default and https URLs on fio.cz in any case", () =>
+    Effect.gen(function* () {
+      assert.strictEqual((yield* loadConfigFrom(baseUrl(undefined))).baseUrl, "https://fioapi.fio.cz/v1/rest");
+      assert.strictEqual((yield* loadConfigFrom(baseUrl("https://fioapi.fio.cz/v1/rest/"))).baseUrl, "https://fioapi.fio.cz/v1/rest");
+      assert.strictEqual((yield* loadConfigFrom(baseUrl("https://FIOAPI.FIO.CZ/v1/rest"))).baseUrl, "https://fioapi.fio.cz/v1/rest");
+      assert.strictEqual((yield* loadConfigFrom(baseUrl("https://fio.cz/api"))).baseUrl, "https://fio.cz/api");
+    }),
+  );
+
+  it.effect("refuses other schemes, hosts, credentials, query and fragment without echoing the value", () =>
+    Effect.gen(function* () {
+      for (const url of [
+        "http://fioapi.fio.cz/v1/rest",
+        "https://fio.cz.evil.com/v1/rest",
+        "https://evilfio.cz/v1/rest",
+        "https://user:pw@fioapi.fio.cz/v1/rest",
+        "https://127.0.0.1/v1/rest",
+        "http://127.0.0.1:1234/v1/rest",
+        "https://fioapi.fio.cz/v1/rest?x=1",
+        "https://fioapi.fio.cz/v1/rest#x",
+        "fioapi.fio.cz/v1/rest",
+      ]) {
+        const message = yield* configError(baseUrl(url));
+        assert.strictEqual(message, MESSAGE, url);
+      }
+    }),
+  );
+
+  it.effect("with FIO_API_ALLOW_TEST_BASE_URL accepts http on loopback only, and warns without the URL", () =>
+    Effect.gen(function* () {
+      const { result, logs } = yield* withLogs(loadConfigFrom(baseUrl("http://127.0.0.1:1234/v1/rest", true)));
+      assert.strictEqual(result.baseUrl, "http://127.0.0.1:1234/v1/rest");
+      assert.strictEqual(logs.length, 1);
+      assert.include(logs[0], "FIO_API_ALLOW_TEST_BASE_URL=true");
+      assert.notInclude(logs[0], "1234");
+      assert.strictEqual((yield* loadConfigFrom(baseUrl("http://localhost:1234/v1/rest", true))).baseUrl, "http://localhost:1234/v1/rest");
+      assert.strictEqual((yield* loadConfigFrom(baseUrl("http://[::1]:1234/v1/rest", true))).baseUrl, "http://[::1]:1234/v1/rest");
+      assert.strictEqual(yield* configError(baseUrl("http://10.0.0.1/v1/rest", true)), MESSAGE);
+      assert.strictEqual(yield* configError(baseUrl("http://fio.example.test/v1/rest", true)), MESSAGE);
+      const quiet = yield* withLogs(loadConfigFrom(baseUrl(undefined)));
+      assert.deepStrictEqual(quiet.logs, []);
+    }),
+  );
+});
+
+describe("unauthenticated HTTP guard", () => {
+  it.effect("starts only on a loopback host", () =>
+    Effect.gen(function* () {
+      for (const host of ["127.0.0.1", "::1", "localhost"]) {
+        const config = yield* loadConfigFrom({ ...UNAUTHENTICATED, FIO_MCP_HOST: host });
+        assert.deepStrictEqual(config.transport.kind === "http" ? config.transport.auth : undefined, { kind: "unauthenticated" }, host);
+      }
+      for (const env of [UNAUTHENTICATED, { ...UNAUTHENTICATED, FIO_MCP_HOST: "0.0.0.0" }, { ...UNAUTHENTICATED, FIO_MCP_HOST: "192.168.1.2" }]) {
+        const message = yield* configError(env);
+        assert.include(message, "FIO_MCP_ALLOW_UNAUTHENTICATED");
+        assert.include(message, "FIO_MCP_HOST");
+      }
+    }),
+  );
+
+  it.effect("starts on 0.0.0.0 with FIO_MCP_ALLOW_UNAUTHENTICATED_ON_NETWORK and repeats the warning every 10 minutes", () =>
+    Effect.gen(function* () {
+      const env = { ...UNAUTHENTICATED, FIO_MCP_HOST: "0.0.0.0", FIO_MCP_ALLOW_UNAUTHENTICATED_ON_NETWORK: "true" };
+      const config = yield* loadConfigFrom(env);
+      assert.deepStrictEqual(config.transport.kind === "http" ? config.transport.auth : undefined, { kind: "unauthenticated", onNetwork: true });
+      const live = authFromConfig.pipe(
+        Layer.provide(Layer.merge(HttpRouter.layer, RedactorLive)),
+        Layer.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: { HOME: "/home/test", ...env } }))),
+      );
+      const { logs } = yield* withLogs(
+        Effect.scoped(
+          Effect.gen(function* () {
+            yield* Layer.build(live);
+            yield* Effect.yieldNow;
+            yield* TestClock.adjust("10 minutes");
+            yield* Effect.yieldNow;
+            yield* TestClock.adjust("10 minutes");
+            yield* Effect.yieldNow;
+          }),
+        ),
+      );
+      assert.strictEqual(logs.filter((line) => line.includes(UNAUTHENTICATED_WARNING.slice(0, 40))).length, 3);
+    }),
+  );
+
+  it.effect("warns once on a loopback host", () =>
+    Effect.gen(function* () {
+      const { logs } = yield* withLogs(
+        Effect.scoped(
+          Effect.gen(function* () {
+            yield* Layer.build(unauthenticatedWarning(false));
+            yield* TestClock.adjust("30 minutes");
+          }),
+        ),
+      );
+      assert.strictEqual(logs.length, 1);
+      assert.include(logs[0], "FIO_MCP_ALLOW_UNAUTHENTICATED=true");
+    }),
+  );
+
+  it.effect("refuses the flag together with the OAuth variables", () =>
+    Effect.gen(function* () {
+      const oauth = yield* oauthEnv();
+      const cases: ReadonlyArray<Record<string, string>> = [
+        { ...oauth, FIO_MCP_ALLOW_UNAUTHENTICATED: "true" },
+        { FIO_TOKEN: READ_TOKEN, FIO_MCP_TRANSPORT: "http", FIO_MCP_HOST: "127.0.0.1", FIO_MCP_ALLOW_UNAUTHENTICATED: "true", FIO_MCP_PUBLIC_URL: oauth.FIO_MCP_PUBLIC_URL },
+        {
+          FIO_TOKEN: READ_TOKEN,
+          FIO_MCP_TRANSPORT: "http",
+          FIO_MCP_HOST: "127.0.0.1",
+          FIO_MCP_ALLOW_UNAUTHENTICATED: "true",
+          FIO_MCP_ADMIN_PASSWORD_HASH_FILE: oauth.FIO_MCP_ADMIN_PASSWORD_HASH_FILE,
+        },
+      ];
+      for (const env of cases) {
+        const message = yield* configError(env);
+        assert.include(message, "FIO_MCP_ALLOW_UNAUTHENTICATED=true cannot be combined with FIO_MCP_PUBLIC_URL or FIO_MCP_ADMIN_PASSWORD_HASH_FILE");
+      }
+    }),
+  );
+});
+
+describe("loadConfig", () => {
+  it.effect("reads a single token with defaults", () =>
+    Effect.gen(function* () {
+      const config = yield* loadConfigFrom({ FIO_TOKEN: READ_TOKEN });
+      assert.strictEqual(config.accounts.length, 1);
+      const [account] = config.accounts;
+      assert.strictEqual(account?.name, "default");
+      assert.strictEqual(account && Redacted.value(account.token), READ_TOKEN);
+      assert.isUndefined(account?.accountNumber);
+      assert.strictEqual(config.baseUrl, "https://fioapi.fio.cz/v1/rest");
+      assert.strictEqual(config.rateLimitIntervalMs, 30_000);
+      assert.strictEqual(config.maxWaitMs, 25_000);
+      assert.deepStrictEqual(config.transport, { kind: "stdio" });
+      assert.strictEqual(config.cache.dbPath, "/home/test/.local/share/fio-mcp/fio.sqlite");
+      // The token is held as Redacted and never printed.
+      assert.notInclude(String(account?.token), READ_TOKEN);
+      assert.notInclude(JSON.stringify(config), READ_TOKEN);
+    }),
+  );
+
+  it.effect("reads single-token account details", () =>
+    Effect.gen(function* () {
+      const config = yield* loadConfigFrom({
+        FIO_TOKEN: PAY_TOKEN,
+        FIO_ACCOUNT_NAME: "main",
+        FIO_ACCOUNT_NUMBER: "2400222222",
+        FIO_ACCOUNT_CURRENCY: "czk",
+        FIO_MAX_WAIT_MS: "10000",
+      });
+      assert.deepInclude(config.accounts[0], { name: "main", accountNumber: "2400222222", currency: "CZK" });
+      assert.strictEqual(config.maxWaitMs, 10_000);
+    }),
+  );
+
+  it.effect("trims account names and accepts printable Unicode", () =>
+    Effect.gen(function* () {
+      const config = yield* loadConfigFrom({
+        FIO_ACCOUNTS: JSON.stringify([
+          { name: "  Business Credit  ", token: READ_TOKEN },
+          { name: " Účet Běžný ", token: PAY_TOKEN },
+        ]),
+      });
+      assert.deepStrictEqual(config.accounts.map((account) => account.name), ["Business Credit", "Účet Běžný"]);
+
+      const codePoints = "😀".repeat(64);
+      const bounded = yield* loadConfigFrom({ FIO_ACCOUNTS: JSON.stringify([{ name: codePoints, token: READ_TOKEN }]) });
+      assert.strictEqual(bounded.accounts[0]?.name, codePoints);
+
+      const single = yield* loadConfigFrom({ FIO_TOKEN: PAY_TOKEN, FIO_ACCOUNT_NAME: "  Business Credit  " });
+      assert.strictEqual(single.accounts[0]?.name, "Business Credit");
+    }),
+  );
+
+  it.effect("rejects invalid account names without echoing their values", () =>
+    Effect.gen(function* () {
+      const invalidNames = [
+        "",
+        "   ",
+        "😀".repeat(65),
+        "Account\nName",
+        "Account\tName",
+        // Format characters (zero-width space, right-to-left override) and a line separator.
+        "Account\u200BName",
+        "\u202Eniam",
+        "Account\u2028Name",
+      ];
+      for (const name of invalidNames) {
+        const message = yield* configError({ FIO_ACCOUNTS: JSON.stringify([{ name, token: READ_TOKEN }]) });
+        assert.match(message, /^Invalid account configuration: FIO_ACCOUNTS\[0\]\.name must be 1-64 Unicode code points after trimming, with no control, format or line separator characters$/);
+        if (name !== "") assert.notInclude(message, name);
+      }
+
+      const single = yield* configError({ FIO_TOKEN: PAY_TOKEN, FIO_ACCOUNT_NAME: "   " });
+      assert.strictEqual(
+        single,
+        "Invalid account configuration: FIO_ACCOUNT_NAME must be 1-64 Unicode code points after trimming, with no control, format or line separator characters",
+      );
+      const singleControl = yield* configError({ FIO_TOKEN: PAY_TOKEN, FIO_ACCOUNT_NAME: "Account\tName" });
+      assert.notInclude(singleControl, "Account\tName");
+      const singleTooLong = yield* configError({ FIO_TOKEN: PAY_TOKEN, FIO_ACCOUNT_NAME: "😀".repeat(65) });
+      assert.notInclude(singleTooLong, "😀".repeat(65));
+    }),
+  );
+
+  it.effect("rejects account names that differ only by case after trimming", () =>
+    Effect.gen(function* () {
+      const names = ["Business", " business "];
+      const message = yield* configError({
+        FIO_ACCOUNTS: JSON.stringify(names.map((name, index) => ({ name, token: index === 0 ? READ_TOKEN : PAY_TOKEN }))),
+      });
+      assert.strictEqual(
+        message,
+        "FIO_ACCOUNTS[1].name repeats the name of FIO_ACCOUNTS[0]; names must be unique ignoring case after trimming",
+      );
+      assert.notInclude(message, "Business");
+    }),
+  );
+
+  it.effect("reads several accounts from FIO_ACCOUNTS", () =>
+    Effect.gen(function* () {
+      const config = yield* loadConfigFrom({
+        FIO_ACCOUNTS: JSON.stringify([
+          { name: "personal", token: READ_TOKEN },
+          { name: "business", token: PAY_TOKEN, accountNumber: "2400222222" },
+        ]),
+      });
+      assert.deepStrictEqual(
+        config.accounts.map((a) => [a.name, a.accountNumber]),
+        [
+          ["personal", undefined],
+          ["business", "2400222222"],
+        ],
+      );
+      assert.strictEqual(config.secrets.length, 2);
+    }),
+  );
+
+  it.effect("reads secrets from *_FILE variables and drops the trailing newline", () =>
+    Effect.gen(function* () {
+      const single = yield* loadConfigFrom({ FIO_TOKEN_FILE: secretFile(`${READ_TOKEN}\n`) });
+      assert.strictEqual(Redacted.value(single.accounts[0]?.token ?? Redacted.make("")), READ_TOKEN);
+      const multi = yield* loadConfigFrom({
+        FIO_ACCOUNTS_FILE: secretFile(`${JSON.stringify([{ name: "a", token: PAY_TOKEN }])}\n`),
+      });
+      assert.strictEqual(multi.accounts[0]?.name, "a");
+    }),
+  );
+
+  it.effect("rejects a secret set both directly and as a file, naming only the variables", () =>
+    Effect.gen(function* () {
+      const path = secretFile(READ_TOKEN);
+      assert.strictEqual(
+        yield* configError({ FIO_TOKEN: READ_TOKEN, FIO_TOKEN_FILE: path }),
+        "Set either FIO_TOKEN or FIO_TOKEN_FILE, not both",
+      );
+      assert.strictEqual(
+        yield* configError({ FIO_ACCOUNTS: "[]", FIO_ACCOUNTS_FILE: path }),
+        "Set either FIO_ACCOUNTS or FIO_ACCOUNTS_FILE, not both",
+      );
+      const missing = yield* configError({ FIO_TOKEN_FILE: "/nonexistent/fio-token" });
+      assert.strictEqual(missing, "FIO_TOKEN_FILE: file not readable");
+    }),
+  );
+
+  it.effect("never echoes the value or path of a *_FILE variable", () =>
+    Effect.gen(function* () {
+      // A token pasted into a _FILE variable is read as a path; it must not be printed.
+      const pasted = "Xq7LmR2vT9bWc4NzK8pJd3HsF6gYa1UeQ5oVi0nZrM2tB7xLw4kCj9hPy3sDf8Ga";
+      const pastedDir = join(mkdtempSync(join(tmpdir(), "fio-mcp-config-")), pasted);
+      mkdirSync(pastedDir);
+      const fileIn = (content: string) => {
+        const path = join(pastedDir, `secret-${content.length}`);
+        writeFileSync(path, content, { mode: 0o440 });
+        return path;
+      };
+      const http = {
+        FIO_TOKEN: READ_TOKEN,
+        FIO_MCP_TRANSPORT: "http",
+        FIO_MCP_PUBLIC_URL: "https://fio.example.test",
+      };
+      const attempts: Array<[Record<string, string>, string]> = [
+        [{ FIO_TOKEN_FILE: pasted }, "FIO_TOKEN_FILE: file not readable"],
+        [{ FIO_TOKEN_FILE: fileIn("\n") }, "FIO_TOKEN_FILE: file is empty"],
+        [{ FIO_ACCOUNTS_FILE: pasted }, "FIO_ACCOUNTS_FILE: file not readable"],
+        [{ FIO_ACCOUNTS_FILE: fileIn("  \n") }, "FIO_ACCOUNTS_FILE: file is empty"],
+        [{ ...http, FIO_MCP_ADMIN_PASSWORD_HASH_FILE: pasted }, "FIO_MCP_ADMIN_PASSWORD_HASH_FILE: file not readable"],
+        [
+          { ...http, FIO_MCP_ADMIN_PASSWORD_HASH_FILE: fileIn("") },
+          "FIO_MCP_ADMIN_PASSWORD_HASH_FILE: file must contain exactly one hash line",
+        ],
+        [
+          { ...http, FIO_MCP_ADMIN_PASSWORD_HASH_FILE: fileIn("not-a-hash") },
+          "FIO_MCP_ADMIN_PASSWORD_HASH_FILE: file is not a fio-mcp password hash ($scrypt$ln=…,r=…,p=…$salt$hash); create one with `fio-mcp hash-password`",
+        ],
+      ];
+      for (const [env, expected] of attempts) {
+        const error = yield* Effect.flip(loadConfigFrom(env));
+        assert.instanceOf(error, ConfigError);
+        assert.strictEqual(error.message, expected);
+        for (const output of [error.message, error.detail, String(error), JSON.stringify(error)]) {
+          assert.notInclude(output, pasted.slice(0, 20), JSON.stringify(Object.keys(env)));
+        }
+      }
+    }),
+  );
+
+  it.effect("rejects tokens shorter than 32 characters or with unsafe characters", () =>
+    Effect.gen(function* () {
+      for (const token of ["short", "a".repeat(31), `${"a".repeat(40)}/x`, `${"a".repeat(40)}"x`]) {
+        const message = yield* configError({ FIO_TOKEN: token });
+        assert.match(message, /^Invalid account configuration: FIO_TOKEN must be at least 32 characters/);
+        assert.notInclude(message, token);
+      }
+      const ok = yield* loadConfigFrom({ FIO_TOKEN: "a".repeat(32) });
+      assert.strictEqual(ok.accounts.length, 1);
+    }),
+  );
+
+  it.effect("rejects bad configuration without echoing tokens", () =>
+    Effect.gen(function* () {
+      const attempts: Array<Record<string, string>> = [
+        {},
+        { FIO_TOKEN: READ_TOKEN, FIO_ACCOUNTS: "[]" },
+        { FIO_ACCOUNTS: `[{"name":"a","token":"${READ_TOKEN}"` },
+        { FIO_ACCOUNTS: JSON.stringify([{ name: "a", token: READ_TOKEN, unknownKey: true }]) },
+        { FIO_ACCOUNTS: JSON.stringify([{ name: "a", token: READ_TOKEN }, { name: "a", token: PAY_TOKEN }]) },
+        { FIO_ACCOUNTS: JSON.stringify([{ name: "bad\nname", token: READ_TOKEN }]) },
+        { FIO_TOKEN: READ_TOKEN, FIO_RATE_LIMIT_INTERVAL_MS: "soon" },
+        { FIO_TOKEN: READ_TOKEN, FIO_MCP_TRANSPORT: "carrier-pigeon" },
+        { FIO_TOKEN: READ_TOKEN, FIO_MCP_TRANSPORT: "http", FIO_MCP_PORT: "70000" },
+        { FIO_TOKEN: READ_TOKEN, FIO_BACKFILL_FROM: "2024-02-30" },
+        { FIO_TOKEN: READ_TOKEN, FIO_SYNC_INTERVAL_MINUTES: "1" },
+        { FIO_TOKEN: READ_TOKEN, FIO_CACHE_ENABLED: "maybe" },
+      ];
+      for (const env of attempts) {
+        const message = yield* configError(env);
+        assert.notInclude(message, READ_TOKEN);
+        assert.notInclude(message, PAY_TOKEN);
+      }
+    }),
+  );
+
+  it.effect("never echoes a token pasted into the wrong variable or field", () =>
+    Effect.gen(function* () {
+      const attempts: Array<Record<string, string>> = [
+        { FIO_TOKEN: PAY_TOKEN, FIO_MAX_WAIT_MS: READ_TOKEN },
+        { FIO_TOKEN: PAY_TOKEN, FIO_REQUEST_TIMEOUT_MS: READ_TOKEN },
+        { FIO_TOKEN: PAY_TOKEN, FIO_RATE_LIMIT_INTERVAL_MS: READ_TOKEN },
+        { FIO_TOKEN: PAY_TOKEN, FIO_ACCOUNT_NAME: `${READ_TOKEN}\n` },
+        { FIO_TOKEN: PAY_TOKEN, FIO_ACCOUNT_NUMBER: READ_TOKEN },
+        { FIO_TOKEN: PAY_TOKEN, FIO_ACCOUNT_CURRENCY: READ_TOKEN },
+        { FIO_TOKEN: PAY_TOKEN, FIO_MCP_TRANSPORT: READ_TOKEN },
+        { FIO_TOKEN: PAY_TOKEN, FIO_BACKFILL_FROM: READ_TOKEN },
+        { FIO_ACCOUNTS: JSON.stringify([{ name: `${READ_TOKEN}\n`, token: PAY_TOKEN }]) },
+        { FIO_ACCOUNTS: JSON.stringify([{ name: "a", token: PAY_TOKEN, [READ_TOKEN]: true }]) },
+        { FIO_ACCOUNTS: JSON.stringify([{ name: "a", token: PAY_TOKEN, currency: READ_TOKEN }]) },
+        { FIO_ACCOUNTS: JSON.stringify([READ_TOKEN]) },
+        { FIO_ACCOUNTS: `[{"name":"a","token":${READ_TOKEN}}]` },
+      ];
+      for (const env of attempts) {
+        const message = yield* configError(env);
+        assert.notInclude(message, READ_TOKEN.slice(0, 20), JSON.stringify(Object.keys(env)));
+        assert.notInclude(message, PAY_TOKEN.slice(0, 20));
+      }
+      assert.strictEqual(
+        yield* configError({ FIO_TOKEN: PAY_TOKEN, FIO_MAX_WAIT_MS: READ_TOKEN }),
+        "FIO_MAX_WAIT_MS must be an integer >= 0",
+      );
+      assert.strictEqual(
+        yield* configError({ FIO_ACCOUNTS: JSON.stringify([{ name: "a", token: PAY_TOKEN, [READ_TOKEN]: true }]) }),
+        "Invalid account configuration: FIO_ACCOUNTS[0] has unknown fields; allowed fields are name, token, accountNumber, currency",
+      );
+    }),
+  );
+
+  it.effect("rejects rate-limit intervals below FIO's 30 s limit", () =>
+    Effect.gen(function* () {
+      for (const value of ["0", "1", "29999"]) {
+        assert.strictEqual(
+          yield* configError({ FIO_TOKEN: READ_TOKEN, FIO_RATE_LIMIT_INTERVAL_MS: value }),
+          "FIO_RATE_LIMIT_INTERVAL_MS must be an integer >= 30000 (FIO allows one request per token every 30 s)",
+        );
+      }
+      assert.strictEqual((yield* loadConfigFrom({ FIO_TOKEN: READ_TOKEN, FIO_RATE_LIMIT_INTERVAL_MS: "30000" })).rateLimitIntervalMs, 30_000);
+      assert.strictEqual((yield* loadConfigFrom({ FIO_TOKEN: READ_TOKEN, FIO_RATE_LIMIT_INTERVAL_MS: "45000" })).rateLimitIntervalMs, 45_000);
+      assert.strictEqual(MIN_RATE_LIMIT_INTERVAL_MS, 30_000);
+    }),
+  );
+
+  it.effect("loads OAuth HTTP auth config and normalizes the public origin", () =>
+    Effect.gen(function* () {
+      const hash = yield* hashPassword(Redacted.make("test-admin-password"), { ln: 14, r: 8, p: 1 });
+      const hashFile = secretFile(`${hash}\n`);
+      const env = {
+        FIO_TOKEN: READ_TOKEN,
+        FIO_MCP_TRANSPORT: "http",
+        FIO_MCP_PUBLIC_URL: "https://fio.example.test",
+        FIO_MCP_ADMIN_PASSWORD_HASH_FILE: hashFile,
+        FIO_MCP_DATA_KEY_FILE: secretFile(`${"ab".repeat(32)}\n`),
+      };
+
+      const config = yield* loadConfigFrom(env);
+      assert.strictEqual(config.transport.kind, "http");
+      if (config.transport.kind === "http") {
+        assert.strictEqual(config.transport.auth.kind, "oauth");
+        if (config.transport.auth.kind === "oauth") {
+          assert.strictEqual(config.transport.auth.publicUrl, "https://fio.example.test");
+        }
+      }
+
+      const normalized = yield* loadConfigFrom({ ...env, FIO_MCP_PUBLIC_URL: "https://FIO.example.test/" });
+      assert.strictEqual(normalized.transport.kind, "http");
+      if (normalized.transport.kind === "http" && normalized.transport.auth.kind === "oauth") {
+        assert.strictEqual(normalized.transport.auth.publicUrl, "https://fio.example.test");
+      }
+    }),
+  );
+
+  it.effect("loads the optional admin TOTP secret and refuses a bad one without echoing it", () =>
+    Effect.gen(function* () {
+      const hash = yield* hashPassword(Redacted.make("test-admin-password"), { ln: 14, r: 8, p: 1 });
+      const env = {
+        FIO_TOKEN: READ_TOKEN,
+        FIO_MCP_TRANSPORT: "http",
+        FIO_MCP_PUBLIC_URL: "https://fio.example.test",
+        FIO_MCP_ADMIN_PASSWORD_HASH_FILE: secretFile(`${hash}\n`),
+        FIO_MCP_DATA_KEY_FILE: secretFile(`${"ab".repeat(32)}\n`),
+      };
+      const totpOf = (config: AppConfigShape) =>
+        config.transport.kind === "http" && config.transport.auth.kind === "oauth" ? config.transport.auth.totpSecret : "not oauth";
+      // Unset, or set to blanks: no second factor.
+      assert.isUndefined(totpOf(yield* loadConfigFrom(env)));
+      assert.isUndefined(totpOf(yield* loadConfigFrom({ ...env, FIO_MCP_ADMIN_TOTP_SECRET_FILE: "  " })));
+      // Lowercase, spaces and padding are accepted; the file is named with surrounding blanks.
+      const secret = totpOf(
+        yield* loadConfigFrom({ ...env, FIO_MCP_ADMIN_TOTP_SECRET_FILE: ` ${secretFile("gezd gnbv gy3t qojq gezd gnbv gy3t qojq====\n")} ` }),
+      );
+      if (secret === undefined || typeof secret === "string") return assert.fail("expected a TOTP secret");
+      assert.strictEqual(new TextDecoder().decode(Redacted.value(secret)), "12345678901234567890");
+      assert.notInclude(String(secret), "12345");
+
+      const missing = join(mkdtempSync(join(tmpdir(), "fio-mcp-config-")), "gone");
+      const cases: ReadonlyArray<readonly [string, string]> = [
+        [missing, "FIO_MCP_ADMIN_TOTP_SECRET_FILE: file not readable"],
+        [secretFile("NOT-BASE32!\n"), "FIO_MCP_ADMIN_TOTP_SECRET_FILE: file must contain a base32 secret; create one with `fio-mcp totp-init`"],
+        [secretFile("\n"), "FIO_MCP_ADMIN_TOTP_SECRET_FILE: file must contain a base32 secret; create one with `fio-mcp totp-init`"],
+        // 15 bytes: under the 128-bit minimum.
+        [
+          secretFile("GEZDGNBVGY3TQOJQGEZDGNBV\n"),
+          "FIO_MCP_ADMIN_TOTP_SECRET_FILE: the secret must be at least 16 bytes (26 base32 characters); create one with `fio-mcp totp-init`",
+        ],
+      ];
+      for (const [file, expected] of cases) {
+        assert.strictEqual(yield* configError({ ...env, FIO_MCP_ADMIN_TOTP_SECRET_FILE: file }), expected);
+      }
+    }),
+  );
+
+  it.effect("defers the account seed with OAuth; stdio still validates it at load", () =>
+    Effect.gen(function* () {
+      const hash = yield* hashPassword(Redacted.make("test-admin-password"), { ln: 14, r: 8, p: 1 });
+      const oauth = {
+        FIO_MCP_TRANSPORT: "http",
+        FIO_MCP_PUBLIC_URL: "https://fio.example.test",
+        FIO_MCP_ADMIN_PASSWORD_HASH_FILE: secretFile(`${hash}\n`),
+        FIO_MCP_DATA_KEY_FILE: secretFile(`${"ab".repeat(32)}\n`),
+      };
+      const malformed = `[{"name":"main","token":"${READ_TOKEN}"`;
+      const missing = join(mkdtempSync(join(tmpdir(), "fio-mcp-config-")), "gone.json");
+      const cases: ReadonlyArray<readonly [Record<string, string>, string]> = [
+        [{ FIO_ACCOUNTS: malformed }, "FIO_ACCOUNTS is not valid JSON"],
+        [{ FIO_ACCOUNTS_FILE: missing }, "FIO_ACCOUNTS_FILE: file not readable"],
+        [{ FIO_TOKEN: READ_TOKEN, FIO_ACCOUNTS: "[]" }, "Set either FIO_TOKEN or FIO_ACCOUNTS (or their _FILE variants), not both"],
+      ];
+      for (const [env, expected] of cases) {
+        assert.strictEqual(yield* configError(env), expected);
+        const config = yield* loadConfigFrom({ ...oauth, ...env });
+        assert.deepStrictEqual(config.accounts, []);
+        assert.deepStrictEqual(config.secrets, []);
+        if (config.transport.kind !== "http" || config.transport.auth.kind !== "oauth") return assert.fail("expected OAuth");
+        assert.isTrue(config.transport.auth.accountSeed.configured);
+        // Reading it later fails the same way, without the value or the path.
+        const error = yield* Effect.flip(config.transport.auth.accountSeed.load);
+        assert.instanceOf(error, ConfigError);
+        assert.strictEqual(error.message, expected);
+      }
+      const unset = yield* loadConfigFrom(oauth);
+      if (unset.transport.kind !== "http" || unset.transport.auth.kind !== "oauth") return assert.fail("expected OAuth");
+      assert.isFalse(unset.transport.auth.accountSeed.configured);
+      assert.deepStrictEqual(yield* unset.transport.auth.accountSeed.load, []);
+      const valid = yield* loadConfigFrom({ ...oauth, FIO_TOKEN: READ_TOKEN });
+      if (valid.transport.kind !== "http" || valid.transport.auth.kind !== "oauth") return assert.fail("expected OAuth");
+      const [seeded] = yield* valid.transport.auth.accountSeed.load;
+      assert.strictEqual(seeded && Redacted.value(seeded.token), READ_TOKEN);
+    }),
+  );
+
+  it.effect("requires OAuth settings unless unauthenticated HTTP is explicitly allowed", () =>
+    Effect.gen(function* () {
+      const env = { FIO_TOKEN: READ_TOKEN, FIO_MCP_TRANSPORT: "http" };
+      const message = yield* configError(env);
+      assert.include(message, "HTTP mode requires FIO_MCP_PUBLIC_URL and FIO_MCP_ADMIN_PASSWORD_HASH_FILE");
+
+      const open = yield* loadConfigFrom({ ...env, FIO_MCP_ALLOW_UNAUTHENTICATED: "true", FIO_MCP_HOST: "127.0.0.1" });
+      assert.strictEqual(open.transport.kind, "http");
+      if (open.transport.kind === "http") assert.strictEqual(open.transport.auth.kind, "unauthenticated");
+    }),
+  );
+
+  it.effect("requires both OAuth public URL and password hash file", () =>
+    Effect.gen(function* () {
+      const publicOnly = yield* configError({
+        FIO_TOKEN: READ_TOKEN,
+        FIO_MCP_TRANSPORT: "http",
+        FIO_MCP_PUBLIC_URL: "https://fio.example.test",
+      });
+      assert.include(publicOnly, "FIO_MCP_ADMIN_PASSWORD_HASH_FILE is not");
+
+      const hashOnly = yield* configError({
+        FIO_TOKEN: READ_TOKEN,
+        FIO_MCP_TRANSPORT: "http",
+        FIO_MCP_ADMIN_PASSWORD_HASH_FILE: secretFile("unused\n"),
+      });
+      assert.include(hashOnly, "FIO_MCP_PUBLIC_URL is not");
+    }),
+  );
+
+  it.effect("ignores the removed static bearer token: HTTP mode still requires OAuth", () =>
+    Effect.gen(function* () {
+      const value = "legacy-bearer-secret-value";
+      const message = yield* configError({
+        FIO_TOKEN: READ_TOKEN,
+        FIO_MCP_TRANSPORT: "http",
+        FIO_MCP_AUTH_TOKEN: value,
+      });
+      assert.include(message, "HTTP mode requires FIO_MCP_PUBLIC_URL and FIO_MCP_ADMIN_PASSWORD_HASH_FILE");
+      assert.notInclude(message, value);
+    }),
+  );
+
+  it.effect("validates OAuth public URL origins and allows loopback HTTP", () =>
+    Effect.gen(function* () {
+      const hash = yield* hashPassword(Redacted.make("test-admin-password"), { ln: 14, r: 8, p: 1 });
+      const common = {
+        FIO_TOKEN: READ_TOKEN,
+        FIO_MCP_TRANSPORT: "http",
+        FIO_MCP_ADMIN_PASSWORD_HASH_FILE: secretFile(`${hash}\n`),
+        FIO_MCP_DATA_KEY_FILE: secretFile(`${"ab".repeat(32)}\n`),
+      };
+
+      const path = yield* configError({ ...common, FIO_MCP_PUBLIC_URL: "https://fio.example.test/base" });
+      assert.include(path, "must be an origin");
+      const insecure = yield* configError({ ...common, FIO_MCP_PUBLIC_URL: "http://fio.example.test" });
+      assert.include(insecure, "must use https");
+
+      const loopback = yield* loadConfigFrom({ ...common, FIO_MCP_PUBLIC_URL: "http://127.0.0.1:3000" });
+      assert.strictEqual(loopback.transport.kind, "http");
+      if (loopback.transport.kind === "http" && loopback.transport.auth.kind === "oauth") {
+        assert.strictEqual(loopback.transport.auth.publicUrl, "http://127.0.0.1:3000");
+      }
+    }),
+  );
+
+  it.effect("rejects malformed password hash files without echoing their contents", () =>
+    Effect.gen(function* () {
+      const secret = "not-a-hash-secretvalue";
+      const message = yield* configError({
+        FIO_TOKEN: READ_TOKEN,
+        FIO_MCP_TRANSPORT: "http",
+        FIO_MCP_PUBLIC_URL: "https://fio.example.test",
+        FIO_MCP_ADMIN_PASSWORD_HASH_FILE: secretFile(secret),
+      });
+      assert.include(message, "is not a fio-mcp password hash");
+      assert.notInclude(message, "secretvalue");
+    }),
+  );
+
+  it.effect("accepts a hash file with a trailing LF or CRLF and rejects captured prompts without echoing them", () =>
+    Effect.gen(function* () {
+      const hash = yield* hashPassword(Redacted.make("test-admin-password"), { ln: 14, r: 8, p: 1 });
+      const env = {
+        FIO_TOKEN: READ_TOKEN,
+        FIO_MCP_TRANSPORT: "http",
+        FIO_MCP_PUBLIC_URL: "https://fio.example.test",
+        FIO_MCP_DATA_KEY_FILE: secretFile(`${"ab".repeat(32)}\n`),
+      };
+      for (const content of [`${hash}\n`, `${hash}\r\n`]) {
+        const config = yield* loadConfigFrom({ ...env, FIO_MCP_ADMIN_PASSWORD_HASH_FILE: secretFile(content) });
+        assert.strictEqual(config.transport.kind, "http");
+      }
+      // What `docker run -t … > admin.hash` captured: the prompts land in the file.
+      const path = secretFile(`Admin password: \n${hash}\n`);
+      const message = yield* configError({ ...env, FIO_MCP_ADMIN_PASSWORD_HASH_FILE: path });
+      assert.strictEqual(message, "FIO_MCP_ADMIN_PASSWORD_HASH_FILE: file must contain exactly one hash line");
+      assert.notInclude(message, path);
+      assert.notInclude(message, "Admin password");
+      assert.notInclude(message, hash);
+    }),
+  );
+
+  it.effect("reads trusted proxies and rejects invalid entries without echoing them", () =>
+    Effect.gen(function* () {
+      const env = { FIO_TOKEN: READ_TOKEN, FIO_MCP_TRANSPORT: "http", FIO_MCP_ALLOW_UNAUTHENTICATED: "true", FIO_MCP_HOST: "127.0.0.1" };
+      const config = yield* loadConfigFrom({ ...env, FIO_MCP_TRUSTED_PROXIES: "172.18.0.0/16, 10.0.0.2,fd00::/8" });
+      assert.strictEqual(config.transport.kind === "http" ? config.transport.trustedProxies.length : 0, 3);
+      const message = yield* configError({ ...env, FIO_MCP_TRUSTED_PROXIES: "172.18.0.0/16,secret-proxy-name" });
+      assert.include(message, "FIO_MCP_TRUSTED_PROXIES entry 2");
+      assert.notInclude(message, "secret-proxy-name");
+    }),
+  );
+
+  it.effect("reads FIO_CACHE_ENCRYPT, off by default, and requires FIO_MCP_DATA_KEY_FILE without OAuth", () =>
+    Effect.gen(function* () {
+      const keyBytes = Array.from({ length: 32 }, () => 0xab);
+      const keyFile = secretFile(`${"ab".repeat(32)}\n`);
+      const off = yield* loadConfigFrom({ FIO_TOKEN: READ_TOKEN });
+      assert.isFalse(off.cache.encrypt);
+      assert.isUndefined(off.cache.dataKey);
+      assert.isFalse((yield* loadConfigFrom({ FIO_TOKEN: READ_TOKEN, FIO_CACHE_ENCRYPT: "  " })).cache.encrypt);
+
+      const on = yield* loadConfigFrom({ FIO_TOKEN: READ_TOKEN, FIO_CACHE_ENCRYPT: " true ", FIO_MCP_DATA_KEY_FILE: keyFile });
+      assert.isTrue(on.cache.encrypt);
+      assert.deepStrictEqual(Array.from(Redacted.value(on.cache.dataKey ?? Redacted.make(new Uint8Array()))), keyBytes);
+      // Off with the key file set: the key stays available to decrypt rows sealed while it was on.
+      const turnedOff = yield* loadConfigFrom({ FIO_TOKEN: READ_TOKEN, FIO_CACHE_ENCRYPT: "off", FIO_MCP_DATA_KEY_FILE: keyFile });
+      assert.isFalse(turnedOff.cache.encrypt);
+      assert.isDefined(turnedOff.cache.dataKey);
+
+      const invalid = yield* configError({ FIO_TOKEN: READ_TOKEN, FIO_CACHE_ENCRYPT: "encrypt-please" });
+      assert.include(invalid, "FIO_CACHE_ENCRYPT must be true or false");
+      assert.notInclude(invalid, "encrypt-please");
+      const withoutKey: ReadonlyArray<Record<string, string>> = [
+        { FIO_TOKEN: READ_TOKEN, FIO_CACHE_ENCRYPT: "true" },
+        { FIO_TOKEN: READ_TOKEN, FIO_CACHE_ENCRYPT: "1", FIO_MCP_TRANSPORT: "http", FIO_MCP_HOST: "127.0.0.1", FIO_MCP_ALLOW_UNAUTHENTICATED: "true" },
+      ];
+      for (const env of withoutKey) {
+        const missing = yield* configError(env);
+        assert.include(missing, "FIO_CACHE_ENCRYPT");
+        assert.include(missing, "FIO_MCP_DATA_KEY_FILE");
+      }
+      const badKey = yield* configError({
+        FIO_TOKEN: READ_TOKEN,
+        FIO_CACHE_ENCRYPT: "true",
+        FIO_MCP_DATA_KEY_FILE: secretFile(`${READ_TOKEN}\n`),
+      });
+      assert.include(badKey, "FIO_MCP_DATA_KEY_FILE");
+      assert.notInclude(badKey, READ_TOKEN);
+
+      // OAuth: the data key loaded for the FIO tokens.
+      const hash = yield* hashPassword(Redacted.make("test-admin-password"), { ln: 14, r: 8, p: 1 });
+      const oauth = yield* loadConfigFrom({
+        FIO_MCP_TRANSPORT: "http",
+        FIO_MCP_PUBLIC_URL: "https://fio.example.test",
+        FIO_MCP_ADMIN_PASSWORD_HASH_FILE: secretFile(`${hash}\n`),
+        FIO_MCP_DATA_KEY_FILE: keyFile,
+        FIO_CACHE_ENCRYPT: "yes",
+      });
+      assert.isTrue(oauth.cache.encrypt);
+      assert.strictEqual(
+        oauth.cache.dataKey,
+        oauth.transport.kind === "http" && oauth.transport.auth.kind === "oauth" ? oauth.transport.auth.dataKey : undefined,
+      );
+    }),
+  );
+
+  it.effect("reads HTTP transport and cache settings", () =>
+    Effect.gen(function* () {
+      const config = yield* loadConfigFrom({
+        FIO_TOKEN: READ_TOKEN,
+        FIO_MCP_TRANSPORT: "HTTP",
+        FIO_MCP_ALLOW_UNAUTHENTICATED: "true",
+        FIO_MCP_ALLOW_UNAUTHENTICATED_ON_NETWORK: "true",
+        FIO_MCP_PORT: "8080",
+        FIO_MCP_ALLOWED_ORIGINS: "https://a.example, https://b.example",
+        FIO_MCP_ALLOWED_HOSTS: "Fio.Example:443,localhost",
+        FIO_DB_PATH: "/data/fio.sqlite",
+        FIO_SYNC_INTERVAL_MINUTES: "30",
+        FIO_SYNC_ON_STARTUP: "false",
+        FIO_BACKFILL_FROM: "2015-01-01",
+      });
+      assert.deepStrictEqual(config.transport, {
+        kind: "http",
+        host: "0.0.0.0",
+        port: 8080,
+        auth: { kind: "unauthenticated", onNetwork: true },
+        allowedOrigins: ["https://a.example", "https://b.example"],
+        allowedHosts: ["fio.example:443", "localhost"],
+        trustedProxies: [],
+        adminAllowedNetworks: [],
+        adminListener: undefined,
+      });
+      assert.deepInclude(config.cache, {
+        enabled: true,
+        dbPath: "/data/fio.sqlite",
+        syncOnStartup: false,
+        syncIntervalMinutes: 30,
+        backfillFrom: "2015-01-01",
+      });
+      const xdg = yield* loadConfigFrom({ FIO_TOKEN: READ_TOKEN, XDG_DATA_HOME: "/xdg" });
+      assert.strictEqual(xdg.cache.dbPath, "/xdg/fio-mcp/fio.sqlite");
+    }),
+  );
+});
+
+describe("payment limits", () => {
+  const PER_ORDER = "FIO_MCP_PAYMENT_MAX_PER_ORDER";
+  const PER_DAY = "FIO_MCP_PAYMENT_MAX_PER_DAY";
+  const ORDERS = "FIO_MCP_PAYMENT_MAX_ORDERS_PER_DAY";
+
+  it.effect("refuses consent-form limits above the configured ceiling", () =>
+    Effect.gen(function* () {
+      const { paymentLimits } = yield* loadConfigFrom({
+        FIO_TOKEN: READ_TOKEN,
+        [PER_ORDER]: "CZK:1000",
+        [PER_DAY]: "CZK:2000",
+        [ORDERS]: "5",
+      });
+      const form = (fields: Partial<PaymentFormValues>): PaymentFormValues => ({
+        maxPerOrder: "CZK:1000",
+        maxPerDay: "CZK:2000",
+        maxOrdersPerDay: "5",
+        mode: "off",
+        allowlist: "",
+        ...fields,
+      });
+      assert.isTrue(Result.isSuccess(parsePaymentForm(form({}), paymentLimits)));
+      assert.isTrue(Result.isSuccess(parsePaymentForm(form({ maxPerOrder: "CZK:10", maxPerDay: "CZK:20" }), paymentLimits)));
+      for (const above of [
+        { maxPerOrder: "CZK:1000.01" },
+        { maxPerDay: "CZK:2001" },
+        { maxOrdersPerDay: "6" },
+        { maxPerOrder: "CZK:1000,EUR:1", maxPerDay: "CZK:2000,EUR:1" },
+      ]) {
+        const parsed = parsePaymentForm(form(above), paymentLimits);
+        assert.isTrue(Result.isFailure(parsed), JSON.stringify(above));
+        if (Result.isFailure(parsed)) assert.match(parsed.failure, /server ceiling|not allowed by the server/);
+      }
+    }),
+  );
+
+  it.effect("defaults to CZK:50000,EUR:2000 per order, CZK:100000,EUR:4000 per day and 20 orders", () =>
+    Effect.gen(function* () {
+      const config = yield* loadConfigFrom({ FIO_TOKEN: READ_TOKEN, [PER_ORDER]: "  ", [PER_DAY]: "" });
+      assert.deepStrictEqual(config.paymentLimits, {
+        maxPerOrder: { CZK: 50_000, EUR: 2_000 },
+        maxPerDay: { CZK: 100_000, EUR: 4_000 },
+        maxOrdersPerDay: 20,
+      });
+    }),
+  );
+
+  it.effect("reads custom values", () =>
+    Effect.gen(function* () {
+      const config = yield* loadConfigFrom({
+        FIO_TOKEN: READ_TOKEN,
+        [PER_ORDER]: " CZK:1000.5, USD:10 ",
+        [PER_DAY]: "USD:20,CZK:5000",
+        [ORDERS]: " 5 ",
+      });
+      assert.deepStrictEqual(config.paymentLimits, {
+        maxPerOrder: { CZK: 1000.5, USD: 10 },
+        maxPerDay: { USD: 20, CZK: 5000 },
+        maxOrdersPerDay: 5,
+      });
+    }),
+  );
+
+  for (const [key, value] of [
+    [PER_ORDER, "CZK:-12345"],
+    [PER_ORDER, "CZK:12.345"],
+    [PER_DAY, "czk:777777"],
+    [PER_DAY, "CZK:5,CZK:6"],
+    [PER_DAY, "CZK777777"],
+    [ORDERS, "0"],
+    [ORDERS, "2.5"],
+    [ORDERS, "lots"],
+  ] as const) {
+    it.effect(`fails on an invalid ${key}, naming the variable and not the value`, () =>
+      Effect.gen(function* () {
+        const message = yield* configError({ FIO_TOKEN: READ_TOKEN, [key]: value });
+        assert.include(message, key);
+        assert.notInclude(message, value);
+      }),
+    );
+  }
+
+  it.effect("fails when the two maps list different currencies", () =>
+    Effect.gen(function* () {
+      // Setting only one map keeps the other at its default (CZK and EUR).
+      const value = "CZK:1000";
+      const message = yield* configError({ FIO_TOKEN: READ_TOKEN, [PER_ORDER]: value });
+      assert.include(message, PER_ORDER);
+      assert.include(message, PER_DAY);
+      assert.include(message, "same currencies");
+      assert.notInclude(message, value);
+    }),
+  );
+
+  it.effect("fails when a per-order limit exceeds the daily limit", () =>
+    Effect.gen(function* () {
+      const message = yield* configError({
+        FIO_TOKEN: READ_TOKEN,
+        [PER_ORDER]: "CZK:654321,EUR:10",
+        [PER_DAY]: "CZK:123456,EUR:10",
+      });
+      assert.include(message, PER_ORDER);
+      assert.include(message, PER_DAY);
+      assert.notInclude(message, "654321");
+      assert.notInclude(message, "123456");
+    }),
+  );
+});

@@ -1,0 +1,291 @@
+engine biome(1.0)
+language js(typescript)
+
+// packages/core is the server-neutral layer that every MCP server builds on.
+// It must not import a server: the fio-mcp package, anything under servers/,
+// or a relative path that climbs out of packages/core. A file N directories
+// below packages/core may climb at most N levels with leading `../`
+// segments. Variables do not reach inside bubble, so each depth from 0 to 11
+// has its own branch; the branches differ only in their two depth regexes.
+// Files 12 or more levels deep may not climb 13 or more levels at all, which
+// catches every escape and rejects only in-package imports that deep.
+// Specifiers are checked as written, so keep them normalised.
+// test/core-import-boundary.test.sh covers the rule.
+file($name, $body) where {
+  $name <: r".*/packages/core/.+\.[cm]?tsx?$",
+  or {
+    and {
+      $name <: r".*/packages/core/[^/]+$",
+      $body <: contains bubble {
+        or {
+          JsModuleSource() as $source,
+          `import($source)`,
+          `require($source)`
+        } where {
+          $source <: or {
+            r"['\"`]fio-mcp(?:/[^'\"`]*)?['\"`]",
+            r"['\"`](?:[^'\"`]*/)?servers/[^'\"`]*['\"`]",
+            r"['\"`](?:\./)?\.\./.*"
+          },
+          register_diagnostic(
+            span = $source,
+            message = "packages/core must stay server-neutral: do not import fio-mcp, servers/, or paths outside packages/core. Inject server-specific behaviour from the server instead.",
+            severity = "error"
+          )
+        }
+      }
+    },
+    and {
+      $name <: r".*/packages/core/[^/]+/[^/]+$",
+      $body <: contains bubble {
+        or {
+          JsModuleSource() as $source,
+          `import($source)`,
+          `require($source)`
+        } where {
+          $source <: or {
+            r"['\"`]fio-mcp(?:/[^'\"`]*)?['\"`]",
+            r"['\"`](?:[^'\"`]*/)?servers/[^'\"`]*['\"`]",
+            r"['\"`](?:\./)?(?:\.\./){2}.*"
+          },
+          register_diagnostic(
+            span = $source,
+            message = "packages/core must stay server-neutral: do not import fio-mcp, servers/, or paths outside packages/core. Inject server-specific behaviour from the server instead.",
+            severity = "error"
+          )
+        }
+      }
+    },
+    and {
+      $name <: r".*/packages/core/(?:[^/]+/){2}[^/]+$",
+      $body <: contains bubble {
+        or {
+          JsModuleSource() as $source,
+          `import($source)`,
+          `require($source)`
+        } where {
+          $source <: or {
+            r"['\"`]fio-mcp(?:/[^'\"`]*)?['\"`]",
+            r"['\"`](?:[^'\"`]*/)?servers/[^'\"`]*['\"`]",
+            r"['\"`](?:\./)?(?:\.\./){3}.*"
+          },
+          register_diagnostic(
+            span = $source,
+            message = "packages/core must stay server-neutral: do not import fio-mcp, servers/, or paths outside packages/core. Inject server-specific behaviour from the server instead.",
+            severity = "error"
+          )
+        }
+      }
+    },
+    and {
+      $name <: r".*/packages/core/(?:[^/]+/){3}[^/]+$",
+      $body <: contains bubble {
+        or {
+          JsModuleSource() as $source,
+          `import($source)`,
+          `require($source)`
+        } where {
+          $source <: or {
+            r"['\"`]fio-mcp(?:/[^'\"`]*)?['\"`]",
+            r"['\"`](?:[^'\"`]*/)?servers/[^'\"`]*['\"`]",
+            r"['\"`](?:\./)?(?:\.\./){4}.*"
+          },
+          register_diagnostic(
+            span = $source,
+            message = "packages/core must stay server-neutral: do not import fio-mcp, servers/, or paths outside packages/core. Inject server-specific behaviour from the server instead.",
+            severity = "error"
+          )
+        }
+      }
+    },
+    and {
+      $name <: r".*/packages/core/(?:[^/]+/){4}[^/]+$",
+      $body <: contains bubble {
+        or {
+          JsModuleSource() as $source,
+          `import($source)`,
+          `require($source)`
+        } where {
+          $source <: or {
+            r"['\"`]fio-mcp(?:/[^'\"`]*)?['\"`]",
+            r"['\"`](?:[^'\"`]*/)?servers/[^'\"`]*['\"`]",
+            r"['\"`](?:\./)?(?:\.\./){5}.*"
+          },
+          register_diagnostic(
+            span = $source,
+            message = "packages/core must stay server-neutral: do not import fio-mcp, servers/, or paths outside packages/core. Inject server-specific behaviour from the server instead.",
+            severity = "error"
+          )
+        }
+      }
+    },
+    and {
+      $name <: r".*/packages/core/(?:[^/]+/){5}[^/]+$",
+      $body <: contains bubble {
+        or {
+          JsModuleSource() as $source,
+          `import($source)`,
+          `require($source)`
+        } where {
+          $source <: or {
+            r"['\"`]fio-mcp(?:/[^'\"`]*)?['\"`]",
+            r"['\"`](?:[^'\"`]*/)?servers/[^'\"`]*['\"`]",
+            r"['\"`](?:\./)?(?:\.\./){6}.*"
+          },
+          register_diagnostic(
+            span = $source,
+            message = "packages/core must stay server-neutral: do not import fio-mcp, servers/, or paths outside packages/core. Inject server-specific behaviour from the server instead.",
+            severity = "error"
+          )
+        }
+      }
+    },
+    and {
+      $name <: r".*/packages/core/(?:[^/]+/){6}[^/]+$",
+      $body <: contains bubble {
+        or {
+          JsModuleSource() as $source,
+          `import($source)`,
+          `require($source)`
+        } where {
+          $source <: or {
+            r"['\"`]fio-mcp(?:/[^'\"`]*)?['\"`]",
+            r"['\"`](?:[^'\"`]*/)?servers/[^'\"`]*['\"`]",
+            r"['\"`](?:\./)?(?:\.\./){7}.*"
+          },
+          register_diagnostic(
+            span = $source,
+            message = "packages/core must stay server-neutral: do not import fio-mcp, servers/, or paths outside packages/core. Inject server-specific behaviour from the server instead.",
+            severity = "error"
+          )
+        }
+      }
+    },
+    and {
+      $name <: r".*/packages/core/(?:[^/]+/){7}[^/]+$",
+      $body <: contains bubble {
+        or {
+          JsModuleSource() as $source,
+          `import($source)`,
+          `require($source)`
+        } where {
+          $source <: or {
+            r"['\"`]fio-mcp(?:/[^'\"`]*)?['\"`]",
+            r"['\"`](?:[^'\"`]*/)?servers/[^'\"`]*['\"`]",
+            r"['\"`](?:\./)?(?:\.\./){8}.*"
+          },
+          register_diagnostic(
+            span = $source,
+            message = "packages/core must stay server-neutral: do not import fio-mcp, servers/, or paths outside packages/core. Inject server-specific behaviour from the server instead.",
+            severity = "error"
+          )
+        }
+      }
+    },
+    and {
+      $name <: r".*/packages/core/(?:[^/]+/){8}[^/]+$",
+      $body <: contains bubble {
+        or {
+          JsModuleSource() as $source,
+          `import($source)`,
+          `require($source)`
+        } where {
+          $source <: or {
+            r"['\"`]fio-mcp(?:/[^'\"`]*)?['\"`]",
+            r"['\"`](?:[^'\"`]*/)?servers/[^'\"`]*['\"`]",
+            r"['\"`](?:\./)?(?:\.\./){9}.*"
+          },
+          register_diagnostic(
+            span = $source,
+            message = "packages/core must stay server-neutral: do not import fio-mcp, servers/, or paths outside packages/core. Inject server-specific behaviour from the server instead.",
+            severity = "error"
+          )
+        }
+      }
+    },
+    and {
+      $name <: r".*/packages/core/(?:[^/]+/){9}[^/]+$",
+      $body <: contains bubble {
+        or {
+          JsModuleSource() as $source,
+          `import($source)`,
+          `require($source)`
+        } where {
+          $source <: or {
+            r"['\"`]fio-mcp(?:/[^'\"`]*)?['\"`]",
+            r"['\"`](?:[^'\"`]*/)?servers/[^'\"`]*['\"`]",
+            r"['\"`](?:\./)?(?:\.\./){10}.*"
+          },
+          register_diagnostic(
+            span = $source,
+            message = "packages/core must stay server-neutral: do not import fio-mcp, servers/, or paths outside packages/core. Inject server-specific behaviour from the server instead.",
+            severity = "error"
+          )
+        }
+      }
+    },
+    and {
+      $name <: r".*/packages/core/(?:[^/]+/){10}[^/]+$",
+      $body <: contains bubble {
+        or {
+          JsModuleSource() as $source,
+          `import($source)`,
+          `require($source)`
+        } where {
+          $source <: or {
+            r"['\"`]fio-mcp(?:/[^'\"`]*)?['\"`]",
+            r"['\"`](?:[^'\"`]*/)?servers/[^'\"`]*['\"`]",
+            r"['\"`](?:\./)?(?:\.\./){11}.*"
+          },
+          register_diagnostic(
+            span = $source,
+            message = "packages/core must stay server-neutral: do not import fio-mcp, servers/, or paths outside packages/core. Inject server-specific behaviour from the server instead.",
+            severity = "error"
+          )
+        }
+      }
+    },
+    and {
+      $name <: r".*/packages/core/(?:[^/]+/){11}[^/]+$",
+      $body <: contains bubble {
+        or {
+          JsModuleSource() as $source,
+          `import($source)`,
+          `require($source)`
+        } where {
+          $source <: or {
+            r"['\"`]fio-mcp(?:/[^'\"`]*)?['\"`]",
+            r"['\"`](?:[^'\"`]*/)?servers/[^'\"`]*['\"`]",
+            r"['\"`](?:\./)?(?:\.\./){12}.*"
+          },
+          register_diagnostic(
+            span = $source,
+            message = "packages/core must stay server-neutral: do not import fio-mcp, servers/, or paths outside packages/core. Inject server-specific behaviour from the server instead.",
+            severity = "error"
+          )
+        }
+      }
+    },
+    and {
+      $name <: r".*/packages/core/(?:[^/]+/){12,}[^/]+$",
+      $body <: contains bubble {
+        or {
+          JsModuleSource() as $source,
+          `import($source)`,
+          `require($source)`
+        } where {
+          $source <: or {
+            r"['\"`]fio-mcp(?:/[^'\"`]*)?['\"`]",
+            r"['\"`](?:[^'\"`]*/)?servers/[^'\"`]*['\"`]",
+            r"['\"`](?:\./)?(?:\.\./){13,}.*"
+          },
+          register_diagnostic(
+            span = $source,
+            message = "packages/core must stay server-neutral: do not import fio-mcp, servers/, or paths outside packages/core. Inject server-specific behaviour from the server instead.",
+            severity = "error"
+          )
+        }
+      }
+    }
+  }
+}

@@ -132,11 +132,13 @@ exec "$@"
 EOF
 chmod +x "$work/bin/docker" "$work/remote-bin/docker" "$work/bin/ssh" "$work/bin/gzip" "$work/bin/sudo"
 
-# A throwaway clean repository holding the script and a package.json.
+# A throwaway clean repository holding the script, the private workspace
+# root manifest and the fio server manifest that carries the version.
 repo=$work/repo
-mkdir -p "$repo/scripts"
+mkdir -p "$repo/scripts" "$repo/servers/fio"
 cp "$ship_script" "$repo/scripts/ship-image.sh"
-echo '{ "version": "1.2.3" }' >"$repo/package.json"
+echo '{ "name": "mcps", "private": true, "version": "9.9.9" }' >"$repo/package.json"
+echo '{ "name": "fio-mcp", "version": "1.2.3" }' >"$repo/servers/fio/package.json"
 git -C "$repo" init -q
 git -C "$repo" add .
 git -C "$repo" -c user.name=test -c user.email=test@example.invalid commit -qm init
@@ -211,7 +213,7 @@ case_name="ships compressed to the default host"
 ship
 expect_status 0
 expect_stdout_result
-grep -Fqx "build --platform linux/amd64 --tag $tag --tag fio-mcp:1.2.3 ." "$work/log/docker.log" ||
+grep -Fqx "build --platform linux/amd64 --file servers/fio/Dockerfile --tag $tag --tag fio-mcp:1.2.3 ." "$work/log/docker.log" ||
   fail "build call: $(cat "$work/log/docker.log")"
 expect_ssh_call "[-o][BatchMode=yes][nas][sudo -n docker version --format '{{.Server.Version}}']"
 expect_ssh_call "[-o][BatchMode=yes][nas][sudo -n docker load]"
@@ -252,7 +254,7 @@ expect_err "remote load received invalid gzip"
 case_name="builds with buildx when it is installed"
 SHIM_BUILDX=1 ship
 expect_status 0
-grep -Fqx "buildx build --platform linux/amd64 --tag $tag --tag fio-mcp:1.2.3 --load ." "$work/log/docker.log" ||
+grep -Fqx "buildx build --platform linux/amd64 --file servers/fio/Dockerfile --tag $tag --tag fio-mcp:1.2.3 --load ." "$work/log/docker.log" ||
   fail "buildx call: $(cat "$work/log/docker.log")"
 
 case_name="runs every local docker call through DOCKER"
@@ -269,6 +271,8 @@ redis_check="run --rm --network none --entrypoint sh $tag -c test ! -e /app/node
 grep -Fqx -- "$redis_check" "$work/log/docker.log" || fail "no redis check: $(cat "$work/log/docker.log")"
 grep -Fq -- "run --rm --network none --entrypoint node $tag --input-type=module -e " "$work/log/docker.log" ||
   fail "no module load check: $(cat "$work/log/docker.log")"
+grep -Fq -- '["/app/dist", "/app/packages/core/dist"]' "$work/log/docker.log" ||
+  fail "module load check skips the core workspace: $(cat "$work/log/docker.log")"
 
 case_name="fails without shipping when the image cannot load its modules"
 SHIM_IMAGE_MODULES_FAIL=1 ship

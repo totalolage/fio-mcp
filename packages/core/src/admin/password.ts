@@ -1,0 +1,210 @@
+import { createHash } from "node:crypto";
+import { Clock, Context, Effect, Layer, Option, Redacted, Schema } from "effect";
+import type { AppIdentity } from "../app-identity.js";
+import {
+  DEFAULT_SCRYPT,
+  formatPasswordHash,
+  hashPassword,
+  type PasswordHash,
+  PasswordHashError,
+  parsePasswordHash,
+  type ScryptParams,
+} from "../oauth/crypto.js";
+import { DEFAULT_THROTTLE, type LoginResult, makeLoginGuard, PasswordUnavailable, type ThrottlePolicy } from "../oauth/login.js";
+import { matchingTotpSteps, TOTP_WINDOW, totpStep } from "./totp.js";
+
+/**
+ * The admin password, shared by the OAuth sign-in (/login) and the admin UI
+ * (/admin): one LoginGuard, so both count failures per address together and
+ * share the one-at-a-time scrypt slot.
+ *
+ * Source: the hash in the app's PasswordStore once the password was changed
+ * at /admin (or set with `<name> reset-admin-password --set`), otherwise the
+ * bootstrap hash the app read at start-up. Read on every check, so a change
+ * or a CLI reset applies at once.
+ *
+ * `stamp` identifies the current hash. Signed-in sessions (admin and OAuth)
+ * remember it and end when it changes: changing the password signs out
+ * every other session.
+ *
+ * With a TOTP secret configured (`totpSecret`), a sign-in also needs the current
+ * RFC 6238 code, checked in the same permit right after the password. A
+ * wrong or missing code is a counted failure, and an accepted code (its
+ * 30 s step) is never accepted again by `signIn` or `verifyTotp`.
+ */
+
+export class InvalidNewPassword extends Schema.TaggedError<InvalidNewPassword>()("InvalidNewPassword", {
+  detail: Schema.String,
+}) {
+  override get message(): string {
+    return this.detail;
+  }
+}
+
+/** The bounds `hash-password`, `reset-admin-password --set` and /admin enforce. */
+export const MIN_PASSWORD_LENGTH = 12;
+export const MAX_PASSWORD_LENGTH = 1024;
+
+/**
+ * Where a changed admin password's hash line lives (the app's settings
+ * table, say). Errors are logged by their message; none holds a secret.
+ */
+export interface PasswordStore {
+  /** The stored hash line, if the password was changed. */
+  readonly get: Effect.Effect<Option.Option<string>, { readonly message: string }>;
+  readonly put: (line: string) => Effect.Effect<void, { readonly message: string }>;
+}
+
+export interface AdminPasswordOptions {
+  readonly app: AppIdentity;
+  /** The hash used until a changed one is stored. */
+  readonly bootstrap: Redacted.Redacted<PasswordHash>;
+  readonly throttle?: ThrottlePolicy | undefined;
+  /** Parameters for hashing a changed password; tests pass cheaper ones. */
+  readonly scrypt?: ScryptParams | undefined;
+  /** RFC 6238 secret; when set, sign-ins and `verifyTotp` need a current code. */
+  readonly totpSecret?: Redacted.Redacted<Uint8Array> | undefined;
+}
+
+/** Hashing or storing the new password failed; the cause is logged. */
+export class PasswordChangeFailed extends Schema.TaggedError<PasswordChangeFailed>()("PasswordChangeFailed", {}) {
+  override get message(): string {
+    return "The new password could not be stored. The old password still applies. See the server log.";
+  }
+}
+
+export interface AdminPasswordShape {
+  /**
+   * A sign-in check (throttled, counted); Accepted carries the stamp of the
+   * hash the password matched. With TOTP enabled, `code` must be a current,
+   * unused code; it is ignored otherwise.
+   */
+  readonly signIn: (address: string, password: Redacted.Redacted<string>, code?: string) => Effect.Effect<LoginResult<string>>;
+  /** Identifies the current hash; changes with the password. */
+  readonly stamp: Effect.Effect<string, PasswordUnavailable>;
+  /**
+   * Checks `current` like a sign-in (throttled, counted) and, when it is
+   * right, stores the hash of `next` (same scrypt parameters as
+   * `hash-password`) within the same scrypt slot. Accepted carries the new
+   * hash's stamp.
+   */
+  readonly change: (
+    address: string,
+    current: Redacted.Redacted<string>,
+    next: Redacted.Redacted<string>,
+  ) => Effect.Effect<LoginResult<string>, PasswordChangeFailed>;
+  /** True when a TOTP secret is configured. */
+  readonly totpEnabled: boolean;
+  /**
+   * Second factor on its own, for an already signed-in admin action.
+   * Throttled and counted per `address` in the same LoginGuard as sign-ins.
+   * A wrong or missing code counts as a failed attempt. An accepted code is
+   * single-use, and this replay memory is shared with sign-in.
+   * When TOTP is disabled, it returns Accepted at once and counts nothing.
+   */
+  readonly verifyTotp: (address: string, code: string | undefined) => Effect.Effect<LoginResult<void>>;
+}
+
+/** 12 to 1024 characters, as `hash-password` requires. */
+export const checkNewPassword = (next: string, confirm: string): InvalidNewPassword | undefined => {
+  const length = Array.from(next).length;
+  if (length < MIN_PASSWORD_LENGTH || length > MAX_PASSWORD_LENGTH) {
+    return new InvalidNewPassword({ detail: `The new password must be ${MIN_PASSWORD_LENGTH} to ${MAX_PASSWORD_LENGTH} characters.` });
+  }
+  if (next !== confirm) return new InvalidNewPassword({ detail: "The new passwords do not match." });
+  return undefined;
+};
+
+const stampOfLine = (line: string) => createHash("sha256").update(line).digest("hex").slice(0, 32);
+const stampOf = (hash: PasswordHash) => stampOfLine(formatPasswordHash(hash));
+
+/** `options.totpSecret` turns on the second factor. */
+export const makeAdminPassword = Effect.fn("AdminPassword.make")(function* (
+  settings: PasswordStore,
+  options: AdminPasswordOptions,
+) {
+  const { app, bootstrap, totpSecret } = options;
+  const throttle = options.throttle ?? DEFAULT_THROTTLE;
+  const scrypt = options.scrypt ?? DEFAULT_SCRYPT;
+
+  const current = Effect.gen(function* () {
+    const stored = yield* settings.get.pipe(Effect.mapError(() => new PasswordUnavailable()));
+    if (Option.isNone(stored)) return bootstrap;
+    const parsed = parsePasswordHash(stored.value, app);
+    if (parsed instanceof PasswordHashError) {
+      yield* Effect.logError(
+        `admin password: the hash stored in the database ${parsed.detail}; run \`${app.name} reset-admin-password\``,
+      );
+      return yield* new PasswordUnavailable();
+    }
+    return Redacted.make(parsed);
+  });
+
+  const guard = yield* makeLoginGuard(current, throttle);
+
+  const stamp = Effect.map(current, (hash) => stampOf(Redacted.value(hash)));
+
+  /** Accepted TOTP steps, kept while they are inside the window; only read and written under the guard's permit. */
+  const usedSteps = new Set<number>();
+
+  /**
+   * True for a current code none of whose matching steps was accepted
+   * before; every step it matches is then used up (adjacent steps can share
+   * digits, so recording one would let the same digits pass again).
+   */
+  const acceptCode = (secret: Redacted.Redacted<Uint8Array>, code: string | undefined) =>
+    Effect.map(Clock.currentTimeMillis, (millis) => {
+      const seconds = Math.floor(millis / 1000);
+      const oldest = totpStep(seconds) - TOTP_WINDOW;
+      for (const step of usedSteps) if (step < oldest) usedSteps.delete(step);
+      const steps = code === undefined ? [] : matchingTotpSteps(Redacted.value(secret), code, seconds);
+      if (steps.length === 0 || steps.some((step) => usedSteps.has(step))) return false;
+      for (const step of steps) usedSteps.add(step);
+      return true;
+    });
+
+  const signIn = (address: string, password: Redacted.Redacted<string>, code?: string) =>
+    guard.attemptThen(
+      address,
+      password,
+      (verified) => Effect.succeed(stampOf(Redacted.value(verified))),
+      { secondFactor: totpSecret === undefined ? undefined : acceptCode(totpSecret, code) },
+    );
+
+  const verifyTotp = (address: string, code: string | undefined): Effect.Effect<LoginResult<void>> =>
+    totpSecret === undefined
+      ? Effect.succeed({ _tag: "Accepted", value: undefined })
+      : guard.attemptFactor(address, acceptCode(totpSecret, code));
+
+  /** Hashes and stores `next`; returns its stamp. */
+  const store = (next: Redacted.Redacted<string>) =>
+    hashPassword(next, scrypt).pipe(
+      Effect.tap((line) => settings.put(line)),
+      Effect.map(stampOfLine),
+      Effect.tapError((error) => Effect.logError(`admin password: the change failed: ${error.message}`)),
+      Effect.mapError(() => new PasswordChangeFailed()),
+    );
+
+  const change = (address: string, password: Redacted.Redacted<string>, next: Redacted.Redacted<string>) =>
+    // Password only: with TOTP on, it must not wipe the code failures counted for this address.
+    guard.attemptThen(address, password, () => store(next), { keepFailures: totpSecret !== undefined }).pipe(
+      Effect.tap((result) => (result._tag === "Accepted" ? Effect.logInfo("admin password: changed at /admin") : Effect.void)),
+    );
+
+  return { signIn, stamp, change, totpEnabled: totpSecret !== undefined, verifyTotp } satisfies AdminPasswordShape;
+});
+
+export class AdminPassword extends Context.Service<AdminPassword, AdminPasswordShape>()("mcps/admin/AdminPassword") {
+  /** `store` is built once, with the layer. */
+  static readonly layer = <R>(
+    store: Effect.Effect<PasswordStore, never, R>,
+    options: AdminPasswordOptions,
+  ): Layer.Layer<AdminPassword, never, R> =>
+    Layer.effect(
+      AdminPassword,
+      store.pipe(
+        Effect.flatMap((settings) => makeAdminPassword(settings, options)),
+        Effect.map(AdminPassword.of),
+      ),
+    );
+}

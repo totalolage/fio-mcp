@@ -1,0 +1,146 @@
+import { createHash } from "node:crypto";
+import type { OAuthApp } from "./app.js";
+import { isLoopbackRedirect, originOf } from "./urls.js";
+
+/**
+ * Server-rendered pages of the authorization server: login, consent, and
+ * errors, framed in core and filled in by the app (OAuthApp). Every
+ * interpolated value goes through `escapeHtml`; the only style is one inline
+ * block (core's rules, then the app's) allowed by its CSP hash; there is no
+ * script.
+ */
+
+export function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+const STYLE =
+  "body{font-family:system-ui,sans-serif;max-width:32rem;margin:3rem auto;padding:0 1rem;color:#1b1b1b;line-height:1.45}" +
+  "h1{font-size:1.4rem}fieldset{border:1px solid #ccc;border-radius:6px;margin:1rem 0;padding:.5rem 1rem}" +
+  "label{display:block;margin:.35rem 0}input[type=password]{width:100%;padding:.4rem;font-size:1rem;box-sizing:border-box}" +
+  "button{font-size:1rem;padding:.45rem 1.1rem;margin-right:.5rem}.warn{background:#fff4d6;border:1px solid #e0b84c;padding:.5rem .75rem;border-radius:6px}" +
+  ".error{color:#a40000}code{word-break:break-all}.muted{color:#555;font-size:.9rem}";
+
+/** CSP source hash of an inline style block. */
+export const styleHash = (style: string) => createHash("sha256").update(style, "utf8").digest("base64");
+
+const STYLE_HASH = styleHash(STYLE);
+
+/** The style block of the app's pages: core's rules followed by the app's (ConsentRenderer.style). */
+export const pageStyle = (app: OAuthApp): string => STYLE + (app.consent.style ?? "");
+
+/**
+ * Headers for every HTML page. `formTargets` widens form-action for the
+ * consent page: browsers apply it to the redirect that follows the POST.
+ * `style` is the hash of the page's one inline style block.
+ */
+export function pageHeaders(formTargets: ReadonlyArray<string> = [], style: string = STYLE_HASH): Record<string, string> {
+  const formAction = ["'self'", ...formTargets].join(" ");
+  return {
+    "content-security-policy": `default-src 'none'; style-src 'sha256-${style}'; form-action ${formAction}; frame-ancestors 'none'; base-uri 'none'`,
+    "x-frame-options": "DENY",
+    "x-content-type-options": "nosniff",
+    // Not no-referrer: browsers then send `Origin: null` on the form posts,
+    // which the Origin check refuses. Cross-origin navigations carry no referrer.
+    "referrer-policy": "same-origin",
+    "cache-control": "no-store",
+    pragma: "no-cache",
+  };
+}
+
+const layout = (app: OAuthApp, title: string, body: string) =>
+  `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>${escapeHtml(title)}</title><style>${pageStyle(app)}</style></head><body>${body}</body></html>`;
+
+const clientLabel = (name: string | null) => (name === null || name === "" ? "An unnamed application" : `“${escapeHtml(name)}”`);
+
+export interface LoginPage {
+  readonly clientName: string | null;
+  readonly redirectUri: string;
+  readonly csrf: string;
+  readonly error: string | undefined;
+  /** Ask for the authenticator code too (the admin password has a TOTP second factor). */
+  readonly totp?: boolean;
+}
+
+/** The second-factor field of both sign-in forms (/login and /admin/login). */
+export const TOTP_FIELD = `<label for="totp">Authenticator code</label>
+<input id="totp" type="text" name="totp" inputmode="numeric" autocomplete="one-time-code" maxlength="16" required>
+`;
+
+export const loginPage = (app: OAuthApp, page: LoginPage): string =>
+  layout(
+    app,
+    `${app.identity.name} sign-in`,
+    `<h1>Sign in to ${escapeHtml(app.identity.name)}</h1>
+<p>${clientLabel(page.clientName)} asks to use ${escapeHtml(app.consent.tools)}. It will return to <strong>${escapeHtml(originOf(page.redirectUri))}</strong>.</p>
+${page.error === undefined ? "" : `<p class="error" role="alert">${escapeHtml(page.error)}</p>`}
+<form method="post" action="/login">
+<input type="hidden" name="csrf" value="${escapeHtml(page.csrf)}">
+<label for="password">Admin password</label>
+<input id="password" type="password" name="password" autocomplete="current-password" required autofocus>
+${page.totp === true ? TOTP_FIELD : ""}<p><button type="submit">Sign in</button></p>
+</form>`,
+  );
+
+export interface ConsentPage {
+  readonly clientId: string;
+  readonly clientName: string | null;
+  readonly redirectUri: string;
+  readonly csrf: string;
+  /** Identifies what this form showed (see AuthSession.consentForms). */
+  readonly formId: string;
+  /** The scopes the authorization request asked for. */
+  readonly requestedScopes: ReadonlyArray<string>;
+  /** Labels of the resources on offer, all preselected. */
+  readonly resources: ReadonlyArray<string>;
+  /** The owner's own submission when the page is shown again after an error. */
+  readonly posted?: URLSearchParams | undefined;
+  readonly error: string | undefined;
+}
+
+export const consentPage = (app: OAuthApp, page: ConsentPage): string => {
+  const loopback = isLoopbackRedirect(page.redirectUri)
+    ? `<p class="warn">The application receives the authorization on this computer (<code>${escapeHtml(originOf(page.redirectUri))}</code>). Only continue if you just started the sign-in from an application on this computer.</p>`
+    : "";
+  const words = app.consent.resources;
+  const resources = page.resources
+    .map(
+      (label) =>
+        `<label><input type="checkbox" name="${escapeHtml(words.field)}" value="${escapeHtml(label)}" checked> ${escapeHtml(label)}</label>`,
+    )
+    .join("\n");
+  return layout(
+    app,
+    `${app.identity.name} authorization`,
+    `<h1>Authorize ${clientLabel(page.clientName)}</h1>
+<p class="muted">The name is supplied by the application and not verified. Client ID <code>${escapeHtml(page.clientId)}</code>.</p>
+<p>After you approve, the browser returns to:<br><code>${escapeHtml(page.redirectUri)}</code></p>
+${loopback}
+${page.error === undefined ? "" : `<p class="error" role="alert">${escapeHtml(page.error)}</p>`}
+<form method="post" action="/consent">
+<input type="hidden" name="csrf" value="${escapeHtml(page.csrf)}">
+<input type="hidden" name="form" value="${escapeHtml(page.formId)}">
+<fieldset><legend>Permissions</legend>
+${app.consent.permissions(page.requestedScopes, page.posted)}
+</fieldset>
+<fieldset><legend>${escapeHtml(words.legend)}</legend>
+${resources}
+</fieldset>
+<p><button type="submit" name="decision" value="approve">Approve</button><button type="submit" name="decision" value="deny">Deny</button></p>
+</form>`,
+  );
+};
+
+export const errorPage = (app: OAuthApp, title: string, detail: string): string =>
+  layout(app, `${app.identity.name}: ${title}`, `<h1>${escapeHtml(title)}</h1><p>${escapeHtml(detail)}</p>`);
+
+/** CSP form-action source for the redirect after consent. */
+export const redirectFormTarget = (redirectUri: string): ReadonlyArray<string> => {
+  const origin = originOf(redirectUri);
+  return origin === "" || origin === "null" ? [] : [origin];
+};

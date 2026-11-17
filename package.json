@@ -1,43 +1,32 @@
 {
-  "name": "fio-mcp",
-  "version": "0.2.0",
-  "description": "MCP server for FIO Bank's API Bankovnictví: transactions, statements, and payment orders",
+  "name": "mcps",
+  "private": true,
   "type": "module",
   "license": "MIT",
-  "bin": {
-    "fio-mcp": "dist/main.js"
-  },
-  "main": "dist/main.js",
-  "files": [
-    "dist"
+  "workspaces": [
+    "packages/*",
+    "servers/*"
   ],
   "engines": {
     "node": ">=22.13"
   },
   "packageManager": "bun@1.4.2",
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "tsc -b servers/fio/tsconfig.build.json",
+    "typecheck": "tsc -b packages/core/tsconfig.build.json && tsc -p packages/core/tsconfig.json --noEmit && tsc -p servers/fio/tsconfig.json --noEmit && tsc -p tsconfig.json --noEmit",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "test": "vitest run",
-    "generate": "node scripts/generate-fio-client.ts",
-    "generate:check": "bun run generate && git diff --exit-code -- src/generated",
+    "generate": "bun run --cwd servers/fio generate",
+    "generate:check": "bun run --cwd servers/fio generate:check",
     "check": "bun run typecheck && bun run lint && bun run test",
-    "start": "node dist/main.js",
+    "start": "bun run --cwd servers/fio start",
     "ship:image": "sh scripts/ship-image.sh",
-    "test:scripts": "sh test/ship-image.test.sh",
+    "test:scripts": "sh test/ship-image.test.sh && sh test/core-import-boundary.test.sh",
     "prepare": "effect-tsgo patch --typescript --no-oxlint && bun run build"
-  },
-  "dependencies": {
-    "@effect/platform-node": "4.0.6",
-    "@effect/sql-sqlite-node": "4.0.6",
-    "effect": "4.0.6",
-    "fast-xml-parser": "5.12.0"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.15",
-    "@effect/openapi-generator": "4.0.6",
     "@effect/tsgo": "0.53.3",
     "@effect/vitest": "4.0.6",
     "@modelcontextprotocol/sdk": "1.32.1",

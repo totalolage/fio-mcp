@@ -1,0 +1,1164 @@
+import { MAX_ADMIN_SESSIONS } from "@mcps/core/admin/sessions.js";
+import { totpCode } from "@mcps/core/admin/totp.js";
+import { DEFAULT_THROTTLE, type LoginResult } from "@mcps/core/oauth/login.js";
+import { escapeHtml } from "@mcps/core/oauth/pages.js";
+import type { Principal } from "@mcps/core/transport/principal.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { type CallToolResult, ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
+import { Effect, Exit, Layer, Redacted, Schema, Sink, Stdio, Stream, Terminal } from "effect";
+import { HttpRouter, HttpServerResponse } from "effect/http";
+import { SqlClient } from "effect/sql";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { tokenFingerprint } from "../src/accounts.js";
+import { makeCacheStore } from "../src/cache/store.js";
+import { resetAdminPasswordCommand } from "../src/oauth/cli.js";
+import { readGrantPayments } from "../src/oauth/grant-payments.js";
+import { PENDING_TTL_MS, sha256Hex } from "../src/payment-controls.js";
+import { buildImportXml, type Payer, PaymentOrders } from "../src/payments.js";
+import { IMPORT_OK_XML } from "./fixtures.js";
+import { NOW, statement, TODAY, tx } from "./support/cache.js";
+import { LAST_STATEMENT } from "./support/fio-api.js";
+import {
+  authorizationUrl,
+  Browser,
+  consentFormOf,
+  csrfOf,
+  type InProcessHarness,
+  LOOPBACK_REDIRECT,
+  PASSWORD,
+  PEER_HEADER,
+  PUBLIC_URL,
+  pkcePair,
+  postMcp,
+  RESOURCE,
+  register,
+  startOAuth,
+  tokensFor,
+} from "./support/oauth.js";
+import { FIO_TOKEN, SAVINGS_TOKEN } from "./support/transport.js";
+
+const ADMIN_COOKIE = "__Secure-fio-mcp-admin";
+const NEW_MAIN_TOKEN = "rotatedT0ken-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMN";
+const THIRD_TOKEN = "thirdT0ken-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQ";
+const NEW_PASSWORD = "a brand new admin password";
+
+// End to end: every test builds the whole app (router, SQLite, McpServer) and
+// drives it with many requests. A loaded host stalls whole test workers for
+// 10-15 s at times, past the 5 s default; this file allows 30 s.
+vi.setConfig({ testTimeout: 30_000, hookTimeout: 30_000 });
+
+let harness: InProcessHarness;
+
+beforeEach(async () => {
+  harness = await startOAuth();
+});
+
+afterEach(async () => {
+  await harness.close();
+});
+
+/** A browser for /admin: keeps the admin cookie and the last page's CSRF token, follows no redirects. */
+class Admin {
+  cookie: string | undefined;
+  csrf: string | undefined;
+  readonly setCookies: Array<string> = [];
+  constructor(private readonly extra: Record<string, string> = {}) {}
+
+  private absorb(response: Response) {
+    for (const header of response.headers.getSetCookie()) {
+      this.setCookies.push(header);
+      const [pair = ""] = header.split(";");
+      const at = pair.indexOf("=");
+      if (pair.slice(0, at) === ADMIN_COOKIE) {
+        const value = pair.slice(at + 1);
+        this.cookie = value === "" ? undefined : `${ADMIN_COOKIE}=${value}`;
+      }
+    }
+    return response;
+  }
+
+  private headers(extra: Record<string, string> = {}) {
+    return { ...this.extra, ...(this.cookie === undefined ? {} : { cookie: this.cookie }), ...extra };
+  }
+
+  async get(path: string, extra: Record<string, string> = {}) {
+    return this.absorb(await harness.fetch(new URL(path, PUBLIC_URL), { headers: this.headers(extra) }));
+  }
+
+  /** GET a page and remember its CSRF token. */
+  async page(path: string) {
+    const response = await this.get(path);
+    const html = await response.text();
+    this.csrf = /name="csrf" value="([^"]*)"/.exec(html)?.[1] ?? this.csrf;
+    return { response, html };
+  }
+
+  async post(
+    path: string,
+    form: Record<string, string>,
+    options: { origin?: string | undefined; csrf?: string | undefined; headers?: Record<string, string> } = {},
+  ) {
+    const body = new URLSearchParams(form);
+    const csrf = "csrf" in options ? options.csrf : this.csrf;
+    if (csrf !== undefined) body.set("csrf", csrf);
+    const origin = "origin" in options ? options.origin : PUBLIC_URL;
+    const headers = this.headers({
+      "content-type": "application/x-www-form-urlencoded",
+      ...(origin === undefined ? {} : { origin }),
+      ...options.headers,
+    });
+    return this.absorb(await harness.fetch(new URL(path, PUBLIC_URL), { method: "POST", headers, body }));
+  }
+
+  async signIn(password = PASSWORD) {
+    await this.page("/admin/login");
+    const response = await this.post("/admin/login", { password });
+    expect(response.status).toBe(303);
+    expect(response.headers.get("location")).toBe("/admin");
+    return this.page("/admin");
+  }
+
+  /** POSTs a form, follows the redirect back, and returns the page's message. */
+  async act(path: string, form: Record<string, string>) {
+    const response = await this.post(path, form);
+    expect(response.status, await response.clone().text()).toBe(303);
+    const back = await this.page(response.headers.get("location") ?? "/admin");
+    return { html: back.html, message: messageOf(back.html) };
+  }
+}
+
+const messageOf = (html: string) => /<p class="(?:ok|error)" role="(?:status|alert)">([^<]*)<\/p>/.exec(html)?.[1] ?? "";
+
+/** The account id in the row of `name` (from the accounts page). */
+const idOf = (html: string, name: string) => {
+  const rows = html.split("<tr>");
+  const row = rows.find((candidate) => candidate.includes(`<strong>${name}</strong>`));
+  const id = /name="id" value="([^"]+)"/.exec(row ?? "")?.[1];
+  if (id === undefined) throw new Error(`no row for ${name}`);
+  return id;
+};
+
+const signedIn = async () => {
+  const admin = new Admin();
+  await admin.signIn();
+  return admin;
+};
+
+/** An MCP session with a bearer token; counts the tools/list_changed notifications it receives. */
+const mcpSession = async (access: string) => {
+  const client = new Client({ name: "admin-test", version: "1.0.0" });
+  let changes = 0;
+  client.setNotificationHandler(ToolListChangedNotificationSchema, () => {
+    changes++;
+  });
+  const transport = new StreamableHTTPClientTransport(new URL(RESOURCE), {
+    requestInit: { headers: { authorization: `Bearer ${access}` } },
+    fetch: (url, init) => harness.fetch(url, init),
+  });
+  await client.connect(transport);
+  const enumOf = async (tool = "get_transactions") => {
+    const listed = (await client.listTools()).tools.find((candidate) => candidate.name === tool);
+    if (listed === undefined) return undefined;
+    const account = listed.inputSchema.properties?.account as { enum?: ReadonlyArray<string> } | undefined;
+    return account?.enum ?? [];
+  };
+  return { client, changes: () => changes, enumOf };
+};
+
+const text = (result: CallToolResult) => result.content.map((c) => (c.type === "text" ? c.text : "")).join("\n");
+
+describe("admin sign-in and sessions", () => {
+  it("is separate from OAuth: an MCP bearer token signs nothing in", async () => {
+    const { access } = await tokensFor(harness);
+    const bearer = { authorization: `Bearer ${access}` };
+    const page = await harness.fetch(`${PUBLIC_URL}/admin`, { headers: bearer });
+    expect(page.status).toBe(303);
+    expect(page.headers.get("location")).toBe("/admin/login");
+    const add = await harness.fetch(`${PUBLIC_URL}/admin/accounts/add`, {
+      method: "POST",
+      headers: { ...bearer, "content-type": "application/x-www-form-urlencoded", origin: PUBLIC_URL },
+      body: new URLSearchParams({ name: "sneaky", token: THIRD_TOKEN }),
+    });
+    expect(add.status).toBe(303);
+    expect(add.headers.get("location")).toBe("/admin/login");
+    expect((await harness.accounts().list.pipe(Effect.runPromise)).map((account) => account.name)).toEqual(["main", "savings"]);
+  });
+
+  it("signs in under a fresh session id with a strict cookie and strict page headers", async () => {
+    const admin = new Admin();
+    const login = await admin.page("/admin/login");
+    expect(login.response.status).toBe(200);
+    const csp = login.response.headers.get("content-security-policy") ?? "";
+    expect(csp).toContain("frame-ancestors 'none'");
+    expect(csp).toContain("default-src 'none'");
+    expect(csp).not.toContain("script-src");
+    expect(csp).not.toContain("unsafe-inline");
+    expect(login.response.headers.get("x-frame-options")).toBe("DENY");
+    expect(login.response.headers.get("cache-control")).toBe("no-store");
+    const cookie = admin.setCookies[0] ?? "";
+    expect(cookie).toMatch(/^__Secure-fio-mcp-admin=/);
+    for (const attribute of ["HttpOnly", "Secure", "SameSite=Strict", "Path=/admin"]) expect(cookie).toContain(attribute);
+    expect(cookie).not.toMatch(/Domain=/i);
+    const preLogin = admin.cookie;
+
+    const wrong = await admin.post("/admin/login", { password: "not the password" });
+    expect(wrong.status).toBe(401);
+    expect(await wrong.text()).toContain("Wrong password.");
+    const right = await admin.post("/admin/login", { password: PASSWORD });
+    expect(right.status).toBe(303);
+    expect(admin.cookie).toBeDefined();
+    expect(admin.cookie).not.toBe(preLogin);
+    expect((await admin.page("/admin")).response.status).toBe(200);
+    // The pre-login id does not become a signed-in session (no fixation).
+    const stale = await harness.fetch(`${PUBLIC_URL}/admin`, { headers: { cookie: preLogin ?? "" } });
+    expect(stale.status).toBe(303);
+  });
+
+  it("refuses state changes without the session's CSRF token, from another origin, or as GET", async () => {
+    const admin = await signedIn();
+    const form = { name: "third", token: THIRD_TOKEN };
+    expect((await admin.post("/admin/accounts/add", form, { csrf: undefined })).status).toBe(403);
+    expect((await admin.post("/admin/accounts/add", form, { csrf: "x".repeat(43) })).status).toBe(403);
+    expect((await admin.post("/admin/accounts/add", form, { origin: "https://evil.example" })).status).toBe(403);
+    expect((await admin.get("/admin/accounts/add")).status).toBe(404);
+    expect((await harness.accounts().list.pipe(Effect.runPromise)).length).toBe(2);
+    expect((await admin.act("/admin/accounts/add", form)).message).toContain("Added “third”");
+  });
+
+  it("creates no session for sign-in posts without a sign-in form", async () => {
+    const legit = new Admin();
+    await legit.page("/admin/login");
+    // One more post than the pool holds would evict the open form if posts made sessions.
+    for (let i = 0; i <= MAX_ADMIN_SESSIONS.preLogin; i++) {
+      const response = await harness.fetch(`${PUBLIC_URL}/admin/login`, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded", origin: PUBLIC_URL },
+        body: new URLSearchParams({ password: "guess" }),
+      });
+      expect(response.status).toBe(303);
+      expect(response.headers.get("location")).toBe("/admin/login");
+      expect(response.headers.getSetCookie()).toEqual([]);
+    }
+    // The pool of sign-in forms was not churned: the open form still signs in.
+    const right = await legit.post("/admin/login", { password: PASSWORD });
+    expect(right.status).toBe(303);
+    expect(right.headers.get("location")).toBe("/admin");
+  });
+
+  it("ends a session after 15 minutes without a request", async () => {
+    const admin = await signedIn();
+    harness.clock.advance(10 * 60_000);
+    expect((await admin.get("/admin")).status).toBe(200);
+    harness.clock.advance(10 * 60_000);
+    expect((await admin.get("/admin")).status).toBe(200);
+    harness.clock.advance(15 * 60_000 + 1_000);
+    const expired = await admin.get("/admin");
+    expect(expired.status).toBe(303);
+    expect(expired.headers.get("location")).toBe("/admin/login");
+  });
+
+  it("shares failed-sign-in throttling with the OAuth sign-in page", async () => {
+    const admin = new Admin();
+    await admin.page("/admin/login");
+    for (let i = 0; i < 6; i++) expect((await admin.post("/admin/login", { password: "wrong" })).status).toBe(401);
+    expect((await admin.post("/admin/login", { password: PASSWORD })).status).toBe(429);
+    // The OAuth sign-in from the same address waits too.
+    const { body } = await register(harness, [LOOPBACK_REDIRECT]);
+    const browser = new Browser(harness);
+    const { challenge } = pkcePair();
+    await browser.get(
+      authorizationUrl({
+        response_type: "code",
+        client_id: String(body.client_id),
+        redirect_uri: LOOPBACK_REDIRECT,
+        code_challenge: challenge,
+        code_challenge_method: "S256",
+        resource: RESOURCE,
+      }),
+    );
+    const csrf = await csrfOf(await browser.get("/login"));
+    expect((await browser.post("/login", { csrf, password: PASSWORD })).status).toBe(429);
+  });
+});
+
+describe("network allowlist (FIO_MCP_ADMIN_ALLOWED_CIDRS)", () => {
+  const OUTSIDE = { [PEER_HEADER]: "192.0.2.1" };
+  const INSIDE = { [PEER_HEADER]: "10.1.2.3" };
+  const PROBE = HttpRouter.add("GET", "/admin/extra/probe", HttpServerResponse.text("extra route"));
+  const hidden = async (response: Response) => {
+    expect(response.status).toBe(404);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(await response.text()).toBe("");
+  };
+
+  beforeEach(async () => {
+    await harness.close();
+    harness = await startOAuth({ allowedNetworks: ["10.0.0.0/8"], extraAdminRoutes: PROBE });
+  });
+
+  it("answers 404 to clients outside the list on every /admin route and spelling", async () => {
+    const get = (path: string) => harness.fetch(`${PUBLIC_URL}${path}`, { headers: OUTSIDE });
+    for (const path of ["/admin", "/admin/login", "/admin/clients", "/admin/password", "/ADMIN", "//admin", "/%61dmin"]) {
+      await hidden(await get(path));
+    }
+    const outsider = new Admin(OUTSIDE);
+    await hidden(await outsider.post("/admin/login", { password: PASSWORD }));
+    await hidden(await outsider.post("/admin/accounts/add", { name: "third", token: THIRD_TOKEN }));
+    expect((await harness.accounts().list.pipe(Effect.runPromise)).length).toBe(2);
+  });
+
+  it("covers a route registered under /admin the way AdminLive registers its routes", async () => {
+    await hidden(await harness.fetch(`${PUBLIC_URL}/admin/extra/probe`, { headers: OUTSIDE }));
+    await hidden(await harness.fetch(`${PUBLIC_URL}/ADMIN/extra/probe`, { headers: OUTSIDE }));
+    const inside = await harness.fetch(`${PUBLIC_URL}/admin/extra/probe`, { headers: INSIDE });
+    expect(inside.status).toBe(200);
+    expect(await inside.text()).toBe("extra route");
+  });
+
+  it("covers the payments pages and actions AdminLive registers", async () => {
+    for (const path of ["/admin/payments", "/admin/payments/pending", "/ADMIN/payments/pending", "/admin/payments?grant=x"]) {
+      await hidden(await harness.fetch(`${PUBLIC_URL}${path}`, { headers: OUTSIDE }));
+    }
+    const outsider = new Admin(OUTSIDE);
+    await hidden(await outsider.post("/admin/payments/pending/approve", { pending: "p" }));
+    await hidden(await outsider.post("/admin/payments/pending/decline", { pending: "p" }));
+    // Inside the list the real pages answer: a sign-in redirect, then the page.
+    const anonymous = await harness.fetch(`${PUBLIC_URL}/admin/payments/pending`, { headers: INSIDE, redirect: "manual" });
+    expect(anonymous.status).toBe(303);
+    const admin = new Admin(INSIDE);
+    await admin.signIn();
+    expect((await admin.page("/admin/payments/pending")).response.status).toBe(200);
+    expect((await admin.page("/admin/payments")).response.status).toBe(200);
+  });
+
+  it("keeps the admin flows working for clients inside the list", async () => {
+    const admin = new Admin(INSIDE);
+    await admin.signIn();
+    const { message } = await admin.act("/admin/accounts/add", { name: "third", token: THIRD_TOKEN });
+    expect(message).not.toBe("");
+    expect((await harness.accounts().list.pipe(Effect.runPromise)).map((account) => account.name)).toContain("third");
+  });
+});
+
+describe("accounts at /admin", () => {
+  it("changes accounts at runtime: the next tools/list of a live session follows", async () => {
+    const { access } = await tokensFor(harness, { accounts: ["main", "savings"] });
+    const session = await mcpSession(access);
+    expect(await session.enumOf()).toEqual(["main", "savings"]);
+    const admin = await signedIn();
+
+    // Rename keeps the grant.
+    const renamed = await admin.act("/admin/accounts/rename", { id: idOf((await admin.page("/admin")).html, "savings"), name: "rainy day" });
+    expect(renamed.message).toContain("Renamed to “rainy day”");
+    expect(await session.enumOf()).toEqual(["main", "rainy day"]);
+    // tools/list_changed is queued for the session and arrives with its next
+    // tool call (a streamed response): Effect's Streamable HTTP endpoint has
+    // no GET event stream (405) to push it sooner.
+    expect(session.changes()).toBe(0);
+    await session.client.callTool({ name: "get_server_status", arguments: {} });
+    expect(session.changes()).toBe(1);
+    const stream = await harness.fetch(RESOURCE, {
+      headers: { authorization: `Bearer ${access}`, accept: "text/event-stream", "mcp-protocol-version": "2025-11-25" },
+    });
+    expect(stream.status).toBe(405);
+
+    // A new token drops the account from existing grants.
+    const page = await admin.page("/admin");
+    expect((await admin.act("/admin/accounts/rotate", { id: idOf(page.html, "main"), token: NEW_MAIN_TOKEN })).message).toContain(
+      "Replaced the token of “main”",
+    );
+    expect(await session.enumOf()).toEqual(["rainy day"]);
+    const refused = (await session.client.callTool({ name: "get_server_status", arguments: {} })) as CallToolResult;
+    expect(text(refused)).not.toContain('"main"');
+
+    // An added account is not in anyone's grant.
+    expect((await admin.act("/admin/accounts/add", { name: "third", token: THIRD_TOKEN, currency: "eur" })).message).toContain(
+      "Added “third”",
+    );
+    expect(await session.enumOf()).toEqual(["rainy day"]);
+
+    // Removing the last granted account hides the tools that take one.
+    const before = await admin.page("/admin");
+    expect((await admin.act("/admin/accounts/remove", { id: idOf(before.html, "rainy day"), cache: "keep", confirm: "yes" })).message).toContain(
+      "Removed “rainy day”",
+    );
+    expect(await session.enumOf()).toBeUndefined();
+    const status = (await session.client.callTool({ name: "get_server_status", arguments: {} })) as CallToolResult;
+    expect(text(status)).not.toContain("rainy day");
+
+    const accounts = await harness.accounts().list.pipe(Effect.runPromise);
+    expect(accounts.map((account) => [account.name, account.configuredCurrency])).toEqual([
+      ["main", "CZK"],
+      ["third", "EUR"],
+    ]);
+    // The page shows the last four characters and never a token.
+    const final = await admin.page("/admin");
+    expect(final.html).toContain(`…${NEW_MAIN_TOKEN.slice(-4)}`);
+    for (const token of [FIO_TOKEN, SAVINGS_TOKEN, NEW_MAIN_TOKEN, THIRD_TOKEN]) expect(final.html).not.toContain(token);
+    expect(session.changes()).toBeGreaterThan(1);
+    await session.client.close();
+  });
+
+  it("purges a removed account's cached data unless an account still reads that bank account, and says which", async () => {
+    const admin = await signedIn();
+    const commit = (token: string, accountName: string, ids: ReadonlyArray<number>, accountId?: string) =>
+      harness.sql(
+        Effect.flatMap(makeCacheStore(), (store) =>
+          store.commit({
+            accountName,
+            tokenFingerprint: tokenFingerprint(Redacted.make(token)),
+            statement: statement(TODAY, TODAY, ids.map((id) => tx(id, TODAY, 5)), accountId),
+            fetchedAt: NOW,
+          }),
+        ),
+      );
+    const cached = () =>
+      harness.sql(
+        Effect.flatMap(SqlClient.SqlClient, (sql) =>
+          Effect.all({
+            movements: Effect.map(sql<{ id: number }>`SELECT movement_id AS id FROM transactions ORDER BY movement_id`, (rows) =>
+              rows.map((row) => row.id),
+            ),
+            bindings: Effect.map(sql<{ n: number }>`SELECT COUNT(*) AS n FROM bindings`, ([row]) => row?.n),
+          }),
+        ),
+      );
+    const remove = async (name: string) =>
+      (await admin.act("/admin/accounts/remove", { id: idOf((await admin.page("/admin")).html, name), cache: "purge", confirm: "yes" })).message;
+
+    // Cached under the first token, then under the replacing one: the old token's binding must not keep the data.
+    await commit(FIO_TOKEN, "main", [101]);
+    await admin.act("/admin/accounts/rotate", { id: idOf((await admin.page("/admin")).html, "main"), token: NEW_MAIN_TOKEN });
+    await commit(NEW_MAIN_TOKEN, "main", [202]);
+    expect(await cached()).toEqual({ movements: [101, 202], bindings: 2 });
+    expect(await remove("main")).toContain("Removed “main”. Its cached transactions were deleted.");
+    expect(await cached()).toEqual({ movements: [], bindings: 0 });
+
+    // Another configured account reading the same bank account keeps it, and is named.
+    await admin.act("/admin/accounts/add", { name: "third", token: THIRD_TOKEN });
+    await commit(SAVINGS_TOKEN, "savings", [303], "2000000009");
+    await commit(THIRD_TOKEN, "third", [404], "2000000009");
+    // Replaced since: the token it had still links it to the bank account.
+    await admin.act("/admin/accounts/rotate", { id: idOf((await admin.page("/admin")).html, "third"), token: NEW_MAIN_TOKEN });
+    expect(await remove("savings")).toContain(
+      "Removed “savings”. Its cached transactions were kept: “third” has or had a token for the same bank account.",
+    );
+    expect(await cached()).toEqual({ movements: [303, 404], bindings: 1 });
+    expect(await remove("third")).toContain("Removed “third”. Its cached transactions were deleted.");
+    expect(await cached()).toEqual({ movements: [], bindings: 0 });
+
+    // A token that never cached anything deletes nothing and says so.
+    await admin.act("/admin/accounts/add", { name: "fourth", token: NEW_MAIN_TOKEN });
+    expect(await remove("fourth")).toContain("Removed “fourth”. Nothing was cached under its tokens, so nothing was deleted.");
+
+    // Its tokens reached two bank accounts: one only it had goes, the other stays for the account that reads it too.
+    await admin.act("/admin/accounts/add", { name: "alpha", token: FIO_TOKEN });
+    await commit(FIO_TOKEN, "alpha", [707]);
+    await admin.act("/admin/accounts/rotate", { id: idOf((await admin.page("/admin")).html, "alpha"), token: SAVINGS_TOKEN });
+    await admin.act("/admin/accounts/add", { name: "beta", token: THIRD_TOKEN });
+    await commit(SAVINGS_TOKEN, "alpha", [808], "2000000009");
+    await commit(THIRD_TOKEN, "beta", [909], "2000000009");
+    expect(await remove("alpha")).toContain(
+      "Removed “alpha”. Its cached transactions were deleted, except where “beta” has or had a token for the same bank account.",
+    );
+    expect(await cached()).toEqual({ movements: [808, 909], bindings: 1 });
+  });
+
+  /** What the cache holds, and a removal with purge at /admin. */
+  const purging = (admin: Admin) => {
+    const movements = () =>
+      harness.sql(
+        Effect.flatMap(SqlClient.SqlClient, (sql) =>
+          Effect.map(sql<{ id: number }>`SELECT movement_id AS id FROM transactions ORDER BY movement_id`, (rows) => rows.map((row) => row.id)),
+        ),
+      );
+    const leftFor = (token: string) =>
+      harness.sql(
+        Effect.flatMap(SqlClient.SqlClient, (sql) => {
+          const fingerprint = tokenFingerprint(Redacted.make(token));
+          return Effect.map(
+            sql<{ n: number }>`SELECT (SELECT COUNT(*) FROM bindings WHERE token_fingerprint = ${fingerprint}) + (SELECT COUNT(*) FROM sync_state WHERE token_fingerprint = ${fingerprint}) AS n`,
+            ([row]) => row?.n,
+          );
+        }),
+      );
+    const cache = (token: string, accountName: string, id: number, accountId?: string) =>
+      harness.sql(
+        Effect.flatMap(makeCacheStore(), (store) =>
+          store.commit({
+            accountName,
+            tokenFingerprint: tokenFingerprint(Redacted.make(token)),
+            statement: statement(TODAY, TODAY, [tx(id, TODAY, 5)], accountId),
+            fetchedAt: NOW,
+          }),
+        ),
+      );
+    const remove = async (name: string) =>
+      (await admin.act("/admin/accounts/remove", { id: idOf((await admin.page("/admin")).html, name), cache: "purge", confirm: "yes" })).message;
+    return { movements, leftFor, cache, remove };
+  };
+
+  it("deletes what an earlier token cached when the current one cached nothing, and keeps data another account's token reads", async () => {
+    const admin = await signedIn();
+    const { movements, leftFor, cache, remove } = purging(admin);
+
+    // Replaced before the new token downloaded anything: the old token's data is the account's, and goes.
+    await cache(SAVINGS_TOKEN, "savings", 505, "2000000009");
+    expect(await leftFor(SAVINGS_TOKEN)).toBeGreaterThan(0);
+    await admin.act("/admin/accounts/rotate", { id: idOf((await admin.page("/admin")).html, "savings"), token: THIRD_TOKEN });
+    expect(await remove("savings")).toContain("Removed “savings”. Its cached transactions were deleted.");
+    expect(await movements()).toEqual([]);
+    expect(await leftFor(SAVINGS_TOKEN)).toBe(0);
+
+    // Accounts with the same token keep what it cached, all named; nothing is deleted.
+    await cache(FIO_TOKEN, "main", 606);
+    await admin.act("/admin/accounts/add", { name: "twin", token: FIO_TOKEN });
+    await admin.act("/admin/accounts/add", { name: "triplet", token: FIO_TOKEN });
+    expect(await remove("main")).toBe(
+      "Removed “main”. Its cached transactions were kept: “twin”, “triplet” have or had tokens for the same bank account.",
+    );
+    expect(await movements()).toEqual([606]);
+
+    // Kept at a removal, the data belongs to no configured account: a later purge leaves it and says so.
+    for (const name of ["twin", "triplet"]) {
+      await admin.act("/admin/accounts/remove", { id: idOf((await admin.page("/admin")).html, name), cache: "keep", confirm: "yes" });
+    }
+    await admin.act("/admin/accounts/add", { name: "fifth", token: NEW_MAIN_TOKEN });
+    expect(await remove("fifth")).toContain(
+      "Removed “fifth”. Nothing was cached under its tokens, so nothing was deleted. 1 cached bank account could not be linked to any configured account and was not touched.",
+    );
+    expect(await movements()).toEqual([606]);
+  });
+
+  it("purges what only the removed account's tokens cached when another account uses its current token", async () => {
+    const admin = await signedIn();
+    const { movements, leftFor, cache, remove } = purging(admin);
+    // main caches bank account X, then gets a new token, which beta also uses and caches bank account Y with.
+    await cache(FIO_TOKEN, "main", 1101, "2000000001");
+    await admin.act("/admin/accounts/rotate", { id: idOf((await admin.page("/admin")).html, "main"), token: NEW_MAIN_TOKEN });
+    await admin.act("/admin/accounts/add", { name: "beta", token: NEW_MAIN_TOKEN });
+    await cache(NEW_MAIN_TOKEN, "beta", 2202, "2000000002");
+
+    // X was only main's: it goes. Y stays with the token beta uses.
+    expect(await remove("main")).toBe(
+      "Removed “main”. Its cached transactions were deleted, except where “beta” has or had a token for the same bank account.",
+    );
+    expect(await movements()).toEqual([2202]);
+    expect(await leftFor(FIO_TOKEN)).toBe(0);
+    expect(await leftFor(NEW_MAIN_TOKEN)).toBeGreaterThan(0);
+
+    // Nothing of X is left behind for beta's purge to leave unlinked.
+    expect(await remove("beta")).toBe("Removed “beta”. Its cached transactions were deleted.");
+    expect(await movements()).toEqual([]);
+    expect(await leftFor(NEW_MAIN_TOKEN)).toBe(0);
+  });
+
+  it("counts cached data it cannot link to an account without naming a cause, as when a token's data moved to another bank account", async () => {
+    const admin = await signedIn();
+    const { movements, cache, remove } = purging(admin);
+    // FIO reports main's token for bank account X, later for Y: the binding moves to Y, and X is no longer linked.
+    await cache(FIO_TOKEN, "main", 3301, "2000000001");
+    await cache(FIO_TOKEN, "main", 3302, "2000000002");
+    expect(await remove("main")).toBe(
+      "Removed “main”. Its cached transactions were deleted. 1 cached bank account could not be linked to any configured account and was not touched.",
+    );
+    expect(await movements()).toEqual([3301]);
+  });
+
+  it("tests a token with one read-only call through its rate limiter, which follows a replaced token", async () => {
+    const admin = await signedIn();
+    const page = await admin.page("/admin");
+    const main = idOf(page.html, "main");
+    const first = await admin.act("/admin/accounts/test", { id: main });
+    expect(first.message).toContain("FIO accepted the token of “main” for reading (latest statement 2026/7)");
+    expect(LAST_STATEMENT).toContain("2026");
+    // FIO allows one request per token every 30 s: the limiter refuses at once instead of waiting past its budget.
+    const second = await admin.act("/admin/accounts/test", { id: main });
+    expect(second.message).toMatch(/^The token test failed: Rate limited: .*Retry after \d+ s\.$/);
+    // A replaced token has a limiter of its own.
+    await admin.act("/admin/accounts/rotate", { id: main, token: NEW_MAIN_TOKEN });
+    expect((await admin.act("/admin/accounts/test", { id: main })).message).toContain("FIO accepted the token");
+    // The fake FioApi implements no last/set-last-*: nothing moved the download marker.
+    expect(harness.logs.join("\n")).not.toMatch(/Unimplemented method/);
+  });
+
+  it("checks names and tokens without echoing them", async () => {
+    const admin = await signedIn();
+    const badToken = await admin.act("/admin/accounts/add", { name: "x", token: "short-secret<b>" });
+    expect(badToken.message).toContain("The token must be at least 32 characters");
+    expect(badToken.html).not.toContain("short-secret");
+    const duplicate = await admin.act("/admin/accounts/add", { name: "  MAIN ", token: THIRD_TOKEN });
+    expect(duplicate.message).toContain("Another account already has this name");
+    const invisible = await admin.act("/admin/accounts/add", { name: "ma​in", token: THIRD_TOKEN });
+    expect(invisible.message).toContain("The name must be 1-64 Unicode code points");
+    const tooLong = await admin.act("/admin/accounts/add", { name: "😀".repeat(65), token: THIRD_TOKEN });
+    expect(tooLong.message).toContain("The name must be 1-64");
+    expect((await harness.accounts().list.pipe(Effect.runPromise)).length).toBe(2);
+  });
+
+  it("escapes account names and client names in every page", async () => {
+    const admin = await signedIn();
+    const evil = `<img src=x onerror="alert(1)">&'`;
+    await admin.act("/admin/accounts/add", { name: evil, token: THIRD_TOKEN });
+    const accounts = await admin.page("/admin");
+    expect(accounts.html).not.toContain("<img src=x");
+    expect(accounts.html).toContain("&lt;img src=x onerror=&quot;alert(1)&quot;&gt;&amp;&#39;");
+    await register(harness, [LOOPBACK_REDIRECT], `<script>alert("client")</script>`);
+    const clients = await admin.page("/admin/clients");
+    expect(clients.html).not.toContain("<script>");
+    expect(clients.html).toContain("&lt;script&gt;alert(&quot;client&quot;)&lt;/script&gt;");
+  });
+
+  it("does not authorize a token that changed while the consent page was open", async () => {
+    const { body } = await register(harness, [LOOPBACK_REDIRECT]);
+    const browser = new Browser(harness);
+    const { challenge } = pkcePair();
+    await browser.get(
+      authorizationUrl({
+        response_type: "code",
+        client_id: String(body.client_id),
+        redirect_uri: LOOPBACK_REDIRECT,
+        code_challenge: challenge,
+        code_challenge_method: "S256",
+        resource: RESOURCE,
+      }),
+    );
+    const csrf = await csrfOf(await browser.get("/login"));
+    await browser.post("/login", { csrf, password: PASSWORD });
+    // Tab A shows main's old token; then the token changes and tab B shows the new one.
+    const tabA = await consentFormOf(await browser.get("/consent"));
+    const admin = await signedIn();
+    await admin.act("/admin/accounts/rotate", { id: idOf((await admin.page("/admin")).html, "main"), token: NEW_MAIN_TOKEN });
+    const tabB = await consentFormOf(await browser.get("/consent"));
+    // Tab A cannot approve the token it never showed, even after tab B rendered it.
+    const changed = await browser.post("/consent", { ...tabA, decision: "approve", account: "main" });
+    expect(changed.status).toBe(409);
+    expect(await changed.text()).toContain("The accounts changed while this page was open");
+    // Neither can a form id that was never issued.
+    expect((await browser.post("/consent", { ...tabB, form: "made-up", decision: "approve", account: "main" })).status).toBe(409);
+    const approved = await browser.post("/consent", { ...tabB, decision: "approve", account: "main" });
+    expect(approved.status).toBe(303);
+    expect(approved.headers.get("location")).toContain("code=");
+  });
+});
+
+describe("connected clients at /admin", () => {
+  it("lists clients and grants by account name, and revokes a grant, a client, or everything", async () => {
+    const alice = await tokensFor(harness, { accounts: ["main"], payments: true });
+    const bob = await tokensFor(harness, { accounts: ["savings"] });
+    expect((await postMcp(harness, { authorization: `Bearer ${alice.access}` })).status).toBe(200);
+    const admin = await signedIn();
+    const page = await admin.page("/admin/clients");
+    expect(page.html).toContain(alice.clientId);
+    expect(page.html).toContain("<code>fio:payments</code>");
+    expect(page.html).toMatch(/<td>main<\/td>/);
+    expect(page.html).toMatch(/<td>savings<\/td>/);
+    // Alice used her token; Bob did not.
+    expect(page.html.match(/UTC<\/td>\n<td>never<\/td>/g)?.length).toBe(1);
+
+    const grantId = /name="grant" value="([^"]+)"/.exec(page.html.slice(page.html.indexOf(alice.clientId)))?.[1] ?? "";
+    expect((await admin.act("/admin/grants/revoke", { grant: grantId })).message).toBe("Revoked the authorization.");
+    expect((await postMcp(harness, { authorization: `Bearer ${alice.access}` })).status).toBe(401);
+    expect((await postMcp(harness, { authorization: `Bearer ${bob.access}` })).status).toBe(200);
+
+    expect((await admin.act("/admin/clients/revoke", { client: bob.clientId })).message).toContain("Removed the client");
+    expect((await postMcp(harness, { authorization: `Bearer ${bob.access}` })).status).toBe(401);
+    expect((await harness.store((store) => store.client(bob.clientId))).valueOf()).toMatchObject({ _tag: "None" });
+
+    const carol = await tokensFor(harness);
+    expect((await admin.act("/admin/clients/revoke-all", {})).message).toBe("Tick the box to confirm.");
+    expect((await admin.act("/admin/clients/revoke-all", { confirm: "yes" })).message).toContain("Revoked 1 active authorizations");
+    expect((await postMcp(harness, { authorization: `Bearer ${carol.access}` })).status).toBe(401);
+  });
+});
+
+/** Runs `fio-mcp reset-admin-password [--set]` against the harness's database. */
+const resetPassword = (set: boolean, stdin = "") => {
+  const stdio = Stdio.layerTest({
+    stdin: Stream.make(new TextEncoder().encode(stdin)),
+    stdinIsTerminal: Effect.succeed(false),
+    stdout: () => Sink.drain,
+    stderr: () => Sink.drain,
+  });
+  const terminal = Layer.succeed(
+    Terminal.Terminal,
+    Terminal.make({
+      columns: Effect.succeed(80),
+      rows: Effect.succeed(24),
+      readLine: Effect.die("no terminal"),
+      readInput: Effect.die("no terminal"),
+      display: () => Effect.void,
+    }),
+  );
+  return harness.sql(resetAdminPasswordCommand(set, { ln: 14, r: 8, p: 1 }).pipe(Effect.provide(Layer.mergeAll(stdio, terminal))));
+};
+
+describe("payments at /admin", () => {
+  const PAYER: Payer = { accountNumber: "2900000000", currency: "CZK" };
+  const LISTED = "2212-2000000699/0300";
+  const domestic = (amount: number, account = LISTED) => {
+    const [accountTo, bankCode] = account.split("/");
+    return { type: "domestic", amount, accountTo, bankCode, date: "2026-12-01" };
+  };
+  const decodeOrders = Schema.decodeUnknownSync(PaymentOrders);
+  let keys = 0;
+
+  /** Submits through the server's PaymentControls as `principal`; the exit and the exact XML. */
+  const submitAs = (principal: Principal, raw: ReadonlyArray<unknown>) =>
+    harness.payments((controls) =>
+      Effect.gen(function* () {
+        const account = (yield* harness.accounts().list).find((candidate) => candidate.name === "main");
+        if (account === undefined) return yield* Effect.die("no main account");
+        const orders = decodeOrders(raw);
+        const xml = yield* buildImportXml(orders, PAYER);
+        keys += 1;
+        const exit = yield* Effect.exit(
+          controls.submit({ principal, account, payer: PAYER, orders, xml, idempotencyKey: `admin-test-key-${keys}` }),
+        );
+        return { exit, xml };
+      }),
+    );
+
+  const audit = () => harness.payments((controls) => controls.listAudit({ limit: 50 }));
+
+  const grantOfClient = async (clientId: string) => {
+    const grants = await harness.store((store) => store.listGrants(harness.clock.currentTimeMillisUnsafe()));
+    const grant = grants.find((candidate) => candidate.clientId === clientId);
+    if (grant === undefined) throw new Error(`no live grant for ${clientId}`);
+    return grant;
+  };
+
+  /** A real grant consented in confirm mode, listing LISTED, as its principal. */
+  const confirmPrincipal = async (totp?: string): Promise<Principal> => {
+    const { clientId } = await tokensFor(harness, {
+      ...(totp === undefined ? {} : { totp }),
+      payments: true,
+      paymentSettings: { payAllowlistMode: "confirm", payAllowlist: `${LISTED}, Landlord` },
+    });
+    const grant = await grantOfClient(clientId);
+    expect(readGrantPayments(grant.settings).allowlist.mode).toBe("confirm");
+    return {
+      subject: grant.grantId,
+      scopes: grant.scopes,
+      resources: grant.resources,
+      clientId,
+      settings: grant.settings,
+    };
+  };
+
+  /** Restarts the app with a FIO fake that records every uploaded XML. */
+  const startRecording = async (secondFactor?: () => Effect.Effect<LoginResult<void>>, totpSecret?: Redacted.Redacted<Uint8Array>) => {
+    await harness.close();
+    const uploads: Array<string> = [];
+    harness = await startOAuth({
+      fio: {
+        importXml: (_account, xml) =>
+          Effect.sync(() => {
+            uploads.push(xml);
+            return IMPORT_OK_XML;
+          }),
+      },
+      ...(secondFactor === undefined ? {} : { secondFactor }),
+      ...(totpSecret === undefined ? {} : { totpSecret }),
+    });
+    return uploads;
+  };
+
+  /** Signs in and holds a two-order batch (one payee listed) for confirmation. */
+  const holdBatch = async (
+    signIn: (admin: Admin) => Promise<unknown> = (admin) => admin.signIn(),
+    /** With TOTP on: a fresh code for the OAuth /login behind the grant. */
+    oauthCode?: () => string,
+  ) => {
+    const admin = new Admin();
+    await signIn(admin);
+    const principal = await confirmPrincipal(oauthCode?.());
+    const { exit, xml } = await submitAs(principal, [domestic(100), domestic(250, "19-2000145399/0800")]);
+    if (!Exit.isSuccess(exit)) throw new Error(`submit failed: ${String(exit.cause)}`);
+    expect(exit.value.outcome).toBe("awaiting-admin-confirmation");
+    return { admin, principal, xml, pendingId: String(exit.value.pendingId) };
+  };
+
+  it("lists audit rows newest first, only to a signed-in admin, filtered by grant", async () => {
+    const admin = new Admin();
+    await admin.signIn();
+    const principal = (subject: string): Principal => ({ subject, scopes: "all", resources: "all" });
+    // Above the default 50000 CZK per order: refused rows, nothing sent.
+    expect(Exit.isFailure((await submitAs(principal("fio_grant_a"), [domestic(60_000)])).exit)).toBe(true);
+    harness.clock.advance(1_000);
+    expect(Exit.isFailure((await submitAs(principal("fio_grant_b"), [domestic(70_000)])).exit)).toBe(true);
+
+    const anonymous = await new Admin().get("/admin/payments");
+    expect(anonymous.status).toBe(303);
+    expect(anonymous.headers.get("location")).toBe("/admin/login");
+    expect(await anonymous.text()).not.toContain("fio_grant_a");
+
+    const all = await admin.page("/admin/payments");
+    expect(all.response.status).toBe(200);
+    expect(all.html.indexOf("fio_grant_b")).toBeGreaterThan(0);
+    expect(all.html.indexOf("fio_grant_b")).toBeLessThan(all.html.indexOf("fio_grant_a"));
+    expect(all.html).toContain("refused");
+    expect(all.html).toContain("60000.00 CZK");
+    expect(all.html).toContain(LISTED);
+
+    const filtered = await admin.page("/admin/payments?grant=fio_grant_a");
+    expect(filtered.html).toContain("60000.00 CZK");
+    expect(filtered.html).not.toContain("fio_grant_b");
+    expect(filtered.html).not.toContain("70000.00 CZK");
+    // Payee details never reach the log.
+    expect(harness.logs.join("\n")).not.toContain("2000000699");
+  });
+
+  it("edits a payments grant's limits and allowlist at /admin/clients, never above the ceiling", async () => {
+    const readOnly = await tokensFor(harness);
+    const payments = await tokensFor(harness, { payments: true });
+    const admin = new Admin();
+    await admin.signIn();
+    const page = await admin.page("/admin/clients");
+    expect(page.html.match(/action="\/admin\/grants\/payments"/g)).toHaveLength(1);
+    const grant = await grantOfClient(payments.clientId);
+    const fields = {
+      grant: grant.grantId,
+      payMaxPerOrder: "CZK:100",
+      payMaxPerDay: "CZK:300",
+      payMaxOrdersPerDay: "2",
+      payAllowlistMode: "enforce",
+      payAllowlist: "de89 3704 0044 0532 0130 00, Hans",
+    };
+    expect((await admin.act("/admin/grants/payments", fields)).message).toBe("Saved the payment limits and payee allowlist.");
+    const saved = {
+      limits: { maxPerOrder: { CZK: 100 }, maxPerDay: { CZK: 300 }, maxOrdersPerDay: 2 },
+      allowlist: { mode: "enforce", entries: [{ account: "DE89370400440532013000", label: "Hans" }] },
+    };
+    expect(readGrantPayments((await grantOfClient(payments.clientId)).settings)).toEqual(saved);
+    expect((await admin.page("/admin/clients")).html).toContain('name="payMaxPerOrder" value="CZK:100"');
+
+    const above = await admin.act("/admin/grants/payments", { ...fields, payMaxPerDay: "CZK:100001" });
+    expect(above.message).toContain("above the server ceiling");
+    const unknownCurrency = await admin.act("/admin/grants/payments", { ...fields, payMaxPerOrder: "USD:1", payMaxPerDay: "USD:1" });
+    expect(unknownCurrency.message).toContain("not allowed by the server");
+    expect(readGrantPayments((await grantOfClient(payments.clientId)).settings)).toEqual(saved);
+
+    const notPayments = await admin.act("/admin/grants/payments", { ...fields, grant: (await grantOfClient(readOnly.clientId)).grantId });
+    expect(notPayments.message).toContain("cannot submit payments");
+    // Without CSRF nothing changes.
+    expect((await admin.post("/admin/grants/payments", { ...fields, payMaxOrdersPerDay: "1" }, { csrf: undefined })).status).toBe(403);
+    expect(readGrantPayments((await grantOfClient(payments.clientId)).settings)).toEqual(saved);
+  });
+
+  it("uploads a held batch's exact XML only after the admin approves it", async () => {
+    const uploads = await startRecording();
+    const { admin, xml, pendingId } = await holdBatch();
+    expect(uploads).toEqual([]);
+
+    const page = await admin.page("/admin/payments/pending");
+    expect(page.html).toContain(pendingId);
+    expect(page.html).toContain(sha256Hex(xml));
+    expect(page.html).toContain(`<pre>${escapeHtml(xml)}</pre>`);
+    expect(page.html).toContain(`${LISTED}</code> (bank 0300): 100.00 CZK <span class="muted">listed</span>`);
+    expect(page.html).toContain('250.00 CZK <span class="unlisted">not on the allowlist</span>');
+    expect(page.html).toContain("350.00 CZK");
+
+    // Without CSRF, or from another origin: refused, nothing uploaded.
+    expect((await admin.post("/admin/payments/pending/approve", { pending: pendingId }, { csrf: undefined })).status).toBe(403);
+    expect((await admin.post("/admin/payments/pending/approve", { pending: pendingId }, { origin: "https://evil.example" })).status).toBe(
+      403,
+    );
+    // Not signed in: back to the sign-in page.
+    const stranger = await new Admin().post("/admin/payments/pending/approve", { pending: pendingId }, { csrf: admin.csrf });
+    expect(stranger.headers.get("location")).toBe("/admin/login");
+    expect(uploads).toEqual([]);
+
+    const approved = await admin.act("/admin/payments/pending/approve", { pending: pendingId });
+    expect(approved.message).toContain(`Batch ${pendingId}: accepted.`);
+    expect(uploads).toEqual([xml]);
+    expect((await audit())[0]?.outcome).toBe("accepted");
+    expect((await admin.page("/admin/payments/pending")).html).not.toContain(pendingId);
+
+    // A second approval uploads nothing.
+    expect((await admin.act("/admin/payments/pending/approve", { pending: pendingId })).message).toContain("no longer awaiting");
+    expect(uploads).toHaveLength(1);
+  });
+
+  it("drops a held batch after 24 hours: approving then uploads nothing", async () => {
+    const uploads = await startRecording();
+    const { pendingId } = await holdBatch();
+    harness.clock.advance(PENDING_TTL_MS + 1_000);
+    // The earlier admin session is past its lifetime; sign in again.
+    const admin = new Admin();
+    await admin.signIn();
+    expect((await admin.page("/admin/payments/pending")).html).not.toContain(pendingId);
+    expect((await admin.act("/admin/payments/pending/approve", { pending: pendingId })).message).toContain("no longer awaiting");
+    expect(uploads).toEqual([]);
+    const [row] = await audit();
+    expect(row?.outcome).toBe("refused");
+    expect(row?.reason).toBe("confirmation expired");
+  });
+
+  it("refuses to approve a held batch whose grant was revoked, uploading nothing", async () => {
+    const uploads = await startRecording();
+    const { admin, principal, pendingId } = await holdBatch();
+    expect((await admin.act("/admin/grants/revoke", { grant: principal.subject })).message).toBe("Revoked the authorization.");
+    expect((await admin.page("/admin/payments/pending")).html).toContain("approving it uploads nothing");
+
+    const approved = await admin.act("/admin/payments/pending/approve", { pending: pendingId });
+    expect(approved.message).toContain(`Batch ${pendingId}: refused.`);
+    expect(approved.message).toContain("no longer active");
+    expect(uploads).toEqual([]);
+    const [row] = await audit();
+    expect(row?.outcome).toBe("refused");
+    expect(row?.reason).toBe("approval: grant no longer active");
+    expect((await admin.page("/admin/payments/pending")).html).not.toContain(pendingId);
+  });
+
+  it("declines a held batch without uploading it", async () => {
+    const uploads = await startRecording();
+    const { admin, pendingId } = await holdBatch();
+    expect((await admin.post("/admin/payments/pending/decline", { pending: pendingId }, { csrf: undefined })).status).toBe(403);
+    expect((await admin.act("/admin/payments/pending/decline", { pending: pendingId })).message).toBe(
+      "Declined the batch; nothing was sent to FIO.",
+    );
+    expect((await admin.act("/admin/payments/pending/approve", { pending: pendingId })).message).toContain("no longer awaiting");
+    expect(uploads).toEqual([]);
+    const [row] = await audit();
+    expect(row?.outcome).toBe("refused");
+    expect(row?.reason).toBe("declined by admin");
+  });
+
+  it("uploads nothing unless the second factor accepts the approval", async () => {
+    let factor: LoginResult<void> = { _tag: "Rejected" };
+    const uploads = await startRecording(() => Effect.succeed(factor));
+    const { admin, xml, pendingId } = await holdBatch();
+    const refusals: ReadonlyArray<LoginResult<void>> = [
+      { _tag: "Rejected" },
+      { _tag: "Throttled", retryAfterSeconds: 30 },
+      { _tag: "Unavailable" },
+    ];
+    for (const refusal of refusals) {
+      factor = refusal;
+      const outcome = await admin.act("/admin/payments/pending/approve", { pending: pendingId, totp: "000000" });
+      expect(outcome.message).toContain("Nothing was uploaded.");
+      expect(uploads).toEqual([]);
+      expect((await admin.page("/admin/payments/pending")).html).toContain(pendingId);
+    }
+    factor = { _tag: "Accepted", value: undefined };
+    expect((await admin.act("/admin/payments/pending/approve", { pending: pendingId })).message).toContain("accepted");
+    expect(uploads).toEqual([xml]);
+  });
+
+  describe("with the admin TOTP secret set (SEC-03)", () => {
+    const SECRET = new TextEncoder().encode("12345678901234567890");
+    const APPROVE = "/admin/payments/pending/approve";
+    const WRONG_CODE = "The authentication code is wrong. Nothing was uploaded.";
+    const codeNow = () => totpCode(SECRET, Math.floor(harness.clock.currentTimeMillisUnsafe() / 1000));
+    const wrongCode = () => {
+      const valid = new Set([-1, 0, 1].map((steps) => totpCode(SECRET, Math.floor(harness.clock.currentTimeMillisUnsafe() / 1000) + steps * 30)));
+      return ["000000", "111111", "222222", "333333"].find((code) => !valid.has(code)) ?? "444444";
+    };
+    /** The next step's code, for the OAuth sign-in behind the held batch's grant. */
+    const nextCode = () => {
+      harness.clock.advance(30_000);
+      return codeNow();
+    };
+    /** Signs in with the password and the current code; returns that code. */
+    const signInWithCode = async (admin: Admin) => {
+      const code = codeNow();
+      await admin.page("/admin/login");
+      expect((await admin.post("/admin/login", { password: PASSWORD, totp: code })).status).toBe(303);
+      await admin.page("/admin");
+      return code;
+    };
+
+    it("approves only with a current, unused code: missing, wrong and replayed codes upload nothing", async () => {
+      const uploads = await startRecording(undefined, Redacted.make(SECRET));
+      let signInCode = "";
+      const { admin, xml, pendingId } = await holdBatch(async (a) => {
+        signInCode = await signInWithCode(a);
+      }, nextCode);
+      expect((await admin.page("/admin/payments/pending")).html).toContain('name="totp"');
+
+      expect((await admin.act(APPROVE, { pending: pendingId })).message).toBe(WRONG_CODE);
+      expect((await admin.act(APPROVE, { pending: pendingId, totp: wrongCode() })).message).toBe(WRONG_CODE);
+      // The code that signed in is spent: it never approves.
+      expect((await admin.act(APPROVE, { pending: pendingId, totp: signInCode })).message).toBe(WRONG_CODE);
+      expect(uploads).toEqual([]);
+      expect((await admin.page("/admin/payments/pending")).html).toContain(pendingId);
+
+      // A second batch, held by a fresh sign-in, before the first is approved.
+      const second = await holdBatch(async (a) => {
+        harness.clock.advance(30_000);
+        await signInWithCode(a);
+      }, nextCode);
+      harness.clock.advance(30_000);
+      const approval = codeNow();
+      expect((await admin.act(APPROVE, { pending: pendingId, totp: approval })).message).toContain("accepted");
+      expect(uploads).toEqual([xml]);
+
+      // The code that approved one batch never approves another, even within its window.
+      expect((await second.admin.act(APPROVE, { pending: second.pendingId, totp: approval })).message).toBe(WRONG_CODE);
+      expect(uploads).toEqual([xml]);
+      harness.clock.advance(30_000);
+      expect((await second.admin.act(APPROVE, { pending: second.pendingId, totp: codeNow() })).message).toContain("accepted");
+      expect(uploads).toEqual([xml, second.xml]);
+    });
+
+    it("throttles repeated wrong approval codes", async () => {
+      const uploads = await startRecording(undefined, Redacted.make(SECRET));
+      const { admin, pendingId } = await holdBatch(signInWithCode, nextCode);
+      const messages: Array<string> = [];
+      // DEFAULT_THROTTLE: five free failures; the sixth starts the backoff.
+      for (let attempt = 0; attempt < 7; attempt++) {
+        messages.push((await admin.act(APPROVE, { pending: pendingId, totp: wrongCode() })).message);
+      }
+      expect(messages.slice(0, 6)).toEqual(Array(6).fill(WRONG_CODE));
+      expect(messages[6]).toMatch(/^Too many failed attempts\. Try again in \d+ s\. Nothing was uploaded\.$/);
+      expect(uploads).toEqual([]);
+    });
+
+    it("declines without a code, uploading nothing", async () => {
+      const uploads = await startRecording(undefined, Redacted.make(SECRET));
+      const { admin, pendingId } = await holdBatch(signInWithCode, nextCode);
+      expect((await admin.act("/admin/payments/pending/decline", { pending: pendingId })).message).toBe(
+        "Declined the batch; nothing was sent to FIO.",
+      );
+      expect((await admin.page("/admin/payments/pending")).html).not.toContain(pendingId);
+      // Even a fresh, valid code cannot approve it afterwards.
+      harness.clock.advance(30_000);
+      expect((await admin.act(APPROVE, { pending: pendingId, totp: codeNow() })).message).toContain("no longer awaiting");
+      expect(uploads).toEqual([]);
+      const [row] = await audit();
+      expect(row?.reason).toBe("declined by admin");
+    });
+  });
+
+  it("asks for no code and approves without one when TOTP is off", async () => {
+    const uploads = await startRecording();
+    const { admin, xml, pendingId } = await holdBatch();
+    expect((await admin.page("/admin/payments/pending")).html).not.toContain('name="totp"');
+    expect((await admin.act("/admin/payments/pending/approve", { pending: pendingId })).message).toContain("accepted");
+    expect(uploads).toEqual([xml]);
+  });
+});
+
+describe("admin password", () => {
+  it("changes the password after checking the current one, signing out every other session", async () => {
+    const admin = await signedIn();
+    const other = await signedIn();
+    expect((await admin.act("/admin/password", { current: PASSWORD, next: "short", confirm: "short" })).message).toContain(
+      "12 to 1024 characters",
+    );
+    expect(
+      (await admin.act("/admin/password", { current: PASSWORD, next: NEW_PASSWORD, confirm: `${NEW_PASSWORD}!` })).message,
+    ).toBe("The new passwords do not match.");
+    expect((await admin.act("/admin/password", { current: "wrong", next: NEW_PASSWORD, confirm: NEW_PASSWORD })).message).toBe(
+      "The current password is wrong.",
+    );
+    const before = admin.cookie;
+    const changed = await admin.act("/admin/password", { current: PASSWORD, next: NEW_PASSWORD, confirm: NEW_PASSWORD });
+    expect(changed.message).toBe("Password changed. Every other admin session was signed out.");
+    expect(admin.cookie).not.toBe(before);
+    expect((await admin.get("/admin")).status).toBe(200);
+    expect((await other.get("/admin")).status).toBe(303);
+    // The new password signs in at /admin and on the OAuth page; the old one no longer does.
+    const fresh = new Admin();
+    await fresh.page("/admin/login");
+    expect((await fresh.post("/admin/login", { password: PASSWORD })).status).toBe(401);
+    expect((await fresh.post("/admin/login", { password: NEW_PASSWORD })).status).toBe(303);
+    // The hash lives in the database, never the password.
+    const stored = await harness.sql(
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        return yield* sql<{ value: string }>`SELECT value FROM server_settings WHERE key = 'admin_password_hash'`;
+      }),
+    );
+    expect(stored[0]?.value).toMatch(/^\$scrypt\$ln=14,r=8,p=1\$/);
+    expect(JSON.stringify(stored)).not.toContain(NEW_PASSWORD);
+
+    // Recovery: `fio-mcp reset-admin-password` drops it; the hash file applies again and sessions end.
+    await resetPassword(false);
+    expect((await fresh.get("/admin")).status).toBe(303);
+    const recovered = new Admin();
+    await recovered.signIn(PASSWORD);
+    // `--set` stores a new one read from standard input.
+    await resetPassword(true, "a password from the cli\n");
+    expect((await recovered.get("/admin")).status).toBe(303);
+    await new Admin().signIn("a password from the cli");
+  });
+});
+
+describe("admin TOTP second factor at /admin/login (SEC-03)", () => {
+  const SECRET = new TextEncoder().encode("12345678901234567890");
+  const codeNow = (steps = 0) => totpCode(SECRET, Math.floor(harness.clock.currentTimeMillisUnsafe() / 1000) + steps * 30);
+  const wrongCode = () => {
+    const valid = new Set([codeNow(-1), codeNow(), codeNow(1)]);
+    return ["000000", "111111", "222222", "333333"].find((code) => !valid.has(code)) ?? "444444";
+  };
+
+  it("shows no code field when the secret is not configured", async () => {
+    const { html } = await new Admin().page("/admin/login");
+    expect(html).not.toContain('name="totp"');
+  });
+
+  it("needs a current, unused code with the password and counts a wrong or missing one", async () => {
+    await harness.close();
+    harness = await startOAuth({ throttle: { ...DEFAULT_THROTTLE, freeFailures: 1 }, totpSecret: Redacted.make(SECRET) });
+    const admin = new Admin();
+    const { html } = await admin.page("/admin/login");
+    expect(html).toContain('name="totp"');
+    expect(html).toContain('autocomplete="one-time-code"');
+
+    const missing = await admin.post("/admin/login", { password: PASSWORD });
+    expect(missing.status).toBe(401);
+    expect(await missing.text()).toContain("Wrong password or code.");
+    expect((await admin.post("/admin/login", { password: PASSWORD, totp: wrongCode() })).status).toBe(401);
+    // Both counted: the second failure started the backoff, even for a correct code.
+    expect((await admin.post("/admin/login", { password: PASSWORD, totp: codeNow() })).status).toBe(429);
+    harness.clock.advance(1000);
+
+    const code = codeNow();
+    expect((await admin.post("/admin/login", { password: PASSWORD, totp: code })).status).toBe(303);
+    expect((await admin.get("/admin")).status).toBe(200);
+    // The same code in another sign-in, here or at /login: refused.
+    const again = new Admin();
+    await again.page("/admin/login");
+    expect((await again.post("/admin/login", { password: PASSWORD, totp: code })).status).toBe(401);
+    // A fresh code works.
+    expect((await again.post("/admin/login", { password: PASSWORD, totp: codeNow(1) })).status).toBe(303);
+  });
+});
+
+describe("busy password check at /admin/password (SEC-09)", () => {
+  it("says sign-in busy, not the lockout text, when another check holds the slot", async () => {
+    await harness.close();
+    // A real busy answer depends on timing; the stub returns it for every change.
+    harness = await startOAuth({
+      adminPassword: (real) => ({
+        ...real,
+        change: () => Effect.succeed({ _tag: "Throttled", retryAfterSeconds: 1, busy: true } as const),
+      }),
+    });
+    const admin = await signedIn();
+    const result = await admin.act("/admin/password", { current: PASSWORD, next: NEW_PASSWORD, confirm: NEW_PASSWORD });
+    expect(result.message).toBe("Sign-in busy, try again.");
+  });
+});
+
+describe("busy sign-in at /admin/login (SEC-09)", () => {
+  it("answers a sign-in that finds another check running as busy, with retry-after 1", async () => {
+    await harness.close();
+    // Nothing is locked out here: every 429 must be the busy answer.
+    harness = await startOAuth({ throttle: { ...DEFAULT_THROTTLE, freeFailures: 100, lockoutFailures: 200 } });
+    const admins = Array.from({ length: 8 }, () => new Admin());
+    for (const admin of admins) await admin.page("/admin/login");
+    let busy: Response | undefined;
+    for (let round = 0; round < 5 && busy === undefined; round++) {
+      const responses = await Promise.all(admins.map((admin) => admin.post("/admin/login", { password: "wrong password!" })));
+      for (const response of responses) expect([401, 429]).toContain(response.status);
+      busy = responses.find((response) => response.status === 429);
+    }
+    if (busy === undefined) throw new Error("no sign-in was turned away as busy in 5 rounds");
+    expect(busy.headers.get("retry-after")).toBe("1");
+    expect(await busy.text()).toContain("Sign-in busy, try again.");
+  });
+});
