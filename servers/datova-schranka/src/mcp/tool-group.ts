@@ -24,8 +24,11 @@ export interface ToolSpec {
  * One group of MCP tools (read tools, send tools, ...). The app registers
  * every group for the current box labels at startup and again whenever the
  * labels change, and builds the tool policy from the union of their specs.
- * `register` registers the group's tools on the MCP server (a Toolkit via
- * McpServer.registerToolkit, or raw tools via McpServer.addTool).
+ * `register` registers the group's tools on the MCP server: a Toolkit via
+ * registerAuditedToolkit (src/mcp/input-audit.ts) instead of
+ * McpServer.registerToolkit, so a call whose input fails decoding is
+ * audited once; raw tools via McpServer.addTool, calling
+ * recordInvalidInput when their own decode fails.
  */
 export interface ToolGroup<R> {
   readonly specs: ReadonlyArray<ToolSpec>;
