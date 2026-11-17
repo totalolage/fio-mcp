@@ -1,11 +1,20 @@
 import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem";
-import { decodeBase32, MIN_TOTP_SECRET_BYTES } from "@mcps/core/admin/totp.js";
-import { type PasswordHash, PasswordHashError } from "@mcps/core/oauth/crypto.js";
-import { parseTrustedProxy } from "@mcps/core/transport/client-address.js";
-import { Config, Context, Effect, FileSystem, Layer, Option, Predicate, Redacted, Result, Schema } from "effect";
+import { boolVar, intVar, optionalVar, secretVar } from "@mcps/core/config/env.js";
+import {
+  loadAdminAllowedNetworks,
+  loadAdminListener,
+  loadAllowedHosts,
+  loadAllowedOrigins,
+  loadListenAddress,
+  loadOAuthCredentials,
+  loadTrustedProxies,
+} from "@mcps/core/config/http.js";
+import { readDataKeyFile, readTotpSecretFile } from "@mcps/core/config/secret-files.js";
+import type { PasswordHash } from "@mcps/core/oauth/crypto.js";
+import { Config, Context, Effect, type FileSystem, Layer, Option, Predicate, Redacted, Result, Schema } from "effect";
 import type { IpNetwork } from "effect/net";
 import { ConfigError } from "./errors.js";
-import { parseFioBaseUrl, parsePasswordHash, parsePublicUrl } from "./identity.js";
+import { FIO_APP, parseFioBaseUrl } from "./identity.js";
 import {
   type CurrencyAmounts,
   DEFAULT_PAYMENT_LIMITS,
@@ -14,7 +23,6 @@ import {
   parseOrdersPerDay,
   toCents,
 } from "./payment-limits.js";
-import { parseDataKey } from "./token-crypto.js";
 
 /**
  * Configuration from the environment, through Effect's ConfigProvider.
@@ -239,71 +247,8 @@ const ACCOUNT_FIELDS = Object.keys(FIELD_RULES).join(", ");
 
 const fail = (detail: string) => Effect.fail(new ConfigError({ detail }));
 
-/** A trimmed, non-empty variable, or None. Never echoes the value on failure. */
-const optionalVar = Effect.fn("config.optionalVar")(function* (key: string) {
-  const value = yield* Config.option(Config.String(key)).pipe(
-    Effect.mapError(() => new ConfigError({ detail: `Could not read ${key}` })),
-  );
-  return Option.filter(
-    Option.map(value, (s) => s.trim()),
-    (s) => s !== "",
-  );
-});
-
-/**
- * A secret from `key` or from the file named by `${key}_FILE`. Exactly one
- * may be set. A trailing newline in the file is dropped.
- */
-const secretVar = Effect.fn("config.secretVar")(function* (key: string) {
-  const direct = yield* optionalVar(key);
-  const file = yield* optionalVar(`${key}_FILE`);
-  if (Option.isSome(direct) && Option.isSome(file)) {
-    return yield* fail(`Set either ${key} or ${key}_FILE, not both`);
-  }
-  if (Option.isSome(file)) {
-    const fs = yield* FileSystem.FileSystem;
-    const content = yield* fs
-      .readFileString(file.value)
-      .pipe(Effect.mapError(() => new ConfigError({ detail: `${key}_FILE: file not readable` })));
-    const trimmed = content.replace(/\r?\n$/, "").trim();
-    if (trimmed === "") return yield* fail(`${key}_FILE: file is empty`);
-    return Option.some(Redacted.make(trimmed));
-  }
-  return Option.map(direct, (value) => Redacted.make(value));
-});
-
-const intVar = Effect.fn("config.intVar")(function* (key: string, fallback: number, min: number, why = "") {
-  const raw = yield* optionalVar(key);
-  if (Option.isNone(raw)) return fallback;
-  const value = Number(raw.value);
-  if (!Number.isInteger(value) || value < min) {
-    return yield* fail(`${key} must be an integer >= ${min}${why}`);
-  }
-  return value;
-});
-
-const boolVar = Effect.fn("config.boolVar")(function* (key: string, fallback: boolean) {
-  const raw = yield* optionalVar(key);
-  if (Option.isNone(raw)) return fallback;
-  const value = raw.value.toLowerCase();
-  if (["1", "true", "yes", "on"].includes(value)) return true;
-  if (["0", "false", "no", "off"].includes(value)) return false;
-  return yield* fail(`${key} must be true or false`);
-});
-
-const listVar = (key: string) =>
-  optionalVar(key).pipe(
-    Effect.map((raw) =>
-      Option.match(raw, {
-        onNone: () => [],
-        onSome: (value) =>
-          value
-            .split(",")
-            .map((s) => s.trim())
-            .filter((s) => s !== ""),
-      }),
-    ),
-  );
+/** Prefix of the HTTP, OAuth and admin-listener variables core reads (FIO_MCP_HOST, ...). */
+const PREFIX = "FIO_MCP_";
 
 const isCalendarDate = (value: string): boolean => {
   if (!DATE.test(value)) return false;
@@ -441,27 +386,12 @@ const loadHttpAuth = Effect.fn("config.loadHttpAuth")(function* (host: string) {
     }
     return { kind: "unauthenticated", onNetwork: true } satisfies HttpAuthConfig;
   }
-  if (Option.isNone(publicUrl)) return yield* fail(`FIO_MCP_ADMIN_PASSWORD_HASH_FILE is set but FIO_MCP_PUBLIC_URL is not. ${HTTP_AUTH_REQUIRED}`);
-  if (Option.isNone(hashFile)) return yield* fail(`FIO_MCP_PUBLIC_URL is set but FIO_MCP_ADMIN_PASSWORD_HASH_FILE is not. ${HTTP_AUTH_REQUIRED}`);
-  const parsedUrl = parsePublicUrl(publicUrl.value);
-  if ("problem" in parsedUrl) return yield* fail(`FIO_MCP_PUBLIC_URL ${parsedUrl.problem}`);
-  const fs = yield* FileSystem.FileSystem;
-  const content = yield* fs
-    .readFileString(hashFile.value)
-    .pipe(Effect.mapError(() => new ConfigError({ detail: "FIO_MCP_ADMIN_PASSWORD_HASH_FILE: file not readable" })));
-  const lines = content.split(/\r?\n/).filter((line) => line.trim() !== "");
-  if (lines.length !== 1) {
-    return yield* fail("FIO_MCP_ADMIN_PASSWORD_HASH_FILE: file must contain exactly one hash line");
-  }
-  const hash = parsePasswordHash(lines[0] ?? "");
-  if (hash instanceof PasswordHashError) {
-    return yield* fail(`FIO_MCP_ADMIN_PASSWORD_HASH_FILE: file ${hash.detail}`);
-  }
+  const credentials = yield* loadOAuthCredentials(PREFIX, FIO_APP, HTTP_AUTH_REQUIRED);
   const dataKey = yield* loadDataKey();
   return {
     kind: "oauth",
-    publicUrl: parsedUrl.origin,
-    passwordHash: Redacted.make(hash),
+    publicUrl: credentials.publicUrl,
+    passwordHash: credentials.passwordHash,
     dataKey,
     accountSeed: yield* loadAccountSeed(),
     totpSecret: yield* loadTotpSecret(),
@@ -484,17 +414,9 @@ const OAUTH_DATA_KEY_REQUIRED = `HTTP mode with OAuth requires FIO_MCP_DATA_KEY_
 
 /** FIO_MCP_DATA_KEY_FILE: 32 bytes as 64 hex digits or base64. Never echoes the content. Fails with `missing` when unset. */
 const loadDataKey = Effect.fn("config.loadDataKey")(function* (missing: string = OAUTH_DATA_KEY_REQUIRED) {
-  const file = yield* optionalVar("FIO_MCP_DATA_KEY_FILE");
-  if (Option.isNone(file)) return yield* fail(missing);
-  const fs = yield* FileSystem.FileSystem;
-  const content = yield* fs
-    .readFileString(file.value)
-    .pipe(Effect.mapError(() => new ConfigError({ detail: "FIO_MCP_DATA_KEY_FILE: file not readable" })));
-  const key = parseDataKey(content);
-  if (key === undefined) {
-    return yield* fail(`FIO_MCP_DATA_KEY_FILE: file must contain 32 bytes as 64 hex digits or base64; ${DATA_KEY_HELP}`);
-  }
-  return key;
+  const key = yield* readDataKeyFile("FIO_MCP_DATA_KEY_FILE", DATA_KEY_HELP);
+  if (Option.isNone(key)) return yield* fail(missing);
+  return key.value;
 });
 
 const TOTP_HELP = "create one with `fio-mcp totp-init`";
@@ -506,88 +428,24 @@ const TOTP_HELP = "create one with `fio-mcp totp-init`";
  * Lowercase, spaces and `=` padding are accepted; at least 16 bytes
  * (128 bits). Never echoes the content.
  */
-const loadTotpSecret = Effect.fn("config.loadTotpSecret")(function* () {
-  const file = yield* optionalVar("FIO_MCP_ADMIN_TOTP_SECRET_FILE");
-  if (Option.isNone(file)) return undefined;
-  const fs = yield* FileSystem.FileSystem;
-  const content = yield* fs
-    .readFileString(file.value)
-    .pipe(Effect.mapError(() => new ConfigError({ detail: "FIO_MCP_ADMIN_TOTP_SECRET_FILE: file not readable" })));
-  const secret = decodeBase32(content);
-  if (secret === undefined) {
-    return yield* fail(`FIO_MCP_ADMIN_TOTP_SECRET_FILE: file must contain a base32 secret; ${TOTP_HELP}`);
-  }
-  if (secret.length < MIN_TOTP_SECRET_BYTES) {
-    return yield* fail(
-      `FIO_MCP_ADMIN_TOTP_SECRET_FILE: the secret must be at least ${MIN_TOTP_SECRET_BYTES} bytes (${Math.ceil((MIN_TOTP_SECRET_BYTES * 8) / 5)} base32 characters); ${TOTP_HELP}`,
-    );
-  }
-  return Redacted.make(secret);
-});
-
-/** A comma-separated list of IP addresses and CIDR networks (parseTrustedProxy). */
-const loadNetworks = Effect.fn("config.loadNetworks")(function* (key: string) {
-  const networks: Array<IpNetwork.IpNetwork> = [];
-  for (const [index, entry] of (yield* listVar(key)).entries()) {
-    const network = parseTrustedProxy(entry);
-    if (network === undefined) {
-      return yield* fail(`${key} entry ${index + 1} must be an IP address or a CIDR network such as 172.18.0.0/16`);
-    }
-    networks.push(network);
-  }
-  return networks;
-});
-
-const loadTrustedProxies = () => loadNetworks("FIO_MCP_TRUSTED_PROXIES");
-
-/** An empty allowlist allows everyone, so a set variable must name at least one network (not just commas). */
-const loadAdminAllowedNetworks = Effect.fn("config.loadAdminAllowedNetworks")(function* () {
-  const networks = yield* loadNetworks("FIO_MCP_ADMIN_ALLOWED_CIDRS");
-  if (networks.length === 0 && Option.isSome(yield* optionalVar("FIO_MCP_ADMIN_ALLOWED_CIDRS"))) {
-    return yield* fail("FIO_MCP_ADMIN_ALLOWED_CIDRS must name at least one IP address or CIDR network");
-  }
-  return networks;
-});
-
-/** Default bind address of the admin listener (FIO_MCP_ADMIN_HOST). */
-export const DEFAULT_ADMIN_HOST = "127.0.0.1";
-
-/** FIO_MCP_ADMIN_HOST / FIO_MCP_ADMIN_PORT; see `TransportConfig.adminListener`. */
-const loadAdminListener = Effect.fn("config.loadAdminListener")(function* (port: number) {
-  const adminHost = yield* optionalVar("FIO_MCP_ADMIN_HOST");
-  const rawPort = yield* optionalVar("FIO_MCP_ADMIN_PORT");
-  if (Option.isNone(rawPort)) {
-    if (Option.isSome(adminHost)) return yield* fail("FIO_MCP_ADMIN_HOST is set but FIO_MCP_ADMIN_PORT is not");
-    return undefined;
-  }
-  const adminPort = Number(rawPort.value);
-  if (!Number.isInteger(adminPort) || adminPort < 1 || adminPort > 65_535) {
-    return yield* fail("FIO_MCP_ADMIN_PORT must be an integer from 1 to 65535");
-  }
-  const listener = { host: Option.getOrElse(adminHost, () => DEFAULT_ADMIN_HOST), port: adminPort };
-  if (listener.port === port) {
-    return yield* fail("FIO_MCP_ADMIN_PORT must differ from FIO_MCP_PORT");
-  }
-  return listener;
-});
+const loadTotpSecret = () =>
+  readTotpSecretFile("FIO_MCP_ADMIN_TOTP_SECRET_FILE", TOTP_HELP).pipe(Effect.map(Option.getOrUndefined));
 
 const loadTransport = Effect.fn("config.loadTransport")(function* () {
   const kind = Option.getOrElse(yield* optionalVar("FIO_MCP_TRANSPORT"), () => "stdio").toLowerCase();
   if (kind === "stdio") return { kind: "stdio" } satisfies TransportConfig;
   if (kind !== "http") return yield* fail("FIO_MCP_TRANSPORT must be stdio or http");
-  const host = Option.getOrElse(yield* optionalVar("FIO_MCP_HOST"), () => DEFAULT_HTTP_HOST);
-  const port = yield* intVar("FIO_MCP_PORT", DEFAULT_HTTP_PORT, 1);
-  if (port > 65_535) return yield* fail("FIO_MCP_PORT must be an integer from 1 to 65535");
+  const { host, port } = yield* loadListenAddress(PREFIX, { host: DEFAULT_HTTP_HOST, port: DEFAULT_HTTP_PORT });
   const transport = {
     kind: "http",
     host,
     port,
     auth: yield* loadHttpAuth(host),
-    allowedOrigins: yield* listVar("FIO_MCP_ALLOWED_ORIGINS"),
-    allowedHosts: (yield* listVar("FIO_MCP_ALLOWED_HOSTS")).map((h) => h.toLowerCase()),
-    trustedProxies: yield* loadTrustedProxies(),
-    adminAllowedNetworks: yield* loadAdminAllowedNetworks(),
-    adminListener: yield* loadAdminListener(port),
+    allowedOrigins: yield* loadAllowedOrigins(PREFIX),
+    allowedHosts: yield* loadAllowedHosts(PREFIX),
+    trustedProxies: yield* loadTrustedProxies(PREFIX),
+    adminAllowedNetworks: yield* loadAdminAllowedNetworks(PREFIX),
+    adminListener: yield* loadAdminListener(PREFIX, port),
   } satisfies TransportConfig;
   if (transport.adminListener !== undefined && transport.auth.kind !== "oauth") {
     return yield* fail("FIO_MCP_ADMIN_PORT needs OAuth (FIO_MCP_PUBLIC_URL); without authentication there is no admin UI");

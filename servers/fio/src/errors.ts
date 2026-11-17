@@ -179,13 +179,7 @@ export class PaymentAuditError extends Schema.TaggedError<PaymentAuditError>()("
 }
 
 /** Invalid configuration. Names the variable, never its value or a path. */
-export class ConfigError extends Schema.TaggedError<ConfigError>()("ConfigError", {
-  detail: Schema.String,
-}) {
-  override get message(): string {
-    return this.detail;
-  }
-}
+export { ConfigError } from "@mcps/core/config/env.js";
 
 /** Errors any FIO request can fail with. */
 export type FioRequestError =
