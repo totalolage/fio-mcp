@@ -8,7 +8,16 @@ import type { Migrations } from "./cache/db.js";
  * import cycle through src/accounts.ts.
  */
 
-/** Ids continue the shared sequence (src/cache/db.ts); 0004 and 0006 are src/oauth/store.ts's. */
+/**
+ * Ids continue the shared sequence (src/cache/db.ts); 0004 and 0006 are src/oauth/store.ts's.
+ *
+ * 0005 also creates `server_settings`, core's settings table
+ * (@mcps/core/server-settings.js: the settings store, the admin password
+ * store and the instance lease use it). It keeps its own statement text,
+ * column for column the same as core's `SERVER_SETTINGS_DDL`, because the
+ * schema stores that text: changing it would make new databases differ
+ * from existing ones.
+ */
 export const ACCOUNT_MIGRATIONS: Migrations = {
   "0005_create_accounts": Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;

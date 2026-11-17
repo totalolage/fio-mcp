@@ -1,4 +1,6 @@
 import { randomBytes } from "node:crypto";
+import { ADMIN_PASSWORD_HASH_KEY } from "@mcps/core/admin/password.js";
+import { makeServerSettings, putSetting } from "@mcps/core/server-settings.js";
 import { Clock, Effect, Option, Redacted, Result, Schema } from "effect";
 import { SqlClient } from "effect/sql";
 import { type Account, tokenFingerprint } from "./accounts.js";
@@ -32,7 +34,7 @@ import {
 
 export const SETTING = {
   dataKeyCheck: "data_key_check",
-  adminPasswordHash: "admin_password_hash",
+  adminPasswordHash: ADMIN_PASSWORD_HASH_KEY,
   /** Set once env accounts were imported, or the accounts were edited at /admin. */
   accountsSeeded: "accounts_seeded",
 } as const;
@@ -108,41 +110,9 @@ export interface NewAccount {
 
 export const newAccountId = Effect.sync(() => `acct_${randomBytes(16).toString("base64url")}`);
 
-const putSettingSql = (sql: SqlClient.SqlClient, name: string, value: string, now: number) =>
-  sql`
-    INSERT INTO server_settings ${sql.insert({ key: name, value, updated_at: now })}
-    ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-  `;
-
 /** `server_settings` rows; values are not secret (hashes, check values, markers). */
 export const makeSettingsStore = Effect.fn("SettingsStore.make")(function* () {
-  const sql = yield* SqlClient.SqlClient;
-
-  const get = (name: string) =>
-    sql<{ value: string }>`SELECT value FROM server_settings WHERE key = ${name}`.pipe(
-      Effect.map(([row]) => Option.map(Option.fromNullishOr(row), (r) => r.value)),
-      storeFailure("read a setting"),
-    );
-
-  const put = (name: string, value: string) =>
-    Effect.flatMap(Clock.currentTimeMillis, (now) => putSettingSql(sql, name, value, now)).pipe(
-      Effect.asVoid,
-      storeFailure("store a setting"),
-    );
-
-  /** True when the setting existed. */
-  const remove = (name: string) =>
-    sql
-      .withTransaction(
-        Effect.gen(function* () {
-          const [row] = yield* sql<{ key: string }>`SELECT key FROM server_settings WHERE key = ${name}`;
-          yield* sql`DELETE FROM server_settings WHERE key = ${name}`;
-          return row !== undefined;
-        }),
-      )
-      .pipe(storeFailure("delete a setting"));
-
-  return { get, put, remove };
+  return yield* makeServerSettings(storeFailure);
 });
 
 export type SettingsStore = Effect.Success<ReturnType<typeof makeSettingsStore>>;
@@ -150,7 +120,8 @@ export type SettingsStore = Effect.Success<ReturnType<typeof makeSettingsStore>>
 export const makeAccountStore = Effect.fn("AccountStore.make")(function* (key: Redacted.Redacted<Uint8Array>) {
   const sql = yield* SqlClient.SqlClient;
   const settings = yield* makeSettingsStore();
-  const putSettingNow = (name: string, value: string, now: number) => putSettingSql(sql, name, value, now);
+  const putSettingNow = (name: string, value: string, now: number) =>
+    putSetting(name, value, now).pipe(Effect.provideService(SqlClient.SqlClient, sql));
 
   const toRecord = (row: AccountRow): Result.Result<AccountRecord, TokenDecryptionFailed> => {
     const sealed = decodeSealed(row.token_sealed);

@@ -1,7 +1,7 @@
 import {
   AdminPassword,
   makeAdminPassword as makeCoreAdminPassword,
-  type PasswordStore,
+  settingsPasswordStore,
 } from "@mcps/core/admin/password.js";
 import { type AdminSettings, AdminLive as CoreAdminLive } from "@mcps/core/admin/server.js";
 import type { AdminApp } from "@mcps/core/admin/tab.js";
@@ -11,7 +11,7 @@ import { makeOAuthStore } from "@mcps/core/oauth/store.js";
 import { Effect, Layer, type Redacted } from "effect";
 import type { HttpRouter } from "effect/http";
 import type { SqlClient } from "effect/sql";
-import { makeSettingsStore, SETTING } from "../account-store.js";
+import { makeSettingsStore } from "../account-store.js";
 import { Accounts } from "../accounts.js";
 import type { Transactions } from "../cache/service.js";
 import { AppConfig } from "../config.js";
@@ -64,13 +64,7 @@ export const AdminLive = (
   ).pipe(Layer.provide(Accounts.resources));
 
 /** The changed admin password's hash, as the `admin_password_hash` setting. */
-const passwordStore = Effect.map(
-  makeSettingsStore(),
-  (settings): PasswordStore => ({
-    get: settings.get(SETTING.adminPasswordHash),
-    put: (line) => settings.put(SETTING.adminPasswordHash, line),
-  }),
-);
+const passwordStore = Effect.map(makeSettingsStore(), settingsPasswordStore);
 
 /**
  * `scrypt` hashes a changed password; tests pass cheaper parameters.
