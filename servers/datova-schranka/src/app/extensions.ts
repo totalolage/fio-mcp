@@ -1,6 +1,9 @@
 import type { AdminTab } from "@mcps/core/admin/tab.js";
 import type { Migrations } from "@mcps/core/migrations.js";
 import { Effect, Layer } from "effect";
+import { auditTab } from "../admin/audit-tab.js";
+import { boxesTab } from "../admin/boxes-tab.js";
+import { readToolGroup } from "../mcp/read-tools.js";
 import type { ToolGroup } from "../mcp/tool-group.js";
 import type { AppServices } from "./services.js";
 
@@ -21,10 +24,17 @@ export type ExtensionRequirements = AppServices | ExtensionServices;
 export const EXTENSION_MIGRATIONS: Migrations = {};
 
 /** Every MCP tool group the server registers. */
-export const TOOL_GROUPS: ReadonlyArray<ToolGroup<ExtensionRequirements>> = [];
+export const TOOL_GROUPS: ReadonlyArray<ToolGroup<ExtensionRequirements>> = [readToolGroup];
 
-/** Admin tabs after core's built-in ones, in display order. */
-export const adminTabs: Effect.Effect<ReadonlyArray<AdminTab>, never, ExtensionRequirements> = Effect.all([]);
+/**
+ * Admin tabs after core's built-in ones, in display order. The boxes tab is
+ * built once and stays first (it serialises box writes on that one
+ * instance); send inserts recipients and filings between boxes and audit.
+ */
+export const adminTabs: Effect.Effect<ReadonlyArray<AdminTab>, never, ExtensionRequirements> = Effect.all([
+  boxesTab,
+  auditTab,
+]);
 
 /**
  * Services the extensions provide to tools, tabs and background layers.
