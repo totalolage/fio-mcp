@@ -2,7 +2,7 @@ import type { Flash } from "@mcps/core/admin/pages.js";
 import { ADMIN_PATH } from "@mcps/core/admin/sessions.js";
 import { type AdminActionContext, type AdminFormFile, type AdminTab, field, file } from "@mcps/core/admin/tab.js";
 import { Redactor } from "@mcps/core/redaction.js";
-import { Effect, Redacted } from "effect";
+import { Effect, Redacted, Semaphore } from "effect";
 import { type AuditFinalOutcome, AuditLog } from "../domain/audit-log.js";
 import { type Box, BoxRegistry, checkBoxSecretLength } from "../domain/boxes.js";
 import { DomainConfig } from "../domain/config.js";
@@ -124,7 +124,7 @@ const secretOf = (credentials: IsdsCredentials) =>
 const labelHoldsSecret = (label: string, secret: string) =>
   secret !== "" && label.toLocaleLowerCase("cs").includes(secret.toLocaleLowerCase("cs"));
 
-const LABEL_HOLDS_SECRET = "The label must not contain the box's password or passphrase.";
+const LABEL_HOLDS_SECRET = "A box label must not contain a box's password or passphrase.";
 
 const boxInfo = (box: Box) => ({ label: box.label, dbId: box.dbId, authKind: box.authKind });
 
@@ -133,6 +133,13 @@ export const boxesTab: Effect.Effect<AdminTab, never, BoxRegistry | AuditLog | R
   const audit = yield* AuditLog;
   const redactor = yield* Redactor;
   const { environment } = yield* DomainConfig;
+  /**
+   * Serializes the actions that change labels or credentials (add, rename,
+   * replace), each from its label/secret check to its write and audit row: this tab is
+   * their only writer, so no check can pass against a state another of
+   * them is about to change.
+   */
+  const labelsAndSecrets = yield* Semaphore.make(1);
 
   /** A safe one-line message of an error: redacted, bounded. */
   const messageOf = (error: { readonly message: string }) => {
@@ -184,6 +191,12 @@ export const boxesTab: Effect.Effect<AdminTab, never, BoxRegistry | AuditLog | R
   const labelExposesSecret = (label: string, incoming?: string) =>
     redactor.redact(label) !== label || (incoming !== undefined && labelHoldsSecret(label, incoming));
 
+  /** Whether a stored box's label (loaded or of another environment) holds `secret`. */
+  const secretInLabels = (secret: string) =>
+    Effect.map(Effect.all([registry.list, registry.skipped]), ([boxes, skipped]) =>
+      [...boxes, ...skipped].some((box) => labelHoldsSecret(box.label, secret)),
+    );
+
   /** Undefined when the second factor passed, else the refusal. */
   const secondFactorRefusal = (context: AdminActionContext, nothing: string) =>
     Effect.map(context.checkSecondFactor, (factor): string | undefined => {
@@ -210,7 +223,10 @@ export const boxesTab: Effect.Effect<AdminTab, never, BoxRegistry | AuditLog | R
     const detail = { authKind: authKindOf(form) };
     const credentials = credentialsOf(form, context.files);
     if (typeof credentials === "string") return refused(`Not added: ${credentials}`, undefined, detail);
-    if (labelExposesSecret(label, secretOf(credentials))) return refused(`Not added: ${LABEL_HOLDS_SECRET}`, undefined, detail);
+    const secret = secretOf(credentials);
+    if (labelExposesSecret(label, secret) || (yield* secretInLabels(secret))) {
+      return refused(`Not added: ${LABEL_HOLDS_SECRET}`, undefined, detail);
+    }
     return yield* registry.add({ label, environment, credentials }).pipe(
       Effect.map(
         (box): Outcome => ({
@@ -261,9 +277,7 @@ export const boxesTab: Effect.Effect<AdminTab, never, BoxRegistry | AuditLog | R
       Effect.catch((error) => Effect.succeed({ error })),
     );
     if ("error" in current) return failed("Not replaced: ", auditedId, detail)(current.error);
-    if (labelHoldsSecret(current.box.label, secretOf(credentials))) {
-      return refused(`Not replaced: ${LABEL_HOLDS_SECRET}`, auditedId, detail);
-    }
+    if (yield* secretInLabels(secretOf(credentials))) return refused(`Not replaced: ${LABEL_HOLDS_SECRET}`, auditedId, detail);
     const factor = yield* secondFactorRefusal(context, "The credentials were not replaced.");
     if (factor !== undefined) return refused(factor, auditedId, { ...detail, secondFactor: "failed" });
     return yield* registry.replaceCredentials(boxId, credentials).pipe(
@@ -327,12 +341,20 @@ export const boxesTab: Effect.Effect<AdminTab, never, BoxRegistry | AuditLog | R
     nav: "first",
     render,
     actions: [
-      { path: ADD_PATH, form: multipart, run: (form, context) => audited(BOX_AUDIT_ACTIONS.add, add(form, context)) },
-      { path: RELABEL_PATH, run: (form) => audited(BOX_AUDIT_ACTIONS.relabel, relabel(form)) },
+      {
+        path: ADD_PATH,
+        form: multipart,
+        run: (form, context) => Semaphore.withPermit(labelsAndSecrets)(audited(BOX_AUDIT_ACTIONS.add, add(form, context))),
+      },
+      {
+        path: RELABEL_PATH,
+        run: (form) => Semaphore.withPermit(labelsAndSecrets)(audited(BOX_AUDIT_ACTIONS.relabel, relabel(form))),
+      },
       {
         path: CREDENTIALS_PATH,
         form: multipart,
-        run: (form, context) => audited(BOX_AUDIT_ACTIONS.replaceCredentials, replaceCredentials(form, context)),
+        run: (form, context) =>
+          Semaphore.withPermit(labelsAndSecrets)(audited(BOX_AUDIT_ACTIONS.replaceCredentials, replaceCredentials(form, context))),
       },
       { path: TEST_PATH, run: (form) => audited(BOX_AUDIT_ACTIONS.test, testConnection(form)) },
       { path: REMOVE_PATH, run: (form, context) => audited(BOX_AUDIT_ACTIONS.remove, remove(form, context)) },

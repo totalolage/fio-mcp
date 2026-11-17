@@ -435,11 +435,11 @@ describe("council follow-ups", () => {
   it("never stores a label that holds the box's password or passphrase", async () => {
     const { app, browser } = await start();
     const added = await browser.actMultipart("/admin/boxes/add", passwordForm(`My ${PASSWORD_A.toUpperCase()}`, "alice", PASSWORD_A));
-    expect(added.flash).toEqual({ kind: "error", text: "Not added: The label must not contain the box's password or passphrase." });
+    expect(added.flash).toEqual({ kind: "error", text: "Not added: A box label must not contain a box's password or passphrase." });
     expect(app.isds.requests).toEqual([]);
     const box = await addAlice(browser);
     const renamed = await browser.act("/admin/boxes/relabel", { box: box.id, label: PASSWORD_A });
-    expect(renamed.flash).toEqual({ kind: "error", text: "Not renamed: The label must not contain the box's password or passphrase." });
+    expect(renamed.flash).toEqual({ kind: "error", text: "Not renamed: A box label must not contain a box's password or passphrase." });
     const checked: Array<string> = [];
     await app.close();
     const restarted = await start({
@@ -454,7 +454,7 @@ describe("council follow-ups", () => {
       "/admin/boxes/credentials",
       passwordForm("", "alice-new", "password-1234", { box: stored?.id ?? "" }),
     );
-    expect(replaced.flash).toEqual({ kind: "error", text: "Not replaced: The label must not contain the box's password or passphrase." });
+    expect(replaced.flash).toEqual({ kind: "error", text: "Not replaced: A box label must not contain a box's password or passphrase." });
     expect(checked).toEqual([]);
     expect((await audits(restarted.app)).map((entry) => [entry.action, entry.outcome])).toEqual([
       ["box_add", "ok"],
@@ -545,13 +545,13 @@ describe("labels never expose another box's secret", () => {
     await browser.actMultipart("/admin/boxes/add", passwordForm("Archive", "bob", PASSWORD_B));
     const archive = (await boxes(app)).find((box) => box.label === "Archive");
     const crossRename = await browser.act("/admin/boxes/relabel", { box: archive?.id ?? "", label: `x ${PASSWORD_A} x` });
-    expect(crossRename.flash).toEqual({ kind: "error", text: "Not renamed: The label must not contain the box's password or passphrase." });
+    expect(crossRename.flash).toEqual({ kind: "error", text: "Not renamed: A box label must not contain a box's password or passphrase." });
     const crossAdd = await browser.actMultipart("/admin/boxes/add", passwordForm(PASSWORD_B, "carol", "carol-password-1"));
-    expect(crossAdd.flash).toEqual({ kind: "error", text: "Not added: The label must not contain the box's password or passphrase." });
+    expect(crossAdd.flash).toEqual({ kind: "error", text: "Not added: A box label must not contain a box's password or passphrase." });
     // A secret the registry registered for a sign-in still in flight.
     await app.run(Effect.map(Redactor, (redactor) => redactor.register(["pending-secret-5k2q"])));
     const pending = await browser.act("/admin/boxes/relabel", { box: archive?.id ?? "", label: "pending-secret-5k2q" });
-    expect(pending.flash?.text).toBe("Not renamed: The label must not contain the box's password or passphrase.");
+    expect(pending.flash?.text).toBe("Not renamed: A box label must not contain a box's password or passphrase.");
     expect((await boxes(app)).map((box) => box.label)).toEqual(["Office", "Archive"]);
     const refusals = (await audits(app)).filter((entry) => entry.outcome === "refused");
     expect(refusals.map((entry) => [entry.action, entry.boxId])).toEqual([
@@ -565,5 +565,62 @@ describe("labels never expose another box's secret", () => {
     const unknown = await browser.actMultipart("/admin/boxes/credentials", passwordForm("", "alice-new", "fresh-password-1", { box: newBoxId() }));
     expect(unknown.flash?.text).toMatch(/^Not replaced: No data box .* is configured\.$/);
     expect(checked).toEqual([]);
+  });
+});
+
+describe("label and secret changes are serialized", () => {
+  it("refuses a secret that another box's label holds", async () => {
+    const { app, browser } = await start();
+    await browser.actMultipart("/admin/boxes/add", passwordForm("Sunflower-2024!", "bob", PASSWORD_B));
+    const added = await browser.actMultipart("/admin/boxes/add", passwordForm("Office", "alice", "sunflower-2024!"));
+    expect(added.flash?.text).toBe("Not added: A box label must not contain a box's password or passphrase.");
+    const box = await addAlice(browser);
+    const replaced = await browser.actMultipart("/admin/boxes/credentials", passwordForm("", "alice-new", "Sunflower-2024!", { box: box.id }));
+    expect(replaced.flash?.text).toBe("Not replaced: A box label must not contain a box's password or passphrase.");
+    expect(app.isds.requests.filter((entry) => entry.request.operation === "GetOwnerInfoFromLogin")).toHaveLength(2);
+  });
+
+  it("holds a rename to the incoming password until the replacement finished, then refuses it", async () => {
+    let entered: () => void = () => undefined;
+    const signingIn = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const base = loginResponder(LOGINS);
+    const { app, browser } = await start({
+      respond: (config, request) =>
+        config.credentials._tag === "Password" && config.credentials.username === "alice-new"
+          ? Effect.sync(() => entered()).pipe(
+              Effect.andThen(Effect.promise(() => gate)),
+              Effect.andThen(base(config, request)),
+            )
+          : base(config, request),
+    });
+    const box = await addAlice(browser);
+    await browser.actMultipart("/admin/boxes/add", passwordForm("Archive", "bob", PASSWORD_B));
+    const archive = (await boxes(app)).find((entry) => entry.label === "Archive");
+    const incoming = "incoming-password-3v8";
+    const replacing = browser.postMultipart("/admin/boxes/credentials", passwordForm("", "alice-new", incoming, { box: box.id }));
+    await signingIn;
+    let renamed = false;
+    const renaming = browser.post("/admin/boxes/relabel", { box: archive?.id ?? "", label: incoming }).then((page) => {
+      renamed = true;
+      return page;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(renamed).toBe(false);
+    release();
+    await Promise.all([replacing, renaming]);
+    expect((await boxes(app)).map((entry) => entry.label)).toEqual(["Office", "Archive"]);
+    const rows = (await audits(app)).filter((entry) => entry.action !== "box_add");
+    expect(rows.map((entry) => [entry.action, entry.outcome])).toEqual([
+      ["box_replace_credentials", "ok"],
+      ["box_relabel", "refused"],
+    ]);
+    const page = await browser.get("/admin");
+    expect(page.html).not.toContain(incoming);
   });
 });
