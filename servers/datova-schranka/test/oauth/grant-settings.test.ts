@@ -44,6 +44,14 @@ describe("grantSettings", () => {
         { delivery_consent_version: "", delivery_consented_at: "2026-11-17T10:00:00.000Z" },
         { delivery_consent_version: DELIVERY_CONSENT_VERSION, delivery_consented_at: "yesterday" },
         { delivery_consent_version: 1, delivery_consented_at: "2026-11-17T10:00:00.000Z" },
+        { delivery_consent_version: "garbage", delivery_consented_at: "2026-11-17T10:00:00.000Z" },
+        { delivery_consent_version: "2026-11-17", delivery_consented_at: "2026-11-17T10:00:00.000Z" },
+        { delivery_consent_version: ` ${DELIVERY_CONSENT_VERSION}`, delivery_consented_at: "2026-11-17T10:00:00.000Z" },
+        { delivery_consent_version: DELIVERY_CONSENT_VERSION, delivery_consented_at: "2026-11-17" },
+        { delivery_consent_version: DELIVERY_CONSENT_VERSION, delivery_consented_at: "2026-11-17T10:00:00+01:00" },
+        { delivery_consent_version: DELIVERY_CONSENT_VERSION, delivery_consented_at: "2026-13-45T10:00:00.000Z" },
+        { delivery_consent_version: DELIVERY_CONSENT_VERSION, delivery_consented_at: 1_763_373_600_000 },
+        {},
       ]) {
         const error = yield* Effect.flip(Effect.asVoid(grantSettings.decode(row)));
         assert.strictEqual(error._tag, "GrantSettingsError", JSON.stringify(row));

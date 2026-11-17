@@ -111,6 +111,23 @@ describe("consent approval", () => {
     assert.deepStrictEqual(await state(h), { grants: [], codes: 0, audit: [] });
   });
 
+  it("shows the page again with the posted scopes and the delivery consent unticked", async () => {
+    const h = await start();
+    for (const scopes of [[SEND_SCOPE], [READ_SCOPE]]) {
+      const { url } = await clientAuthorization(h, [READ_SCOPE, SEND_SCOPE]);
+      // Ticked, but no box selected: core shows the page again.
+      const response = await submitConsent(await openConsent(h, url), { scopes, boxes: [], deliveryConsent: true });
+      assert.strictEqual(response.status, 400);
+      const html = await response.text();
+      for (const scope of [READ_SCOPE, SEND_SCOPE]) {
+        const tag = inputTag(html, "scope", scope) ?? "";
+        assert.strictEqual(tag.includes(" checked"), scopes.includes(scope), `${scope} after posting ${scopes}`);
+      }
+      assert.notInclude(inputTag(html, "isds_delivery_consent", "on") ?? "missing checked", "checked");
+    }
+    assert.deepStrictEqual(await state(h), { grants: [], codes: 0, audit: [] });
+  });
+
   it("refuses an approval without any scope and stores nothing", async () => {
     const h = await start();
     const { url } = await clientAuthorization(h);

@@ -1,24 +1,33 @@
 import { type GrantSettings, GrantSettingsError } from "@mcps/core/oauth/grant-settings.js";
 import { DateTime, Effect, Schema } from "effect";
 import { READ_SCOPE } from "../mcp/tool-group.js";
-import { DELIVERY_CONSENT_FIELD, DELIVERY_CONSENT_VERSION } from "./consent.js";
+import { DELIVERY_CONSENT_FIELD, DELIVERY_CONSENT_VERSION, DELIVERY_CONSENT_VERSION_PATTERN } from "./consent.js";
 
 /**
  * A grant's delivery consent (principal.settings, src/mcp/caller.ts): the
- * wording version the owner ticked and when (ISO 8601). Both are null on a
- * grant without isds:read, and both are set on every grant with it.
+ * wording version the owner ticked and when (ISO 8601 UTC). Both are null on
+ * a grant without isds:read, and both are set on every grant with it. A
+ * stored value of any other shape fails the grant read (fail closed); which
+ * versions a tool accepts is ACCEPTED_DELIVERY_CONSENT_VERSIONS.
  */
 export interface DeliveryConsentSettings {
   readonly deliveryConsentVersion: string | null;
   readonly deliveryConsentedAt: string | null;
 }
 
+// As DateTime.formatIso writes it: UTC with milliseconds.
+const ISO_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+
 const IsoTimestamp = Schema.String.check(
-  Schema.makeFilter((text) => !Number.isNaN(Date.parse(text)) || "an ISO 8601 timestamp"),
+  Schema.makeFilter((text) => (ISO_UTC.test(text) && !Number.isNaN(Date.parse(text))) || "an ISO 8601 UTC timestamp"),
+);
+
+const ConsentVersion = Schema.String.check(
+  Schema.makeFilter((text) => DELIVERY_CONSENT_VERSION_PATTERN.test(text) || "a delivery consent version"),
 );
 
 const SettingsSchema = Schema.Union([
-  Schema.Struct({ deliveryConsentVersion: Schema.NonEmptyString, deliveryConsentedAt: IsoTimestamp }),
+  Schema.Struct({ deliveryConsentVersion: ConsentVersion, deliveryConsentedAt: IsoTimestamp }),
   Schema.Struct({ deliveryConsentVersion: Schema.Null, deliveryConsentedAt: Schema.Null }),
 ]);
 
