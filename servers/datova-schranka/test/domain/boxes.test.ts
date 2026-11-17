@@ -555,3 +555,91 @@ describe("BoxRegistry changes under interruption", () => {
     ),
   );
 });
+
+describe("BoxRegistry edge cases", () => {
+  it.effect("registers the secret of an add whose login fails", () =>
+    withDatabase(
+      Effect.gen(function* () {
+        const { registry, registered } = yield* startRegistry({
+          logins: LOGINS,
+          onMake: () => Effect.fail(new IsdsCredentialsError({ detail: "rejected" })),
+        });
+        yield* Effect.flip(
+          registry.add({ label: "A", environment: "production", credentials: passwordCredentials("alice", "failed-pw") }),
+        );
+        expect(registered).toContain("failed-pw");
+      }),
+    ),
+  );
+
+  it.effect("a skipped box of the other environment still holds its label", () =>
+    withDatabase(
+      Effect.gen(function* () {
+        const testEnv = yield* startRegistry({ logins: LOGINS, environment: "test" });
+        yield* testEnv.registry.add({ label: "Sandbox", environment: "test", credentials: passwordCredentials("alice") });
+        const production = yield* startRegistry({ logins: LOGINS });
+        const error = yield* Effect.flip(
+          production.registry.add({ label: "SANDBOX", environment: "production", credentials: passwordCredentials("bob") }),
+        );
+        expect(error).toMatchObject({ _tag: "BoxLabelTaken" });
+      }),
+    ),
+  );
+
+  it.effect("fails startup with DomainStoreError when a stored owner does not decode", () =>
+    withDatabase(
+      Effect.gen(function* () {
+        const { registry } = yield* startRegistry({ logins: LOGINS });
+        yield* registry.add({ label: "A", environment: "production", credentials: passwordCredentials("alice") });
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`UPDATE boxes SET owner_json = ${"{not json"}`;
+        expect(yield* Effect.flip(startRegistry({ logins: LOGINS }))).toMatchObject({ _tag: "DomainStoreError" });
+      }),
+    ),
+  );
+
+  it.effect("of two concurrent adds of the same data box exactly one is stored", () =>
+    withDatabase(
+      Effect.gen(function* () {
+        const { registry } = yield* startRegistry({ logins: LOGINS });
+        const results = yield* Effect.all(
+          [
+            Effect.result(registry.add({ label: "A", environment: "production", credentials: passwordCredentials("alice") })),
+            Effect.result(
+              registry.add({ label: "B", environment: "production", credentials: passwordCredentials("alice-again") }),
+            ),
+          ],
+          { concurrency: "unbounded" },
+        );
+        const stored = yield* registry.list;
+        expect(stored.length).toBe(1);
+        expect(results.filter((result) => result._tag === "Success").length).toBe(1);
+        const failure = results.find((result) => result._tag === "Failure");
+        expect(failure?._tag === "Failure" ? failure.failure : undefined).toMatchObject({
+          _tag: "BoxAlreadyAdded",
+          existingBoxId: stored[0]?.id,
+        });
+        expect(yield* countRows("boxes")).toBe(1);
+      }),
+    ),
+  );
+
+  it.effect("a remove that fails part way changes nothing", () =>
+    withDatabase(
+      Effect.gen(function* () {
+        const { registry } = yield* startRegistry({ logins: LOGINS });
+        const box = yield* registry.add({ label: "A", environment: "production", credentials: passwordCredentials("alice") });
+        yield* insertTier(box.id, "rcp0001");
+        yield* insertFiling({ id: "f1", boxId: box.id, state: "awaiting_approval" });
+        yield* insertNonce({ hash: "n1", filingId: "f1", boxId: box.id });
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`CREATE TRIGGER refuse_box_delete BEFORE DELETE ON boxes BEGIN SELECT RAISE(ABORT, 'refused'); END`;
+        expect(yield* Effect.flip(registry.remove(box.id))).toMatchObject({ _tag: "DomainStoreError" });
+        expect(yield* registry.list).toEqual([box]);
+        expect(yield* countRows("recipient_tiers")).toBe(1);
+        expect((yield* filingRows).map((row) => [row.state, row.payload_sealed])).toEqual([["awaiting_approval", "sealed-f1"]]);
+        expect((yield* nonceRows).map((row) => row.used_at)).toEqual([null]);
+      }),
+    ),
+  );
+});

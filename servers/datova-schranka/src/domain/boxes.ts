@@ -261,7 +261,7 @@ const makeBoxRegistry = Effect.gen(function* () {
       Result.mapError(decodeStoredCredentials(Redacted.value(plaintext)), () => "invalid" as const),
     );
     if (Result.isFailure(stored)) return yield* new BoxCredentialsUnreadable({ boxId: row.id });
-    const owner = yield* decodeOwner(row.owner_json).pipe(storeFailure("read a stored data box"));
+    const owner = yield* decodeOwner(row.owner_json).pipe(storeFailure(`read the owner of data box ${row.id}`));
     const box: Box = {
       id: row.id,
       dbId: row.db_id,
@@ -538,6 +538,8 @@ export class BoxRegistry extends Context.Service<BoxRegistry, BoxRegistryShape>(
    * The boxes stored in the database. Boxes of the other ISDS environment are
    * not loaded (see `skipped`); a box whose credentials do not decrypt fails
    * startup. Passwords and passphrases are registered with the Redactor.
+   * Each change runs its own transaction and publishes once it commits, so
+   * do not call one inside an outer `withTransaction`.
    */
   static readonly layer: Layer.Layer<
     BoxRegistry,
