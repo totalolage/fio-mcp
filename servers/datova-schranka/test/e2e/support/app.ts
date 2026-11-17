@@ -10,9 +10,11 @@
  * database, the ZFO store, a throwaway data key and the admin password hash.
  *
  * Credentials passed to the admin helpers are never logged or rendered by
- * the harness: the server's log lines go through its Redactor into `logs`
- * (nothing reaches stderr), and every text the harness returns (logs, admin
- * messages, audit cells) has those values replaced with SCRUBBED.
+ * the harness: the server's log lines (and those of effects given to `run`)
+ * go through the app's Redactor into memory only, nothing reaches stderr,
+ * and every text the harness returns or throws (logs, admin messages, pages,
+ * audit cells, consent and MCP errors) has those values, raw or
+ * HTML-escaped, replaced with SCRUBBED.
  */
 
 import { randomBytes } from "node:crypto";
@@ -124,7 +126,7 @@ export interface Grant {
 }
 
 export interface McpOptions {
-  /** Per-request timeout of the MCP client (default: the SDK's 60 s); live ISDS calls can take long. */
+  /** Per-request timeout of the MCP client, initialization included (default: the SDK's 60 s); live ISDS calls can take long. */
   readonly requestTimeoutMs?: number;
 }
 
@@ -140,7 +142,7 @@ export interface E2eApp {
   readonly base: string;
   /** The data directory (database, ZFO store, key and hash files); removed by close. */
   readonly dir: string;
-  /** The OAuth view of the app for test/support/oauth.ts's helpers (requests go to the socket). */
+  /** The OAuth view of the app for test/support/oauth.ts's helpers (requests go to the socket; its logs are scrubbed, its helpers' errors are not). */
   readonly oauth: OAuthHarness;
   /** Runs an effect with the app's own services. */
   readonly run: <A, E>(effect: Effect.Effect<A, E, HarnessServices>) => Promise<A>;
@@ -173,11 +175,32 @@ async function e2eEnv(dir: string, extra: Readonly<Record<string, string>>) {
   };
 }
 
-/** Replaces every known credential value in `text`. */
+const escapeHtml = (text: string) =>
+  text
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+
+/** Replaces every known credential value, raw or HTML-escaped, longest first (so one inside another goes too). */
 const scrubber = (secrets: Set<string>) => (text: string) => {
+  const forms = Array.from(secrets)
+    .filter((secret) => secret !== "")
+    .flatMap((secret) => [secret, escapeHtml(secret)])
+    .sort((a, b) => b.length - a.length);
   let out = text;
-  for (const secret of secrets) if (secret !== "") out = out.replaceAll(secret, SCRUBBED);
+  for (const form of forms) out = out.replaceAll(form, SCRUBBED);
   return out;
+};
+
+/** Runs `f`, rethrowing any failure with credentials scrubbed from its message (and no cause). */
+const scrubbingErrors = async <A>(scrub: (text: string) => string, f: () => Promise<A>): Promise<A> => {
+  try {
+    return await f();
+  } catch (error) {
+    throw new Error(scrub(error instanceof Error ? error.message : String(error)));
+  }
 };
 
 const unescapeHtml = (text: string) =>
@@ -239,7 +262,8 @@ async function adminSession(
   // The session's form token comes with its first page.
   await get(signedIn.location ?? "/admin");
 
-  const act = async (form: FormData): Promise<AdminOutcome> => {
+  const act = (form: FormData): Promise<AdminOutcome> => scrubbingErrors(scrub, () => addBox(form));
+  const addBox = async (form: FormData): Promise<AdminOutcome> => {
     const posted = await post(ADD_PATH, form);
     if (posted.status !== 303 || posted.location === null) {
       return { status: posted.status, kind: undefined, text: scrub(cellText(posted.html)).slice(0, 300), added: false };
@@ -297,35 +321,36 @@ export async function startE2eApp(options: E2eOptions): Promise<E2eApp> {
     const secrets = new Set<string>();
     const scrub = scrubber(secrets);
     const lines: Array<string> = [];
-    // The app's log lines through the app's own Redactor (the instance its services register box secrets with).
-    const capture = Layer.unwrap(
-      Effect.map(Effect.service(Redactor), (redactor) =>
-        Logger.layer([
-          Logger.make<unknown, void>((entry) => {
-            lines.push(redactor.redact(Logger.formatLogFmt.log(entry)));
-          }),
-        ]),
-      ),
-    ).pipe(Layer.provide(RedactorLive));
+    // Log lines through the app's own Redactor (the instance its services register box secrets with).
+    const capture = (redactor: Redactor["Service"]) =>
+      Logger.layer([
+        Logger.make<unknown, void>((entry) => {
+          lines.push(redactor.redact(Logger.formatLogFmt.log(entry)));
+        }),
+      ]);
+    const appCapture = Layer.unwrap(Effect.map(Effect.service(Redactor), capture)).pipe(Layer.provide(RedactorLive));
     const config = await Effect.runPromise(loadConfigFrom(await e2eEnv(dir, options.env ?? {})));
     const platform = Layer.mergeAll(
       Layer.succeed(AppConfig, { ...config, http: { ...config.http, port: 0 } }),
       NodeFileSystem.layer,
       options.isds === "live" ? IsdsTransports.Live : options.isds,
     );
-    const app = httpApp(options.features ?? FEATURES).pipe(Layer.provide(platform), Layer.provide(capture));
+    const app = httpApp(options.features ?? FEATURES).pipe(Layer.provide(platform), Layer.provide(appCapture));
     const services = await Effect.runPromise(Layer.buildWithScope(app, scope));
     const address = Context.get(services, HttpServer.HttpServer).address;
     const base = `http://127.0.0.1:${"port" in address ? address.port : 0}`;
+    const runCapture = capture(Context.get(services, Redactor));
     const run = <A, E>(effect: Effect.Effect<A, E, HarnessServices>) =>
-      Effect.runPromise(effect.pipe(Effect.provideContext(services)));
+      Effect.runPromise(effect.pipe(Effect.provideContext(services), Effect.provide(runCapture)));
     const fetch = socketFetch(base);
     const refuse = () => Promise.reject(new Error("add boxes through the admin tab"));
     const oauth: OAuthHarness = {
       fetch,
       // Not wired: the app runs on real time.
       clock: new SkewedClock(),
-      logs: lines,
+      get logs() {
+        return lines.map(scrub);
+      },
       store: (f) => run(Effect.flatMap(makeOAuthStore(undefined, grantSettings), f)),
       sql: run,
       run,
@@ -339,31 +364,39 @@ export async function startE2eApp(options: E2eOptions): Promise<E2eApp> {
       run,
       logs: () => lines.map(scrub),
       admin: () => adminSession(fetch, secrets, scrub),
-      consent: async (request) => {
-        const tokens = await tokensFor(oauth, {
-          boxes: request.boxes,
-          scopes: request.scopes,
-          deliveryConsent: request.deliveryConsent,
-        });
-        return { clientId: tokens.clientId, access: tokens.access, refresh: tokens.refresh };
-      },
-      mcp: async (access, mcpOptions = {}) => {
-        const client = new Client({ name: "datova-schranka-e2e", version: "1.0.0" });
-        sessions.push(() => client.close());
-        await client.connect(
-          new StreamableHTTPClientTransport(new URL("/mcp", base), {
-            requestInit: { headers: { authorization: `Bearer ${access}` } },
-          }),
-        );
-        const requestOptions =
-          mcpOptions.requestTimeoutMs === undefined ? undefined : { timeout: mcpOptions.requestTimeoutMs };
-        return {
-          client,
-          listTools: async () => (await client.listTools(undefined, requestOptions)).tools,
-          call: async (name, args = {}) =>
-            (await client.callTool({ name, arguments: args }, undefined, requestOptions)) as CallToolResult,
-        };
-      },
+      consent: (request) =>
+        scrubbingErrors(scrub, async () => {
+          const tokens = await tokensFor(oauth, {
+            boxes: request.boxes,
+            scopes: request.scopes,
+            deliveryConsent: request.deliveryConsent,
+          });
+          if (tokens.access === "undefined" || tokens.access === "") throw new Error("the token endpoint issued no access token");
+          return { clientId: tokens.clientId, access: tokens.access, refresh: tokens.refresh };
+        }),
+      mcp: (access, mcpOptions = {}) =>
+        scrubbingErrors(scrub, async () => {
+          const client = new Client({ name: "datova-schranka-e2e", version: "1.0.0" });
+          sessions.push(() => client.close());
+          const requestOptions =
+            mcpOptions.requestTimeoutMs === undefined ? undefined : { timeout: mcpOptions.requestTimeoutMs };
+          await client.connect(
+            new StreamableHTTPClientTransport(new URL("/mcp", base), {
+              requestInit: { headers: { authorization: `Bearer ${access}` } },
+            }),
+            requestOptions,
+          );
+          return {
+            client,
+            listTools: () =>
+              scrubbingErrors(scrub, async () => (await client.listTools(undefined, requestOptions)).tools),
+            call: (name, args = {}) =>
+              scrubbingErrors(
+                scrub,
+                async () => (await client.callTool({ name, arguments: args }, undefined, requestOptions)) as CallToolResult,
+              ),
+          };
+        }),
       close,
     };
   } catch (error) {
