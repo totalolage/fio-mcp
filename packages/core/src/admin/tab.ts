@@ -1,4 +1,4 @@
-import type { Effect } from "effect";
+import type { Effect, Redacted } from "effect";
 import type { AppIdentity } from "../app-identity.js";
 import type { GrantSettings } from "../oauth/grant-settings.js";
 import type { LoginResult } from "../oauth/login.js";
@@ -86,6 +86,43 @@ export interface AdminActionContext {
    * Origin and CSRF checks passed.
    */
   readonly checkSecondFactor: Effect.Effect<LoginResult<void>>;
+  /**
+   * The files of a multipart form (`AdminFormLimits.multipart`), in the
+   * order sent; empty for a url-encoded form. Its text fields are in `form`.
+   */
+  readonly files: ReadonlyArray<AdminFormFile>;
+}
+
+/** A file of a verified multipart form, held in memory. */
+export interface AdminFormFile {
+  /** The form field's name. */
+  readonly field: string;
+  /** The file name the browser sent (untrusted; "" when a file input was left empty). */
+  readonly name: string;
+  /** The content type the browser sent (untrusted). */
+  readonly contentType: string;
+  /** The bytes, redacted so that logging or printing the file never shows them. */
+  readonly content: Redacted.Redacted<Uint8Array>;
+}
+
+/**
+ * How core reads a tab action's form. Without it: url-encoded only, at most
+ * DEFAULT_MAX_FORM_BYTES (16 KiB).
+ */
+export interface AdminFormLimits {
+  /**
+   * The largest request body in bytes, the whole multipart body included.
+   * A larger body is refused (like a form without a valid CSRF token) and
+   * not read past this size; the action does not run.
+   */
+  readonly maxBytes?: number | undefined;
+  /**
+   * Also accept multipart/form-data (for example a file upload, with
+   * `enctype="multipart/form-data"` on the form); its files reach the action
+   * in `context.files`. The session, Origin, CSRF token and second factor
+   * are checked exactly as for a url-encoded form.
+   */
+  readonly multipart?: boolean | undefined;
 }
 
 /** A form the tab handles. */
@@ -99,6 +136,8 @@ export interface AdminTabAction {
    * hold a secret) shows once on the `back` page.
    */
   readonly run: (form: URLSearchParams, context: AdminActionContext) => Effect.Effect<Flash, { readonly message: string }>;
+  /** A larger or multipart form; a url-encoded form of at most 16 KiB when absent. */
+  readonly form?: AdminFormLimits | undefined;
 }
 
 export interface AdminTab {
@@ -120,4 +159,10 @@ export interface AdminTab {
 export const field = (form: URLSearchParams, name: string) => {
   const values = form.getAll(name);
   return values.length === 1 ? values[0] : undefined;
+};
+
+/** The one file sent as `name`; repeated or missing is undefined. */
+export const file = (files: ReadonlyArray<AdminFormFile>, name: string) => {
+  const matching = files.filter((entry) => entry.field === name);
+  return matching.length === 1 ? matching[0] : undefined;
 };

@@ -8,15 +8,17 @@
  * web handler, with a cookie-keeping browser; PEER_HEADER sets the socket
  * peer address.
  */
+import { createServer } from "node:http";
+import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import { SqliteClient } from "@effect/sql-sqlite-node";
-import { Clock, Effect, Exit, Layer, Option, Redacted, Ref, Scope, Stream } from "effect";
+import { Clock, Context, Effect, Exit, Layer, Option, Redacted, Ref, Scope, Stream } from "effect";
 import { HttpRouter, HttpServer, HttpServerRequest } from "effect/http";
 import { SqlClient } from "effect/sql";
 import { csrfField, type Flash, hidden } from "../../src/admin/pages.js";
 import { AdminPassword, type AdminPasswordShape, type PasswordStore } from "../../src/admin/password.js";
 import { AdminLive, type SecondFactorCheck } from "../../src/admin/server.js";
 import { ADMIN_PATH } from "../../src/admin/sessions.js";
-import { type AdminApp, type AdminGrantSettings, type AdminTab, field } from "../../src/admin/tab.js";
+import { type AdminApp, type AdminFormFile, type AdminGrantSettings, type AdminTab, field, file } from "../../src/admin/tab.js";
 import { hashPassword, PasswordHashError, parsePasswordHash } from "../../src/oauth/crypto.js";
 import { type GrantSettings, GrantSettingsError } from "../../src/oauth/grant-settings.js";
 import { escapeHtml } from "../../src/oauth/pages.js";
@@ -45,8 +47,26 @@ export const NOTE_SETTINGS: GrantSettings = {
   fromConsent: () => Effect.succeed(""),
 };
 
-/** The demo app's tab: lists the boxes and adds one. */
-const boxesTab = (boxes: Ref.Ref<ReadonlyArray<Resource>>): AdminTab => ({
+/** The largest certificate import form (AdminFormLimits.maxBytes of /admin/boxes/import). */
+export const IMPORT_MAX_BYTES = 256 * 1024;
+/** The largest bulk-add form (url-encoded). */
+export const BULK_MAX_BYTES = 64 * 1024;
+
+/** What the multipart import action received. */
+export interface DemoImport {
+  readonly label: string | undefined;
+  readonly passphrase: string | undefined;
+  readonly certificate: AdminFormFile | undefined;
+  readonly files: ReadonlyArray<AdminFormFile>;
+}
+
+/**
+ * The demo app's tab: lists the boxes and adds one; imports a box
+ * certificate (a multipart form with a file, up to IMPORT_MAX_BYTES, behind
+ * the second factor) and adds boxes in bulk (url-encoded, up to
+ * BULK_MAX_BYTES).
+ */
+const boxesTab = (boxes: Ref.Ref<ReadonlyArray<Resource>>, imports: Ref.Ref<ReadonlyArray<DemoImport>>): AdminTab => ({
   id: "boxes",
   label: "Boxes",
   path: ADMIN_PATH,
@@ -66,6 +86,28 @@ const boxesTab = (boxes: Ref.Ref<ReadonlyArray<Resource>>): AdminTab => ({
           Effect.as<Flash>({ kind: "ok", text: `Added box “${label}”.` }),
         );
       },
+    },
+    {
+      path: `${ADMIN_PATH}/boxes/import`,
+      form: { maxBytes: IMPORT_MAX_BYTES, multipart: true },
+      run: (form, context) =>
+        Effect.flatMap(context.checkSecondFactor, (factor) => {
+          if (factor._tag !== "Accepted") return Effect.fail({ message: `Not imported: ${factor._tag}.` });
+          const received: DemoImport = {
+            label: field(form, "label"),
+            passphrase: field(form, "passphrase"),
+            certificate: file(context.files, "certificate"),
+            files: context.files,
+          };
+          return Ref.update(imports, (list) => [...list, received]).pipe(
+            Effect.as<Flash>({ kind: "ok", text: `Imported ${received.certificate === undefined ? "no" : "a"} certificate.` }),
+          );
+        }),
+    },
+    {
+      path: `${ADMIN_PATH}/boxes/bulk`,
+      form: { maxBytes: BULK_MAX_BYTES },
+      run: (form) => Effect.succeed<Flash>({ kind: "ok", text: `Got ${(field(form, "labels") ?? "").length} characters.` }),
     },
   ],
 });
@@ -178,12 +220,16 @@ export interface DemoAdminOptions {
   readonly password?: ((real: AdminPasswordShape) => AdminPasswordShape) | undefined;
   /** AdminSettings.allowedNetworks, as CIDR strings. */
   readonly allowedNetworks?: ReadonlyArray<string> | undefined;
+  /** Serve on a Node HTTP server on 127.0.0.1 (as apps do) instead of a web handler. */
+  readonly node?: boolean | undefined;
 }
 
 export interface DemoAdmin {
   readonly fetch: (request: Request) => Promise<Response>;
   /** Runs an OAuth store operation (with the app's grant settings) against the app's database. */
   readonly store: <A, E>(f: (store: OAuthStore) => Effect.Effect<A, E, SqlClient.SqlClient>) => Promise<A>;
+  /** The certificate imports the multipart action received, oldest first. */
+  readonly imports: () => Promise<ReadonlyArray<DemoImport>>;
   readonly close: () => Promise<void>;
 }
 
@@ -197,6 +243,7 @@ export async function startDemoAdmin(options: DemoAdminOptions = {}): Promise<De
   const appStore = await withDb(makeOAuthStore(undefined, NOTE_SETTINGS));
   const boxes = await Effect.runPromise(Ref.make<ReadonlyArray<Resource>>([{ id: "box-1", label: "Inbox" }]));
   const locked = await Effect.runPromise(Ref.make(0));
+  const imports = await Effect.runPromise(Ref.make<ReadonlyArray<DemoImport>>([]));
   const demoApp: AdminApp = {
     identity: DEMO_IDENTITY,
     resourcesHeading: "Boxes",
@@ -217,16 +264,43 @@ export async function startDemoAdmin(options: DemoAdminOptions = {}): Promise<De
         ).pipe(
           Layer.provide(realPassword),
         );
-  const admin = AdminLive({ publicUrl: PUBLIC_URL, allowedNetworks, secondFactor: options.secondFactor }, demoApp, Effect.succeed([boxesTab(boxes), shelvesTab(locked)])).pipe(
+  const admin = AdminLive({ publicUrl: PUBLIC_URL, allowedNetworks, secondFactor: options.secondFactor }, demoApp, Effect.succeed([boxesTab(boxes, imports), shelvesTab(locked)])).pipe(
     Layer.provide(password),
     Layer.provide(Layer.succeed(Resources, Resources.of({ list: Ref.get(boxes), changes: Stream.empty }))),
     Layer.provide(Layer.succeedContext(db)),
   );
+  const store: DemoAdmin["store"] = (f) => withDb(Effect.flatMap(makeOAuthStore(undefined, NOTE_SETTINGS), f));
+  const importsOf = () => Effect.runPromise(Ref.get(imports));
+  if (options.node === true) {
+    const served = HttpRouter.serve(Layer.mergeAll(admin, peerFromHeader), { disableLogger: true }).pipe(
+      Layer.provideMerge(NodeHttpServer.layer(createServer, { host: "127.0.0.1", port: 0 })),
+    );
+    const context = await Effect.runPromise(Layer.buildWithScope(served, scope));
+    const address = Context.get(context, HttpServer.HttpServer).address;
+    const base = `http://127.0.0.1:${"port" in address ? address.port : 0}`;
+    return {
+      // The same request, sent over HTTP; redirects come back as they are.
+      fetch: (request) => {
+        const url = new URL(request.url);
+        const init: RequestInit & { duplex?: "half" } = { method: request.method, headers: request.headers, redirect: "manual" };
+        if (request.body !== null) {
+          init.body = request.body;
+          init.duplex = "half";
+        }
+        // @effect-diagnostics-next-line globalFetch:off
+        return fetch(`${base}${url.pathname}${url.search}`, init);
+      },
+      store,
+      imports: importsOf,
+      close: () => Effect.runPromise(Scope.close(scope, Exit.void)),
+    };
+  }
   const app = Layer.mergeAll(admin, peerFromHeader).pipe(Layer.provide(HttpServer.layerServices));
   const web = HttpRouter.toWebHandler(app, { disableLogger: true });
   return {
     fetch: (request) => web.handler(request),
-    store: (f) => withDb(Effect.flatMap(makeOAuthStore(undefined, NOTE_SETTINGS), f)),
+    store,
+    imports: importsOf,
     close: async () => {
       await web.dispose();
       await Effect.runPromise(Scope.close(scope, Exit.void));
@@ -267,6 +341,25 @@ export class AdminBrowser {
     const headers: Record<string, string> = { ...this.headers, "content-type": "application/x-www-form-urlencoded", origin: PUBLIC_URL };
     if (this.cookie !== undefined) headers.cookie = this.cookie;
     return this.absorb(await this.app.fetch(new Request(new URL(path, PUBLIC_URL), { method: "POST", headers, body })));
+  }
+
+  /**
+   * Posts any body (a multipart FormData, a string, a stream) with the
+   * cookie and the public Origin; `headers` add to or replace those.
+   */
+  async send(path: string, body: FormData | string | Uint8Array<ArrayBuffer> | ReadableStream<Uint8Array>, headers: Record<string, string> = {}) {
+    const all: Record<string, string> = { ...this.headers, origin: PUBLIC_URL };
+    if (this.cookie !== undefined) all.cookie = this.cookie;
+    let payload = body;
+    if (body instanceof FormData) {
+      // Sent as bytes: undici's FormData stream fails unhandled when the server stops reading it.
+      const encoded = new Response(body);
+      all["content-type"] = encoded.headers.get("content-type") ?? "";
+      payload = new Uint8Array(await encoded.arrayBuffer());
+    }
+    const init: RequestInit & { duplex?: "half" } = { method: "POST", headers: { ...all, ...headers }, body: payload };
+    if (payload instanceof ReadableStream) init.duplex = "half";
+    return this.absorb(await this.app.fetch(new Request(new URL(path, PUBLIC_URL), init)));
   }
 
   async signIn(extra: Record<string, string> = {}) {
