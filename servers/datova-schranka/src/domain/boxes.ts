@@ -295,8 +295,14 @@ const makeBoxRegistry = Effect.gen(function* () {
   yield* Effect.logInfo(`datova-schranka: ${initial.length} data boxes loaded`);
 
   const current = yield* SubscriptionRef.make<ReadonlyArray<Box>>(initial.map((entry) => entry.box));
-  /** Serializes changes so the database, `entries` and `current` move together. */
   const lock = yield* Semaphore.make(1);
+  /**
+   * Runs one change alone and uninterruptibly, so a committed write is
+   * always published to `entries` and `current`. Only database work goes
+   * here; logins happen before.
+   */
+  const exclusive = <A, E, R>(change: Effect.Effect<A, E, R>) =>
+    Semaphore.withPermit(lock)(Effect.uninterruptible(change));
 
   const find = (boxId: string): Effect.Effect<Entry, BoxNotFound> =>
     Effect.suspend(() => {
@@ -390,7 +396,7 @@ const makeBoxRegistry = Effect.gen(function* () {
     if (taken !== undefined) return yield* taken;
     redactor.register(secretsOf(input.credentials));
     const { owner, dbId } = yield* login(input.credentials);
-    return yield* Semaphore.withPermit(lock)(
+    return yield* exclusive(
       Effect.gen(function* () {
         const id = newBoxId();
         const now = yield* Clock.currentTimeMillis;
@@ -432,7 +438,7 @@ const makeBoxRegistry = Effect.gen(function* () {
 
   const relabel = Effect.fn("BoxRegistry.relabel")(function* (boxId: string, newLabel: string) {
     const label = yield* checkLabel(newLabel);
-    return yield* Semaphore.withPermit(lock)(
+    return yield* exclusive(
       Effect.gen(function* () {
         const entry = yield* find(boxId);
         const now = yield* Clock.currentTimeMillis;
@@ -455,7 +461,7 @@ const makeBoxRegistry = Effect.gen(function* () {
     yield* find(boxId);
     redactor.register(secretsOf(credentials));
     const { owner, dbId } = yield* login(credentials);
-    return yield* Semaphore.withPermit(lock)(
+    return yield* exclusive(
       Effect.gen(function* () {
         const entry = yield* find(boxId);
         if (dbId !== entry.box.dbId) {
@@ -488,7 +494,7 @@ const makeBoxRegistry = Effect.gen(function* () {
   );
 
   const remove = Effect.fn("BoxRegistry.remove")(function* (boxId: string) {
-    return yield* Semaphore.withPermit(lock)(
+    return yield* exclusive(
       Effect.gen(function* () {
         const entry = yield* find(boxId);
         const now = yield* Clock.currentTimeMillis;

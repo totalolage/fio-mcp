@@ -1,6 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
 import { Resources } from "@mcps/core/resources.js";
-import { Context, Effect, Fiber, Layer, Redacted, type Scope, Stream } from "effect";
+import { Context, Deferred, Effect, Fiber, Layer, Redacted, type Scope, Stream } from "effect";
 import { SqlClient } from "effect/sql";
 import { TestClock } from "effect/testing";
 import { BoxRegistry } from "../../src/domain/boxes.js";
@@ -521,6 +521,36 @@ describe("BoxRegistry list, changes and resources", () => {
         const lists = yield* Fiber.join(seen);
         expect(Array.from(lists)).toEqual([[{ id: box.id, label: "Office" }], []]);
         expect(Array.from(lists)[0]).toBe(first);
+      }),
+    ),
+  );
+});
+
+describe("BoxRegistry changes under interruption", () => {
+  /** Holds the database connection in a transaction until `release` completes. */
+  const holdDatabase = Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const release = yield* Deferred.make<void>();
+    const held = yield* Effect.forkChild(sql.withTransaction(Deferred.await(release)), { startImmediately: true });
+    return {
+      release: Deferred.succeed(release, undefined).pipe(Effect.andThen(Fiber.join(held))),
+    };
+  });
+
+  it.effect("a remove interrupted while its write waits for the database still lands in memory and storage", () =>
+    withDatabase(
+      Effect.gen(function* () {
+        const { registry } = yield* startRegistry({ logins: LOGINS });
+        const box = yield* registry.add({ label: "A", environment: "production", credentials: passwordCredentials("alice") });
+        const database = yield* holdDatabase;
+        const removing = yield* Effect.forkChild(registry.remove(box.id), { startImmediately: true });
+        expect((yield* registry.list).length).toBe(1);
+        const interrupting = yield* Effect.forkChild(Fiber.interrupt(removing), { startImmediately: true });
+        yield* database.release;
+        yield* Fiber.join(interrupting);
+        expect(yield* registry.list).toEqual([]);
+        expect(yield* Effect.flip(registry.credentials(box.id))).toMatchObject({ _tag: "BoxNotFound" });
+        expect(yield* countRows("boxes")).toBe(0);
       }),
     ),
   );
