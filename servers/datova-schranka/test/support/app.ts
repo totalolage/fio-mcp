@@ -25,7 +25,7 @@ import { AppConfig } from "../../src/config.js";
 import { type Box, BoxRegistry } from "../../src/domain/boxes.js";
 import { grantSettings } from "../../src/oauth/grant-settings.js";
 import { loadConfigFrom } from "../config/support.js";
-import { fakeIsdsTransports, loginResponder, passwordCredentials } from "../domain/support/fake-isds.js";
+import { type FakeRespond, fakeIsdsTransports, loginResponder, passwordCredentials } from "../domain/support/fake-isds.js";
 import { FAST_SCRYPT, type HarnessServices, type OAuthHarness, PASSWORD, PUBLIC_URL, SkewedClock } from "./oauth.js";
 
 /** The data key the harness writes (hex). */
@@ -44,6 +44,8 @@ export interface AppStartOptions {
   readonly env?: Readonly<Record<string, string>>;
   /** Boxes to add once the server runs (default APP_BOXES; [] for none). */
   readonly boxes?: ReadonlyArray<{ readonly label: string; readonly username: string; readonly dbId: string }>;
+  /** The fake ISDS's answer to every operation besides logins and DummyOperation (default: an empty 200). */
+  readonly respond?: FakeRespond;
 }
 
 /** OAuthHarness over the socket; its `clock` is inert (the app runs on real time). */
@@ -115,10 +117,11 @@ export async function appEnv(dir: string, extra: Readonly<Record<string, string>
 export async function appPlatform(
   env: Readonly<Record<string, string>>,
   boxes: AppStartOptions["boxes"] = APP_BOXES,
+  respond?: FakeRespond,
 ) {
   const config = await Effect.runPromise(loadConfigFrom({ ...env }));
   const logins = Object.fromEntries((boxes ?? []).map((box) => [box.username, box.dbId]));
-  const isds = fakeIsdsTransports(loginResponder(logins));
+  const isds = fakeIsdsTransports(loginResponder(logins, respond));
   return Layer.mergeAll(
     Layer.succeed(AppConfig, { ...config, http: { ...config.http, port: 0 } }),
     NodeFileSystem.layer,
@@ -144,7 +147,7 @@ export async function startApp(options: AppStartOptions = {}): Promise<AppHarnes
       logs.push(Logger.formatLogFmt.log(entry));
     });
     const app = httpApp(options.features ?? FEATURES).pipe(
-      Layer.provide(await appPlatform(env, boxes)),
+      Layer.provide(await appPlatform(env, boxes, options.respond)),
       Layer.provide(Logger.layer([capture])),
     );
     const services = await Effect.runPromise(Layer.buildWithScope(app, scope));
