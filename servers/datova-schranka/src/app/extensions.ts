@@ -26,8 +26,16 @@ export const TOOL_GROUPS: ReadonlyArray<ToolGroup<ExtensionRequirements>> = [];
 /** Admin tabs after core's built-in ones, in display order. */
 export const adminTabs: Effect.Effect<ReadonlyArray<AdminTab>, never, ExtensionRequirements> = Effect.all([]);
 
-/** Services the extensions provide to tools, tabs and background layers. */
+/**
+ * Services the extensions provide to tools, tabs and background layers.
+ * Built after the instance lease is held and before the listeners start, so
+ * startup work that must finish before requests are served (send: recover
+ * 'dispatching' filings) runs while this layer is acquired.
+ */
 export const ExtensionServicesLive: Layer.Layer<ExtensionServices, never, AppServices> = Layer.empty;
 
-/** Long-running work (sweeps, reconciliation); built only after the instance lease is held. */
+/**
+ * Long-running work (sweeps, reconciliation); built only after the instance
+ * lease is held, alongside the listeners.
+ */
 export const BackgroundLive: Layer.Layer<never, never, ExtensionRequirements> = Layer.empty;
