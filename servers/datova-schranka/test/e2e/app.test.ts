@@ -9,20 +9,26 @@ import { Buffer } from "node:buffer";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { REDACTED } from "@mcps/core/redaction.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { Effect } from "effect";
+import { Effect, Redacted } from "effect";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { BOX_AUDIT_ACTIONS } from "../../src/admin/boxes-tab.js";
+import { IsdsAuthError } from "../../src/isds/errors.js";
 import { READ_SCOPE, SEND_SCOPE } from "../../src/mcp/tool-group.js";
 import { CONSENT_ACTION } from "../../src/oauth/app.js";
 import { fakeIsdsTransports, loginResponder } from "../domain/support/fake-isds.js";
 import { fixture, ok } from "../isds/fake-transport.js";
 import { createTestPki, type TestPki } from "../isds/support/pki.js";
-import { type E2eApp, startE2eApp } from "./support/app.js";
+import { type E2eApp, SCRUBBED, startE2eApp } from "./support/app.js";
 
 const MAIN = { label: "Main", username: "main-user", password: "main-password-7f3a", dbId: "abc2def" };
 const SIGNED = { label: "Signed", dbId: "ghi3jkm" };
 const MESSAGE_ID = "8765432";
+/** A login the fake ISDS refuses (HTTP 401, as ISDS answers a wrong password). */
+const REJECTED = { label: "Rejected", username: "rejected-user", password: "rejected-password-9q4w" };
+/** What the fake ISDS logs, with the box password, on every GetListOfSentMessages (the app's Redactor must hide it). */
+const SENT_LOG = "fake ISDS: list sent with password";
 
 const READ_TOOLS = [
   "get_server_status",
@@ -85,11 +91,18 @@ afterEach(async () => {
 
 /** The app over a fake ISDS that logs MAIN in by username and SIGNED by its certificate passphrase. */
 const start = async () => {
-  isds = fakeIsdsTransports(
-    loginResponder({ [MAIN.username]: MAIN.dbId, [pki.clientPassphrase]: SIGNED.dbId }, (_config, request) => {
-      const reply = READ_REPLIES[request.operation];
-      return reply === undefined ? Effect.die(`unexpected ISDS operation ${request.operation}`) : Effect.succeed(ok(reply));
-    }),
+  const logins = loginResponder({ [MAIN.username]: MAIN.dbId, [pki.clientPassphrase]: SIGNED.dbId }, (config, request) => {
+    const reply = READ_REPLIES[request.operation];
+    if (reply === undefined) return Effect.die(`unexpected ISDS operation ${request.operation}`);
+    const password = config.credentials._tag === "Password" ? Redacted.value(config.credentials.password) : "";
+    return request.operation === "GetListOfSentMessages"
+      ? Effect.as(Effect.logInfo(`${SENT_LOG} ${password}`), ok(reply))
+      : Effect.succeed(ok(reply));
+  });
+  isds = fakeIsdsTransports((config, request) =>
+    config.credentials._tag === "Password" && config.credentials.username === REJECTED.username
+      ? Effect.fail(new IsdsAuthError({ service: request.service, operation: request.operation, httpStatus: 401 }))
+      : logins(config, request),
   );
   app = await startE2eApp({ isds: isds.layer });
   return app;
@@ -184,8 +197,13 @@ describe("datova-schranka end to end (fake ISDS)", () => {
     expect(rows.filter((row) => toolActions.includes(row.action)).every((row) => row.outcome.includes("ok"))).toBe(true);
     expect(rows.filter((row) => row.action === BOX_AUDIT_ACTIONS.add).every((row) => row.outcome.includes("ok"))).toBe(true);
 
-    // No credential reached a log line.
-    for (const line of running.logs()) {
+    // The app's Redactor hid the box password in the line the fake ISDS logged; the harness had nothing left to scrub.
+    const logs = running.logs();
+    const sentLines = logs.filter((line) => line.includes(SENT_LOG));
+    expect(sentLines).toHaveLength(1);
+    expect(sentLines[0]).toContain(REDACTED);
+    expect(sentLines[0]).not.toContain(SCRUBBED);
+    for (const line of logs) {
       expect(line).not.toContain(MAIN.password);
       expect(line).not.toContain(pki.clientPassphrase);
     }
@@ -197,7 +215,9 @@ describe("datova-schranka end to end (fake ISDS)", () => {
     const before = (await admin.auditRows()).length;
 
     // Read consent without the delivery checkbox is refused at consent: no grant comes of it.
-    await expect(running.consent({ boxes: [MAIN.label], scopes: [READ_SCOPE], deliveryConsent: false })).rejects.toThrow();
+    await expect(running.consent({ boxes: [MAIN.label], scopes: [READ_SCOPE], deliveryConsent: false })).rejects.toThrow(
+      /^consent answered/,
+    );
 
     const signedOnly = await running.mcp(
       (await running.consent({ boxes: [SIGNED.label], scopes: [READ_SCOPE], deliveryConsent: true })).access,
@@ -221,5 +241,27 @@ describe("datova-schranka end to end (fake ISDS)", () => {
     expect(countBy(rows.map((row) => row.action))).toEqual({ [CONSENT_ACTION]: 2, list_sent_messages: 2 });
     // No ISDS call was made for either refusal.
     expect(isds.requests.filter((request) => request.request.operation === "GetListOfSentMessages")).toEqual([]);
+  });
+  it("reports a refused box addition as an outcome, its message free of the credentials, and audits it", async () => {
+    const running = await start();
+    const admin = await addBoxes(running);
+
+    const rejected = await admin.addPasswordBox(REJECTED);
+    expect(rejected).toMatchObject({ status: 200, kind: "error", added: false });
+    const duplicate = await admin.addPasswordBox({ ...MAIN, label: "Main again" });
+    expect(duplicate).toMatchObject({ status: 200, kind: "error", added: false });
+    for (const outcome of [rejected, duplicate]) {
+      expect(outcome.text).toMatch(/^Not added: /);
+      expect(outcome.text).not.toContain(REJECTED.password);
+      expect(outcome.text).not.toContain(MAIN.password);
+    }
+
+    const page = await admin.page("/admin");
+    expect(page.html).not.toContain(REJECTED.password);
+    expect(page.html).not.toContain("Rejected");
+
+    const adds = (await admin.auditRows()).filter((row) => row.action === BOX_AUDIT_ACTIONS.add);
+    expect(adds.map((row) => row.outcome.includes("ok"))).toEqual([false, false, true, true]);
+    for (const row of adds) expect(row.detail).not.toContain(REJECTED.password);
   });
 });
