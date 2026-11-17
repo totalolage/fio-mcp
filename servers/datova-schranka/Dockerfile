@@ -82,9 +82,9 @@ EXPOSE 3000
 # Probes the configured bind address (loopback for the wildcard ones).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
   CMD ["node", "-e", "const h = (process.env.DATOVA_SCHRANKA_HOST || '').trim() || '0.0.0.0'; const host = h === '0.0.0.0' ? '127.0.0.1' : h === '::' ? '[::1]' : h.includes(':') ? `[${h}]` : h; fetch(`http://${host}:${(process.env.DATOVA_SCHRANKA_PORT || '').trim() || 3000}/healthz`, { signal: AbortSignal.timeout(4000) }).then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
-# `docker run <image>` serves; `docker run <image> backup /data/backup.sqlite`
-# (or `docker exec <container> node dist/main.js backup ...`) runs a backup of
-# the database (not the ZFO files). Other admin commands: `hash-password`,
+# `docker run <image>` serves; `docker exec <container> node dist/main.js
+# backup /data/backup.sqlite` writes a backup of the database (not the ZFO
+# files) into the volume. Other admin commands: `hash-password`,
 # `totp-init`, `clients list|revoke <id>`, `tokens revoke-all`,
 # `reset-admin-password`, `audit purge --before YYYY-MM-DD`.
 ENTRYPOINT ["node", "/app/dist/main.js"]

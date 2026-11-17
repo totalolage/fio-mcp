@@ -48,7 +48,7 @@ All variables start with `DATOVA_SCHRANKA_`. Secrets are read from files; the va
 
 The first start writes the ISDS environment and a check value sealed with the data key into the database. Later starts refuse to run when:
 
-- `DATOVA_SCHRANKA_ISDS_ENVIRONMENT` differs from the one the database was created with. A database and its ZFO directory belong to one environment. To switch, start with a new volume.
+- `DATOVA_SCHRANKA_ISDS_ENVIRONMENT` differs from the one the database was created with. A database and its ZFO directory belong to one environment, and nothing moves data between environments. A setup for the other environment needs its own volume.
 - the data key cannot open the check value ("data key does not match this database"). Nothing can recover the box credentials without the original key. Keep a copy of the key apart from the database backups. If the key is lost, start with a new database and add the boxes again.
 
 ## Storage
@@ -56,10 +56,10 @@ The first start writes the ISDS environment and a check value sealed with the da
 Everything lives in the database and the ZFO directory, both in `/data` in the image.
 
 - Sealed with the data key: box credentials (PKCS#12, passphrases, passwords), send approval nonces and the payloads of pending filings.
-- Plaintext at rest: the signed ZFO files of downloaded messages, and filing previews (envelope, attachment names, sizes and hashes). Whoever can read the volume can read these. Encrypt the volume if that matters.
+- Plaintext at rest: the signed ZFO files of downloaded messages (envelope, text and attachments), filing previews (envelope, attachment names, sizes and hashes), the audit log and every other database row that is not in the list above. Whoever can read the volume or a backup can read these. Encrypt the volume and the backups if that matters.
 - The server never deletes ZFO files. Remove old ones from `DATOVA_SCHRANKA_DATA_DIR` by hand.
 - `audit purge --before YYYY-MM-DD` deletes audit rows of days (UTC) before the date and keeps at least the last 365 days. It deletes audit rows only, no messages or ZFO files.
-- `backup <dest>` copies the database while the server runs. It does not copy the ZFO files; copy `DATOVA_SCHRANKA_DATA_DIR` yourself.
+- `backup <dest>` copies the database with SQLite's `VACUUM INTO`, safe while the server runs. In the container, run it with `docker exec`, so it gets the container's configuration, and write into the volume, the only writable path: `docker exec datova-schranka node dist/main.js backup /data/backup.sqlite`. The copy is still sealed with the same data key. It does not include the ZFO files; copy `DATOVA_SCHRANKA_DATA_DIR` yourself.
 
 ## Setup
 
@@ -78,7 +78,7 @@ Everything lives in the database and the ZFO directory, both in `/data` in the i
    chmod 0400 secrets/admin_hash secrets/data_key
    ```
 
-3. Optional: `docker run --rm datova-schranka totp-init > secrets/totp_secret` prints a TOTP secret and its `otpauth://` URI and stores nothing. Load the URI into an authenticator app, keep only the secret line in the file, and set `DATOVA_SCHRANKA_ADMIN_TOTP_SECRET_FILE`.
+3. Optional: `docker run --rm datova-schranka totp-init > secrets/totp_secret` prints a TOTP secret and its `otpauth://` URI and stores nothing. Load the URI into an authenticator app, keep only the secret line in the file, `chmod 0400 secrets/totp_secret`, and set `DATOVA_SCHRANKA_ADMIN_TOTP_SECRET_FILE`.
 4. Start the server (see [Container](#container)) and add the boxes at `https://<host>/admin`. Adding a box calls ISDS once to show the box ID and owner. A box added under the other ISDS environment is not loaded.
 
 ## Container
@@ -109,15 +109,17 @@ docker run -d --name datova-schranka \
 
 `/admin` and the sign-in pages decide who can add boxes and approve access to them. Keep them off the public internet:
 
-- `DATOVA_SCHRANKA_ADMIN_ALLOWED_CIDRS=10.0.0.0/8,192.168.0.0/16` limits `/admin` and the sign-in pages to those client networks. Behind a reverse proxy, set `DATOVA_SCHRANKA_TRUSTED_PROXIES` too, or every request has the proxy's address.
-- Or set `DATOVA_SCHRANKA_ADMIN_PORT`: a second listener then alone serves `/admin`, on `DATOVA_SCHRANKA_ADMIN_HOST` (`127.0.0.1` by default). Inside a container, loopback is reachable only from the container itself. To reach it from the host, set `DATOVA_SCHRANKA_ADMIN_HOST=0.0.0.0` and publish the port on the host's loopback, for example `-p 127.0.0.1:3001:3001` with `DATOVA_SCHRANKA_ADMIN_PORT=3001`, and use an SSH tunnel from elsewhere.
+- `DATOVA_SCHRANKA_ADMIN_ALLOWED_CIDRS=10.0.0.0/8,192.168.0.0/16` limits `/admin` and the OAuth sign-in pages to those client networks. Behind a reverse proxy, set `DATOVA_SCHRANKA_TRUSTED_PROXIES` too, or every request has the proxy's address.
+- `DATOVA_SCHRANKA_ADMIN_PORT` moves `/admin` alone to a second listener on `DATOVA_SCHRANKA_ADMIN_HOST` (`127.0.0.1` by default), and the main port stops serving it. The OAuth sign-in pages stay on the main port, so restrict them with `DATOVA_SCHRANKA_ADMIN_ALLOWED_CIDRS` as well.
+
+The admin pages need the public https origin. Form posts must carry the Origin of `DATOVA_SCHRANKA_PUBLIC_URL`, the session cookie is `Secure`, and the Host allowlist applies, so a plain `http://127.0.0.1:<port>` tunnel cannot sign in. Route `https://<public host>/admin` to the admin port from the reverse proxy on a private entry point only, such as the LAN or a VPN. In a container, set `DATOVA_SCHRANKA_ADMIN_HOST=0.0.0.0` so the proxy can reach the admin port, and publish that port only where the proxy connects, never to the internet.
 
 ## Production
 
 1. Pick `DATOVA_SCHRANKA_ISDS_ENVIRONMENT` before the first start; the database is bound to it.
 2. Generate the password hash and the data key as in [Setup](#setup). Store a copy of the data key apart from the backups. Set up TOTP.
 3. Terminate TLS at a reverse proxy. Set `DATOVA_SCHRANKA_PUBLIC_URL` to the https origin, `DATOVA_SCHRANKA_ALLOWED_HOSTS` to the host names clients use, and `DATOVA_SCHRANKA_TRUSTED_PROXIES` to the proxy's address.
-4. Restrict `/admin` with `DATOVA_SCHRANKA_ADMIN_ALLOWED_CIDRS` or a separate `DATOVA_SCHRANKA_ADMIN_PORT`.
+4. Restrict `/admin` and the sign-in pages with `DATOVA_SCHRANKA_ADMIN_ALLOWED_CIDRS`, and optionally move `/admin` to `DATOVA_SCHRANKA_ADMIN_PORT` behind a private proxy route.
 5. Run read-only, as a non-root UID, with no capabilities, and mount `/data` on a volume that only that UID can read. Encrypt it if the ZFO files must not be readable at rest.
 6. Add the boxes at `/admin` and check the box ID and owner it shows.
 7. Back up with `backup <dest>` plus a copy of the ZFO directory. Purge old audit rows with `audit purge` and old ZFO files by hand when you want them gone.
