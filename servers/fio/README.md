@@ -767,7 +767,7 @@ src/
   account-migrations.ts the account store's tables
   account-runtime.ts    sync jobs and rate limiters following account changes
   token-crypto.ts       data key and token encryption on core's AES-256-GCM seal
-  instance-lease.ts     single-instance lease in the database
+  instance-lease.ts     fio's single-instance lease on core's database lease
   payment-limits.ts     server ceilings, grant limits and payee allowlist rules
   payment-controls.ts   limits, allowlist, provenance and idempotency around submit; held batches
   payment-ledger.ts     payment audit log, idempotency records and held batches in SQLite
@@ -781,11 +781,12 @@ src/
   fio-countries.ts      country codes from the XSD's country_type enumeration
   import-response.ts    import response parser
   cache/                SQLite database, migrations, store, sync engine, Transactions service, encryption at rest
-  mcp/                  tool definitions and handlers (FIO tools, cache tools), their scopes and the bank-text guards (core registers them as the accounts change)
+  mcp/                  tool definitions and handlers (FIO tools, cache tools), their scopes and the bank-text guard policy (core has the guard engine and registers the tools as the accounts change)
   oauth/                the OAuth scopes and consent choices, and the client and token admin commands
   transport/            the auth layer for fio's accounts (core has the stdio and HTTP transports, Host check, admin network allowlist and listener, frame redaction, grant-filtered tools/list)
 openapi/fio-api.yaml    FIO REST API spec
 docs/fio-api.md         FIO API reference
+docs/security-hardening.md  operator guide for running fio-mcp as a network service
 assets/icon.svg         icon
 scripts/                OpenAPI client generator
 Dockerfile              image build (context: repository root)

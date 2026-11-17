@@ -227,7 +227,7 @@ Check: a sign-in attempt from outside the VPN never reaches the sign-in page.
 
 Before each deployment:
 
-- `bun install --frozen-lockfile --ignore-scripts`, so no install script runs, not even the project's own `prepare`. Then run that step by hand (`bunx effect-tsgo patch --typescript --no-oxlint && bun run build`, which patches TypeScript for the Effect diagnostics and builds `dist/`), followed by `bun run check` and `bun audit`. Deploy with no advisory in a production dependency, or with the exception written down. (Bun 1.4.2's `bun audit` has no flag to skip development dependencies; judge those by whether they reach the image.)
+- `bun install --frozen-lockfile --ignore-scripts`, so no install script runs, not even the project's own `prepare`. Then run that step by hand (`bunx effect-tsgo patch --typescript --no-oxlint && bun run build`, which patches TypeScript for the Effect diagnostics and builds `packages/core` and `servers/fio` into their `dist/` directories), followed by `bun run check` and `bun audit`. Deploy with no advisory in a production dependency, or with the exception written down. (Bun 1.4.2's `bun audit` has no flag to skip development dependencies; judge those by whether they reach the image.)
 - On Node security releases, bump the digest-pinned `NODE_IMAGE` and `BUN_IMAGE` at the top of the `Dockerfile`.
 - Keep `"trustedDependencies": []` in `package.json` and `minimumReleaseAge` in `bunfig.toml` as they are.
 - Record the audit output and the commit of each deployed tag in your release notes.
