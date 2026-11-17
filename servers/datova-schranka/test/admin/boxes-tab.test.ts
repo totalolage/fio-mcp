@@ -48,8 +48,16 @@ const start = async (options: AdminHarnessOptions = {}) => {
 const passwordForm = (label: string, username: string, password: string, extra: Record<string, string> = {}) =>
   multipart({ label, auth: "password", username, password, passphrase: "", ...extra });
 
+/** The audit rows in the order they were written (rows of one millisecond tie on `at` in AuditLog's own order). */
 const audits = (harness: AdminHarness) =>
-  harness.run(Effect.flatMap(AuditLog, (log) => log.list())).then((page) => [...page.entries].reverse());
+  harness.run(
+    Effect.gen(function* () {
+      const page = yield* Effect.flatMap(AuditLog, (log) => log.list({ limit: 500 }));
+      const sql = yield* SqlClient.SqlClient;
+      const order = (yield* sql<{ readonly id: string }>`SELECT id FROM audit_log ORDER BY rowid`).map((row) => row.id);
+      return [...page.entries].sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id));
+    }).pipe(Effect.orDie),
+  );
 
 const boxes = (harness: AdminHarness) => harness.run(Effect.flatMap(BoxRegistry, (registry) => registry.list));
 
