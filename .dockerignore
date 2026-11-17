@@ -14,3 +14,6 @@
 !servers/fio/package.json
 !servers/fio/tsconfig.build.json
 !servers/fio/src/
+!servers/datova-schranka/package.json
+!servers/datova-schranka/tsconfig.build.json
+!servers/datova-schranka/src/
