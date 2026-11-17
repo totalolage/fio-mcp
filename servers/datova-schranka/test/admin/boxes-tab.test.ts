@@ -1,4 +1,5 @@
 import type { LoginResult } from "@mcps/core/oauth/login.js";
+import { Redactor } from "@mcps/core/redaction.js";
 import { Effect, Fiber, Redacted } from "effect";
 import { SqlClient } from "effect/sql";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -528,5 +529,41 @@ describe("council follow-ups", () => {
     expect(app.logs.some((line) => line.includes("admin: the audit row of box_relabel could not be written"))).toBe(true);
     const text = [...browser.pages, ...app.logs].join("\n");
     expect(text).not.toContain(PASSWORD_A);
+  });
+});
+
+describe("labels never expose another box's secret", () => {
+  it("refuses a label holding any stored or pending box secret, and audits the refusals without it", async () => {
+    const checked: Array<string> = [];
+    const { app, browser } = await start({
+      secondFactor: () => {
+        checked.push("checked");
+        return Effect.succeed<LoginResult<void>>({ _tag: "Accepted", value: undefined });
+      },
+    });
+    await addAlice(browser);
+    await browser.actMultipart("/admin/boxes/add", passwordForm("Archive", "bob", PASSWORD_B));
+    const archive = (await boxes(app)).find((box) => box.label === "Archive");
+    const crossRename = await browser.act("/admin/boxes/relabel", { box: archive?.id ?? "", label: `x ${PASSWORD_A} x` });
+    expect(crossRename.flash).toEqual({ kind: "error", text: "Not renamed: The label must not contain the box's password or passphrase." });
+    const crossAdd = await browser.actMultipart("/admin/boxes/add", passwordForm(PASSWORD_B, "carol", "carol-password-1"));
+    expect(crossAdd.flash).toEqual({ kind: "error", text: "Not added: The label must not contain the box's password or passphrase." });
+    // A secret the registry registered for a sign-in still in flight.
+    await app.run(Effect.map(Redactor, (redactor) => redactor.register(["pending-secret-5k2q"])));
+    const pending = await browser.act("/admin/boxes/relabel", { box: archive?.id ?? "", label: "pending-secret-5k2q" });
+    expect(pending.flash?.text).toBe("Not renamed: The label must not contain the box's password or passphrase.");
+    expect((await boxes(app)).map((box) => box.label)).toEqual(["Office", "Archive"]);
+    const refusals = (await audits(app)).filter((entry) => entry.outcome === "refused");
+    expect(refusals.map((entry) => [entry.action, entry.boxId])).toEqual([
+      ["box_relabel", archive?.id],
+      ["box_add", undefined],
+      ["box_relabel", archive?.id],
+    ]);
+    const text = JSON.stringify(refusals);
+    for (const secret of [PASSWORD_A, PASSWORD_B, "carol-password-1", "pending-secret-5k2q"]) expect(text).not.toContain(secret);
+    // An unknown box is refused before the second factor.
+    const unknown = await browser.actMultipart("/admin/boxes/credentials", passwordForm("", "alice-new", "fresh-password-1", { box: newBoxId() }));
+    expect(unknown.flash?.text).toMatch(/^Not replaced: No data box .* is configured\.$/);
+    expect(checked).toEqual([]);
   });
 });

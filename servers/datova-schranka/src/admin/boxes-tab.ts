@@ -27,7 +27,8 @@ import {
  * removing ask for the second factor when one is configured.
  *
  * Every action writes exactly one audit row (actor admin, action box_*,
- * outcome ok, refused or error). Secrets are never rendered, never part of
+ * outcome ok, refused or error) while the audit store is writable; a failed
+ * write is logged and shown, and the change stands. Secrets are never rendered, never part of
  * a message or an audit detail, and every message passes the Redactor,
  * which the registry gives each secret before it signs in.
  */
@@ -175,6 +176,14 @@ export const boxesTab: Effect.Effect<AdminTab, never, BoxRegistry | AuditLog | R
         ),
     ).pipe(Effect.uninterruptible);
 
+  /**
+   * Whether a label would expose a secret: it holds one the Redactor knows
+   * (every stored box's, and a new one from the moment the registry signs in
+   * with it), or `incoming`, which is not registered yet.
+   */
+  const labelExposesSecret = (label: string, incoming?: string) =>
+    redactor.redact(label) !== label || (incoming !== undefined && labelHoldsSecret(label, incoming));
+
   /** Undefined when the second factor passed, else the refusal. */
   const secondFactorRefusal = (context: AdminActionContext, nothing: string) =>
     Effect.map(context.checkSecondFactor, (factor): string | undefined => {
@@ -201,7 +210,7 @@ export const boxesTab: Effect.Effect<AdminTab, never, BoxRegistry | AuditLog | R
     const detail = { authKind: authKindOf(form) };
     const credentials = credentialsOf(form, context.files);
     if (typeof credentials === "string") return refused(`Not added: ${credentials}`, undefined, detail);
-    if (labelHoldsSecret(label, secretOf(credentials))) return refused(`Not added: ${LABEL_HOLDS_SECRET}`, undefined, detail);
+    if (labelExposesSecret(label, secretOf(credentials))) return refused(`Not added: ${LABEL_HOLDS_SECRET}`, undefined, detail);
     return yield* registry.add({ label, environment, credentials }).pipe(
       Effect.map(
         (box): Outcome => ({
@@ -222,7 +231,7 @@ export const boxesTab: Effect.Effect<AdminTab, never, BoxRegistry | AuditLog | R
     const { boxId, audited: auditedId } = boxIdOf(form);
     const label = field(form, "label") ?? "";
     const stored = yield* Effect.option(registry.credentials(boxId));
-    if (stored._tag === "Some" && labelHoldsSecret(label, secretOf(stored.value))) {
+    if (labelExposesSecret(label, stored._tag === "Some" ? secretOf(stored.value) : undefined)) {
       return refused(`Not renamed: ${LABEL_HOLDS_SECRET}`, auditedId);
     }
     const before = yield* Effect.option(registry.get(boxId));
@@ -247,8 +256,12 @@ export const boxesTab: Effect.Effect<AdminTab, never, BoxRegistry | AuditLog | R
     // Checked before the second factor, so a form refused anyway does not use up a code.
     const tooShort = yield* Effect.flip(checkBoxSecretLength(credentials)).pipe(Effect.option);
     if (tooShort._tag === "Some") return failed("Not replaced: ", auditedId, detail)(tooShort.value);
-    const current = yield* Effect.option(registry.get(boxId));
-    if (current._tag === "Some" && labelHoldsSecret(current.value.label, secretOf(credentials))) {
+    const current = yield* registry.get(boxId).pipe(
+      Effect.map((box) => ({ box })),
+      Effect.catch((error) => Effect.succeed({ error })),
+    );
+    if ("error" in current) return failed("Not replaced: ", auditedId, detail)(current.error);
+    if (labelHoldsSecret(current.box.label, secretOf(credentials))) {
       return refused(`Not replaced: ${LABEL_HOLDS_SECRET}`, auditedId, detail);
     }
     const factor = yield* secondFactorRefusal(context, "The credentials were not replaced.");
