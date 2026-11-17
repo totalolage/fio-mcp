@@ -126,6 +126,28 @@ describe("frame redaction with protectEmbeddedResources", () => {
     ]);
   });
 
+  it("withholds a resource result the extra scrubber would change though the raw frame shows nothing", () => {
+    // The scrubber matches a decoded newline, which the frame carries escaped.
+    const redactor = makeRedactor([], (text) => text.replace(/BEGIN\nKEY/g, "***"));
+    const on = makeFrameRedactor(redactor, { protectEmbeddedResources: true });
+    const off = makeFrameRedactor(redactor);
+    const resource = resourceResult(1, "clean bytes");
+    resource.result.content[0] = { type: "text", text: "metadata BEGIN\nKEY" };
+    const other = textResult(2, "BEGIN\nKEY");
+    const body = `${sse(other)}${sse(resource)}${sse(resourceResult(3, "clean bytes"))}`;
+    assert.strictEqual(redactor.redact(body), body);
+    assert.strictEqual(on.text(body), `${sse(other)}${sse(withheldResult(1))}${sse(resourceResult(3, "clean bytes"))}`);
+    assert.strictEqual(off.text(body), body);
+    const clean = encoder.encode(sse(resourceResult(4, "clean bytes")));
+    assert.strictEqual(on.chunk(clean), clean);
+  });
+
+  it("keeps the id of a withheld result when redaction would rename the id key", () => {
+    const redactor = makeRedactor([SECRET], (text) => (text === "id" ? "***" : text));
+    const frames = makeFrameRedactor(redactor, { protectEmbeddedResources: true });
+    assert.strictEqual(frames.text(json(resourceResult(9, SECRET))), json(withheldResult(9)));
+  });
+
   it("leaves results without embedded resources as redaction without the option does", () => {
     const { redactor, registerLate } = lateRedactor();
     const on = makeFrameRedactor(redactor, { protectEmbeddedResources: true });
