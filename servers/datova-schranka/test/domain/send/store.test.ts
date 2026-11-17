@@ -538,6 +538,21 @@ describe("FilingStore nonces", () => {
   );
 });
 
+describe("FilingStore nonce replacement failures", () => {
+  it.effect("keep the old nonce live when the new one cannot be stored", () =>
+    withStore((store) =>
+      Effect.gen(function* () {
+        yield* inserted(store, awaiting("f1"));
+        yield* inserted(store, awaiting("f2"));
+        const exit = yield* Effect.exit(store.replaceNonce("f1", nonce("n-f2")));
+        assert.instanceOf(Exit.findErrorOption(exit).pipe(Option.getOrUndefined), DomainStoreError);
+        assert.strictEqual(Option.getOrUndefined(yield* store.liveNonce("f1"))?.nonceHash, "n-f1");
+        assert.strictEqual(Option.getOrUndefined(yield* store.nonceByHash("n-f2"))?.filingId, "f2");
+      }),
+    ),
+  );
+});
+
 describe("FilingStore dmID and competitor lookups", () => {
   it.effect("name the filing that holds a dmID", () =>
     withStore((store) =>
