@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Context, Effect, Layer } from "effect";
+import { Context, Duration, Effect, Layer } from "effect";
 import { BoxClients } from "../../src/domain/box-clients.js";
 import { DomainConfig } from "../../src/domain/config.js";
 import { memoryDatabase } from "./support/database.js";
@@ -16,7 +16,7 @@ describe("BoxClients over BoxRegistry", () => {
           BoxClients.layer.pipe(
             Layer.provide(Layer.succeedContext(context)),
             Layer.provide(isds.layer),
-            Layer.provide(DomainConfig.layer({ dataDir: "/nonexistent" })),
+            Layer.provide(DomainConfig.layer({ dataDir: "/nonexistent", requestTimeout: Duration.seconds(7) })),
           ),
         ),
         BoxClients,
@@ -28,6 +28,9 @@ describe("BoxClients over BoxRegistry", () => {
       yield* clients.use(box.id, (client) => client.ping());
       yield* clients.use(box.id, (client) => client.ping());
       expect(isds.made.length - madeBefore).toBe(1);
+      expect(isds.made.slice(madeBefore).map((config) => [config.environment, Duration.toMillis(config.requestTimeout)])).toEqual([
+        ["production", 7_000],
+      ]);
 
       yield* registry.replaceCredentials(box.id, passwordCredentials("alice-again"));
       yield* clients.use(box.id, (client) => client.ping());
