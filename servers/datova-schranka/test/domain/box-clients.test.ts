@@ -315,6 +315,41 @@ describe("BoxClients", () => {
     ),
   );
 
+  for (const rebuild of [false, true]) {
+    it.effect(`closes a box removed while its client is ${rebuild ? "rebuilt" : "first built"}, without another use`, () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const b1 = entry("b1");
+          const replacement = passwordCredentials("user-b1", "new-secret");
+          const building = yield* Deferred.make<void>();
+          const proceed = yield* Deferred.make<void>();
+          const gated = rebuild ? replacement : b1.credentials;
+          const { clients, registry, nextClose } = yield* setup([b1], {
+            afterMake: (config) =>
+              config.credentials === gated
+                ? Deferred.succeed(building, undefined).pipe(Effect.andThen(Deferred.await(proceed)))
+                : Effect.void,
+          });
+          if (rebuild) {
+            yield* clients.use("b1", (client) => client.ping());
+            yield* registry.replaceCredentials("b1", replacement);
+          }
+
+          const a = yield* clients.use("b1", (client) => client.ping()).pipe(Effect.forkChild);
+          yield* Deferred.await(building);
+          if (rebuild) assert.strictEqual((yield* nextClose).credentials, b1.credentials);
+          yield* registry.remove("b1");
+          // Let the registry's change reach BoxClients while the client is still being built.
+          yield* Effect.repeat(Effect.yieldNow, { times: 20 });
+
+          yield* Deferred.succeed(proceed, undefined);
+          yield* Fiber.join(a);
+          assert.strictEqual((yield* nextClose).credentials, gated);
+        }),
+      ),
+    );
+  }
+
   it.effect("closes the transport of an interrupted build and builds again on the next use", () =>
     Effect.scoped(
       Effect.gen(function* () {

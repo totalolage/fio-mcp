@@ -1,4 +1,4 @@
-import { Context, Effect, Exit, Layer, Ref, Scope, Stream } from "effect";
+import { Context, Effect, Exit, Layer, Option, Ref, Scope, Stream } from "effect";
 import type { IsdsClientShape } from "../isds/client.js";
 import type { IsdsCredentials } from "../isds/config.js";
 import type { IsdsConfigError, IsdsCredentialsError } from "../isds/errors.js";
@@ -39,21 +39,35 @@ const make = Effect.gen(function* () {
   const transports = yield* IsdsTransports;
   const config = yield* DomainConfig;
   const layerScope = yield* Scope.Scope;
-  /** The client last built per box. A box's entry is read and changed only under its BoxLocks permit. */
-  const built = yield* Ref.make<ReadonlyMap<string, BuiltClient>>(new Map());
+  /**
+   * Every box a `use` has reached, with the client last built for it (none while one is being
+   * built, or after a build failed). A `use` adds its box before asking the registry for the
+   * credentials, so a removal published after that always finds the box here and is cleaned up
+   * once the `use` ends. A box's entry is read and changed only under its BoxLocks permit.
+   */
+  const built = yield* Ref.make<ReadonlyMap<string, Option.Option<BuiltClient>>>(new Map());
 
-  /** Drops the box's client, if any, and closes its scope, without leaving it half-dropped. Under the box's permit. */
-  const discard = (boxId: string) =>
-    Ref.modify(built, (current): readonly [BuiltClient | undefined, ReadonlyMap<string, BuiltClient>] => {
-      const existing = current.get(boxId);
-      if (existing === undefined) return [undefined, current];
-      const next = new Map(current);
-      next.delete(boxId);
-      return [existing, next];
-    }).pipe(
-      Effect.flatMap((existing) => (existing === undefined ? Effect.void : Scope.close(existing.scope, Exit.void))),
+  /** Takes the box's client out of `built` (dropping the box too when `forget`) and closes its scope. */
+  const take = (boxId: string, forget: boolean) =>
+    Ref.modify(
+      built,
+      (current): readonly [Option.Option<BuiltClient>, ReadonlyMap<string, Option.Option<BuiltClient>>] => {
+        if (!current.has(boxId)) return [Option.none(), current];
+        const next = new Map(current);
+        if (forget) next.delete(boxId);
+        else next.set(boxId, Option.none());
+        return [current.get(boxId) ?? Option.none(), next];
+      },
+    ).pipe(
+      Effect.flatMap(Option.match({ onNone: () => Effect.void, onSome: ({ scope }) => Scope.close(scope, Exit.void) })),
       Effect.uninterruptible,
     );
+
+  /** Closes the box's client, if any, keeping the box known. Under the box's permit. */
+  const discard = (boxId: string) => take(boxId, false);
+
+  /** Closes a removed box's client and forgets the box. Under the box's permit. */
+  const forget = (boxId: string) => take(boxId, true);
 
   /**
    * Closes the box's old client and builds one over `credentials` in a new child of the layer
@@ -79,7 +93,7 @@ const make = Effect.gen(function* () {
       yield* Scope.close(scope, exit);
       return yield* Effect.failCause(exit.cause);
     }
-    yield* Ref.update(built, (current) => new Map(current).set(boxId, { credentials, client: exit.value, scope }));
+    yield* Ref.update(built, (current) => new Map(current).set(boxId, Option.some({ credentials, client: exit.value, scope })));
     return exit.value;
   });
 
@@ -88,8 +102,8 @@ const make = Effect.gen(function* () {
    * the reference until the credentials are replaced), else a new one. Under the box's permit.
    */
   const clientFor = Effect.fn("BoxClients.clientFor")(function* (boxId: string, credentials: IsdsCredentials) {
-    const existing = (yield* Ref.get(built)).get(boxId);
-    if (existing !== undefined && existing.credentials === credentials) return existing.client;
+    const existing = (yield* Ref.get(built)).get(boxId) ?? Option.none();
+    if (Option.isSome(existing) && existing.value.credentials === credentials) return existing.value.client;
     return yield* Effect.uninterruptibleMask((restore) => rebuild(boxId, credentials, restore));
   });
 
@@ -100,9 +114,10 @@ const make = Effect.gen(function* () {
     return yield* locks.withBox(
       boxId,
       Effect.gen(function* () {
+        yield* Ref.update(built, (current) => (current.has(boxId) ? current : new Map(current).set(boxId, Option.none())));
         const credentials = yield* registry
           .credentials(boxId)
-          .pipe(Effect.tapError((error) => (error._tag === "BoxNotFound" ? discard(boxId) : Effect.void)));
+          .pipe(Effect.tapError((error) => (error._tag === "BoxNotFound" ? forget(boxId) : Effect.void)));
         const client = yield* clientFor(boxId, credentials);
         return yield* f(client);
       }),
@@ -113,7 +128,7 @@ const make = Effect.gen(function* () {
   const dropIfRemoved = (boxId: string) =>
     locks.withBox(
       boxId,
-      registry.get(boxId).pipe(Effect.matchEffect({ onFailure: () => discard(boxId), onSuccess: () => Effect.void })),
+      registry.get(boxId).pipe(Effect.matchEffect({ onFailure: () => forget(boxId), onSuccess: () => Effect.void })),
     );
 
   yield* registry.changes.pipe(
