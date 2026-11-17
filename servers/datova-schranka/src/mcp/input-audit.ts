@@ -75,7 +75,13 @@ export const payloadIssues = (schema: Schema.Top, payload: unknown): ReadonlyArr
   return Schema.isSchemaError(error) ? inputIssues(error.issue) : [];
 };
 
-/** Writes the one refused row of a call to `tool` whose input failed decoding. Never fails. */
+/**
+ * Writes the one refused row of a call to `tool` whose input failed
+ * decoding. Never fails: when the audit store cannot take the row, the
+ * failure is logged at error level and the call is still rejected (nothing
+ * runs for it), the same outage policy as a refusal (call.ts) and as a
+ * service whose intent row cannot be written.
+ */
 export const recordInvalidInput = (
   tool: string,
   issues: ReadonlyArray<InputIssue>,
@@ -109,6 +115,12 @@ export const registerAuditedToolkit = <Tools extends Record<string, Tool.Any>>(t
     });
     yield* McpServer.registerToolkit(toolkit).pipe(Effect.provideService(McpServer.McpServer, capturing));
     const tools: Readonly<Record<string, Tool.Any>> = toolkit.tools;
+    // Every tool must come back through addTool, or one would be registered without the audit.
+    const names = captured.map((registration) => registration.tool.name).sort();
+    const expected = Object.keys(tools).sort();
+    if (names.join("\n") !== expected.join("\n")) {
+      return yield* Effect.die(`registerAuditedToolkit: captured [${names.join(", ")}] for [${expected.join(", ")}]`);
+    }
     for (const registration of captured) {
       const name = registration.tool.name;
       const parameters = tools[name]?.parametersSchema;

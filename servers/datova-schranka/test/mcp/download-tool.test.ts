@@ -138,6 +138,18 @@ describe("download_message", () => {
   });
 });
 
+describe("download_message edge cases", () => {
+  it("sends a zero-byte attachment as an empty blob, not as withheld", async () => {
+    const h = await start({ replies: { ...REPLIES, MessageDownload: ok(downloadWithFirstFile(new Uint8Array())) } });
+    const result = await download(h);
+    assert.notOk(result.isError, textOf(result));
+    const [first] = metadataOf(textOf(result)).attachments;
+    assert.deepStrictEqual([first?.inline, first?.size], [true, 0]);
+    assert.strictEqual(result.content[1]?.resource?.uri, attachmentUri(BOX_ID, DM_ID, 0));
+    assert.strictEqual(result.content[1]?.resource?.blob, "");
+  });
+});
+
 describe("download MIME types", () => {
   it("normalizes the declaration and passes only the allowed types", () => {
     assert.strictEqual(normalizeMimeType("  Application/PDF; charset=binary "), "application/pdf");

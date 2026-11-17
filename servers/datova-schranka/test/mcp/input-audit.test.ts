@@ -1,13 +1,14 @@
 import { afterEach, assert, describe, it } from "@effect/vitest";
 import { Redactor } from "@mcps/core/redaction.js";
-import { Effect, Schema } from "effect";
+import { Effect, Logger, Schema } from "effect";
 import { Tool, Toolkit } from "effect/ai";
 import { type AuditEntry, AuditLog } from "../../src/domain/audit-log.js";
 import { BoxRegistry } from "../../src/domain/boxes.js";
+import { DomainStoreError } from "../../src/domain/errors.js";
 import { boxParameter } from "../../src/mcp/box-param.js";
 import { authorizedBoxCall, ToolError, toolError, toolOutput } from "../../src/mcp/call.js";
-import { payloadIssues, registerAuditedToolkit } from "../../src/mcp/input-audit.js";
-import { JsonObject } from "../../src/mcp/params.js";
+import { payloadIssues, recordInvalidInput, registerAuditedToolkit } from "../../src/mcp/input-audit.js";
+import { isRealTime, JsonObject } from "../../src/mcp/params.js";
 import { SEND_SCOPE, type ToolGroup, type ToolSpec } from "../../src/mcp/tool-group.js";
 import { BOX, BOX_ID, grant, type Harness, LABEL, startTools, textOf } from "./support/harness.js";
 import { DM_ID, REPLIES } from "./support/replies.js";
@@ -82,11 +83,11 @@ describe("invalid tool input is audited once", () => {
     { bearer: "reader", tool: "get_message", args: { box: LABEL, messageId: "12a" }, issues: [{ path: ["messageId"], kind: "InvalidValue" }] },
     { bearer: "reader", tool: "get_message", args: { box: LABEL }, issues: [{ path: ["messageId"], kind: "MissingKey" }] },
     { bearer: "reader", tool: "list_received_messages", args: { box: "Nope", limit: 5000 }, issues: [
-      { path: ["box"], kind: "AnyOf" },
+      { path: ["box"], kind: "*" },
       { path: ["limit"], kind: "InvalidValue" },
     ] },
     { bearer: "reader", tool: "download_message", args: { box: LABEL, messageId: DM_ID, "x y": 1 }, issues: [{ path: ["<key>"], kind: "UnexpectedKey" }] },
-    { bearer: "reader", tool: "download_message", args: { box: 7, messageId: DM_ID }, issues: [{ path: ["box"], kind: "AnyOf" }] },
+    { bearer: "reader", tool: "download_message", args: { box: 7, messageId: DM_ID }, issues: [{ path: ["box"], kind: "*" }] },
     { bearer: "sender", tool: "ping_box", args: { box: LABEL, count: 9 }, issues: [{ path: ["count"], kind: "InvalidValue" }] },
   ];
 
@@ -108,7 +109,13 @@ describe("invalid tool input is audited once", () => {
       );
       const detail = row?.detail as { reason: string; issues: ReadonlyArray<{ path: ReadonlyArray<string | number>; kind: string }> };
       assert.strictEqual(detail.reason, "invalid_input");
-      for (const expected of issues) assert.deepInclude(detail.issues, expected);
+      for (const expected of issues) {
+        const found = detail.issues.some(
+          (issue) =>
+            JSON.stringify(issue.path) === JSON.stringify(expected.path) && (expected.kind === "*" || issue.kind === expected.kind),
+        );
+        assert.isTrue(found, `${JSON.stringify(expected)} in ${JSON.stringify(detail.issues)}`);
+      }
       const stored = JSON.stringify(detail);
       for (const value of ["12a", "Nope", "5000", "x y", "9"]) assert.notInclude(stored, `"${value}"`);
       assert.deepStrictEqual(h.log, []);
@@ -159,4 +166,51 @@ describe("inputIssues", () => {
     const payload = Object.fromEntries(Array.from({ length: 50 }, (_, i) => [`k${i}`, i]));
     assert.lengthOf(payloadIssues(schema, payload), 20);
   });
+});
+
+describe("input validation details", () => {
+  it("rejects impossible dates and times, accepts real ones", () => {
+    for (const bad of ["2026-02-30", "2026-13-01", "2026-11-17T24:00:00Z", "2026-11-17T10:60Z", "2026-11-17T10:00:00+24:00"]) {
+      assert.isFalse(isRealTime(bad), bad);
+    }
+    for (const good of ["2028-02-29", "2026-11-17", "2026-11-17T23:59:59.5Z", "2026-11-17T08:00+01:00"]) {
+      assert.isTrue(isRealTime(good), good);
+    }
+  });
+
+  it("an impossible date and a malformed directory dbID are invalid params, audited once", async () => {
+    const h = await start();
+    const client = await h.connect("reader");
+    for (const [tool, args] of [
+      ["list_received_messages", { box: LABEL, from: "2026-02-30" }],
+      ["find_data_box", { box: LABEL, query: { dbID: "ABC1234" } }],
+    ] as const) {
+      const rows = await newRows(h, async () => {
+        const result = await client.call(tool, args);
+        assert.isTrue(result.isError, tool);
+      });
+      assert.deepStrictEqual(
+        rows.map((row) => [row.action, row.outcome, (row.detail as { reason: string }).reason]),
+        [[tool, "refused", "invalid_input"]],
+      );
+    }
+    assert.deepStrictEqual(h.log, []);
+  });
+
+  it.effect("an audit store failure is logged and the call still rejected", () =>
+    Effect.gen(function* () {
+      const failing = AuditLog.of({
+        record: () => Effect.fail(new DomainStoreError({ operation: "record audit entry" })),
+      } as unknown as AuditLog["Service"]);
+      const logs: Array<string> = [];
+      const logger = Logger.make(({ message }) => {
+        logs.push(String(message));
+      });
+      yield* recordInvalidInput("get_message", []).pipe(
+        Effect.provideService(AuditLog, failing),
+        Effect.provide(Logger.layer([logger])),
+      );
+      assert.isTrue(logs.some((line) => line.includes("could not audit the invalid input of a get_message call")));
+    }),
+  );
 });

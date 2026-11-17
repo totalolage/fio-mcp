@@ -87,9 +87,9 @@ export const makeDownloadTool = (labels: ReadonlyArray<string>) =>
 const encodeResource = Schema.encodeSync(McpSchema.EmbeddedResource);
 
 /** The base64 text the protocol sends for a resource block's blob. */
-const protocolBase64 = (block: McpSchema.EmbeddedResource): string => {
+const protocolBase64 = (block: McpSchema.EmbeddedResource): string | undefined => {
   const encoded = encodeResource(block).resource;
-  return "blob" in encoded ? encoded.blob : "";
+  return "blob" in encoded ? encoded.blob : undefined;
 };
 
 export interface DescribedDownload {
@@ -128,7 +128,7 @@ export const describeDownload = (
       resource: { uri, mimeType: meta.mimeType, blob: attachment.content },
     });
     const base64 = protocolBase64(block);
-    if (base64.length === 0 || redactor.redact(base64) !== base64) {
+    if (base64 === undefined || redactor.redact(base64) !== base64) {
       return { ...meta, inline: false, reason: WITHHELD, note: IN_ZFO };
     }
     uris.add(uri);

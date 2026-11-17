@@ -129,7 +129,9 @@ export const MESSAGE_GUARD = G.struct({ message: RETURNED_GUARD });
 export const DELIVERY_INFO_GUARD = G.struct({ deliveryInfo: RETURNED_GUARD });
 export const STATE_CHANGES_GUARD = G.struct({ changes: G.array(STATE_CHANGE_GUARD) });
 export const FIND_GUARD = G.struct({ boxes: G.array(OWNER_GUARD) });
-export const STATUS_GUARD = G.struct({ boxes: G.array(G.struct({ owner: OWNER_GUARD })) });
+export const STATUS_GUARD = G.struct({
+  boxes: G.array(G.struct({ dbID: G.id(DATA_BOX_ID), boxType: G.id(CODE), owner: OWNER_GUARD })),
+});
 
 /** Attachment metadata in a download result: the filename and the declared MIME type are the sender's text. */
 const ATTACHMENT_GUARD = G.struct({

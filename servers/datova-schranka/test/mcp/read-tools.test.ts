@@ -71,6 +71,17 @@ describe("readToolGroup", () => {
 });
 
 describe("tools/list per grant", () => {
+  it("lists the box tools in a one-box deployment, with that label as the enum", async () => {
+    const h = await start({ boxes: [BOX] });
+    const tools = await (await h.connect("reader")).tools();
+    assert.deepStrictEqual(tools.map((tool) => tool.name).sort(), ALL_TOOLS);
+    for (const tool of tools) {
+      if (tool.name !== "get_server_status") {
+        assert.deepStrictEqual((tool.inputSchema as Schema).properties?.box?.enum, [LABEL], tool.name);
+      }
+    }
+  });
+
   it("lists every read tool with the box enum narrowed to the granted boxes, the raw tool included", async () => {
     const h = await start();
     const reader = await (await h.connect("reader")).tools();
@@ -271,7 +282,7 @@ describe("untrusted ISDS text", () => {
     for (const [tool, args, key] of subtrees) {
       const body = json(await call(h, tool, args));
       const subtree = key === "boxes" && tool === "get_server_status"
-        ? (body.boxes as ReadonlyArray<Record<string, unknown>>).map((box) => box.owner)
+        ? (body.boxes as ReadonlyArray<Record<string, unknown>>).map(({ label: _label, ...box }) => box)
         : body[key];
       assert.deepStrictEqual(unguardedLeaves(subtree), [], tool);
     }

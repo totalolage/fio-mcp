@@ -14,14 +14,36 @@ export const DataBoxIdParam = Schema.String.check(
 ).annotate({ description: "ISDS data box ID (dbID): 7 lowercase letters or digits." });
 
 const TIME = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d{1,9})?)?(Z|[+-]\d{2}:\d{2}))?$/;
+const PARTS = /^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d{1,9})?(?:Z|[+-](\d{2}):(\d{2})))?$/;
 const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
 const DAY_MS = 24 * 60 * 60 * 1000;
+
+const within = (text: string | undefined, max: number): boolean => text === undefined || Number(text) <= max;
+
+/** Whether a TIME-shaped text names a real calendar day and clock time (Date.parse rolls 02-30 into March). */
+export const isRealTime = (text: string): boolean => {
+  const parts = PARTS.exec(text);
+  if (parts === null) return false;
+  const [, year, month, day, hour, minute, second, offsetHour, offsetMinute] = parts;
+  const date = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day)));
+  return (
+    date.getUTCFullYear() === Number(year) &&
+    date.getUTCMonth() === Number(month) - 1 &&
+    date.getUTCDate() === Number(day) &&
+    within(hour, 23) &&
+    within(minute, 59) &&
+    within(second, 59) &&
+    within(offsetHour, 23) &&
+    within(offsetMinute, 59) &&
+    !Number.isNaN(Date.parse(text))
+  );
+};
 
 /** A date (YYYY-MM-DD, a UTC day) or an ISO 8601 date-time with offset. */
 export const TimeParam = (what: string) =>
   Schema.String.check(
     Schema.isPattern(TIME, { message: "must be YYYY-MM-DD or an ISO 8601 date-time with offset" }),
-    Schema.makeFilter((text: string) => (Number.isNaN(Date.parse(text)) ? "must be a real date" : undefined)),
+    Schema.makeFilter((text: string) => (isRealTime(text) ? undefined : "must be a real date and time")),
   ).annotate({
     description: `${what}: YYYY-MM-DD (a UTC day) or an ISO 8601 date-time with offset, e.g. 2026-11-17T08:00:00+01:00.`,
   });

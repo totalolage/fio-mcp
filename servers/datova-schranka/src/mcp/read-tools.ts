@@ -26,6 +26,7 @@ import {
   timeBound,
 } from "./params.js";
 import {
+  DATA_BOX_ID,
   DELIVERY_INFO_GUARD,
   FIND_GUARD,
   LIST_GUARD,
@@ -56,6 +57,15 @@ const SPEC = {
 export const READ_TOOL_SPECS: ReadonlyArray<ToolSpec> = [...Object.values(SPEC), DOWNLOAD_SPEC];
 
 // --- Tool definitions ------------------------------------------------------------------------
+
+/** FindDataBox2 criteria, with box IDs held to the dbID format before any ISDS call. */
+const FindQueryParam = FindDataBoxesQuery.check(
+  Schema.makeFilter((query: { readonly dbID?: string | undefined; readonly dbUpperID?: string | undefined }) =>
+    [query.dbID, query.dbUpperID].every((id) => id === undefined || DATA_BOX_ID.test(id))
+      ? undefined
+      : "dbID and dbUpperID must be 7 lowercase letters or digits",
+  ),
+);
 
 const MAX_LIST_LIMIT = 1000;
 
@@ -140,7 +150,7 @@ export function makeReadToolkit(labels: ReadonlyArray<string>) {
       tool(
         "find_data_box",
         "Search the ISDS directory for data boxes with the box's credentials (FindDataBox2): by dbID, or by IČO (ic), firm name, person name, birth data or address. Does not deliver anything.",
-        Schema.Struct({ box, query: FindDataBoxesQuery }),
+        Schema.Struct({ box, query: FindQueryParam }),
       ),
       { ...lookup, title: "Find data box" },
     ),
