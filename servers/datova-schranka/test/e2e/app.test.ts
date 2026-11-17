@@ -131,7 +131,7 @@ const countBy = (values: ReadonlyArray<string>) =>
   Object.fromEntries(Array.from(new Set(values), (value) => [value, values.filter((v) => v === value).length]));
 
 describe("datova-schranka end to end (fake ISDS)", () => {
-  it("adds boxes in /admin, consents in the browser, calls every read tool over MCP and audits each step once", async () => {
+  it("adds boxes in /admin, consents in the browser, calls six read tools over MCP and audits each step once", async () => {
     const running = await start();
     const admin = await addBoxes(running);
 
@@ -203,10 +203,8 @@ describe("datova-schranka end to end (fake ISDS)", () => {
     expect(sentLines).toHaveLength(1);
     expect(sentLines[0]).toContain(REDACTED);
     expect(sentLines[0]).not.toContain(SCRUBBED);
-    for (const line of logs) {
-      expect(line).not.toContain(MAIN.password);
-      expect(line).not.toContain(pki.clientPassphrase);
-    }
+    // No text the harness handed back (logs, pages, audit cells, messages) held a credential it had to scrub.
+    expect(running.scrubbed()).toEqual([]);
   });
 
   it("refuses and audits calls for a box outside the grant and read calls on an isds:send-only grant", async () => {
@@ -229,7 +227,7 @@ describe("datova-schranka end to end (fake ISDS)", () => {
       (await running.consent({ boxes: [MAIN.label], scopes: [SEND_SCOPE], deliveryConsent: false })).access,
     );
     const sendTools = await sendOnly.listTools();
-    expect(sendTools.map((tool) => tool.name)).toEqual([]);
+    expect(sendTools.map((tool) => tool.name).filter((name) => READ_TOOLS.includes(name))).toEqual([]);
     const wrongScope = await sendOnly.call("list_sent_messages", { box: MAIN.label });
     expect(wrongScope.isError).toBe(true);
 
@@ -241,6 +239,7 @@ describe("datova-schranka end to end (fake ISDS)", () => {
     expect(countBy(rows.map((row) => row.action))).toEqual({ [CONSENT_ACTION]: 2, list_sent_messages: 2 });
     // No ISDS call was made for either refusal.
     expect(isds.requests.filter((request) => request.request.operation === "GetListOfSentMessages")).toEqual([]);
+    expect(running.scrubbed()).toEqual([]);
   });
   it("reports a refused box addition as an outcome, its message free of the credentials, and audits it", async () => {
     const running = await start();
@@ -263,5 +262,7 @@ describe("datova-schranka end to end (fake ISDS)", () => {
     const adds = (await admin.auditRows()).filter((row) => row.action === BOX_AUDIT_ACTIONS.add);
     expect(adds.map((row) => row.outcome.includes("ok"))).toEqual([false, false, true, true]);
     for (const row of adds) expect(row.detail).not.toContain(REJECTED.password);
+    // The checks above see scrubbed text; this one says nothing needed scrubbing.
+    expect(running.scrubbed()).toEqual([]);
   });
 });

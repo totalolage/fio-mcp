@@ -13,10 +13,13 @@
  * the harness: the server's log lines (and those of effects given to `run`)
  * go through the app's Redactor into memory only, nothing reaches stderr,
  * and every text the harness returns or throws (logs, admin messages, pages,
- * audit cells, consent and MCP errors) has those values, raw or
- * HTML-escaped, replaced with SCRUBBED.
+ * audit cells, consent and MCP errors) has those values, raw, HTML-, JSON-
+ * or URI-encoded, replaced with SCRUBBED. Each replacement is recorded by
+ * site in E2eApp.scrubbed(), so a test asserts that list is empty: the app
+ * itself rendered or logged no credential.
  */
 
+import { Buffer } from "node:buffer";
 import { randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -148,6 +151,8 @@ export interface E2eApp {
   readonly run: <A, E>(effect: Effect.Effect<A, E, HarnessServices>) => Promise<A>;
   /** The server's log lines so far (redacted by its Redactor, credentials replaced with SCRUBBED). */
   readonly logs: () => ReadonlyArray<string>;
+  /** The sites (never the values) where the harness had to replace a credential: in any server log line so far, or in a text it returned or threw. Empty when the app rendered and logged none. */
+  readonly scrubbed: () => ReadonlyArray<string>;
   /** Signs in to /admin with the harness's admin password. */
   readonly admin: () => Promise<AdminSession>;
   /** Registers a client, consents in the browser, and exchanges the code for tokens; throws when consent is refused. */
@@ -183,19 +188,27 @@ const escapeHtml = (text: string) =>
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
 
-/** Replaces every known credential value, raw or HTML-escaped, longest first (so one inside another goes too). */
-const scrubber = (secrets: Set<string>) => (text: string) => {
-  const forms = Array.from(secrets)
-    .filter((secret) => secret !== "")
-    .flatMap((secret) => [secret, escapeHtml(secret)])
-    .sort((a, b) => b.length - a.length);
-  let out = text;
-  for (const form of forms) out = out.replaceAll(form, SCRUBBED);
-  return out;
-};
+/**
+ * Replaces every known credential value, raw, HTML-, JSON- or URI-encoded, longest first (so one
+ * inside another goes too), and records `site` in `hits` whenever it replaced anything.
+ */
+export const scrubber =
+  (secrets: Set<string>, hits: Set<string>) =>
+  (text: string, site = "harness error"): string => {
+    const forms = Array.from(secrets)
+      .filter((secret) => secret !== "")
+      .flatMap((secret) => [secret, escapeHtml(secret), JSON.stringify(secret).slice(1, -1), encodeURIComponent(secret)])
+      .sort((a, b) => b.length - a.length);
+    let out = text;
+    for (const form of forms) out = out.replaceAll(form, SCRUBBED);
+    if (out !== text) hits.add(site);
+    return out;
+  };
+
+type Scrub = ReturnType<typeof scrubber>;
 
 /** Runs `f`, rethrowing any failure with credentials scrubbed from its message (and no cause). */
-const scrubbingErrors = async <A>(scrub: (text: string) => string, f: () => Promise<A>): Promise<A> => {
+const scrubbingErrors = async <A>(scrub: Scrub, f: () => Promise<A>): Promise<A> => {
   try {
     return await f();
   } catch (error) {
@@ -214,10 +227,10 @@ const unescapeHtml = (text: string) =>
 const cellText = (html: string) => unescapeHtml(html.replace(/<br\s*\/?>/g, " ").replace(/<[^>]*>/g, "")).trim();
 
 /** The audit tab's rows and its "Older" link, if any. */
-const auditPage = (html: string, scrub: (text: string) => string) => {
+const auditPage = (html: string, scrub: Scrub) => {
   const table = /<tbody>([\s\S]*?)<\/tbody>/.exec(html)?.[1] ?? "";
   const rows = Array.from(table.matchAll(/<tr>([\s\S]*?)<\/tr>/g), (match) => {
-    const cells = Array.from((match[1] ?? "").matchAll(/<td>([\s\S]*?)<\/td>/g), (cell) => scrub(cellText(cell[1] ?? "")));
+    const cells = Array.from((match[1] ?? "").matchAll(/<td>([\s\S]*?)<\/td>/g), (cell) => scrub(cellText(cell[1] ?? ""), "audit row"));
     const [time = "", actor = "", action = "", box = "", outcome = "", detail = ""] = cells;
     return { time, actor, action, box, outcome, detail };
   });
@@ -229,7 +242,7 @@ const auditPage = (html: string, scrub: (text: string) => string) => {
 async function adminSession(
   fetch: OAuthHarness["fetch"],
   secrets: Set<string>,
-  scrub: (text: string) => string,
+  scrub: Scrub,
 ): Promise<AdminSession> {
   let cookie: string | undefined;
   let csrf: string | undefined;
@@ -266,14 +279,14 @@ async function adminSession(
   const addBox = async (form: FormData): Promise<AdminOutcome> => {
     const posted = await post(ADD_PATH, form);
     if (posted.status !== 303 || posted.location === null) {
-      return { status: posted.status, kind: undefined, text: scrub(cellText(posted.html)).slice(0, 300), added: false };
+      return { status: posted.status, kind: undefined, text: scrub(cellText(posted.html), "add box answer").slice(0, 300), added: false };
     }
     const page = await get(posted.location);
     const flash = flashOf(page.html);
     return {
       status: page.status,
       kind: flash?.kind,
-      text: flash === undefined ? undefined : scrub(flash.text),
+      text: flash === undefined ? undefined : scrub(flash.text, "add box message"),
       added: flash?.kind === "ok",
     };
   };
@@ -286,6 +299,7 @@ async function adminSession(
     },
     addCertificateBox: ({ label, pkcs12, passphrase, filename = "box.p12" }) => {
       secrets.add(passphrase);
+      secrets.add(Buffer.from(pkcs12).toString("base64"));
       return act(multipart({ auth: "certificate", label, passphrase }, { certificate: { name: filename, bytes: pkcs12 } }));
     },
     auditRows: async () => {
@@ -302,7 +316,7 @@ async function adminSession(
     },
     page: async (path) => {
       const page = await get(path);
-      return { status: page.status, html: scrub(page.html) };
+      return { status: page.status, html: scrub(page.html, `admin page ${path}`) };
     },
   };
 }
@@ -314,12 +328,16 @@ export async function startE2eApp(options: E2eOptions): Promise<E2eApp> {
   const sessions: Array<() => Promise<void>> = [];
   const close = async () => {
     for (const session of sessions.splice(0)) await session().catch(() => undefined);
-    await Effect.runPromise(Scope.close(scope, Exit.void));
-    rmSync(dir, { recursive: true, force: true });
+    try {
+      await Effect.runPromise(Scope.close(scope, Exit.void));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   };
   try {
     const secrets = new Set<string>();
-    const scrub = scrubber(secrets);
+    const hits = new Set<string>();
+    const scrub = scrubber(secrets, hits);
     const lines: Array<string> = [];
     // Log lines through the app's own Redactor (the instance its services register box secrets with).
     const capture = (redactor: Redactor["Service"]) =>
@@ -349,7 +367,7 @@ export async function startE2eApp(options: E2eOptions): Promise<E2eApp> {
       // Not wired: the app runs on real time.
       clock: new SkewedClock(),
       get logs() {
-        return lines.map(scrub);
+        return lines.map((line) => scrub(line, "server log"));
       },
       store: (f) => run(Effect.flatMap(makeOAuthStore(undefined, grantSettings), f)),
       sql: run,
@@ -362,7 +380,12 @@ export async function startE2eApp(options: E2eOptions): Promise<E2eApp> {
       dir,
       oauth,
       run,
-      logs: () => lines.map(scrub),
+      logs: () => lines.map((line) => scrub(line, "server log")),
+      scrubbed: () => {
+        // Every log line so far is checked, whether or not the test read the logs.
+        for (const line of lines) scrub(line, "server log");
+        return Array.from(hits);
+      },
       admin: () => adminSession(fetch, secrets, scrub),
       consent: (request) =>
         scrubbingErrors(scrub, async () => {
