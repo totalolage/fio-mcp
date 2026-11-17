@@ -124,7 +124,7 @@ export class BoxSecretTooShort extends Schema.TaggedError<BoxSecretTooShort>()("
 }
 
 /** Fails with BoxSecretTooShort when the credentials' password or passphrase is too short (counted in code points). */
-const checkSecretLength = (credentials: IsdsCredentials): Effect.Effect<void, BoxSecretTooShort> => {
+export const checkBoxSecretLength = (credentials: IsdsCredentials): Effect.Effect<void, BoxSecretTooShort> => {
   const [secret, value] =
     credentials._tag === "Password"
       ? (["password", credentials.password] as const)
@@ -431,7 +431,7 @@ const makeBoxRegistry = Effect.gen(function* () {
     }
     const taken = yield* labelTaken(label, undefined).pipe(storeFailure("check the data box label"));
     if (taken !== undefined) return yield* taken;
-    yield* checkSecretLength(input.credentials);
+    yield* checkBoxSecretLength(input.credentials);
     redactor.register(secretsOf(input.credentials));
     const { owner, dbId } = yield* login(input.credentials);
     return yield* exclusive(
@@ -497,7 +497,7 @@ const makeBoxRegistry = Effect.gen(function* () {
     credentials: IsdsCredentials,
   ) {
     yield* find(boxId);
-    yield* checkSecretLength(credentials);
+    yield* checkBoxSecretLength(credentials);
     redactor.register(secretsOf(credentials));
     // Under the box's permit, so this login never overlaps another ISDS call for the box.
     const { owner, dbId } = yield* locks.withBox(boxId, login(credentials));

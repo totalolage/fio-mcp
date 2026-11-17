@@ -1,5 +1,5 @@
 import type { LoginResult } from "@mcps/core/oauth/login.js";
-import { Effect, Redacted } from "effect";
+import { Effect, Fiber, Redacted } from "effect";
 import { SqlClient } from "effect/sql";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { BOX_FORM_MAX_BYTES, boxesTab } from "../../src/admin/boxes-tab.js";
@@ -7,6 +7,7 @@ import { type AuditEntry, AuditLog } from "../../src/domain/audit-log.js";
 import { BoxRegistry } from "../../src/domain/boxes.js";
 import { newBoxId } from "../../src/domain/ids.js";
 import { IsdsCredentialsError } from "../../src/isds/errors.js";
+import { loginResponder } from "../domain/support/fake-isds.js";
 import { createTestPki, type TestPki } from "../isds/support/pki.js";
 import { AdminBrowser, type AdminHarness, type AdminHarnessOptions, multipart, startAdmin } from "./support/admin-harness.js";
 
@@ -194,7 +195,8 @@ describe("adding a box", () => {
       ["box_add", "refused"],
       ["box_add", "refused"],
     ]);
-    expect(rows[0]?.detail).toMatchObject({ error: "BoxSecretTooShort", label: "Office", authKind: "password" });
+    expect(rows[0]?.detail).toMatchObject({ error: "BoxSecretTooShort", authKind: "password" });
+    expect(rows[0]?.detail).not.toHaveProperty("label");
     expect(await everything(app, browser)).not.toContain("short77");
   });
 
@@ -274,12 +276,15 @@ describe("changing a box", () => {
       kind: "error",
       text: 'Not renamed: A data box labelled "archive" already exists.',
     });
-    expect((await browser.act("/admin/boxes/relabel", { box: "box_missing", label: "X" })).flash?.text).toMatch(/^Not renamed: /);
+    const missing = newBoxId();
+    expect((await browser.act("/admin/boxes/relabel", { box: missing, label: "X" })).flash?.text).toMatch(/^Not renamed: /);
+    expect((await browser.act("/admin/boxes/relabel", { box: "<not an id>".repeat(100), label: "X" })).flash?.text).toMatch(/^Not renamed: /);
     const rows = (await audits(app)).filter((entry) => entry.action === "box_relabel");
     expect(rows.map((entry) => [entry.outcome, entry.boxId])).toEqual([
       ["ok", box.id],
       ["refused", box.id],
-      ["refused", "box_missing"],
+      ["refused", missing],
+      ["refused", undefined],
     ]);
     expect(rows[0]?.detail).toEqual({ from: "Office", to: "Main office", dbId: "aaa1111" });
   });
@@ -422,5 +427,106 @@ describe("every admin action is audited once", () => {
     );
     const text = await everything(app, browser);
     for (const secret of [PASSWORD_A, PASSWORD_B]) expect(text).not.toContain(secret);
+  });
+});
+
+describe("council follow-ups", () => {
+  it("never stores a label that holds the box's password or passphrase", async () => {
+    const { app, browser } = await start();
+    const added = await browser.actMultipart("/admin/boxes/add", passwordForm(`My ${PASSWORD_A.toUpperCase()}`, "alice", PASSWORD_A));
+    expect(added.flash).toEqual({ kind: "error", text: "Not added: The label must not contain the box's password or passphrase." });
+    expect(app.isds.requests).toEqual([]);
+    const box = await addAlice(browser);
+    const renamed = await browser.act("/admin/boxes/relabel", { box: box.id, label: PASSWORD_A });
+    expect(renamed.flash).toEqual({ kind: "error", text: "Not renamed: The label must not contain the box's password or passphrase." });
+    const checked: Array<string> = [];
+    await app.close();
+    const restarted = await start({
+      secondFactor: () => {
+        checked.push("checked");
+        return Effect.succeed<LoginResult<void>>({ _tag: "Accepted", value: undefined });
+      },
+    });
+    await restarted.browser.actMultipart("/admin/boxes/add", passwordForm("Office password-1234", "alice", PASSWORD_A));
+    const [stored] = await boxes(restarted.app);
+    const replaced = await restarted.browser.actMultipart(
+      "/admin/boxes/credentials",
+      passwordForm("", "alice-new", "password-1234", { box: stored?.id ?? "" }),
+    );
+    expect(replaced.flash).toEqual({ kind: "error", text: "Not replaced: The label must not contain the box's password or passphrase." });
+    expect(checked).toEqual([]);
+    expect((await audits(restarted.app)).map((entry) => [entry.action, entry.outcome])).toEqual([
+      ["box_add", "ok"],
+      ["box_replace_credentials", "refused"],
+    ]);
+    const refusal = (await audits(restarted.app))[1];
+    expect(JSON.stringify(refusal?.detail)).not.toContain("password-1234");
+    expect(JSON.stringify(await audits(restarted.app))).not.toContain(PASSWORD_A);
+  });
+
+  it("refuses a short replacement secret before using up the second factor", async () => {
+    const checked: Array<string> = [];
+    const { browser } = await start({
+      secondFactor: () => {
+        checked.push("checked");
+        return Effect.succeed<LoginResult<void>>({ _tag: "Accepted", value: undefined });
+      },
+    });
+    const box = await addAlice(browser);
+    const short = await browser.actMultipart("/admin/boxes/credentials", passwordForm("", "alice-new", "sh0rt-7", { box: box.id }));
+    expect(short.flash?.text).toBe("Not replaced: The ISDS password must be at least 8 characters long.");
+    expect(checked).toEqual([]);
+  });
+
+  it("finishes a committed add and writes its audit row when the request is interrupted", async () => {
+    let entered: () => void = () => undefined;
+    const signingIn = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const base = loginResponder(LOGINS);
+    const { app } = await start({
+      respond: (config, request) =>
+        Effect.sync(() => entered()).pipe(
+          Effect.andThen(Effect.promise(() => gate)),
+          Effect.andThen(base(config, request)),
+        ),
+    });
+    const exit = await app.run(
+      Effect.gen(function* () {
+        const tab = yield* boxesTab;
+        const add = tab.actions.find((action) => action.path === "/admin/boxes/add");
+        if (add === undefined) return yield* Effect.die("no add action");
+        const form = new URLSearchParams({ label: "Office", auth: "password", username: "alice", password: PASSWORD_A });
+        const accepted = Effect.succeed<LoginResult<void>>({ _tag: "Accepted", value: undefined });
+        const fiber = yield* Effect.forkChild(add.run(form, { checkSecondFactor: accepted, files: [] }), { startImmediately: true });
+        yield* Effect.promise(() => signingIn);
+        const interrupting = yield* Effect.forkChild(Fiber.interrupt(fiber), { startImmediately: true });
+        release();
+        yield* Fiber.join(interrupting);
+        return yield* Fiber.await(fiber);
+      }),
+    );
+    // The interruption waited for the action; the fiber still ends interrupted.
+    expect(exit._tag).toBe("Failure");
+    const [box] = await boxes(app);
+    expect(box?.dbId).toBe("aaa1111");
+    expect((await audits(app)).map(rowSummary)).toEqual([{ action: "box_add", outcome: "ok", actorKind: "admin", boxId: box?.id }]);
+  });
+
+  it("shows and logs a failed audit write without hiding the change", async () => {
+    const { app, browser } = await start();
+    const box = await addAlice(browser);
+    await app.run(Effect.flatMap(SqlClient.SqlClient, (sql) => sql`DROP TABLE audit_log`).pipe(Effect.orDie));
+    const renamed = await browser.act("/admin/boxes/relabel", { box: box.id, label: "Renamed" });
+    expect(renamed.flash?.kind).toBe("error");
+    expect(renamed.flash?.text).toMatch(/^Renamed “Office” to “Renamed”\. The audit row could not be written: /);
+    expect((await boxes(app)).map((entry) => entry.label)).toEqual(["Renamed"]);
+    expect(app.logs.some((line) => line.includes("admin: the audit row of box_relabel could not be written"))).toBe(true);
+    const text = [...browser.pages, ...app.logs].join("\n");
+    expect(text).not.toContain(PASSWORD_A);
   });
 });

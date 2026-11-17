@@ -4,8 +4,9 @@ import { type AdminActionContext, type AdminFormFile, type AdminTab, field, file
 import { Redactor } from "@mcps/core/redaction.js";
 import { Effect, Redacted } from "effect";
 import { type AuditFinalOutcome, AuditLog } from "../domain/audit-log.js";
-import { type Box, BoxRegistry } from "../domain/boxes.js";
+import { type Box, BoxRegistry, checkBoxSecretLength } from "../domain/boxes.js";
 import { DomainConfig } from "../domain/config.js";
+import { isBoxId } from "../domain/ids.js";
 import { IsdsCredentials } from "../isds/config.js";
 import {
   ADD_PATH,
@@ -99,6 +100,31 @@ const credentialsOf = (form: URLSearchParams, files: ReadonlyArray<AdminFormFile
   }
 };
 
+/** The sign-in kind a form chose, as one of the two values (the field itself is untrusted text). */
+const authKindOf = (form: URLSearchParams): "password" | "certificate" | undefined => {
+  const auth = field(form, "auth");
+  return auth === "password" || auth === "certificate" ? auth : undefined;
+};
+
+/** The box id a form names, and the id to audit it under (only a well-formed box id; the field is untrusted text). */
+const boxIdOf = (form: URLSearchParams) => {
+  const boxId = field(form, "box") ?? "";
+  return { boxId, audited: isBoxId(boxId) ? boxId : undefined };
+};
+
+const secretOf = (credentials: IsdsCredentials) =>
+  Redacted.value(credentials._tag === "Password" ? credentials.password : credentials.passphrase);
+
+/**
+ * Whether a label holds the box's password or passphrase (case-insensitive).
+ * Labels are shown to every client and in the admin UI, so one typed into
+ * the wrong field must not be stored.
+ */
+const labelHoldsSecret = (label: string, secret: string) =>
+  secret !== "" && label.toLocaleLowerCase("cs").includes(secret.toLocaleLowerCase("cs"));
+
+const LABEL_HOLDS_SECRET = "The label must not contain the box's password or passphrase.";
+
 const boxInfo = (box: Box) => ({ label: box.label, dbId: box.dbId, authKind: box.authKind });
 
 export const boxesTab: Effect.Effect<AdminTab, never, BoxRegistry | AuditLog | Redactor | DomainConfig> = Effect.gen(function* () {
@@ -126,7 +152,12 @@ export const boxesTab: Effect.Effect<AdminTab, never, BoxRegistry | AuditLog | R
       };
     };
 
-  /** Writes the outcome's audit row and returns its message. */
+  /**
+   * Runs the action and writes its audit row, uninterruptibly: a change the
+   * registry committed always gets its row, even when the request is
+   * cancelled (ISDS calls are bounded by the client's timeouts). A failed
+   * audit write is logged and shown with the action's message.
+   */
   const audited = (action: string, perform: Effect.Effect<Outcome>) =>
     Effect.flatMap(perform, (done) =>
       audit
@@ -134,13 +165,15 @@ export const boxesTab: Effect.Effect<AdminTab, never, BoxRegistry | AuditLog | R
         .pipe(
           Effect.as(done.flash),
           Effect.catch((error) =>
-            Effect.succeed<Flash>({
-              kind: "error",
-              text: `${done.flash.text} The audit row could not be written: ${messageOf(error)}`,
-            }),
+            Effect.logWarning(`admin: the audit row of ${action} could not be written: ${messageOf(error)}`).pipe(
+              Effect.as<Flash>({
+                kind: "error",
+                text: `${done.flash.text} The audit row could not be written: ${messageOf(error)}`,
+              }),
+            ),
           ),
         ),
-    );
+    ).pipe(Effect.uninterruptible);
 
   /** Undefined when the second factor passed, else the refusal. */
   const secondFactorRefusal = (context: AdminActionContext, nothing: string) =>
@@ -164,9 +197,11 @@ export const boxesTab: Effect.Effect<AdminTab, never, BoxRegistry | AuditLog | R
 
   const add = Effect.fnUntraced(function* (form: URLSearchParams, context: AdminActionContext) {
     const label = field(form, "label") ?? "";
-    const detail = { label: label.trim(), authKind: field(form, "auth") };
+    // A refused form's label is not audited: it may be a secret typed into the wrong field.
+    const detail = { authKind: authKindOf(form) };
     const credentials = credentialsOf(form, context.files);
     if (typeof credentials === "string") return refused(`Not added: ${credentials}`, undefined, detail);
+    if (labelHoldsSecret(label, secretOf(credentials))) return refused(`Not added: ${LABEL_HOLDS_SECRET}`, undefined, detail);
     return yield* registry.add({ label, environment, credentials }).pipe(
       Effect.map(
         (box): Outcome => ({
@@ -184,9 +219,14 @@ export const boxesTab: Effect.Effect<AdminTab, never, BoxRegistry | AuditLog | R
   });
 
   const relabel = Effect.fnUntraced(function* (form: URLSearchParams) {
-    const boxId = field(form, "box") ?? "";
+    const { boxId, audited: auditedId } = boxIdOf(form);
+    const label = field(form, "label") ?? "";
+    const stored = yield* Effect.option(registry.credentials(boxId));
+    if (stored._tag === "Some" && labelHoldsSecret(label, secretOf(stored.value))) {
+      return refused(`Not renamed: ${LABEL_HOLDS_SECRET}`, auditedId);
+    }
     const before = yield* Effect.option(registry.get(boxId));
-    return yield* registry.relabel(boxId, field(form, "label") ?? "").pipe(
+    return yield* registry.relabel(boxId, label).pipe(
       Effect.map(
         (box): Outcome => ({
           flash: { kind: "ok", text: `Renamed “${before._tag === "Some" ? before.value.label : box.dbId}” to “${box.label}”.` },
@@ -195,17 +235,24 @@ export const boxesTab: Effect.Effect<AdminTab, never, BoxRegistry | AuditLog | R
           detail: { from: before._tag === "Some" ? before.value.label : undefined, to: box.label, dbId: box.dbId },
         }),
       ),
-      Effect.catch((error) => Effect.succeed(failed("Not renamed: ", boxId)(error))),
+      Effect.catch((error) => Effect.succeed(failed("Not renamed: ", auditedId)(error))),
     );
   });
 
   const replaceCredentials = Effect.fnUntraced(function* (form: URLSearchParams, context: AdminActionContext) {
-    const boxId = field(form, "box") ?? "";
-    const detail = { authKind: field(form, "auth") };
+    const { boxId, audited: auditedId } = boxIdOf(form);
+    const detail = { authKind: authKindOf(form) };
     const credentials = credentialsOf(form, context.files);
-    if (typeof credentials === "string") return refused(`Not replaced: ${credentials}`, boxId, detail);
+    if (typeof credentials === "string") return refused(`Not replaced: ${credentials}`, auditedId, detail);
+    // Checked before the second factor, so a form refused anyway does not use up a code.
+    const tooShort = yield* Effect.flip(checkBoxSecretLength(credentials)).pipe(Effect.option);
+    if (tooShort._tag === "Some") return failed("Not replaced: ", auditedId, detail)(tooShort.value);
+    const current = yield* Effect.option(registry.get(boxId));
+    if (current._tag === "Some" && labelHoldsSecret(current.value.label, secretOf(credentials))) {
+      return refused(`Not replaced: ${LABEL_HOLDS_SECRET}`, auditedId, detail);
+    }
     const factor = yield* secondFactorRefusal(context, "The credentials were not replaced.");
-    if (factor !== undefined) return refused(factor, boxId, { ...detail, secondFactor: "failed" });
+    if (factor !== undefined) return refused(factor, auditedId, { ...detail, secondFactor: "failed" });
     return yield* registry.replaceCredentials(boxId, credentials).pipe(
       Effect.map(
         (box): Outcome => ({
@@ -215,14 +262,15 @@ export const boxesTab: Effect.Effect<AdminTab, never, BoxRegistry | AuditLog | R
           detail: boxInfo(box),
         }),
       ),
-      Effect.catch((error) => Effect.succeed(failed("Not replaced: ", boxId, detail)(error))),
+      Effect.catch((error) => Effect.succeed(failed("Not replaced: ", auditedId, detail)(error))),
     );
   });
 
   const testConnection = Effect.fnUntraced(function* (form: URLSearchParams) {
-    const boxId = field(form, "box") ?? "";
-    return yield* registry.testConnection(boxId).pipe(
-      Effect.flatMap(() => registry.get(boxId)),
+    const { boxId, audited: auditedId } = boxIdOf(form);
+    // The box as it was when tested, so a removal racing the test cannot turn a passed test into a refusal.
+    return yield* registry.get(boxId).pipe(
+      Effect.tap(() => registry.testConnection(boxId)),
       Effect.map(
         (box): Outcome => ({
           flash: { kind: "ok", text: `ISDS accepted the credentials of “${box.label}” (data box ${box.dbId}).` },
@@ -231,15 +279,15 @@ export const boxesTab: Effect.Effect<AdminTab, never, BoxRegistry | AuditLog | R
           detail: { label: box.label, dbId: box.dbId },
         }),
       ),
-      Effect.catch((error) => Effect.succeed(failed("Connection test failed: ", boxId)(error))),
+      Effect.catch((error) => Effect.succeed(failed("Connection test failed: ", auditedId)(error))),
     );
   });
 
   const remove = Effect.fnUntraced(function* (form: URLSearchParams, context: AdminActionContext) {
-    const boxId = field(form, "box") ?? "";
-    if (field(form, "confirm") !== "yes") return refused("Tick the box to confirm the removal.", boxId);
+    const { boxId, audited: auditedId } = boxIdOf(form);
+    if (field(form, "confirm") !== "yes") return refused("Tick the box to confirm the removal.", auditedId);
     const factor = yield* secondFactorRefusal(context, "Nothing was removed.");
-    if (factor !== undefined) return refused(factor, boxId, { secondFactor: "failed" });
+    if (factor !== undefined) return refused(factor, auditedId, { secondFactor: "failed" });
     return yield* registry.remove(boxId).pipe(
       Effect.map(
         ({ box, expiredFilings }): Outcome => ({
@@ -254,7 +302,7 @@ export const boxesTab: Effect.Effect<AdminTab, never, BoxRegistry | AuditLog | R
           detail: { label: box.label, dbId: box.dbId, expiredFilings },
         }),
       ),
-      Effect.catch((error) => Effect.succeed(failed("Not removed: ", boxId)(error))),
+      Effect.catch((error) => Effect.succeed(failed("Not removed: ", auditedId)(error))),
     );
   });
 
