@@ -227,7 +227,7 @@ describe("BoxRegistry credentials", () => {
         yield* registry.relabel(box.id, "Renamed");
         expect(yield* registry.credentials(box.id)).toBe(before);
 
-        const replacement = passwordCredentials("alice-again", "rotated");
+        const replacement = passwordCredentials("alice-again", "rotated-pw");
         yield* registry.replaceCredentials(box.id, replacement);
         const after = yield* registry.credentials(box.id);
         expect(after).not.toBe(before);
