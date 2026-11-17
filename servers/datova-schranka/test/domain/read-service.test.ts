@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { assert, describe, it } from "@effect/vitest";
-import { Effect, Layer } from "effect";
+import { Deferred, Effect, Fiber, Layer } from "effect";
 import type { AuditActor } from "../../src/domain/audit-log.js";
 import { DomainConfig, type DomainConfigShape } from "../../src/domain/config.js";
 import { ReadService } from "../../src/domain/read-service.js";
@@ -34,12 +34,16 @@ const setup = (
   options: {
     readonly replies?: ReadReplies;
     readonly failStart?: boolean;
+    readonly failFinish?: "fail" | "die";
     readonly config?: Partial<Pick<DomainConfigShape, "attachmentInlineMaxBytes" | "responseInlineMaxBytes">>;
   } = {},
 ) => {
   const log: Array<string> = [];
   const clients = readBoxClients(BOX_ID, options.replies ?? replies, log);
-  const audit = readAuditLog(log, { failStart: options.failStart ?? false });
+  const audit = readAuditLog(log, {
+    failStart: options.failStart ?? false,
+    ...(options.failFinish === undefined ? {} : { failFinish: options.failFinish }),
+  });
   const zfo = readZfoStore(log);
   const layer = ReadService.Default.pipe(
     Layer.provide(
@@ -134,6 +138,37 @@ describe("ReadService.listReceivedMessages", () => {
         error: "IsdsTimeoutError",
         requestSent: true,
       });
+    }),
+  );
+
+  it.effect("records an interruption after the intent as uncertain", () =>
+    Effect.gen(function* () {
+      const reached = yield* Deferred.make<void>();
+      const h = setup({
+        replies: { GetListOfReceivedMessages: () => Deferred.succeed(reached, undefined).pipe(Effect.andThen(Effect.never)) },
+      });
+      const fiber = yield* Effect.forkChild(withService(h, (s) => s.listReceivedMessages(actor, BOX_ID, {})));
+      yield* Deferred.await(reached);
+      yield* Fiber.interrupt(fiber);
+      assert.deepStrictEqual(h.log, [
+        "audit.start list_received_messages",
+        "isds GetListOfReceivedMessages",
+        "audit.finish uncertain",
+      ]);
+    }),
+  );
+
+  it.effect("keeps the call's result when the outcome cannot be written", () =>
+    Effect.gen(function* () {
+      for (const failFinish of ["fail", "die"] as const) {
+        const h = setup({ failFinish });
+        const result = yield* withService(h, (s) => s.listReceivedMessages(actor, BOX_ID, {}));
+        assert.isAbove(result.records.length, 0);
+        assert.strictEqual(h.log.at(-1), `audit.finish ok (${failFinish === "fail" ? "failed" : "died"})`);
+        const failed = setup({ failFinish, replies: { GetListOfReceivedMessages: timeout(true) } });
+        const error = yield* Effect.flip(withService(failed, (s) => s.listReceivedMessages(actor, BOX_ID, {})));
+        assert.strictEqual(error._tag, "IsdsTimeoutError");
+      }
     }),
   );
 
@@ -409,6 +444,19 @@ describe("ReadService list, search and check operations", () => {
       assert.deepStrictEqual(h.log, ["audit.start find_data_box", "isds FindDataBox2", "audit.finish ok"]);
       const start = h.audit[0];
       assert.deepStrictEqual(start?.kind === "start" ? start.input.detail : undefined, query);
+    }),
+  );
+
+  it.effect("findDataBox rejects a malformed dbID or dbUpperID before auditing", () =>
+    Effect.gen(function* () {
+      const h = setup();
+      for (const query of [{ dbID: "ABC1234" }, { dbType: "OVM", firmName: "Úřad", dbUpperID: "x/../yz" }] as const) {
+        const error = yield* Effect.flip(withService(h, (s) => s.findDataBox(actor, BOX_ID, query)));
+        assert.strictEqual(error._tag, "InvalidIdentifier");
+        if (error._tag !== "InvalidIdentifier") return;
+        assert.strictEqual(error.kind, "dataBoxId");
+      }
+      assert.deepStrictEqual(h.log, []);
     }),
   );
 

@@ -13,9 +13,13 @@ export type ReadAuditEvent =
 /**
  * An AuditLog that records start/finish in order, into its own `events` and as
  * `audit.start <action>` / `audit.finish <outcome>` lines in the shared `log`.
- * `failStart` makes start fail with DomainStoreError (nothing recorded).
+ * `failStart` makes start fail with DomainStoreError (nothing recorded); `failFinish` makes
+ * finish fail with DomainStoreError or die, after logging `audit.finish <outcome> (failed)`.
  */
-export const readAuditLog = (log: Array<string>, options: { readonly failStart?: boolean } = {}) => {
+export const readAuditLog = (
+  log: Array<string>,
+  options: { readonly failStart?: boolean; readonly failFinish?: "fail" | "die" } = {},
+) => {
   const events: Array<ReadAuditEvent> = [];
   const unused = Effect.die("read-audit-log: not used by ReadService");
   const layer = Layer.succeed(
@@ -30,9 +34,18 @@ export const readAuditLog = (log: Array<string>, options: { readonly failStart?:
           return Effect.succeed(id);
         }),
       finish: (id, outcome, detail) =>
-        Effect.sync(() => {
+        Effect.suspend(() => {
+          if (options.failFinish === "fail") {
+            log.push(`audit.finish ${outcome} (failed)`);
+            return Effect.fail(new DomainStoreError({ operation: "update audit entry" }));
+          }
+          if (options.failFinish === "die") {
+            log.push(`audit.finish ${outcome} (died)`);
+            return Effect.die("read-audit-log: finish died");
+          }
           events.push({ kind: "finish", id, outcome, detail });
           log.push(`audit.finish ${outcome}`);
+          return Effect.void;
         }),
       record: () => unused,
       list: () => unused,

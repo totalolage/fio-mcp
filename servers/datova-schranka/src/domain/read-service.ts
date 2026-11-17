@@ -171,9 +171,10 @@ const outcomeOf = <A, E extends Tagged>(
 
 /**
  * Writes the intent (`detail`), runs `effect` only if that succeeded, then the outcome: the
- * detail merged with `okDetail` of the value, or with the failure's tag and status code. The
- * outcome is written on every exit (interruption → "uncertain"); a failing outcome write is
- * logged and the call's own result kept (the row stays "started").
+ * detail merged with `okDetail` of the value, or with the failure's tag and status code. Only
+ * `effect` is interruptible, so once the intent is written the outcome is written on every exit
+ * (interruption → "uncertain"); a failing or defective outcome write is logged and the call's
+ * own result kept (the row stays "started").
  * Local stand-in for audit-log.ts's `audited` (same semantics); consolidate once both land.
  */
 const audited = <A, E extends Tagged>(
@@ -185,15 +186,19 @@ const audited = <A, E extends Tagged>(
   effect: Effect.Effect<A, E>,
   okDetail: (value: A) => object,
 ): Effect.Effect<A, E | DomainStoreError> =>
-  Effect.flatMap(audit.start({ actor, action, boxId, detail }), (id) =>
-    Effect.uninterruptibleMask((restore) =>
+  Effect.uninterruptibleMask((restore) =>
+    Effect.flatMap(audit.start({ actor, action, boxId, detail }), (id) =>
       restore(effect).pipe(
-        Effect.onExit((exit) => {
-          const [outcome, finalDetail] = outcomeOf(exit, detail, okDetail);
-          return audit
-            .finish(id, outcome, finalDetail)
-            .pipe(Effect.catch((error) => Effect.logWarning("datova-schranka: audit outcome not written", error)));
-        }),
+        Effect.onExit((exit) =>
+          Effect.suspend(() => {
+            const [outcome, finalDetail] = outcomeOf(exit, detail, okDetail);
+            return audit.finish(id, outcome, finalDetail);
+          }).pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning(`datova-schranka: outcome of audit entry ${id} not written`, cause),
+            ),
+          ),
+        ),
       ),
     ),
   );
@@ -201,8 +206,8 @@ const audited = <A, E extends Tagged>(
 const requireMessageId = (dmId: string): Effect.Effect<void, InvalidIdentifier> =>
   isMessageId(dmId) ? Effect.void : Effect.fail(new InvalidIdentifier({ kind: "messageId", rule: "1-20 digits" }));
 
-const requireDataBoxId = (dbId: string): Effect.Effect<void, InvalidIdentifier> =>
-  isDataBoxId(dbId)
+const requireDataBoxId = (dbId: string | undefined): Effect.Effect<void, InvalidIdentifier> =>
+  dbId === undefined || isDataBoxId(dbId)
     ? Effect.void
     : Effect.fail(new InvalidIdentifier({ kind: "dataBoxId", rule: "7 lowercase letters or digits" }));
 
@@ -380,6 +385,8 @@ const makeReadService = Effect.gen(function* () {
       boxId: string,
       query: FindDataBoxesQuery,
     ) {
+      yield* requireDataBoxId(query.dbID);
+      yield* requireDataBoxId(query.dbUpperID);
       return yield* audited(
         audit,
         actor,
