@@ -127,34 +127,77 @@ const MAX_LIMIT = 500;
 const clampLimit = (limit: number | undefined): number =>
   limit === undefined || Number.isNaN(limit) ? DEFAULT_LIMIT : Math.min(MAX_LIMIT, Math.max(1, Math.trunc(limit)));
 
+const summary = (view: Uint8Array) => ({
+  bytes: view.byteLength,
+  sha256: createHash("sha256").update(view).digest("hex"),
+});
+
 /**
- * Replaces every byte array (any ArrayBuffer view, Buffer included) with
- * {bytes, sha256}, walking arrays and plain objects. A value that refers
- * back to one of its ancestors becomes "[circular]".
+ * Turns `detail` into inert JSON data before it is redacted, so nothing
+ * JSON.stringify runs afterwards (a toJSON hook, a getter) can emit
+ * unredacted text. Byte arrays (any ArrayBuffer view, Buffer included, and
+ * ArrayBuffer) become {bytes, sha256}; a toJSON hook (Date, Redacted, Effect
+ * data types) runs first and its result is walked; any other object, a
+ * class instance too, contributes its own enumerable fields; bigints become
+ * strings; undefined, functions and symbols are dropped from objects and
+ * become null in arrays, as JSON does; non-finite numbers become null; a
+ * value that refers back to one of its ancestors becomes "[circular]".
  */
-const summarizeBytes = (value: unknown, ancestors: ReadonlySet<object> = new Set()): unknown => {
-  if (ArrayBuffer.isView(value)) {
-    const view = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
-    return { bytes: view.byteLength, sha256: createHash("sha256").update(view).digest("hex") };
+const toJsonData = (value: unknown, ancestors: ReadonlySet<object> = new Set()): unknown => {
+  switch (typeof value) {
+    case "string":
+    case "boolean":
+      return value;
+    case "number":
+      return Number.isFinite(value) ? value : null;
+    case "bigint":
+      return value.toString();
+    case "undefined":
+    case "function":
+    case "symbol":
+      return undefined;
   }
-  if (value === null || typeof value !== "object") return value;
+  if (value === null || typeof value !== "object") return null;
+  if (ArrayBuffer.isView(value)) return summary(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+  if (value instanceof ArrayBuffer) return summary(new Uint8Array(value));
   if (ancestors.has(value)) return "[circular]";
   const inner = new Set(ancestors).add(value);
-  if (Array.isArray(value)) return value.map((item) => summarizeBytes(item, inner));
-  const proto = Object.getPrototypeOf(value);
-  if (proto !== Object.prototype && proto !== null) return value;
-  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, summarizeBytes(item, inner)]));
+  if ("toJSON" in value && typeof value.toJSON === "function") return toJsonData(value.toJSON(), inner);
+  if (Array.isArray(value)) return value.map((item) => toJsonData(item, inner) ?? null);
+  return Object.fromEntries(
+    Object.entries(value).flatMap(([key, item]) => {
+      const data = toJsonData(item, inner);
+      return data === undefined ? [] : [[key, data] as const];
+    }),
+  );
 };
 
-/** A detail that JSON cannot encode (a BigInt, say) or a stored detail that does not parse; storeFailure logs and drops it. */
-class AuditJsonError extends Data.TaggedError("AuditJsonError")<{ readonly cause: unknown }> {}
+/**
+ * A detail that cannot be encoded (a getter or toJSON hook threw), a stored
+ * detail that does not parse, or a detail mapper of `audited` that threw.
+ */
+class AuditDetailError extends Data.TaggedError("AuditDetailError")<{ readonly cause: unknown }> {}
 
-/** The stored form of `detail`: byte arrays summarized, then redacted, as JSON; undefined is {}. */
-const encodeDetail = (redactor: RedactorShape, detail: unknown): Effect.Effect<string, AuditJsonError> =>
+/** Stored instead of a start or record detail that cannot be encoded. */
+const UNENCODABLE_DETAIL = JSON.stringify({ detailError: "unencodable" });
+
+/**
+ * The stored form of `detail`: inert JSON data, redacted, as JSON; undefined
+ * is {}. A detail that cannot be encoded is logged and gives undefined, so
+ * the entry is still written.
+ */
+const encodeDetail = (redactor: RedactorShape, detail: unknown): Effect.Effect<string | undefined> =>
   Effect.try({
-    try: () => JSON.stringify(redactor.redactDeep(summarizeBytes(detail ?? {}))) ?? "{}",
-    catch: (cause) => new AuditJsonError({ cause }),
-  });
+    try: () => {
+      const data = detail === undefined ? {} : toJsonData(detail);
+      return JSON.stringify(redactor.redactDeep(data === undefined ? {} : data));
+    },
+    catch: (cause) => new AuditDetailError({ cause }),
+  }).pipe(
+    Effect.catch((error) =>
+      Effect.as(Effect.logWarning("datova-schranka: an audit detail could not be encoded", error), undefined),
+    ),
+  );
 
 interface AuditDbRow {
   readonly id: string;
@@ -170,7 +213,7 @@ interface AuditDbRow {
   readonly detail_json: string;
 }
 
-const toEntry = (row: AuditDbRow): Effect.Effect<AuditEntry, AuditJsonError> =>
+const toEntry = (row: AuditDbRow): Effect.Effect<AuditEntry, AuditDetailError> =>
   Effect.try({
     try: () => ({
       id: row.id,
@@ -185,7 +228,7 @@ const toEntry = (row: AuditDbRow): Effect.Effect<AuditEntry, AuditJsonError> =>
       outcome: row.outcome,
       detail: JSON.parse(row.detail_json) as unknown,
     }),
-    catch: (cause) => new AuditJsonError({ cause }),
+    catch: (cause) => new AuditDetailError({ cause }),
   });
 
 /** The latest cutoff purgeBefore accepts at `now`: everything younger than AUDIT_RETENTION_DAYS stays. */
@@ -198,7 +241,7 @@ const makeAuditLog = Effect.gen(function* () {
   const insert = Effect.fnUntraced(function* (input: AuditEventInput, outcome: AuditOutcome) {
     const id = newRowId("aud");
     const now = yield* Clock.currentTimeMillis;
-    const detail = yield* encodeDetail(redactor, input.detail);
+    const detail = (yield* encodeDetail(redactor, input.detail)) ?? UNENCODABLE_DETAIL;
     yield* sql`
       INSERT INTO audit_log ${sql.insert({
         id,
@@ -234,19 +277,18 @@ const makeAuditLog = Effect.gen(function* () {
     detail?: unknown,
   ) {
     const now = yield* Clock.currentTimeMillis;
+    // A detail that cannot be encoded keeps the stored one; the outcome is still recorded.
+    const json = detail === undefined ? undefined : yield* encodeDetail(redactor, detail);
     const rows = yield* (
-      detail === undefined
+      json === undefined
         ? sql<{ id: string }>`
             UPDATE audit_log SET outcome = ${outcome}, updated_at = ${now}
             WHERE id = ${id} AND outcome = 'started' RETURNING id
           `
-        : Effect.flatMap(
-            encodeDetail(redactor, detail),
-            (json) => sql<{ id: string }>`
-              UPDATE audit_log SET outcome = ${outcome}, updated_at = ${now}, detail_json = ${json}
-              WHERE id = ${id} AND outcome = 'started' RETURNING id
-            `,
-          )
+        : sql<{ id: string }>`
+            UPDATE audit_log SET outcome = ${outcome}, updated_at = ${now}, detail_json = ${json}
+            WHERE id = ${id} AND outcome = 'started' RETURNING id
+          `
     ).pipe(storeFailure("finish an audit entry"));
     if (rows.length === 0) {
       yield* Effect.logWarning("datova-schranka: no started audit entry to finish").pipe(
@@ -267,14 +309,16 @@ const makeAuditLog = Effect.gen(function* () {
       ORDER BY at DESC, id DESC
       LIMIT ${limit + 1}
     `.pipe(
-      Effect.flatMap((rows) => Effect.forEach(rows.slice(0, limit), toEntry)),
-      Effect.map((entries): AuditPage => {
-        const last = entries.at(-1);
-        return {
-          entries,
-          next: entries.length === limit && last !== undefined ? { at: last.at, id: last.id } : undefined,
-        };
-      }),
+      Effect.flatMap((rows) =>
+        Effect.map(Effect.forEach(rows.slice(0, limit), toEntry), (entries): AuditPage => {
+          // The extra row fetched past `limit` is what shows an older entry exists.
+          const last = entries.at(-1);
+          return {
+            entries,
+            next: rows.length > limit && last !== undefined ? { at: last.at, id: last.id } : undefined,
+          };
+        }),
+      ),
       storeFailure("list the audit log"),
     );
   };
@@ -312,20 +356,32 @@ export interface AuditedOptions<A, E> {
   readonly classify?: ((error: E) => AuditFinalOutcome) | undefined;
 }
 
+/** Runs a caller's mapper; one that throws is logged and gives `fallback`. */
+const mapped = <T>(mapper: () => T, fallback: T): Effect.Effect<T> =>
+  Effect.try({ try: mapper, catch: (cause) => new AuditDetailError({ cause }) }).pipe(
+    Effect.catch((error) => Effect.as(Effect.logWarning("datova-schranka: an audit mapper failed", error), fallback)),
+  );
+
 const finalOf = <A, E>(
   exit: Exit.Exit<A, E>,
   options: AuditedOptions<A, E>,
-): { readonly outcome: AuditFinalOutcome; readonly detail: unknown } => {
-  if (Exit.isSuccess(exit)) return { outcome: "ok", detail: options.okDetail?.(exit.value) };
+): Effect.Effect<{ readonly outcome: AuditFinalOutcome; readonly detail: unknown }> => {
+  if (Exit.isSuccess(exit)) {
+    return Effect.map(mapped(() => options.okDetail?.(exit.value), undefined), (detail) => ({ outcome: "ok", detail }));
+  }
   const failure = Cause.findError(exit.cause);
   if (Result.isSuccess(failure)) {
     const error = failure.success;
-    const outcome = options.classify?.(error) ?? (isSentTimeout(error) ? "uncertain" : "error");
-    return { outcome, detail: options.errorDetail?.(error) };
+    const classify = options.classify ?? ((e: E): AuditFinalOutcome => (isSentTimeout(e) ? "uncertain" : "error"));
+    return Effect.all({
+      // A classify that throws says nothing about the call, so its outcome is unknown.
+      outcome: mapped((): AuditFinalOutcome => classify(error), "uncertain"),
+      detail: mapped(() => options.errorDetail?.(error), undefined),
+    });
   }
   // Interrupted mid-call: the request may or may not have reached ISDS.
-  if (Cause.hasInterruptsOnly(exit.cause)) return { outcome: "uncertain", detail: undefined };
-  return { outcome: "error", detail: undefined };
+  if (Cause.hasInterruptsOnly(exit.cause)) return Effect.succeed({ outcome: "uncertain", detail: undefined });
+  return Effect.succeed({ outcome: "error", detail: undefined });
 };
 
 /**
@@ -334,9 +390,10 @@ const finalOf = <A, E>(
  * `effect` does not run and the DomainStoreError is returned. Once the
  * intent is written the outcome is recorded on every exit, uninterruptibly:
  * success "ok", failure per `classify`, a defect "error", an interruption
- * "uncertain". A failure to record the outcome (the write, or a detail
- * mapper that throws) is logged and leaves the row "started" (read as
- * "outcome unknown"); the caller still gets the result of `effect`.
+ * "uncertain". A mapper that throws is logged and treated as absent (a
+ * throwing `classify` gives "uncertain"). A failure to record the outcome is
+ * logged and leaves the row "started" (read as "outcome unknown"); the
+ * caller still gets the result of `effect`.
  */
 export const audited = Effect.fn("AuditLog.audited")(function* <A, E, R>(
   input: AuditEventInput,
@@ -348,11 +405,8 @@ export const audited = Effect.fn("AuditLog.audited")(function* <A, E, R>(
     Effect.flatMap(audit.start(input), (id) =>
       restore(effect).pipe(
         Effect.onExit((exit) =>
-          Effect.suspend(() => {
-            const final = finalOf(exit, options);
-            return audit.finish(id, final.outcome, final.detail);
-          }).pipe(
-            // A failing finish or a throwing detail mapper must not replace the call's own result.
+          Effect.flatMap(finalOf(exit, options), (final) => audit.finish(id, final.outcome, final.detail)).pipe(
+            // A failing finish must not replace the call's own result.
             Effect.catchCause((cause) =>
               Effect.logWarning("datova-schranka: audit entry left started", cause).pipe(
                 Effect.annotateLogs({ auditId: id }),

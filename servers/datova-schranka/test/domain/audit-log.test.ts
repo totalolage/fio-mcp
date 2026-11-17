@@ -21,6 +21,8 @@ import { IsdsTimeoutError } from "../../src/isds/errors.js";
 import { memoryDatabase } from "./support/database.js";
 
 const SECRET = "tok-very-secret-1234";
+const bytesOf = (text: string) => new TextEncoder().encode(text);
+const sha = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
 const DAY = 24 * 60 * 60 * 1000;
 
 const auditLayer = AuditLog.Default.pipe(
@@ -166,7 +168,6 @@ describe("AuditLog", () => {
       assert.notInclude(json as string, '"0":');
       assert.notInclude(json as string, "zfo-content");
       assert.notInclude(json as string, Buffer.from("zfo-content").toString("base64"));
-      const sha = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
       assert.deepStrictEqual((yield* entryOf(id)).detail, {
         token: "Bearer ***",
         nested: [{ file: { bytes: 6, sha256: sha(attachment) } }],
@@ -190,12 +191,75 @@ describe("AuditLog", () => {
     }).pipe(Effect.provide(auditLayer)),
   );
 
-  it.effect("a detail JSON cannot encode fails with DomainStoreError and writes nothing", () =>
+  it.effect("walks class instances, so their bytes are summarized and their secrets redacted", () =>
     Effect.gen(function* () {
       const audit = yield* AuditLog;
-      const error = yield* Effect.flip(audit.record({ ...tool("g1", "x"), outcome: "ok", detail: { n: 1n } }));
-      assert.instanceOf(error, DomainStoreError);
-      assert.strictEqual((yield* audit.list()).entries.length, 0);
+      class Upload {
+        readonly name = `report-${SECRET}.pdf`;
+        readonly content = bytesOf("attachment-content");
+        describe() {
+          return this.name;
+        }
+      }
+      const id = yield* audit.record({ ...tool("g1", "x"), outcome: "ok", detail: { upload: new Upload() } });
+      const json = (yield* storedDetail(id)) as string;
+      assert.notInclude(json, SECRET);
+      assert.notInclude(json, "attachment-content");
+      assert.deepStrictEqual((yield* entryOf(id)).detail, {
+        upload: { name: "report-***.pdf", content: { bytes: 18, sha256: sha(bytesOf("attachment-content")) } },
+      });
+    }).pipe(Effect.provide(auditLayer)),
+  );
+
+  it.effect("runs toJSON hooks before redacting, so their output is redacted too", () =>
+    Effect.gen(function* () {
+      const audit = yield* AuditLog;
+      const hooked = { toJSON: () => ({ leaked: SECRET, raw: bytesOf("hook-bytes") }) };
+      const id = yield* audit.record({
+        ...tool("g1", "x"),
+        outcome: "ok",
+        detail: { hooked, when: dateAt(0), list: [undefined, () => 1, Number.NaN] },
+      });
+      const json = (yield* storedDetail(id)) as string;
+      assert.notInclude(json, SECRET);
+      assert.notInclude(json, "hook-bytes");
+      assert.deepStrictEqual((yield* entryOf(id)).detail, {
+        hooked: { leaked: "***", raw: { bytes: 10, sha256: sha(bytesOf("hook-bytes")) } },
+        when: "1970-01-01T00:00:00.000Z",
+        list: [null, null, null],
+      });
+    }).pipe(Effect.provide(auditLayer)),
+  );
+
+  it.effect("keeps null and bigint values, and marks a circular reference", () =>
+    Effect.gen(function* () {
+      const audit = yield* AuditLog;
+      const nullId = yield* audit.record({ ...tool("g1", "x"), outcome: "ok", detail: null });
+      assert.strictEqual((yield* entryOf(nullId)).detail, null);
+      const loop: Record<string, unknown> = { n: 12_345_678_901_234_567_890n };
+      loop.self = loop;
+      const loopId = yield* audit.record({ ...tool("g1", "x"), outcome: "ok", detail: loop });
+      assert.deepStrictEqual((yield* entryOf(loopId)).detail, { n: "12345678901234567890", self: "[circular]" });
+    }).pipe(Effect.provide(auditLayer)),
+  );
+
+  it.effect("writes the entry with an unencodable marker when the detail throws while encoding", () =>
+    Effect.gen(function* () {
+      const audit = yield* AuditLog;
+      const exploding = {
+        get value(): string {
+          throw new Error(`getter failed ${SECRET}`);
+        },
+      };
+      const id = yield* audit.start({ ...tool("g1", "x"), detail: exploding });
+      assert.deepStrictEqual((yield* entryOf(id)).detail, { detailError: "unencodable" });
+
+      // finish with an unencodable detail still records the outcome and keeps the stored detail.
+      const okId = yield* audit.start({ ...tool("g1", "x"), detail: { kept: 1 } });
+      yield* audit.finish(okId, "ok", exploding);
+      const finished = yield* entryOf(okId);
+      assert.strictEqual(finished.outcome, "ok");
+      assert.deepStrictEqual(finished.detail, { kept: 1 });
     }).pipe(Effect.provide(auditLayer)),
   );
 
@@ -220,11 +284,11 @@ describe("AuditLog", () => {
       );
       assert.deepStrictEqual(pages.flat().map((entry) => entry.id), newestFirst(all));
 
-      // A page that ends exactly at the last entry still offers next; the page after it is empty.
+      // A page that ends exactly at the last entry has no next.
       const threes = yield* allPages({ limit: 3 });
       assert.deepStrictEqual(
         threes.map((page) => page.length),
-        [3, 3, 3, 0],
+        [3, 3, 3],
       );
       const last = yield* audit.list({ limit: 500 });
       assert.strictEqual(last.next, undefined);
@@ -265,7 +329,7 @@ describe("AuditLog", () => {
   it.effect("clamps the page size to 1..500 and defaults to 100", () =>
     Effect.gen(function* () {
       const audit = yield* AuditLog;
-      for (let i = 0; i < 101; i++) yield* audit.record({ ...tool("g1", "a"), outcome: "ok" });
+      for (let i = 0; i < 501; i++) yield* audit.record({ ...tool("g1", "a"), outcome: "ok" });
       const byDefault = yield* audit.list();
       assert.strictEqual(byDefault.entries.length, 100);
       assert.isDefined(byDefault.next);
@@ -273,8 +337,11 @@ describe("AuditLog", () => {
       assert.strictEqual((yield* audit.list({ limit: -5 })).entries.length, 1);
       assert.strictEqual((yield* audit.list({ limit: 2.9 })).entries.length, 2);
       const capped = yield* audit.list({ limit: 10_000 });
-      assert.strictEqual(capped.entries.length, 101);
-      assert.strictEqual(capped.next, undefined);
+      assert.strictEqual(capped.entries.length, 500);
+      assert.isDefined(capped.next);
+      const rest = yield* audit.list({ limit: 500, before: capped.next });
+      assert.strictEqual(rest.entries.length, 1);
+      assert.strictEqual(rest.next, undefined);
     }).pipe(Effect.provide(auditLayer)),
   );
 
@@ -422,16 +489,33 @@ describe("audited", () => {
     }),
   );
 
-  it.effect("keeps the call's result when a detail mapper throws", () =>
+  it.effect("records the outcome without detail when a mapper throws, and uncertain when classify throws", () =>
     Effect.gen(function* () {
       const calls = yield* Ref.make<ReadonlyArray<string>>([]);
+      const layer = fakeAudit(calls);
       const value = yield* audited(input, Effect.succeed("sent"), {
         okDetail: () => {
           throw new Error("mapper bug");
         },
-      }).pipe(Effect.provide(fakeAudit(calls)));
+      }).pipe(Effect.provide(layer));
       assert.strictEqual(value, "sent");
-      assert.deepStrictEqual(yield* Ref.get(calls), ["start:send_message"]);
+      const error = yield* Effect.flip(
+        audited(input, Effect.fail("nope"), {
+          classify: () => {
+            throw new Error("classify bug");
+          },
+          errorDetail: () => {
+            throw new Error("detail bug");
+          },
+        }),
+      ).pipe(Effect.provide(layer));
+      assert.strictEqual(error, "nope");
+      assert.deepStrictEqual(yield* Ref.get(calls), [
+        "start:send_message",
+        "finish:aud_1:ok:null",
+        "start:send_message",
+        "finish:aud_1:uncertain:null",
+      ]);
     }),
   );
 
