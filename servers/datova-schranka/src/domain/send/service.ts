@@ -521,39 +521,34 @@ export const makeSendService = Effect.gen(function* () {
     yield* store.transition(filingId, ["outcome_unknown"], "outcome_unknown", patch);
   });
 
+  /** A reconcile attempt that got no answer: recorded, then a SendUnavailable (state unchanged). */
+  const unreachable = Effect.fn("SendService.unreachable")(function* (filingId: string, detail: string) {
+    yield* recordAttempt(filingId, { result: "error", error: detail });
+    return yield* new SendUnavailable({ detail: `the sent messages could not be checked: ${detail}` });
+  });
+
   /**
-   * Reconciles one outcome_unknown filing against the box's sent messages (D-e, C5). Found →
-   * sent, only when the dmID is on no other filing and no competing in-flight filing exists
-   * (checked with the CAS in one transaction); anything else stays outcome_unknown. Every attempt,
-   * failed ones included, sets reconciled_at. A removed box reports "box removed" (D4); a failed
-   * listing is a SendUnavailable with the state unchanged. Takes its own box permit: never call
-   * it inside BoxClients.use.
+   * The reconcile attempt itself, under the box permit: the filing is re-read there, so with
+   * `throttleMs` an attempt recorded by a concurrent call (which records before releasing the
+   * permit) makes this one skip ISDS (C5: at most one attempt per interval, failed ones included).
    */
-  const reconcile = Effect.fn("SendService.reconcile")(function* (filingId: string) {
+  const reconcileUnderPermit = Effect.fn("SendService.reconcileUnderPermit")(function* (
+    client: IsdsClientShape,
+    filingId: string,
+    throttleMs: number | undefined,
+  ) {
     const found = yield* store.byId(filingId);
     if (Option.isNone(found)) return yield* new FilingNotFound({ filingId });
     const filing = found.value;
     if (filing.state !== "outcome_unknown") return ReconcileOutcome.NotApplicable({ state: filing.state });
-
-    const boxRemoved = Effect.gen(function* () {
-      yield* recordAttempt(filingId, { result: "box_removed" });
-      return ReconcileOutcome.StillUnknown({
-        detail: "the data box was removed, so its sent messages cannot be checked (box removed)",
-      });
-    });
-    if (Option.isNone(yield* Effect.option(registry.get(filing.boxId)))) return yield* boxRemoved;
+    if (throttleMs !== undefined && filing.reconciledAt !== undefined && filing.reconciledAt > (yield* now) - throttleMs) {
+      return ReconcileOutcome.StillUnknown({ detail: "reconciled less than a minute ago" });
+    }
 
     const submittedAt = DateTime.makeUnsafe(filing.submittedAt ?? filing.createdAt);
     const input = reconcileInputOf(reconcileHintsOf(filing.preview), submittedAt);
-    const listed = yield* clients
-      .use(filing.boxId, (client) => client.reconcileSentMessage(input))
-      .pipe(Effect.result);
-    if (Result.isFailure(listed)) {
-      if (listed.failure._tag === "BoxNotFound") return yield* boxRemoved;
-      const detail = listed.failure.message;
-      yield* recordAttempt(filingId, { result: "error", error: detail });
-      return yield* new SendUnavailable({ detail: `the sent messages could not be checked: ${detail}` });
-    }
+    const listed = yield* Effect.result(client.reconcileSentMessage(input));
+    if (Result.isFailure(listed)) return yield* unreachable(filingId, listed.failure.message);
 
     const match = listed.success;
     if (match._tag === "NotFound") {
@@ -590,6 +585,39 @@ export const makeSendService = Effect.gen(function* () {
           onSome: (current) => ReconcileOutcome.NotApplicable({ state: current.state }),
         });
     }
+  });
+
+  /**
+   * Reconciles one outcome_unknown filing against the box's sent messages (D-e, C5). Found →
+   * sent, only when the dmID is on no other filing and no competing in-flight filing exists
+   * (checked with the CAS in one transaction); anything else stays outcome_unknown. Every attempt,
+   * failed ones included, sets reconciled_at. A removed box reports "box removed" (D4); a failed
+   * listing is a SendUnavailable with the state unchanged. Takes its own box permit: never call
+   * it inside BoxClients.use. With `throttleMs` (filingStatus) it skips ISDS when an attempt was
+   * recorded within that interval; reconcileNow passes none and always runs.
+   */
+  const reconcile = Effect.fn("SendService.reconcile")(function* (filingId: string, throttleMs?: number) {
+    const found = yield* store.byId(filingId);
+    if (Option.isNone(found)) return yield* new FilingNotFound({ filingId });
+    const filing = found.value;
+    if (filing.state !== "outcome_unknown") return ReconcileOutcome.NotApplicable({ state: filing.state });
+
+    const boxRemoved = Effect.gen(function* () {
+      yield* recordAttempt(filingId, { result: "box_removed" });
+      return ReconcileOutcome.StillUnknown({
+        detail: "the data box was removed, so its sent messages cannot be checked (box removed)",
+      });
+    });
+    if (Option.isNone(yield* Effect.option(registry.get(filing.boxId)))) return yield* boxRemoved;
+
+    return yield* clients.use(filing.boxId, (client) => reconcileUnderPermit(client, filingId, throttleMs)).pipe(
+      Effect.catchTags({
+        BoxNotFound: () => boxRemoved,
+        BoxCredentialsUnreadable: (error) => unreachable(filingId, error.message),
+        IsdsCredentialsError: (error) => unreachable(filingId, error.message),
+        IsdsConfigError: (error) => unreachable(filingId, error.message),
+      }),
+    );
   });
 
   /**
@@ -862,7 +890,7 @@ export const makeSendService = Effect.gen(function* () {
       (filing.reconciledAt === undefined || filing.reconciledAt <= at - STATUS_RECONCILE_INTERVAL_MS)
     ) {
       // A failed attempt is recorded too and counts toward the throttle (C5); the filing is reported as it stands.
-      yield* reconcile(filing.id).pipe(
+      yield* reconcile(filing.id, STATUS_RECONCILE_INTERVAL_MS).pipe(
         Effect.catchTag("SendUnavailable", (error) =>
           Effect.logInfo("datova-schranka: a status reconcile failed", error).pipe(Effect.annotateLogs({ filingId: filing.id })),
         ),
