@@ -684,6 +684,7 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (app: OAu
     }
     const code = yield* randomSecret(codePrefix);
     const now = yield* Clock.currentTimeMillis;
+    const afterConsent = app.afterConsent;
     const grant: Grant = {
       grantId: yield* randomId(`${idPrefix}_grant_`),
       clientId: pending.clientId,
@@ -703,6 +704,8 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (app: OAu
           expiresAt: now + LIMITS.codeTtlMs,
         },
         now,
+        // Suspended: a hook that throws while building its effect is a defect inside the transaction.
+        afterConsent === undefined ? undefined : Effect.suspend(() => afterConsent.call(app, { grant, at: now })),
       )
       .pipe(
         Effect.mapError(
