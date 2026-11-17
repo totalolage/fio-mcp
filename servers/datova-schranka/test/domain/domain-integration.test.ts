@@ -3,7 +3,7 @@ import { join } from "node:path";
 import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem";
 import { assert, describe, it } from "@effect/vitest";
 import { makeRedactor, Redactor } from "@mcps/core/redaction.js";
-import { Context, Deferred, Effect, Fiber, FileSystem, Layer } from "effect";
+import { Context, Deferred, Effect, Fiber, FileSystem, Layer, Scheduler } from "effect";
 import { SqlClient } from "effect/sql";
 import { type AuditActor, AuditLog, audited } from "../../src/domain/audit-log.js";
 import { BoxClients } from "../../src/domain/box-clients.js";
@@ -92,7 +92,7 @@ const addBox = (who: { readonly username: string }) =>
     return yield* registry.add({
       label: who.username,
       environment: "production",
-      credentials: passwordCredentials(who.username),
+      credentials: passwordCredentials(who.username, PASSWORD(who.username)),
     });
   });
 
@@ -204,6 +204,7 @@ describe("domain services over their real layers", () => {
         const read = yield* ReadService;
         const failure = yield* Effect.flip(read.listReceivedMessages(actor, box.id, {}));
         assert.strictEqual(failure._tag, "IsdsStatusError");
+        // Precondition of the probe below: the error text itself carries the password.
         assert.include(failure.message, password);
 
         // The read service stores tag and code only; a caller storing the text gets it redacted.
@@ -246,6 +247,9 @@ describe("domain services over their real layers", () => {
         assert.strictEqual(yield* tiers.tier(box.id, "rcp1234"), "none");
         const after = (yield* auditRows()).filter((row) => row.box_id === box.id);
         assert.deepStrictEqual(after.slice(0, before.length), before);
+        const refused = after.at(-1);
+        assert.strictEqual(refused?.outcome, "error");
+        assert.deepInclude(JSON.parse(refused?.detail_json ?? "{}"), { error: "BoxNotFound" });
       }),
     ),
   );
@@ -287,20 +291,26 @@ describe("domain services over their real layers", () => {
 
         const first = yield* Effect.forkChild(read.listReceivedMessages(actor, alice.id, {}));
         yield* Deferred.await(aliceEntered);
-        const second = yield* Effect.forkChild(read.listReceivedMessages(actor, alice.id, {}));
+        // The contender must not yield on its operation budget between its intent and the
+        // transport: with yields prevented, its fiber gives control back only at an async point.
+        // That holds because SQLite (in memory) runs synchronously, Alice's client is already
+        // built (cached by the first call), and the fake transport answers without a timer.
+        const second = yield* Effect.forkChild(
+          read.listReceivedMessages(actor, alice.id, {}).pipe(Effect.provideService(Scheduler.PreventSchedulerYield, true)),
+        );
 
         // Bob's box is not held up by Alice's call in flight.
         const bobResult = yield* read.listReceivedMessages(actor, bob.id, {});
         assert.isAbove(bobResult.records.length, 0);
 
-        // Wait (yielding, no timer) until Alice's second call has written its intent. Its fiber
-        // only gives control back at an async point: the box's permit, or, were calls on one box
-        // not serialised, the held transport, which would already show its request.
+        // Wait (yielding, no timer) until Alice's second call has written its intent. Its next
+        // async point is the box's permit, or, were calls on one box not serialised, the held
+        // transport, which would already show its request.
         const aliceOutcomes = auditRows("list_received_messages").pipe(
           Effect.map((rows) => rows.filter((row) => row.box_id === alice.id).map((row) => row.outcome)),
           Effect.tap(() => Effect.yieldNow),
         );
-        const pending = yield* aliceOutcomes.pipe(Effect.repeat({ until: (outcomes) => outcomes.length === 2 }));
+        const pending = yield* aliceOutcomes.pipe(Effect.repeat({ until: (outcomes) => outcomes.length === 2, times: 1000 }));
         assert.deepStrictEqual(pending, ["started", "started"]);
         assert.strictEqual(aliceRequests(), 1);
         assert.strictEqual(inFlight.get(ALICE.username), 1);
