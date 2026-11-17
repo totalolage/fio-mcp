@@ -3,7 +3,7 @@
  * box only, open filings expired on the spot, outcome_unknown reconciled at most once a minute.
  */
 import { assert, describe, it } from "@effect/vitest";
-import { Duration, Effect } from "effect";
+import { Deferred, Duration, Effect, Exit, Fiber } from "effect";
 import { failWith, sentListUnreachable, sentMessagesReply, timeoutAfterSend } from "./support/isds-replies.js";
 import { CALLER, MINUTE, OTHER_CALLER, SECOND, type StartedSendHarness, sendHarness, T0 } from "./support/service.js";
 
@@ -138,6 +138,53 @@ describe("SendService listFilings and getFiling", () => {
       const missing = yield* Effect.flip(h.service.getFiling("fil_missing"));
       assert.deepStrictEqual(missing._tag, "FilingNotFound");
       assert.strictEqual((yield* h.audit()).length, before);
+    }).pipe(Effect.scoped),
+  );
+});
+
+describe("SendService filingStatus: a listing that dies or is interrupted (C5)", () => {
+  /** Checks the recorded attempt, then that a status within the minute does not list again. */
+  const throttled = (h: StartedSendHarness, filingId: string) =>
+    Effect.gen(function* () {
+      const row = yield* h.filing(filingId);
+      assert.strictEqual(row.state, "outcome_unknown");
+      assert.strictEqual(row.reconciled_at, T0 + MINUTE);
+      assert.deepInclude(JSON.parse(String(row.reconcile_json)) as object, { result: "error" });
+      const listed = h.calls("GetListOfSentMessages");
+      yield* h.reply("GetListOfSentMessages", sentMessagesReply([]));
+      yield* h.advance(59 * SECOND);
+      const status = yield* h.service.filingStatus(CALLER, h.box.id, { filingId });
+      assert.strictEqual(status.filing.state, "outcome_unknown");
+      assert.strictEqual(h.calls("GetListOfSentMessages"), listed);
+      yield* h.advance(SECOND);
+      yield* h.service.filingStatus(CALLER, h.box.id, { filingId });
+      assert.strictEqual(h.calls("GetListOfSentMessages"), listed + 1);
+    });
+
+  it.effect("a dying listing is recorded, the defect propagates, and the next status within a minute does not list", () =>
+    Effect.gen(function* () {
+      const h = yield* sendHarness();
+      const filingId = yield* unknownFiling(h);
+      yield* h.advance(MINUTE);
+      yield* h.reply("GetListOfSentMessages", () => Effect.die("listing defect"));
+      const exit = yield* Effect.exit(h.service.filingStatus(CALLER, h.box.id, { filingId }));
+      assert.isTrue(Exit.isFailure(exit) && Exit.hasDies(exit));
+      yield* throttled(h, filingId);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("an interrupted listing is recorded, the interruption propagates, and the next status within a minute does not list", () =>
+    Effect.gen(function* () {
+      const h = yield* sendHarness();
+      const filingId = yield* unknownFiling(h);
+      yield* h.advance(MINUTE);
+      const listing = yield* Deferred.make<void>();
+      yield* h.reply("GetListOfSentMessages", () => Deferred.succeed(listing, undefined).pipe(Effect.andThen(Effect.never)));
+      const fiber = yield* Effect.forkChild(h.service.filingStatus(CALLER, h.box.id, { filingId }));
+      yield* Deferred.await(listing);
+      yield* Fiber.interrupt(fiber);
+      assert.isTrue(Exit.hasInterrupts(yield* Fiber.await(fiber)));
+      yield* throttled(h, filingId);
     }).pipe(Effect.scoped),
   );
 });

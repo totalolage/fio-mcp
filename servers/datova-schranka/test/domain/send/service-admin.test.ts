@@ -3,7 +3,8 @@
  * the removed box (D4). Each call is audited once under its action, refusals as "refused".
  */
 import { assert, describe, it } from "@effect/vitest";
-import { Effect } from "effect";
+import { Deferred, Effect, Exit, Fiber } from "effect";
+import { SqlClient } from "effect/sql";
 import { createMessageReply, failWith, sentListUnreachable, sentMessagesReply, timeoutAfterSend } from "./support/isds-replies.js";
 import { ADMIN, CALLER, dmIdOf, MINUTE, type StartedSendHarness, sendHarness } from "./support/service.js";
 
@@ -394,6 +395,51 @@ describe("SendService admin decisions when the filing cannot be read", () => {
         );
       }
       yield* h.exec("ALTER TABLE filings_unreadable RENAME TO filings");
+      assert.strictEqual((yield* h.filing(filingId)).state, "outcome_unknown");
+    }).pipe(Effect.scoped),
+  );
+});
+
+describe("SendService admin decisions interrupted during the filing read", () => {
+  it.effect("each call is still audited once as error and leaves the filing as it was", () =>
+    Effect.gen(function* () {
+      const h = yield* sendHarness();
+      const filingId = yield* unknownSend(h, "key-1");
+      const calls: ReadonlyArray<readonly [string, Effect.Effect<void, { readonly _tag: string }>]> = [
+        ["filing.approve", Effect.asVoid(h.service.approve(ADMIN, filingId))],
+        ["filing.reject", h.service.reject(ADMIN, filingId)],
+        ["filing.reconcile", Effect.asVoid(h.service.reconcileNow(ADMIN, filingId))],
+        ["filing.mark_sent", h.service.markSent(ADMIN, filingId, "7654321")],
+        ["filing.confirm_not_sent", h.service.confirmNotSent(ADMIN, filingId)],
+      ];
+      for (const [action, call] of calls) {
+        // Another transaction holds the database connection, so the call's filing read waits for it.
+        const holding = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const holder = yield* h
+          .provide(
+            Effect.gen(function* () {
+              const sql = yield* SqlClient.SqlClient;
+              yield* sql.withTransaction(Deferred.succeed(holding, undefined).pipe(Effect.andThen(Deferred.await(release))));
+            }),
+          )
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(holding);
+        const running = yield* Effect.forkChild(call);
+        for (let i = 0; i < 20; i++) yield* Effect.yieldNow;
+        const interrupting = yield* Effect.forkChild(Fiber.interrupt(running));
+        for (let i = 0; i < 20; i++) yield* Effect.yieldNow;
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(holder);
+        yield* Fiber.join(interrupting);
+        assert.isTrue(Exit.hasInterrupts(yield* Fiber.await(running)), action);
+        const rows = yield* h.audit(action);
+        assert.deepStrictEqual(
+          rows.map((row) => [row.actor_kind, row.outcome, row.box_id]),
+          [["admin", "error", null]],
+          action,
+        );
+      }
       assert.strictEqual((yield* h.filing(filingId)).state, "outcome_unknown");
     }).pipe(Effect.scoped),
   );

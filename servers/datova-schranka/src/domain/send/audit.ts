@@ -1,5 +1,11 @@
 import { Cause, Data, Effect, Exit, Ref, Result } from "effect";
-import { type AuditEventInput, type AuditFinalOutcome, AuditLog, defaultFailureOutcome } from "../audit-log.js";
+import {
+  type AuditEventInput,
+  type AuditFinalOutcome,
+  AuditLog,
+  type AuditLogShape,
+  defaultFailureOutcome,
+} from "../audit-log.js";
 import type { FilingPreview, IsdsStatusSummary, SendResult } from "./api.js";
 
 /**
@@ -70,6 +76,30 @@ const finalOf = <A, E>(
   return Effect.succeed({ outcome: claimed ? "uncertain" : "error", detail: undefined });
 };
 
+/** The ClaimSignal of one audited call: `openWindows` counts its windows still open. */
+const claimSignalOf = (openWindows: Ref.Ref<number>): ClaimSignal => ({
+  whileClaimed: (effect) =>
+    Effect.uninterruptibleMask((restore) =>
+      Ref.update(openWindows, (n) => n + 1).pipe(
+        Effect.andThen(restore(effect)),
+        Effect.onExit((exit) => (Exit.isSuccess(exit) ? Ref.update(openWindows, (n) => n - 1) : Effect.void)),
+      ),
+    ),
+});
+
+/** Writes the finish of audit row `id` for the call's exit; a failing finish is only logged. */
+const finishWith =
+  <A, E>(audit: AuditLogShape, id: string, openWindows: Ref.Ref<number>, options: AuditedSendOptions<A, E>) =>
+  (exit: Exit.Exit<A, E>): Effect.Effect<void> =>
+    Ref.get(openWindows).pipe(
+      Effect.flatMap((open) => finalOf(exit, open > 0, options)),
+      Effect.flatMap((final) => audit.finish(id, final.outcome, final.detail)),
+      // A failing finish must not replace the call's own result.
+      Effect.catchCause((cause) =>
+        Effect.logWarning("datova-schranka: audit entry left started", cause).pipe(Effect.annotateLogs({ auditId: id })),
+      ),
+    );
+
 /**
  * Audits one send-side call (send_message, approve, reject, markSent, confirmNotSent,
  * reconcileNow), client acquisition included (C6). AuditLog.start runs first and fails
@@ -84,29 +114,37 @@ export const auditedSend = Effect.fn("auditedSend")(function* <A, E, R>(
 ) {
   const audit = yield* AuditLog;
   const openWindows = yield* Ref.make(0);
-  const claim: ClaimSignal = {
-    whileClaimed: (effect) =>
-      Effect.uninterruptibleMask((restore) =>
-        Ref.update(openWindows, (n) => n + 1).pipe(
-          Effect.andThen(restore(effect)),
-          Effect.onExit((exit) => (Exit.isSuccess(exit) ? Ref.update(openWindows, (n) => n - 1) : Effect.void)),
-        ),
-      ),
-  };
+  const claim = claimSignalOf(openWindows);
   return yield* Effect.uninterruptibleMask((restore) =>
     Effect.flatMap(audit.start(input), (id) =>
-      restore(Effect.suspend(() => run(claim))).pipe(
-        Effect.onExit((exit) =>
-          Ref.get(openWindows).pipe(
-            Effect.flatMap((open) => finalOf(exit, open > 0, options)),
-            Effect.flatMap((final) => audit.finish(id, final.outcome, final.detail)),
-            // A failing finish must not replace the call's own result.
-            Effect.catchCause((cause) =>
-              Effect.logWarning("datova-schranka: audit entry left started", cause).pipe(
-                Effect.annotateLogs({ auditId: id }),
-              ),
-            ),
-          ),
+      restore(Effect.suspend(() => run(claim))).pipe(Effect.onExit(finishWith(audit, id, openWindows, options))),
+    ),
+  );
+});
+
+/**
+ * `auditedSend` after a `prepare` step whose result the audit row's start needs (an admin call's
+ * filing read, for its box). `prepare` runs interruptibly inside the same uninterruptible
+ * region as the start, and its whole exit (value, failure, defect or interruption) is
+ * captured, so the row is started whatever `prepare` did: `inputOf` builds the start from that
+ * exit and `run` gets it, to go on from a value or re-raise the rest inside the audit window.
+ * An interruption during `prepare` is audited too: the row starts, then `run` is interrupted
+ * as it begins. Only an interruption before `prepare` starts leaves no row (nothing ran).
+ */
+export const auditedSendAfter = Effect.fn("auditedSendAfter")(function* <P, PE, A, E, R>(
+  prepare: Effect.Effect<P, PE, R>,
+  inputOf: (prepared: Exit.Exit<P, PE>) => AuditEventInput,
+  run: (claim: ClaimSignal, prepared: Exit.Exit<P, PE>) => Effect.Effect<A, E, R>,
+  options: AuditedSendOptions<A, E>,
+) {
+  const audit = yield* AuditLog;
+  const openWindows = yield* Ref.make(0);
+  const claim = claimSignalOf(openWindows);
+  return yield* Effect.uninterruptibleMask((restore) =>
+    Effect.flatMap(Effect.exit(restore(prepare)), (prepared) =>
+      Effect.flatMap(audit.start(inputOf(prepared)), (id) =>
+        restore(Effect.suspend(() => run(claim, prepared))).pipe(
+          Effect.onExit(finishWith(audit, id, openWindows, options)),
         ),
       ),
     ),

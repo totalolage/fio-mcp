@@ -4,7 +4,7 @@
  * Also the removed box (D4): a recovered filing stays resolvable without its box.
  */
 import { assert, describe, it } from "@effect/vitest";
-import { Effect } from "effect";
+import { Effect, Logger } from "effect";
 import { sentListUnreachable, sentMessagesReply } from "./support/isds-replies.js";
 import { ADMIN, CALLER, MINUTE, makeSendHarness, T0 } from "./support/service.js";
 
@@ -27,6 +27,31 @@ const recoveredHarness = (count: number) =>
   });
 
 describe("SendService.reconcileRecovered", () => {
+  it.effect("a filing whose reconcile dies is logged with its id and counted out; the rest still run", () => {
+    const logs: Array<string> = [];
+    const capture = Logger.make<unknown, void>((entry) => void logs.push(Logger.formatLogFmt.log(entry)));
+    return Effect.gen(function* () {
+      const { h, ids } = yield* recoveredHarness(3);
+      const [dying = "", found = "", notFound = ""] = ids;
+      yield* h.reply("GetListOfSentMessages", (_request, call) => {
+        if (call === 1) return Effect.die("listing defect");
+        if (call === 2) return Effect.succeed(sentMessagesReply([{ dmID: "7654321" }]));
+        return Effect.succeed(sentMessagesReply([]));
+      });
+      const service = yield* h.start;
+
+      assert.strictEqual(yield* service.reconcileRecovered, 1);
+      assert.strictEqual(h.calls("GetListOfSentMessages"), 3);
+      assert.strictEqual((yield* h.filing(dying)).state, "outcome_unknown");
+      assert.strictEqual((yield* h.filing(found)).state, "sent");
+      assert.strictEqual((yield* h.filing(notFound)).state, "outcome_unknown");
+      const died = logs.filter((line) => line.includes("reconciling a recovered filing died"));
+      assert.strictEqual(died.length, 1);
+      assert.include(died[0], dying);
+      assert.include(died[0], "listing defect");
+    }).pipe(Effect.scoped, Effect.provide(Logger.layer([capture])));
+  });
+
   it.effect("reconcile each recovered filing once, in order; count the ones that ended sent", () =>
     Effect.gen(function* () {
       const { h, ids } = yield* recoveredHarness(3);

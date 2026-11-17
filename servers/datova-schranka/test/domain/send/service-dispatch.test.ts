@@ -4,7 +4,7 @@
  * the interrupted follow-up reconcile (obligation 4).
  */
 import { assert, describe, it } from "@effect/vitest";
-import { Effect, Exit, Fiber } from "effect";
+import { Effect, Exit, Fiber, Logger } from "effect";
 import type { IsdsClientShape } from "../../../src/isds/client.js";
 import { IsdsConfigError, IsdsCredentialsError, IsdsInvalidRequest, IsdsMessageTooLarge } from "../../../src/isds/errors.js";
 import {
@@ -179,4 +179,27 @@ describe("SendService CreateMessage outcomes", () => {
       assert.strictEqual(audit[0]?.outcome, "uncertain");
     }).pipe(Effect.scoped),
   );
+});
+
+describe("SendService dispatch: the sent outcome loses its CAS", () => {
+  it.effect("ISDS accepted the message but the filing moved meanwhile: the dmID is logged at warning", () => {
+    const logs: Array<string> = [];
+    const capture = Logger.make<unknown, void>((entry) => void logs.push(Logger.formatLogFmt.log(entry)));
+    return Effect.gen(function* () {
+      const h = yield* sendHarness();
+      yield* h.reply("CreateMessage", (_request, call) =>
+        Effect.gen(function* () {
+          // Something else moves the dispatching filing while ISDS accepts the message.
+          for (const row of yield* h.filings) yield* h.patchFiling(String(row.id), { state: "outcome_unknown" });
+          return createMessageReply(dmIdOf(call));
+        }),
+      );
+      const result = yield* h.service.sendMessage(CALLER, h.request());
+      assert.strictEqual(result._tag, "OutcomeUnknown");
+      const moved = logs.filter((line) => line.includes("its filing had already moved"));
+      assert.strictEqual(moved.length, 1);
+      assert.include(moved[0], "level=WARN");
+      assert.include(moved[0], `dmID=${dmIdOf(1)}`);
+    }).pipe(Effect.scoped, Effect.provide(Logger.layer([capture])));
+  });
 });

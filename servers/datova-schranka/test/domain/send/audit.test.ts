@@ -1,10 +1,10 @@
 import { assert, describe, it } from "@effect/vitest";
-import { Data, Deferred, Effect, Exit, Fiber, Logger } from "effect";
+import { Cause, Data, Deferred, Effect, Exit, Fiber, Logger } from "effect";
 import type { AuditEventInput, AuditFinalOutcome } from "../../../src/domain/audit-log.js";
 import { DomainStoreError } from "../../../src/domain/errors.js";
 import type { FilingPreview, SendResult as SendResultType } from "../../../src/domain/send/api.js";
 import { SendResult } from "../../../src/domain/send/api.js";
-import { auditedSend, sendDetail, sendResultOutcome } from "../../../src/domain/send/audit.js";
+import { auditedSend, auditedSendAfter, sendDetail, sendResultOutcome } from "../../../src/domain/send/audit.js";
 import { IsdsTimeoutError } from "../../../src/isds/errors.js";
 import { type ReadAuditEvent, readAuditLog } from "../support/read-audit-log.js";
 
@@ -331,4 +331,74 @@ describe("sendDetail", () => {
       reason: "admin said no",
     });
   });
+});
+
+describe("auditedSendAfter", () => {
+  /** The start input from the prepare step: its box on success, none otherwise. */
+  const inputOf = (prepared: Exit.Exit<string, Refusal>): AuditEventInput => ({
+    ...input,
+    action: "filing.approve",
+    boxId: Exit.isSuccess(prepared) ? prepared.value : undefined,
+  });
+  const reraise = (_claim: unknown, prepared: Exit.Exit<string, Refusal>) =>
+    Exit.isSuccess(prepared) ? Effect.succeed(prepared.value) : Effect.failCause(prepared.cause);
+
+  it.effect("a prepare that succeeds names the start's box and hands its value to the work", () => {
+    const log: Array<string> = [];
+    const audit = readAuditLog(log);
+    return Effect.gen(function* () {
+      const value = yield* auditedSendAfter(Effect.succeed("box_9"), inputOf, reraise, { outcomeOf: () => "ok" });
+      assert.strictEqual(value, "box_9");
+      const start = audit.events[0];
+      assert.strictEqual(start?.kind === "start" ? start.input.boxId : undefined, "box_9");
+      assert.deepStrictEqual(finishes(audit.events).map((finish) => finish.outcome), ["ok"]);
+    }).pipe(Effect.provide(audit.layer));
+  });
+
+  it.effect("a prepare that fails, dies or is interrupted still yields exactly one row, outcome error, and keeps its cause", () =>
+    Effect.gen(function* () {
+      const failing: ReadonlyArray<readonly [string, Effect.Effect<string, Refusal>]> = [
+        ["fail", Effect.fail(new Refusal({ reason: "unreadable" }))],
+        ["die", Effect.die("read defect")],
+        ["interrupt", Effect.interrupt],
+      ];
+      for (const [name, prepare] of failing) {
+        const audit = readAuditLog([]);
+        const exit = yield* Effect.exit(
+          auditedSendAfter(prepare, inputOf, reraise, { outcomeOf: () => "ok" }).pipe(Effect.provide(audit.layer)),
+        );
+        assert.isTrue(Exit.isFailure(exit), name);
+        if (Exit.isFailure(exit)) {
+          assert.strictEqual(Cause.hasDies(exit.cause), name === "die", name);
+          assert.strictEqual(Cause.hasInterrupts(exit.cause), name === "interrupt", name);
+        }
+        assert.deepStrictEqual(
+          audit.events.map((event) => event.kind),
+          ["start", "finish"],
+          name,
+        );
+        const start = audit.events[0];
+        assert.isUndefined(start?.kind === "start" ? start.input.boxId : "missing", name);
+        assert.deepStrictEqual(finishes(audit.events).map((finish) => finish.outcome), ["error"], name);
+      }
+    }),
+  );
+
+  it.effect("an interruption that arrives while prepare runs is audited once as error", () =>
+    Effect.gen(function* () {
+      const audit = readAuditLog([]);
+      const reading = yield* Deferred.make<void>();
+      const fiber = yield* auditedSendAfter(
+        Deferred.succeed(reading, undefined).pipe(Effect.andThen(Effect.never)),
+        inputOf,
+        reraise,
+        { outcomeOf: () => "ok" },
+      ).pipe(Effect.provide(audit.layer), Effect.forkChild);
+      yield* Deferred.await(reading);
+      const exit = yield* Fiber.interrupt(fiber).pipe(Effect.andThen(Fiber.await(fiber)));
+      assert.isTrue(Exit.hasInterrupts(exit));
+      assert.deepStrictEqual(audit.events.map((event) => event.kind), ["start", "finish"]);
+      assert.deepStrictEqual(finishes(audit.events).map((finish) => finish.outcome), ["error"]);
+    }),
+  );
 });

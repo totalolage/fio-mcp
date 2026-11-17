@@ -46,7 +46,15 @@ import {
   type SendServiceShape,
   SendUnavailable,
 } from "./api.js";
-import { auditedSend, type ClaimSignal, type SendDetail, sendDetail, sendResultOutcome } from "./audit.js";
+import {
+  type AuditedSendOptions,
+  auditedSend,
+  auditedSendAfter,
+  type ClaimSignal,
+  type SendDetail,
+  sendDetail,
+  sendResultOutcome,
+} from "./audit.js";
 import { type AuthorityVerdict, SendAuthority } from "./authority.js";
 import {
   type CorruptPayload,
@@ -352,16 +360,25 @@ export const makeSendService = Effect.gen(function* () {
       if (write._tag === "Won") return done(SendResult.Sent({ filingId, dmID }));
       if (write._tag === "DmIdTaken") {
         const at = yield* now;
-        yield* persist(
+        const recorded = yield* persist(
           store.transition(filingId, ["dispatching"], "outcome_unknown", {
             isdsStatus,
             reason: `ISDS accepted the message as dmID ${dmID}, which is already linked to filing ${write.filingId}`,
             reconcile: { at, result: "dmid_linked", dmID, linkedTo: write.filingId },
           }),
         );
+        if (recorded._tag !== "Won") {
+          yield* Effect.logWarning("datova-schranka: ISDS accepted a message but its filing had already moved").pipe(
+            Effect.annotateLogs({ filingId, dmID }),
+          );
+        }
         return done(SendResult.OutcomeUnknown({ filingId }));
       }
-      // Nothing else moves a dispatching filing while its claim runs; report what is stored.
+      // Nothing else moves a dispatching filing while its claim runs; report what is stored, and
+      // keep the accepted dmID in the log since the filing does not carry it.
+      yield* Effect.logWarning("datova-schranka: ISDS accepted a message but its filing had already moved").pipe(
+        Effect.annotateLogs({ filingId, dmID }),
+      );
       return done(Option.match(write.current, { onNone: () => SendResult.OutcomeUnknown({ filingId }), onSome: storedResult }));
     }
     const failure = Cause.findError(exit.cause);
@@ -548,7 +565,22 @@ export const makeSendService = Effect.gen(function* () {
 
     const submittedAt = DateTime.makeUnsafe(filing.submittedAt ?? filing.createdAt);
     const input = reconcileInputOf(reconcileHintsOf(filing.preview), submittedAt);
-    const listed = yield* Effect.result(client.reconcileSentMessage(input));
+    const listed = yield* Effect.result(client.reconcileSentMessage(input)).pipe(
+      // A listing that dies or is interrupted is recorded too, still under the permit, so the
+      // status throttle counts it (C5); the state stays outcome_unknown and the cause propagates.
+      Effect.onError((cause) =>
+        recordAttempt(filingId, {
+          result: "error",
+          error: Cause.hasInterruptsOnly(cause) ? "the listing was interrupted" : "the listing failed unexpectedly",
+        }).pipe(
+          Effect.catchCause((recordCause) =>
+            Effect.logWarning("datova-schranka: an unfinished reconcile attempt could not be recorded", recordCause).pipe(
+              Effect.annotateLogs({ filingId }),
+            ),
+          ),
+        ),
+      ),
+    );
     if (Result.isFailure(listed)) return yield* unreachable(filingId, listed.failure.message);
 
     const match = listed.success;
@@ -688,14 +720,16 @@ export const makeSendService = Effect.gen(function* () {
 
   /** Idempotency (plan step 4, D-b): an existing filing for the key, answered from the DB. */
   const replay = Effect.fn("SendService.replay")(function* (existing: Filing, contentHash: string) {
-    const filing = yield* expireIfDue(existing);
-    if (filing.contentHash !== contentHash) {
+    // R3: a different message under a used key is refused with no state change, so the content is
+    // compared before a due filing is expired.
+    if (existing.contentHash !== contentHash) {
       return {
         result: SendResult.Refused({
           reason: "this idempotencyKey was already used for a different message; use a new idempotencyKey",
         }),
       } satisfies Answer;
     }
+    const filing = yield* expireIfDue(existing);
     const result = filing.state === "awaiting_approval" ? yield* approvalAgain(filing) : storedResult(filing);
     return { result, preview: filing.preview } satisfies Answer;
   });
@@ -838,8 +872,12 @@ export const makeSendService = Effect.gen(function* () {
     const nonceHash = request.approvalNonce === undefined ? undefined : sha256Hex(request.approvalNonce);
     const nonce = nonceHash === undefined ? Option.none() : yield* store.nonceByHash(nonceHash);
     const loaded = yield* store.byKey(caller.grantId, request.boxId, request.idempotencyKey);
-    // Obligation (1): a due open filing is expired before any nonce use or replacement.
-    const existing = Option.isSome(loaded) ? Option.some(yield* expireIfDue(loaded.value)) : loaded;
+    // Obligation (1): a due open filing is expired before any nonce use or replacement, but only
+    // for the same message: a different one is refused with the filing untouched (R3).
+    const existing =
+      Option.isSome(loaded) && loaded.value.contentHash === message.contentHash
+        ? Option.some(yield* expireIfDue(loaded.value))
+        : loaded;
     const sameContent = Option.isSome(existing) && existing.value.contentHash === message.contentHash;
 
     if (nonceHash !== undefined) {
@@ -1009,6 +1047,13 @@ export const makeSendService = Effect.gen(function* () {
             Effect.as(undefined),
           ),
         ),
+        // One filing's defect must not stop the others; an interruption still stops the run.
+        Effect.catchDefect((defect) =>
+          Effect.logWarning("datova-schranka: reconciling a recovered filing died", Cause.die(defect)).pipe(
+            Effect.annotateLogs({ filingId }),
+            Effect.as(undefined),
+          ),
+        ),
       );
       if (outcome?._tag === "Sent") sent += 1;
     }
@@ -1031,22 +1076,32 @@ export const makeSendService = Effect.gen(function* () {
   ).pipe(Effect.withSpan("SendService.expireDue"));
 
   /**
-   * Reads the filing an admin call is about before its audit row starts, so the row gets the
-   * filing's box. A failed read does not skip the audit: `body` gets no box and a `found` that
-   * fails with the read's error, which the call then fails with inside its audit window.
+   * An admin call audited once under `action`. The filing it is about is read for the row's box
+   * as the audit's prepare step (auditedSendAfter), so the read's whole outcome lands inside the
+   * audit window: a read that fails, dies or is interrupted still yields exactly one row, with no
+   * box and outcome "error" (nothing was claimed, so nothing can have been sent or changed), and
+   * the call fails with that same cause.
    */
-  const withFilingRead = <A, E>(
+  const auditedAdmin = <A, E>(
+    admin: AuditActor,
+    action: string,
     filingId: string,
-    body: (
-      boxId: string | undefined,
-      found: Effect.Effect<Option.Option<Filing>, DomainStoreError>,
-    ) => Effect.Effect<A, E | DomainStoreError>,
+    detail: Record<string, unknown>,
+    run: (claim: ClaimSignal, found: Option.Option<Filing>) => Effect.Effect<A, E>,
+    options: AuditedSendOptions<A, E | DomainStoreError>,
   ): Effect.Effect<A, E | DomainStoreError> =>
-    Effect.flatMap(Effect.result(store.byId(filingId)), (read) =>
-      Result.isSuccess(read)
-        ? body(Option.isSome(read.success) ? read.success.value.boxId : undefined, Effect.succeed(read.success))
-        : body(undefined, Effect.fail(read.failure)),
-    );
+    auditedSendAfter(
+      store.byId(filingId),
+      (read) => ({
+        actor: admin,
+        action,
+        boxId: Exit.isSuccess(read) && Option.isSome(read.value) ? read.value.value.boxId : undefined,
+        detail,
+      }),
+      (claim, read): Effect.Effect<A, E | DomainStoreError> =>
+        Exit.isSuccess(read) ? run(claim, read.value) : Effect.failCause(read.cause),
+      options,
+    ).pipe(Effect.provideService(AuditLog, audit));
 
   /** An admin decision audited once under `action`; FilingNotFound/FilingStateConflict/DmIdLinked are "refused". */
   const auditedDecision = <A, E extends { readonly _tag: string }>(
@@ -1061,13 +1116,11 @@ export const makeSendService = Effect.gen(function* () {
       readonly classify?: (error: E | DomainStoreError) => "refused" | "error";
     } = {},
   ): Effect.Effect<A, E | DomainStoreError> =>
-    withFilingRead(filingId, (boxId, found) =>
-      audited({ actor: admin, action, boxId, detail }, () => Effect.flatMap(found, run), {
-        outcomeOf: options.outcomeOf ?? (() => "ok"),
-        okDetail: options.okDetail ?? (() => detail),
-        classify: options.classify ?? ((error) => (error._tag === "DmIdLinked" ? "refused" : refusalOutcome(error))),
-      }),
-    );
+    auditedAdmin(admin, action, filingId, detail, (_claim, found) => run(found), {
+      outcomeOf: options.outcomeOf ?? (() => "ok"),
+      okDetail: options.okDetail ?? (() => detail),
+      classify: options.classify ?? ((error) => (error._tag === "DmIdLinked" ? "refused" : refusalOutcome(error))),
+    });
 
   const audited = <A, E>(
     input: Parameters<typeof auditedSend>[0],
@@ -1127,19 +1180,18 @@ export const makeSendService = Effect.gen(function* () {
       ),
 
     approve: (admin: AuditActor, filingId) =>
-      withFilingRead(filingId, (boxId, read) =>
-        audited(
-          { actor: admin, action: "filing.approve", boxId, detail: { filingId } },
-          (claim) =>
-            Effect.flatMap(read, (found) => trackClaims(claim, (tracked) => approveFlow(found, filingId, tracked))),
-          {
-            outcomeOf: (answer: Answer) => sendResultOutcome(answer.result),
-            okDetail: (answer: Answer): SendDetail =>
-              sendDetail({ filingId, preview: answer.preview, result: answer.result }),
-            classify: refusalOutcome,
-          },
-        ).pipe(Effect.map((answer) => answer.result)),
-      ),
+      auditedAdmin(
+        admin,
+        "filing.approve",
+        filingId,
+        { filingId },
+        (claim, found) => trackClaims(claim, (tracked) => approveFlow(found, filingId, tracked)),
+        {
+          outcomeOf: (answer: Answer) => sendResultOutcome(answer.result),
+          okDetail: (answer: Answer): SendDetail => sendDetail({ filingId, preview: answer.preview, result: answer.result }),
+          classify: refusalOutcome,
+        },
+      ).pipe(Effect.map((answer) => answer.result)),
 
     reject: (admin: AuditActor, filingId, reason) => {
       const stated = reason?.trim() === "" ? undefined : reason?.trim();

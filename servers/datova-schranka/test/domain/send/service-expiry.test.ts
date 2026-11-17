@@ -87,3 +87,54 @@ describe("SendService.expireDue", () => {
     }).pipe(Effect.scoped),
   );
 });
+
+describe("SendService: a different message under an overdue filing's key (R3)", () => {
+  /** An overdue filing under "key-a" (awaiting_approval or pending_admin) and an awaiting one under "key-b". */
+  const overdue = (h: StartedSendHarness, state: "awaiting_approval" | "pending_admin") =>
+    Effect.gen(function* () {
+      yield* h.setTier(h.request().recipient, "approve");
+      const other = yield* askApproval(h, { idempotencyKey: "key-b" });
+      if (state === "pending_admin") yield* h.setTier(h.request().recipient, "none");
+      const first = yield* h.service.sendMessage(CALLER, h.request({ idempotencyKey: "key-a" }));
+      const filingId = first._tag === "ApprovalRequired" || first._tag === "Queued" ? first.filingId : undefined;
+      if (filingId === undefined) return yield* Effect.die(`expected an open filing, got ${first._tag}`);
+      yield* h.patchFiling(filingId, { expires_at: (yield* Clock.currentTimeMillis) - MINUTE });
+      return { filingId, own: first._tag === "ApprovalRequired" ? first.nonce : undefined, other };
+    });
+
+  const different = { idempotencyKey: "key-a", annotation: "A different message" };
+
+  for (const state of ["awaiting_approval", "pending_admin"] as const) {
+    it.effect(`${state}: refused with the filing and its nonces untouched; the same message then answers Expired`, () =>
+      Effect.gen(function* () {
+        const h = yield* sendHarness({ tiers: {} });
+        const { filingId, own, other } = yield* overdue(h, state);
+        const before = yield* h.filing(filingId);
+        const noncesOf = (id: string) =>
+          Effect.map(h.nonces, (rows) => rows.filter((row) => row.filing_id === id));
+        const ownNonces = yield* noncesOf(filingId);
+
+        const plain = yield* h.service.sendMessage(CALLER, h.request(different));
+        assert.strictEqual(plain._tag, "Refused");
+        assert.deepStrictEqual(yield* h.filing(filingId), before);
+        assert.deepStrictEqual(yield* noncesOf(filingId), ownNonces);
+
+        // C2: a same-grant nonce that does not match is still burned; the filing stays as it was.
+        const misbound = yield* h.service.sendMessage(CALLER, h.request({ ...different, approvalNonce: other.nonce }));
+        assert.strictEqual(misbound._tag, "Refused");
+        assert.isNotNull((yield* noncesOf(other.filingId))[0]?.used_at);
+        assert.deepStrictEqual(yield* h.filing(filingId), before);
+        assert.deepStrictEqual(yield* noncesOf(filingId), ownNonces);
+        if (own !== undefined) {
+          const ownMismatch = yield* h.service.sendMessage(CALLER, h.request({ ...different, approvalNonce: own }));
+          assert.strictEqual(ownMismatch._tag, "Refused");
+          assert.deepStrictEqual(yield* h.filing(filingId), before);
+        }
+
+        const same = yield* h.service.sendMessage(CALLER, h.request({ idempotencyKey: "key-a" }));
+        assert.deepStrictEqual(same, { _tag: "Expired", filingId });
+        assert.isNull((yield* h.filing(filingId)).payload_sealed);
+      }).pipe(Effect.scoped),
+    );
+  }
+});
