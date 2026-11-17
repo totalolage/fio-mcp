@@ -26,11 +26,12 @@ import { BoxClients } from "../box-clients.js";
 import { BoxRegistry } from "../boxes.js";
 import { DataKey, DomainConfig } from "../config.js";
 import { DomainStoreError } from "../errors.js";
-import { newRowId } from "../ids.js";
+import { isMessageId, newRowId } from "../ids.js";
 import type { FilingState } from "../migrations.js";
 import { type RecipientTier, RecipientTiers } from "../recipient-tiers.js";
 import { approvalNonceAad, filingPayloadAad, openText, sealText } from "../sealed.js";
 import {
+  DmIdLinked,
   type Filing,
   type FilingListQuery,
   FilingNotFound,
@@ -216,7 +217,7 @@ export const makeSendService = Effect.gen(function* () {
       return ids;
     }),
   );
-  /** Ids recovered at construction, for reconcileRecovered (phase B). */
+  /** Ids recovered at construction, for reconcileRecovered. */
   const recoveredIds = yield* Ref.make<ReadonlyArray<string>>(recovered);
 
   // Small effects --------------------------------------------------------------
@@ -946,7 +947,111 @@ export const makeSendService = Effect.gen(function* () {
 
   // The shape -------------------------------------------------------------------------------
 
-  const phaseB = (operation: string) => Effect.die(`SendService.${operation}: implemented in phase B`);
+  // Other admin decisions and the background runs (D-h, D-i, D-j, D4) ---------------------------
+
+  /** The error for an admin decision on a filing that is gone or no longer in `expected`. */
+  const conflictOf = (filingId: string, expected: FilingState, current: Option.Option<Filing>) =>
+    Option.match(current, {
+      onNone: () => new FilingNotFound({ filingId }),
+      onSome: (filing) => new FilingStateConflict({ filingId, state: filing.state, expected }),
+    });
+
+  /**
+   * A one-step admin decision: CAS `from` → `to` with `patch`. An open filing past its expiry is
+   * expired on the spot first, so it conflicts. Never touches BoxRegistry or BoxClients (D4).
+   * Returns the winning write, or DmIdTaken (only possible with a dmId in `patch`).
+   */
+  const adminDecision = Effect.fn("SendService.adminDecision")(function* (
+    found: Option.Option<Filing>,
+    filingId: string,
+    from: FilingState,
+    to: FilingState,
+    patch: FilingPatch,
+  ) {
+    if (Option.isNone(found)) return yield* new FilingNotFound({ filingId });
+    const filing = yield* expireIfDue(found.value);
+    if (filing.state !== from) return yield* conflictOf(filingId, from, Option.some(filing));
+    const write = yield* store.transition(filingId, [from], to, patch);
+    if (write._tag === "Lost") return yield* conflictOf(filingId, from, write.current);
+    return write;
+  });
+
+  /** markSent's dmID check: an id ISDS could have assigned, before anything is read or written. */
+  const validMessageId = (dmId: string): Effect.Effect<string, SendUnavailable> =>
+    isMessageId(dmId)
+      ? Effect.succeed(dmId)
+      : Effect.fail(new SendUnavailable({ detail: `${JSON.stringify(dmId)} is not a valid message ID` }));
+
+  /** The audit outcome of reconcileNow: a filing that is not outcome_unknown is a refused decision. */
+  const reconcileOutcomeOf = (outcome: ReconcileOutcome) => (outcome._tag === "NotApplicable" ? "refused" : "ok");
+
+  const reconcileDetail = (filingId: string, outcome: ReconcileOutcome) =>
+    ReconcileOutcome.$match(outcome, {
+      Sent: ({ dmID }) => ({ filingId, outcome: "Sent", dmID }),
+      StillUnknown: ({ detail }) => ({ filingId, outcome: "StillUnknown", detail }),
+      NotApplicable: ({ state }) => ({ filingId, outcome: "NotApplicable", state }),
+    });
+
+  /**
+   * One reconcile of every filing recovered at startup (D-i), one after another, without the
+   * status throttle. A filing whose attempt fails is logged and counted out.
+   *
+   * Returns how many of them ended sent (a filing already resolved by then does not count).
+   */
+  const reconcileRecovered = Effect.gen(function* () {
+    const ids = yield* Ref.get(recoveredIds);
+    let sent = 0;
+    for (const filingId of ids) {
+      const outcome = yield* reconcile(filingId).pipe(
+        Effect.catch((error) =>
+          Effect.logWarning("datova-schranka: reconciling a recovered filing failed", error.message).pipe(
+            Effect.annotateLogs({ filingId }),
+            Effect.as(undefined),
+          ),
+        ),
+      );
+      if (outcome?._tag === "Sent") sent += 1;
+    }
+    return sent;
+  }).pipe(Effect.withSpan("SendService.reconcileRecovered"));
+
+  /**
+   * The expiry sweep (D-j): open filings past expires_at → expired, payload cleared, nonces
+   * burned, and one system audit row naming them, all in one transaction. Returns the count.
+   */
+  const expireDue = inTransaction(
+    "expire due filings",
+    Effect.gen(function* () {
+      const filingIds = yield* store.expireDue;
+      if (filingIds.length > 0) {
+        yield* audit.record({ actor: { kind: "system" }, action: "filing.expire", outcome: "ok", detail: { filingIds } });
+      }
+      return filingIds.length;
+    }),
+  ).pipe(Effect.withSpan("SendService.expireDue"));
+
+  /** An admin decision audited once under `action`; FilingNotFound/FilingStateConflict/DmIdLinked are "refused". */
+  const auditedDecision = <A, E extends { readonly _tag: string }>(
+    admin: AuditActor,
+    action: string,
+    found: Option.Option<Filing>,
+    detail: Record<string, unknown>,
+    run: Effect.Effect<A, E>,
+    options: {
+      readonly outcomeOf?: (value: A) => "ok" | "refused";
+      readonly okDetail?: (value: A) => unknown;
+      readonly classify?: (error: E) => "refused" | "error";
+    } = {},
+  ) =>
+    audited(
+      { actor: admin, action, boxId: Option.isSome(found) ? found.value.boxId : undefined, detail },
+      () => run,
+      {
+        outcomeOf: options.outcomeOf ?? (() => "ok"),
+        okDetail: options.okDetail ?? (() => detail),
+        classify: options.classify ?? ((error) => (error._tag === "DmIdLinked" ? "refused" : refusalOutcome(error))),
+      },
+    );
 
   const audited = <A, E>(
     input: Parameters<typeof auditedSend>[0],
@@ -1024,15 +1129,75 @@ export const makeSendService = Effect.gen(function* () {
         ).pipe(Effect.map((answer) => answer.result)),
       ),
 
-    // TODO(phase B): reject, reconcileNow, markSent, confirmNotSent, reconcileRecovered, expireDue.
-    reject: () => phaseB("reject"),
-    reconcileNow: () => phaseB("reconcileNow"),
-    markSent: () => phaseB("markSent"),
-    confirmNotSent: () => phaseB("confirmNotSent"),
-    reconcileRecovered: phaseB("reconcileRecovered"),
-    expireDue: phaseB("expireDue"),
+    reject: (admin: AuditActor, filingId, reason) => {
+      const stated = reason?.trim() === "" ? undefined : reason?.trim();
+      return Effect.flatMap(store.byId(filingId), (found) =>
+        auditedDecision(
+          admin,
+          "filing.reject",
+          found,
+          stated === undefined ? { filingId } : { filingId, reason: stated },
+          adminDecision(found, filingId, "pending_admin", "admin_rejected", {
+            reason: stated,
+            clearPayload: true,
+            burnNonces: true,
+          }),
+        ),
+      ).pipe(Effect.asVoid);
+    },
+
+    reconcileNow: (admin: AuditActor, filingId) =>
+      Effect.flatMap(store.byId(filingId), (found) =>
+        auditedDecision(admin, "filing.reconcile", found, { filingId }, reconcile(filingId), {
+          outcomeOf: reconcileOutcomeOf,
+          okDetail: (outcome) => reconcileDetail(filingId, outcome),
+        }),
+      ),
+
+    markSent: (admin: AuditActor, filingId, dmId) =>
+      Effect.flatMap(store.byId(filingId), (found) =>
+        auditedDecision(
+          admin,
+          "filing.mark_sent",
+          found,
+          { filingId, dmId },
+          validMessageId(dmId).pipe(
+            Effect.flatMap((valid) =>
+              adminDecision(found, filingId, "outcome_unknown", "sent", {
+                dmId: valid,
+                reason: "an administrator marked it sent",
+                clearPayload: true,
+              }),
+            ),
+            // The dmID is on another filing (the store's pre-check, or the UNIQUE race it catches).
+            Effect.flatMap((write) =>
+              write._tag === "DmIdTaken"
+                ? Effect.fail(new DmIdLinked({ dmId: write.dmId, filingId: write.filingId }))
+                : Effect.void,
+            ),
+          ),
+          // The only SendUnavailable here is the dmID check: a refused decision, nothing changed.
+          { classify: (error) => (error._tag === "DomainStoreError" ? "error" : "refused") },
+        ),
+      ).pipe(Effect.asVoid),
+
+    confirmNotSent: (admin: AuditActor, filingId) =>
+      Effect.flatMap(store.byId(filingId), (found) =>
+        auditedDecision(
+          admin,
+          "filing.confirm_not_sent",
+          found,
+          { filingId },
+          adminDecision(found, filingId, "outcome_unknown", "not_sent", {
+            reason: "an administrator confirmed it was not sent",
+            clearPayload: true,
+          }),
+        ),
+      ).pipe(Effect.asVoid),
+
+    reconcileRecovered,
+    expireDue,
   };
-  void recoveredIds;
   return service;
 });
 
