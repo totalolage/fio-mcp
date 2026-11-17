@@ -197,9 +197,12 @@ describe("adding a box", () => {
     );
     const shortPassphrase = await browser.actMultipart("/admin/boxes/add", form);
     expect(shortPassphrase.flash).toEqual({ kind: "error", text: "Not added: The certificate passphrase must be at least 8 characters long." });
+    // D2 wins over the label check: a short password typed into the label too still gets the length refusal.
+    const both = await browser.actMultipart("/admin/boxes/add", passwordForm("short77", "alice", "short77"));
+    expect(both.flash?.text).toBe("Not added: The ISDS password must be at least 8 characters long.");
     expect(app.isds.requests).toEqual([]);
     expect(await boxes(app)).toEqual([]);
-    const rows = await audits(app);
+    const rows = (await audits(app)).slice(0, 2);
     expect(rows.map((entry) => [entry.action, entry.outcome])).toEqual([
       ["box_add", "refused"],
       ["box_add", "refused"],

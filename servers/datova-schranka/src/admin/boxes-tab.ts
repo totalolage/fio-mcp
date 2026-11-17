@@ -223,6 +223,9 @@ export const boxesTab: Effect.Effect<AdminTab, never, BoxRegistry | AuditLog | R
     const detail = { authKind: authKindOf(form) };
     const credentials = credentialsOf(form, context.files);
     if (typeof credentials === "string") return refused(`Not added: ${credentials}`, undefined, detail);
+    // D2 first, so a short secret always gets that refusal.
+    const tooShort = yield* Effect.flip(checkBoxSecretLength(credentials)).pipe(Effect.option);
+    if (tooShort._tag === "Some") return failed("Not added: ", undefined, detail)(tooShort.value);
     const secret = secretOf(credentials);
     if (labelExposesSecret(label, secret) || (yield* secretInLabels(secret))) {
       return refused(`Not added: ${LABEL_HOLDS_SECRET}`, undefined, detail);
