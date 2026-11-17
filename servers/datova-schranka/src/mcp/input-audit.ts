@@ -97,6 +97,10 @@ export const recordInvalidInput = (
 
 type Registration = Parameters<McpServer.McpServer["Service"]["addTool"]>[0];
 
+/** What a client sees for input that fails decoding: no input values and no schema values (box labels). */
+export const invalidParamsMessage = (tool: string): string =>
+  `Invalid parameters for tool '${tool}': the input does not match the tool's input schema in tools/list.`;
+
 /**
  * McpServer.registerToolkit with invalid-input auditing: the toolkit's own
  * registrations (same tools/list entries, decoding and handlers) are added
@@ -134,6 +138,11 @@ export const registerAuditedToolkit = <Tools extends Record<string, Tool.Any>>(t
                     Effect.provideService(AuditLog, audit),
                   )
                 : Effect.void,
+            ),
+            // The toolkit's decode message can quote the schema (the box enum lists every loaded
+            // box label, not only the granted ones), so the client gets a value-free message.
+            Effect.mapError((error) =>
+              error instanceof McpSchema.InvalidParams ? new McpSchema.InvalidParams({ message: invalidParamsMessage(name) }) : error,
             ),
           ),
       });

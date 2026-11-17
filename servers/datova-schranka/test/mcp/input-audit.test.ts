@@ -9,8 +9,9 @@ import { boxParameter } from "../../src/mcp/box-param.js";
 import { authorizedBoxCall, ToolError, toolError, toolOutput } from "../../src/mcp/call.js";
 import { payloadIssues, recordInvalidInput, registerAuditedToolkit } from "../../src/mcp/input-audit.js";
 import { isRealTime, JsonObject } from "../../src/mcp/params.js";
+import { READ_TOOL_SPECS } from "../../src/mcp/read-tools.js";
 import { SEND_SCOPE, type ToolGroup, type ToolSpec } from "../../src/mcp/tool-group.js";
-import { BOX, BOX_ID, grant, type Harness, LABEL, startTools, textOf } from "./support/harness.js";
+import { BOX, BOX_ID, grant, type Harness, LABEL, OTHER_BOX, OTHER_LABEL, startTools, textOf } from "./support/harness.js";
 import { DM_ID, REPLIES } from "./support/replies.js";
 
 /** A stand-in for another group (the send tools): its own toolkit, opted in through registerAuditedToolkit. */
@@ -213,4 +214,38 @@ describe("input validation details", () => {
       assert.isTrue(logs.some((line) => line.includes("could not audit the invalid input of a get_message call")));
     }),
   );
+});
+
+describe("invalid input never discloses box labels outside the grant", () => {
+  const boxTools = READ_TOOL_SPECS.filter((spec) => spec.resourceless !== true).map((spec) => spec.name);
+  const inputs: ReadonlyArray<Record<string, unknown>> = [{ box: "Nope" }, { box: 7 }, {}];
+
+  it("covers the seven box-bound toolkit tools and download_message", () => {
+    assert.lengthOf(boxTools, 8);
+    assert.include(boxTools, "download_message");
+  });
+
+  for (const tool of boxTools) {
+    for (const args of inputs) {
+      it(`${tool} ${JSON.stringify(args)} on a one-box grant: no other label, one refused row`, async () => {
+        harness = await startTools({
+          boxes: [BOX, OTHER_BOX],
+          replies: REPLIES,
+          principals: { one: grant("g-one", { boxes: [BOX_ID] }) },
+        });
+        const client = await harness.connect("one");
+        let result: Awaited<ReturnType<typeof client.call>> | undefined;
+        const rows = await newRows(harness, async () => {
+          result = await client.call(tool, args);
+        });
+        assert.isTrue(result?.isError);
+        assert.notInclude(JSON.stringify(result), OTHER_LABEL);
+        assert.match(textOf(result ?? { content: [] }), new RegExp(`^Invalid parameters for tool '${tool}'`));
+        assert.deepStrictEqual(
+          rows.map((row) => [row.action, row.outcome, (row.detail as { reason?: string }).reason]),
+          [[tool, "refused", "invalid_input"]],
+        );
+      });
+    }
+  }
 });
