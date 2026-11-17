@@ -102,12 +102,14 @@ if [ ! -f "$manifest" ]; then
   echo "error: no server '$server': $manifest does not exist" >&2
   exit 2
 fi
-name=$(node -p "require('./$manifest').name")
-version=$(node -p "require('./$manifest').version")
+# A missing field prints as '' instead of 'undefined', so the checks below
+# reject it.
+image=$(node -p "require('./$manifest').name ?? ''")
+version=$(node -p "require('./$manifest').version ?? ''")
 sha=$(git rev-parse --short HEAD)
-case $name in
-  '' | [!a-z0-9]* | *[!a-z0-9._-]*)
-    echo "error: $manifest name '$name' is not usable as a docker image name" >&2
+case $image in
+  '' | [!a-z0-9]* | *[!a-z0-9] | *[!a-z0-9._-]* | *[._-][._]*)
+    echo "error: $manifest name '$image' is not usable as a docker image name" >&2
     exit 2
     ;;
 esac
@@ -117,7 +119,7 @@ case $version in
     exit 2
     ;;
 esac
-tag=$name:$version-$sha
+tag=$image:$version-$sha
 
 tmp=$(mktemp -d)
 cleanup() {
@@ -143,7 +145,7 @@ if docker buildx version >/dev/null 2>&1; then
     --platform linux/amd64 \
     --file "servers/$server/Dockerfile" \
     --tag "$tag" \
-    --tag "$name:$version" \
+    --tag "$image:$version" \
     --load \
     . >&2
 else
@@ -152,7 +154,7 @@ else
     --platform linux/amd64 \
     --file "servers/$server/Dockerfile" \
     --tag "$tag" \
-    --tag "$name:$version" \
+    --tag "$image:$version" \
     . >&2
 fi
 
