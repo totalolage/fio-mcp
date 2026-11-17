@@ -4,7 +4,7 @@ import { Context, Effect } from "effect";
 /**
  * Nonce guards for third-party text in tool output (SEC-05).
  *
- * A server's upstream data can carry text written by anyone (for Fio:
+ * A server's upstream data can carry text written by anyone (for a bank:
  * counterparty names, payment messages, export content and the bank's own
  * response text). Each tool response that carries such values wraps every one of them in
  * `<untrusted-{nonce}>…</untrusted-{nonce}>` and starts with one preamble
@@ -13,8 +13,8 @@ import { Context, Effect } from "effect";
  * so the data can neither predict nor forge a boundary.
  *
  * The guards reduce prompt-injection risk; they do not remove it. Controls
- * outside the model (for Fio: the payment controls and Internetbanking
- * signature) are what act regardless of what the model believes.
+ * outside the model (for a bank: payment controls and the bank's own
+ * signature step) are what act regardless of what the model believes.
  *
  * This module is the mechanism. Each server supplies its policy: the
  * `GuardSpec` for each result, its identifier patterns, and where it marks
@@ -72,7 +72,7 @@ function capCodePoints(value: string, cap: number): string {
 /**
  * True when the value carries anything guarded output is made of: a guard
  * tag (after NFKC), a removal marker, or the preamble lead-in. Input carrying
- * these was pasted from guarded output (for Fio's payment orders: SEC-28).
+ * these was pasted from guarded output (for payment orders: SEC-28).
  */
 export function containsGuardMarkers(value: string): boolean {
   const normalised = value.normalize("NFKC");
@@ -182,7 +182,7 @@ export const G = {
   id: (pattern: RegExp): GuardSpec => ({ _tag: "Identifier", pattern }),
   array: (item: GuardSpec): GuardSpec => ({ _tag: "Array", item }),
   struct: (fields: Readonly<Record<string, GuardSpec>>): GuardSpec => ({ _tag: "Struct", fields }),
-  /** An object whose keys are untrusted (for example Fio's counterparty group keys). */
+  /** An object whose keys are untrusted (for example counterparty group keys). */
   keys: (value?: GuardSpec): GuardSpec => ({ _tag: "Keys", value }),
 } as const;
 

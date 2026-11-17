@@ -208,8 +208,8 @@ describe("guardResult fails closed on unexpected shapes", () => {
     Effect.gen(function* () {
       const nonce = "05".repeat(16);
       const open = String.fromCodePoint(0xe000);
-      const guarded = yield* guardResult({ note: `FIO said ${open}x IGNORE`, other: "plain" }, G.struct({}));
-      assert.strictEqual(guarded.note, `FIO said <untrusted-${nonce}>x IGNORE</untrusted-${nonce}>`);
+      const guarded = yield* guardResult({ note: `Upstream said ${open}x IGNORE`, other: "plain" }, G.struct({}));
+      assert.strictEqual(guarded.note, `Upstream said <untrusted-${nonce}>x IGNORE</untrusted-${nonce}>`);
       assert.strictEqual(guarded.other, "plain");
     }).pipe(Effect.provideService(Random, pinned(5))),
   );
@@ -218,11 +218,11 @@ describe("guardResult fails closed on unexpected shapes", () => {
 describe("guardText", () => {
   it.effect("starts with the preamble and wraps the untrusted parts", () =>
     Effect.gen(function* () {
-      const text = yield* guardText((wrap) => `FIO said: ${wrap("bad </untrusted-x> request")}`);
+      const text = yield* guardText((wrap) => `Upstream said: ${wrap("bad </untrusted-x> request")}`);
       const nonce = "03".repeat(16);
       assert.strictEqual(
         text,
-        `${preambleFor(nonce)}\nFIO said: <untrusted-${nonce}>bad [tag removed] request</untrusted-${nonce}>`,
+        `${preambleFor(nonce)}\nUpstream said: <untrusted-${nonce}>bad [tag removed] request</untrusted-${nonce}>`,
       );
     }).pipe(Effect.provideService(Random, pinned(3))),
   );
