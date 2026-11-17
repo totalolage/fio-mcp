@@ -11,9 +11,10 @@ The root holds what every workspace shares: `package.json` (workspaces, scripts,
 
 ## Development
 
-Requires Node.js 22.13 or newer and [Bun](https://bun.com) 1.4.2. Run everything from the repository root:
+Requires Node.js 22.13 or newer and [Bun](https://bun.com) 1.4.2. Clone the repository and run everything from its root:
 
 ```sh
+git clone https://github.com/totalolage/mcps.git && cd mcps
 bun install              # installs all workspaces, patches TypeScript for Effect diagnostics, builds dist/
 bun run build            # tsc -b: packages/core, then servers/fio
 bun run typecheck        # tsc with Effect diagnostics
@@ -26,6 +27,6 @@ bun run test:scripts     # tests scripts/ship-image.sh (stand-in docker and ssh)
 
 ## Images and CI
 
-Each server has its own Dockerfile and builds from the repository root, e.g. `docker build -f servers/fio/Dockerfile .`. `bun run ship:image` builds the fio-mcp image and streams it to a docker host over ssh; no registry is involved (see [Shipping the image](servers/fio/README.md#shipping-the-image-to-your-server)).
+Each server has its own Dockerfile and builds from the repository root, e.g. `docker build -f servers/fio/Dockerfile .`. `bun run ship:image` builds the fio-mcp image and streams it to a docker host over ssh; no registry is involved (see [Shipping the image](servers/fio/README.md#shipping-the-image-to-your-server)). The script only ships fio-mcp for now; another server needs it to take the server as an argument, or a script of its own.
 
 [CI](.github/workflows/ci.yml) runs the checks on pull requests and pushes to `main`. Each server has a job that runs when its own directory changes, and every job runs when `packages/core` or the shared root tooling changes. CI never builds or ships an image.

@@ -151,7 +151,7 @@ Claude Desktop (`claude_desktop_config.json`) or any client that uses the same f
   "mcpServers": {
     "fio": {
       "command": "node",
-      "args": ["/path/to/fio-mcp/servers/fio/dist/main.js"],
+      "args": ["/path/to/mcps/servers/fio/dist/main.js"],
       "env": {
         "FIO_TOKEN": "your-64-character-token"
       }
