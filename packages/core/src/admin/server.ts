@@ -1,5 +1,5 @@
-import { ByteSize, Clock, Effect, Layer, Option, Redacted, type Scope } from "effect";
-import { Cookies, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
+import { Clock, Effect, Layer, Option, Redacted, type Scope, Stream } from "effect";
+import { Cookies, HttpRouter, type HttpServerRequest, HttpServerResponse, Multipart } from "effect/http";
 import type { IpNetwork } from "effect/net";
 import type { SqlClient } from "effect/sql";
 import { safeEqual } from "../oauth/crypto.js";
@@ -26,6 +26,8 @@ import { ADMIN_ABSOLUTE_MS, ADMIN_PATH, ADMIN_PRELOGIN_MS, type AdminSession, ad
 import {
   type AdminActionContext,
   type AdminApp,
+  type AdminFormFile,
+  type AdminFormLimits,
   type AdminTab,
   type AdminTabAction,
   type AdminTabRequest,
@@ -62,7 +64,8 @@ export interface AdminSettings {
   readonly secondFactor?: SecondFactorCheck | undefined;
 }
 
-const MAX_FORM_BYTES = 16 * 1024;
+/** The largest form of a POST whose action does not raise it (AdminFormLimits.maxBytes). */
+export const DEFAULT_MAX_FORM_BYTES = 16 * 1024;
 const NO_STORE = { "cache-control": "no-store", pragma: "no-cache" } as const;
 
 type Request = HttpServerRequest.HttpServerRequest;
@@ -90,18 +93,83 @@ const redirect = (location: string, cookies?: Cookies.Cookies) =>
 
 const toLogin = redirect(`${ADMIN_PATH}/login`);
 
-type Form = { readonly _tag: "Form"; readonly params: URLSearchParams } | { readonly _tag: "Invalid" };
+type Form =
+  | { readonly _tag: "Form"; readonly params: URLSearchParams; readonly files: ReadonlyArray<AdminFormFile> }
+  | { readonly _tag: "Invalid" };
 
-/** A url-encoded form of at most MAX_FORM_BYTES. */
-const readForm = (request: Request): Effect.Effect<Form> => {
-  const type = (request.headers["content-type"] ?? "").split(";", 1)[0]?.trim().toLowerCase();
-  if (type !== "application/x-www-form-urlencoded") return Effect.succeed({ _tag: "Invalid" });
-  return request.text.pipe(
-    Effect.provideService(HttpServerRequest.MaxBodySize, ByteSize.bytes(MAX_FORM_BYTES)),
-    Effect.map((text): Form => ({ _tag: "Form", params: new URLSearchParams(text) })),
-    Effect.orElseSucceed((): Form => ({ _tag: "Invalid" })),
+const invalid: Form = { _tag: "Invalid" };
+
+const textDecoder = new TextDecoder();
+
+/**
+ * The raw body, read only up to `maxBytes`; undefined when it is longer (or
+ * unreadable). Counting the bytes received, not the parsed form, also counts
+ * whatever follows a multipart form's closing boundary.
+ */
+const readBody = (request: Request, maxBytes: number): Effect.Effect<Uint8Array | undefined> =>
+  Effect.suspend(() => {
+    const chunks: Array<Uint8Array> = [];
+    let size = 0;
+    return request.stream.pipe(
+      Stream.runForEachWhile((chunk) =>
+        Effect.sync(() => {
+          size += chunk.length;
+          if (size > maxBytes) return false;
+          chunks.push(chunk);
+          return true;
+        }),
+      ),
+      Effect.map(() => {
+        if (size > maxBytes) return undefined;
+        const body = new Uint8Array(size);
+        let offset = 0;
+        for (const chunk of chunks) {
+          body.set(chunk, offset);
+          offset += chunk.length;
+        }
+        return body;
+      }),
+      Effect.orElseSucceed(() => undefined),
+    );
+  });
+
+/** A multipart body's text fields into `params` and its files, in the order sent. */
+const parseMultipart = (request: Request, body: Uint8Array, maxBytes: number): Effect.Effect<Form> => {
+  const params = new URLSearchParams();
+  const files: Array<AdminFormFile> = [];
+  return Stream.make(body).pipe(
+    Stream.pipeThroughChannel(Multipart.makeChannel(request.headers)),
+    Stream.runForEach((part) =>
+      part._tag === "Field"
+        ? Effect.sync(() => params.append(part.key, part.value))
+        : Effect.map(part.contentEffect, (bytes) => {
+            files.push({ field: part.key, name: part.name, contentType: part.contentType, content: Redacted.make(bytes) });
+          }),
+    ),
+    Effect.as<Form>({ _tag: "Form", params, files }),
+    // The action's own limits, whatever the route's; text fields may be as large as the body (the default field limit is 10 MiB).
+    Effect.provideContext(Multipart.limitsServices({ maxTotalSize: maxBytes, maxFieldSize: maxBytes, maxFileSize: maxBytes })),
+    // A malformed body; its cause (which may quote the body) is dropped unlogged.
+    Effect.orElseSucceed(() => invalid),
   );
 };
+
+/**
+ * A form of at most `limits.maxBytes` (DEFAULT_MAX_FORM_BYTES): url-encoded,
+ * or multipart when `limits.multipart`. A larger declared length is refused
+ * unread, a longer body stops being read at the limit.
+ */
+const readForm = Effect.fnUntraced(function* (request: Request, limits: AdminFormLimits = {}) {
+  const maxBytes = limits.maxBytes ?? DEFAULT_MAX_FORM_BYTES;
+  const type = (request.headers["content-type"] ?? "").split(";", 1)[0]?.trim().toLowerCase();
+  const multipart = type === "multipart/form-data" && limits.multipart === true;
+  if (!multipart && type !== "application/x-www-form-urlencoded") return invalid;
+  if (Number(request.headers["content-length"]) > maxBytes) return invalid;
+  const body = yield* readBody(request, maxBytes);
+  if (body === undefined) return invalid;
+  if (multipart) return yield* parseMultipart(request, body, maxBytes);
+  return { _tag: "Form", params: new URLSearchParams(textDecoder.decode(body)), files: [] } satisfies Form;
+});
 
 /** The query string of a GET (request.url is the path and query). */
 const queryOf = (request: Request) => {
@@ -242,15 +310,21 @@ export const makeAdminServer = Effect.fn("AdminServer.make")(function* (
   const action =
     <E extends { readonly message: string }>(
       back: string,
-      act: (form: URLSearchParams, session: AdminSession, request: Request) => Effect.Effect<Flash | Response, E, Scope.Scope>,
+      act: (
+        form: URLSearchParams,
+        session: AdminSession,
+        request: Request,
+        files: ReadonlyArray<AdminFormFile>,
+      ) => Effect.Effect<Flash | Response, E, Scope.Scope>,
+      limits?: AdminFormLimits,
     ) =>
     (request: Request): Effect.Effect<Response, never, Scope.Scope> =>
       Effect.gen(function* () {
         const session = yield* signedIn(request);
         if (Option.isNone(session)) return toLogin;
-        const form = yield* readForm(request);
+        const form = yield* readForm(request, limits);
         if (form._tag === "Invalid" || !verified(request, session.value, form.params)) return refused;
-        const outcome = yield* act(form.params, session.value, request).pipe(
+        const outcome = yield* act(form.params, session.value, request, form.files).pipe(
           Effect.catch((error) => Effect.succeed<Flash>({ kind: "error", text: error.message })),
         );
         if (HttpServerResponse.isHttpServerResponse(outcome)) return outcome;
@@ -278,13 +352,14 @@ export const makeAdminServer = Effect.fn("AdminServer.make")(function* (
   };
 
   /** Built only for a verified form; nothing is checked or counted unless the action runs it. */
-  const actionContext = (request: Request, form: URLSearchParams): AdminActionContext => ({
+  const actionContext = (request: Request, form: URLSearchParams, files: ReadonlyArray<AdminFormFile>): AdminActionContext => ({
     checkSecondFactor: Effect.suspend(() => verifySecondFactor(request, form)),
+    files,
   });
 
   /** A tab action as a POST route; its message shows once on `back`, else on `fallback`. */
   const tabAction = (act: AdminTabAction, fallback: string) =>
-    action(act.back ?? fallback, (form, _session, request) => act.run(form, actionContext(request, form)));
+    action(act.back ?? fallback, (form, _session, request, files) => act.run(form, actionContext(request, form, files)), act.form);
 
   const tabRequest = (request: Request): AdminTabRequest => ({ query: queryOf(request), secondFactor: password.totpEnabled });
 
