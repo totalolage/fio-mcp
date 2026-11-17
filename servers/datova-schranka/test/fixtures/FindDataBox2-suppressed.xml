@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/">
+<SOAP-ENV:Body>
+<p:FindDataBox2Response xmlns:p="http://isds.czechpoint.cz/v20" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+<p:dbResults xsi:nil="true"/>
+<p:dbStatus><p:dbStatusCode>0009</p:dbStatusCode><p:dbStatusMessage>Do této schránky není možno zaslat Poštovní datovou zprávu.</p:dbStatusMessage></p:dbStatus>
+</p:FindDataBox2Response>
+</SOAP-ENV:Body>
+</SOAP-ENV:Envelope>

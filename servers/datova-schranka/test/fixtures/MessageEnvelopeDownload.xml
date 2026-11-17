@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/">
+  <SOAP-ENV:Body>
+    <p:MessageEnvelopeDownloadResponse xmlns:p="http://isds.czechpoint.cz/v20" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <p:dmReturnedMessageEnvelope dmType="K" dmVODZ="false" attsNum="2" specMessFlag="0">
+        <p:dmDm>
+          <p:dmID>8765432</p:dmID>
+          <p:dbIDSender>abc1234</p:dbIDSender>
+          <p:dmSender>Finanční úřad &amp; spol.</p:dmSender>
+          <p:dmSenderAddress>Praha 1</p:dmSenderAddress>
+          <p:dmSenderType>10</p:dmSenderType>
+          <p:dmRecipient>Jan Novák</p:dmRecipient>
+          <p:dmRecipientAddress>Brno</p:dmRecipientAddress>
+          <p:dmAmbiguousRecipient xsi:nil="true"/>
+          <p:dmSenderOrgUnit xsi:nil="true"/>
+          <p:dmSenderOrgUnitNum xsi:nil="true"/>
+          <p:dbIDRecipient>xyz9876</p:dbIDRecipient>
+          <p:dmRecipientOrgUnit xsi:nil="true"/>
+          <p:dmRecipientOrgUnitNum xsi:nil="true"/>
+          <p:dmToHands xsi:nil="true"/>
+          <p:dmAnnotation>Výzva k doplnění</p:dmAnnotation>
+          <p:dmRecipientRefNumber xsi:nil="true"/>
+          <p:dmSenderRefNumber>FU/123/2026</p:dmSenderRefNumber>
+          <p:dmRecipientIdent xsi:nil="true"/>
+          <p:dmSenderIdent xsi:nil="true"/>
+          <p:dmLegalTitleLaw>280</p:dmLegalTitleLaw>
+          <p:dmLegalTitleYear>2009</p:dmLegalTitleYear>
+          <p:dmLegalTitleSect xsi:nil="true"/>
+          <p:dmLegalTitlePar xsi:nil="true"/>
+          <p:dmLegalTitlePoint xsi:nil="true"/>
+          <p:dmPersonalDelivery>false</p:dmPersonalDelivery>
+          <p:dmAllowSubstDelivery>true</p:dmAllowSubstDelivery>
+        </p:dmDm>
+        <p:dmHash algorithm="SHA-256">MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=</p:dmHash>
+        <p:dmQTimestamp>MIIBAv8=</p:dmQTimestamp>
+        <p:dmDeliveryTime>2026-11-02T10:15:30.123+01:00</p:dmDeliveryTime>
+        <p:dmAcceptanceTime>2026-11-12T00:00:01.000+01:00</p:dmAcceptanceTime>
+        <p:dmMessageStatus>6</p:dmMessageStatus>
+        <p:dmAttachmentSize>12</p:dmAttachmentSize>
+      </p:dmReturnedMessageEnvelope>
+      <p:dmStatus><p:dmStatusCode>0000</p:dmStatusCode><p:dmStatusMessage>Provedeno úspěšně.</p:dmStatusMessage></p:dmStatus>
+    </p:MessageEnvelopeDownloadResponse>
+  </SOAP-ENV:Body>
+</SOAP-ENV:Envelope>

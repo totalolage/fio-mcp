@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/">
+<SOAP-ENV:Body>
+<p:GetOwnerInfoFromLoginResponse xmlns:p="http://isds.czechpoint.cz/v20" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+<p:dbOwnerInfo>
+<p:dbID>abc2def</p:dbID>
+<p:dbType>PO</p:dbType>
+<p:ic>12345678</p:ic>
+<p:pnFirstName xsi:nil="true"/>
+<p:pnMiddleName xsi:nil="true"/>
+<p:pnLastName xsi:nil="true"/>
+<p:pnLastNameAtBirth xsi:nil="true"/>
+<p:firmName>Příklad &amp; syn s.r.o.</p:firmName>
+<p:biDate xsi:nil="true"/>
+<p:biCity xsi:nil="true"/>
+<p:biCounty xsi:nil="true"/>
+<p:biState xsi:nil="true"/>
+<p:adCity>Praha</p:adCity>
+<p:adStreet>Korunní</p:adStreet>
+<p:adNumberInStreet>12</p:adNumberInStreet>
+<p:adNumberInMunicipality>1234</p:adNumberInMunicipality>
+<p:adZipCode>12000</p:adZipCode>
+<p:adState>CZ</p:adState>
+<p:nationality xsi:nil="true"/>
+<p:email>podatelna@example.cz</p:email>
+<p:identifier></p:identifier>
+<p:registryCode xsi:nil="true"/>
+<p:dbState>1</p:dbState>
+<p:dbEffectiveOVM>false</p:dbEffectiveOVM>
+<p:dbOpenAddressing>1</p:dbOpenAddressing>
+</p:dbOwnerInfo>
+<p:dbStatus><p:dbStatusCode>0000</p:dbStatusCode><p:dbStatusMessage>Provedeno úspěšně.</p:dbStatusMessage></p:dbStatus>
+</p:GetOwnerInfoFromLoginResponse>
+</SOAP-ENV:Body>
+</SOAP-ENV:Envelope>
