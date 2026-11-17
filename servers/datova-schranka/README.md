@@ -89,7 +89,7 @@ Build at the repository root:
 docker build --platform linux/amd64 -f servers/datova-schranka/Dockerfile -t datova-schranka .
 ```
 
-The image has Node, the production dependencies and the compiled `dist/` of datova-schranka and `@mcps/core`. It has no Bun, no fio-mcp code and none of fio-mcp's dependencies. It serves on port 3000, keeps its data in the `/data` volume and runs as any UID. Nothing is written outside `/data`, so the root filesystem can be read-only. `HEALTHCHECK` fetches `/healthz` with Node.
+The image has Node, the production dependencies and the compiled `dist/` of datova-schranka and `@mcps/core`. It has no Bun, no fio-mcp code and no dependency that only fio-mcp uses. It serves on port 3000, keeps its data in the `/data` volume and runs as any UID. Nothing is written outside `/data`, so the root filesystem can be read-only. `HEALTHCHECK` fetches `/healthz` with Node.
 
 ```bash
 docker run -d --name datova-schranka \
