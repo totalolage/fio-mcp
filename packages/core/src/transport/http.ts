@@ -49,6 +49,11 @@ export interface HttpTransportConfig {
    * Each of a subject's MAX_CONCURRENT_REQUESTS requests may hold one.
    */
   readonly maxBodyBytes?: number | undefined;
+  /**
+   * Withholds a /mcp result with embedded resources when response redaction
+   * would change it (frame-redaction.ts). Off when absent.
+   */
+  readonly protectEmbeddedResources?: boolean | undefined;
 }
 
 export { HEALTH_PATH, isAllowedHost, redactResponse } from "./guard.js";
@@ -451,7 +456,13 @@ export const httpRouterApp = <A, E, R, EA, RA>(
   info: ServerInfo,
   config: HttpTransportConfig,
 ) =>
-  Layer.mergeAll(app, HealthRoute, guard(config.allowedHosts, config.trustedProxies, config.trustedProxiesSetting)).pipe(
+  Layer.mergeAll(
+    app,
+    HealthRoute,
+    guard(config.allowedHosts, config.trustedProxies, config.trustedProxiesSetting, {
+      protectEmbeddedResources: config.protectEmbeddedResources,
+    }),
+  ).pipe(
     Layer.provideMerge(
       Layer.unwrap(
         Effect.gen(function* () {
