@@ -1,10 +1,11 @@
 import { assert, describe, it } from "@effect/vitest";
 import type { AdminActionContext, AdminTab } from "@mcps/core/admin/tab.js";
 import { makeRedactor, Redactor } from "@mcps/core/redaction.js";
-import { Effect, Layer } from "effect";
+import { Deferred, Effect, Fiber, Layer } from "effect";
 import { SqlClient } from "effect/sql";
 import { RECIPIENTS_PATH, recipientsTab } from "../../src/admin/recipients-tab.js";
 import { AuditLog } from "../../src/domain/audit-log.js";
+import { DomainStoreError } from "../../src/domain/errors.js";
 import { RecipientTiers } from "../../src/domain/recipient-tiers.js";
 import { memoryDatabase } from "../domain/support/database.js";
 import { fakeBox, makeFakeBoxRegistry } from "../domain/support/fake-box-registry.js";
@@ -32,16 +33,41 @@ const insertBox = (id: string, dbId: string) =>
     `;
   });
 
+interface AuditFaults {
+  failStart: boolean;
+  failFinish: boolean;
+}
+
+/** The real AuditLog, except that start / finish fail while `faults` says so. */
+const faultyAuditLog = (faults: AuditFaults) =>
+  Layer.effect(
+    AuditLog,
+    Effect.gen(function* () {
+      const real = yield* AuditLog;
+      return AuditLog.of({
+        ...real,
+        start: (input) =>
+          faults.failStart ? Effect.fail(new DomainStoreError({ operation: "write audit entry" })) : real.start(input),
+        finish: (id, outcome, detail) =>
+          faults.failFinish
+            ? Effect.fail(new DomainStoreError({ operation: "update audit entry" }))
+            : real.finish(id, outcome, detail),
+      });
+    }),
+  ).pipe(Layer.provide(AuditLog.Default));
+
 /**
  * The tab over a migrated in-memory database (real RecipientTiers and AuditLog), a fake
  * registry with two boxes (the first labelled with markup) and BoxClients over the fake ISDS
- * transport for the first box, answering CheckDataBox with `reply.current`.
+ * transport for the first box, answering CheckDataBox with `reply.current`. `faults` makes
+ * the AuditLog's start or finish fail.
  */
 const withTab = <A, E>(
   body: (harness: {
     readonly tab: AdminTab;
     readonly log: Array<string>;
     readonly reply: { current: ReadReply };
+    readonly faults: AuditFaults;
   }) => Effect.Effect<A, E, RecipientTiers | AuditLog | SqlClient.SqlClient>,
 ) =>
   Effect.gen(function* () {
@@ -55,7 +81,8 @@ const withTab = <A, E>(
       { box: { ...fakeBox(BOX, "aaa1111"), label: "Office <b>&</b>" }, credentials: passwordCredentials("alice") },
       { box: { ...fakeBox(OTHER_BOX, "bbb2222"), label: "Home" }, credentials: passwordCredentials("bob") },
     ]);
-    const services = Layer.mergeAll(RecipientTiers.Default, AuditLog.Default).pipe(
+    const faults: AuditFaults = { failStart: false, failFinish: false };
+    const services = Layer.mergeAll(RecipientTiers.Default, faultyAuditLog(faults)).pipe(
       Layer.provide(Layer.succeed(Redactor, makeRedactor([]))),
       Layer.provideMerge(memoryDatabase()),
     );
@@ -63,7 +90,7 @@ const withTab = <A, E>(
       yield* insertBox(BOX, "aaa1111");
       yield* insertBox(OTHER_BOX, "bbb2222");
       const tab = yield* recipientsTab;
-      return yield* body({ tab, log, reply });
+      return yield* body({ tab, log, reply, faults });
     }).pipe(Effect.provide(Layer.mergeAll(services, registry.layer, clients.layer)));
   });
 
@@ -286,6 +313,59 @@ describe("recipients tab", () => {
             detail: { recipient: RECIPIENT },
           },
         ]);
+      }),
+    ),
+  );
+
+  it.effect("saves nothing when the audit intent cannot be written", () =>
+    withTab(({ tab, log, faults }) =>
+      Effect.gen(function* () {
+        faults.failStart = true;
+        const flash = yield* act(tab, "/admin/recipients/add", { box: BOX, recipient: RECIPIENT, tier: "full" });
+        assert.strictEqual(flash.kind, "error");
+        assert.include(flash.text, "audit entry could not be written");
+        assert.deepStrictEqual(log, []);
+        assert.deepStrictEqual(yield* listed(BOX), []);
+        assert.deepStrictEqual(yield* audits, []);
+      }),
+    ),
+  );
+
+  it.effect("keeps the started audit row when its outcome cannot be written", () =>
+    withTab(({ tab, faults }) =>
+      Effect.gen(function* () {
+        faults.failFinish = true;
+        const flash = yield* act(tab, "/admin/recipients/add", { box: BOX, recipient: RECIPIENT, tier: "full" });
+        assert.strictEqual(flash.kind, "ok");
+        assert.include(flash.text, "audit entry could not be completed");
+        assert.deepStrictEqual(yield* listed(BOX), [{ recipientDbId: RECIPIENT, tier: "full", note: undefined }]);
+        assert.deepStrictEqual(yield* audits, [
+          {
+            action: "recipient.set",
+            outcome: "started",
+            actorKind: "admin",
+            boxId: BOX,
+            detail: { recipient: RECIPIENT, tier: "full" },
+          },
+        ]);
+      }),
+    ),
+  );
+
+  it.effect("an add interrupted during CheckDataBox saves nothing and finishes its audit row as an error", () =>
+    withTab(({ tab, reply }) =>
+      Effect.gen(function* () {
+        const reached = yield* Deferred.make<void>();
+        reply.current = () => Effect.andThen(Deferred.succeed(reached, undefined), Effect.never);
+        const fiber = yield* Effect.forkChild(
+          act(tab, "/admin/recipients/add", { box: BOX, recipient: RECIPIENT, tier: "full" }),
+        );
+        yield* Deferred.await(reached);
+        yield* Fiber.interrupt(fiber);
+        assert.deepStrictEqual(yield* listed(BOX), []);
+        const [row] = yield* audits;
+        assert.deepInclude(row, { action: "recipient.set", outcome: "error", boxId: BOX });
+        assert.deepInclude(row?.detail as object, { error: "interrupted" });
       }),
     ),
   );

@@ -254,23 +254,64 @@ export const recipientsTab: Effect.Effect<AdminTab, never, BoxRegistry | Recipie
         Effect.mapError((error) => checkFailure(target, error)),
       );
 
-    /**
-     * Runs `work` and writes its audit row. Only the ISDS check (`restore`d inside `work`) can
-     * be interrupted; once the tier is being saved, the save and its audit row both happen.
-     */
-    const audited = (work: (restore: Restore) => Effect.Effect<Outcome, Outcome>): Effect.Effect<Flash> =>
-      Effect.uninterruptibleMask((restore) =>
-        work(restore).pipe(Effect.catch((outcome) => Effect.succeed(outcome)), Effect.flatMap(recorded)),
+    /** Finishes a started audit row with the outcome; a failed write is logged and named in the message. */
+    const finished = (id: string, outcome: Outcome): Effect.Effect<Flash> =>
+      audit.finish(id, outcome.outcome, outcome.detail).pipe(
+        Effect.as(outcome.flash),
+        Effect.catch((error) =>
+          Effect.logError("recipients tab: audit entry not finished", error).pipe(
+            Effect.as({ ...outcome.flash, text: `${outcome.flash.text} The audit entry could not be completed.` }),
+          ),
+        ),
       );
 
-    const addWork = Effect.fnUntraced(function* (form: URLSearchParams, restore: Restore) {
-      const target = yield* targetOf(form, SET_ACTION, ["approve", "full"]);
-      const { dbState } = yield* restore(checked(target));
-      return yield* saved(target, dbState);
-    });
+    const intentOf = (target: Target) => ({ recipient: target.recipient, tier: target.tier, note: target.note });
 
-    const editWork = Effect.fnUntraced(function* (form: URLSearchParams) {
-      const target = yield* targetOf(form, SET_ACTION, ["approve", "full", "none"]);
+    /**
+     * Writes the audit row's intent first (fail closed: without the row nothing changes), runs
+     * `work` and finishes the row with its outcome on every exit. Only what `work` passes to
+     * `restore` (the ISDS check) can be interrupted; an interrupted check finishes the row as
+     * an error with nothing saved. Once the tier is being saved, the save and the row's
+     * outcome both happen.
+     */
+    const audited = (
+      target: Target,
+      action: string,
+      work: (restore: Restore) => Effect.Effect<Outcome, Outcome>,
+    ): Effect.Effect<Flash> =>
+      Effect.uninterruptibleMask((restore) =>
+        audit.start({ actor: ADMIN, action, boxId: target.box.id, detail: intentOf(target) }).pipe(
+          Effect.matchEffect({
+            onFailure: (error) =>
+              Effect.logError("recipients tab: audit entry not written", error).pipe(
+                Effect.as<Flash>({ kind: "error", text: "Nothing was saved: the audit entry could not be written." }),
+              ),
+            onSuccess: (id) =>
+              work(restore).pipe(
+                Effect.catch((outcome) => Effect.succeed(outcome)),
+                Effect.onInterrupt(() =>
+                  audit
+                    .finish(id, "error", { ...intentOf(target), error: "interrupted" })
+                    .pipe(Effect.catch((error) => Effect.logError("recipients tab: audit entry not finished", error))),
+                ),
+                Effect.flatMap((outcome) => finished(id, outcome)),
+              ),
+          }),
+        ),
+      );
+
+    /** Checks the form, then runs `next`; a refused form is audited as one finished row. */
+    const withTarget = (
+      form: URLSearchParams,
+      action: string,
+      allowed: ReadonlyArray<RecipientTier> | undefined,
+      next: (target: Target) => Effect.Effect<Flash>,
+    ): Effect.Effect<Flash> =>
+      targetOf(form, action, allowed).pipe(
+        Effect.matchEffect({ onFailure: (outcome) => Effect.uninterruptible(recorded(outcome)), onSuccess: next }),
+      );
+
+    const editWork = Effect.fnUntraced(function* (target: Target) {
       const listed = yield* tiers.list(target.box.id).pipe(
         Effect.mapError(
           (error): Outcome => ({
@@ -295,10 +336,18 @@ export const recipientsTab: Effect.Effect<AdminTab, never, BoxRegistry | Recipie
       return yield* target.tier === "none" ? removed(target) : saved(target, undefined);
     });
 
-    const add = (form: URLSearchParams) => audited((restore) => addWork(form, restore));
-    const edit = (form: URLSearchParams) => audited(() => editWork(form));
+    const add = (form: URLSearchParams) =>
+      withTarget(form, SET_ACTION, ["approve", "full"], (target) =>
+        audited(target, SET_ACTION, (restore) =>
+          Effect.flatMap(restore(checked(target)), ({ dbState }) => saved(target, dbState)),
+        ),
+      );
+    const edit = (form: URLSearchParams) =>
+      withTarget(form, SET_ACTION, ["approve", "full", "none"], (target) =>
+        audited(target, target.tier === "none" ? REMOVE_ACTION : SET_ACTION, () => editWork(target)),
+      );
     const remove = (form: URLSearchParams) =>
-      audited(() => Effect.flatMap(targetOf(form, REMOVE_ACTION, undefined), removed));
+      withTarget(form, REMOVE_ACTION, undefined, (target) => audited(target, REMOVE_ACTION, () => removed(target)));
 
     const render: AdminTab["render"] = Effect.fnUntraced(
       function* (csrf: string) {
