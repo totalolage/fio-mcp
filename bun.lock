@@ -29,6 +29,8 @@
       "name": "datova-schranka",
       "version": "0.0.0",
       "dependencies": {
+        "@effect/platform-node": "4.0.6",
+        "@effect/sql-sqlite-node": "4.0.6",
         "@mcps/core": "workspace:*",
         "effect": "4.0.6",
         "fast-xml-parser": "5.12.0",
