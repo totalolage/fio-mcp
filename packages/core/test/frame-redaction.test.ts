@@ -142,6 +142,15 @@ describe("frame redaction with protectEmbeddedResources", () => {
     assert.strictEqual(on.chunk(clean), clean);
   });
 
+  it("withholds only the resource message of a batch the raw frame shows nothing in", () => {
+    const redactor = makeRedactor([], (text) => text.replace(/BEGIN\nKEY/g, "***"));
+    const frames = makeFrameRedactor(redactor, { protectEmbeddedResources: true });
+    const resource = resourceResult(2, "BEGIN\nKEY");
+    resource.result.content[0] = { type: "text", text: "BEGIN\nKEY" };
+    const batch = [textResult(1, "BEGIN\nKEY"), resource];
+    assert.strictEqual(frames.text(json(batch)), json([textResult(1, "BEGIN\nKEY"), withheldResult(2)]));
+  });
+
   it("keeps the id of a withheld result when redaction would rename the id key", () => {
     const redactor = makeRedactor([SECRET], (text) => (text === "id" ? "***" : text));
     const frames = makeFrameRedactor(redactor, { protectEmbeddedResources: true });

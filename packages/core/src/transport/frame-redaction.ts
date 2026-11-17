@@ -118,10 +118,13 @@ export function makeFrameRedactor(redactor: RedactorShape, options: FrameRedacto
     const prefix = raw.startsWith(SSE_DATA) ? SSE_DATA : "";
     return Option.match(decodeJson(raw.slice(prefix.length)), {
       onNone: () => raw,
-      onSome: (value) =>
-        (Array.isArray(value) ? value : [value]).some((message) => Option.isSome(withheld(message)))
-          ? `${prefix}${JSON.stringify(redactValue(value))}`
-          : raw,
+      onSome: (value) => {
+        // Only withheld messages change; their batch siblings keep their values.
+        const keep = (message: unknown) => Option.getOrElse(withheld(message), () => message);
+        const kept = Array.isArray(value) ? value.map(keep) : keep(value);
+        const out = JSON.stringify(kept);
+        return out === JSON.stringify(value) ? raw : `${prefix}${out}`;
+      },
     });
   };
 
