@@ -7,6 +7,7 @@ import { BoxRegistry } from "../domain/boxes.js";
 import { type DownloadedMessage, ReadService } from "../domain/read-service.js";
 import { boxParameter } from "./box-param.js";
 import { authorizedBoxCall, ToolError, toolError, toolOutput } from "./call.js";
+import { inputIssues, recordInvalidInput } from "./input-audit.js";
 import { jsonObject } from "./json.js";
 import { annotateTool, JsonObject, MessageIdParam } from "./params.js";
 import { DOWNLOAD_GUARD } from "./read-guards.js";
@@ -21,9 +22,10 @@ import { READ_SCOPE, type ToolSpec } from "./tool-group.js";
  * inline attachment in original order; no structuredContent, no
  * outputSchema. Input schema, validation, authorization and auditing are
  * the toolkit tools': the same `box` enum (core's grant filter narrows or
- * hides it in tools/list), schema failures are InvalidParams before
- * anything runs, authorizedBoxCall checks every call and audits refusals,
- * and ReadService.downloadMessage audits the call it enters.
+ * hides it in tools/list), schema failures are audited once
+ * (input-audit.ts) and answered InvalidParams before anything else
+ * runs, authorizedBoxCall checks every call and audits refusals, and
+ * ReadService.downloadMessage audits the call it enters.
  *
  * Blob integrity: a blob is the exact attachment bytes (Uint8Array; the
  * protocol encodes it as base64) and never passes through redactDeep or the
@@ -200,7 +202,12 @@ export const registerDownloadTool = Effect.fn("ReadTools.registerDownload")(func
     annotations: tool.annotations,
     handle: (payload: unknown) =>
       decode(payload ?? {}, { onExcessProperty: "error" }).pipe(
-        Effect.mapError(() => new McpSchema.InvalidParams({ message: INVALID_PARAMS })),
+        Effect.catch((error) =>
+          recordInvalidInput(DOWNLOAD_SPEC.name, inputIssues(error.issue)).pipe(
+            Effect.provideService(AuditLog, audit),
+            Effect.andThen(Effect.fail(new McpSchema.InvalidParams({ message: INVALID_PARAMS }))),
+          ),
+        ),
         Effect.flatMap((input) =>
           download(input).pipe(
             Effect.catchTag("ToolError", (error) => Effect.succeed(errorResult(error.message))),

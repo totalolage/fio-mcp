@@ -199,7 +199,7 @@ describe("every read tool call is audited exactly once", () => {
     });
   }
 
-  it("invalid input is rejected as invalid params before anything runs, for toolkit and raw tools alike: no row", async () => {
+  it("invalid input is rejected as invalid params before anything runs, for toolkit and raw tools alike: one refused row each", async () => {
     const h = await start();
     const client = await h.connect("reader");
     for (const [tool, args] of [
@@ -212,7 +212,11 @@ describe("every read tool call is audited exactly once", () => {
       assert.isTrue(result.isError, `${tool} ${JSON.stringify(args)}`);
       assert.match(textOf(result), new RegExp(`^Invalid parameters for tool '${tool}'`));
     }
-    assert.deepStrictEqual(await h.audit(), []);
+    const rows = await h.audit();
+    assert.deepStrictEqual(
+      rows.map((row) => [row.outcome, reasonOf(row)]),
+      Array.from({ length: 4 }, () => ["refused", "invalid_input"]),
+    );
     assert.deepStrictEqual(h.log, []);
   });
 

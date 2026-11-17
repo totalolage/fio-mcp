@@ -15,7 +15,7 @@ import { BoxNotFound } from "../../../src/domain/errors.js";
 import { ReadService } from "../../../src/domain/read-service.js";
 import { toolPolicyLayer } from "../../../src/mcp/policy.js";
 import { readToolGroup } from "../../../src/mcp/read-tools.js";
-import { READ_SCOPE } from "../../../src/mcp/tool-group.js";
+import { READ_SCOPE, type ToolGroup } from "../../../src/mcp/tool-group.js";
 import { memoryDatabase } from "../../domain/support/database.js";
 import { type ReadReplies, readBoxClients } from "../../domain/support/read-box-clients.js";
 import { readTestBox } from "../../domain/support/read-box-registry.js";
@@ -104,6 +104,8 @@ export interface StartOptions {
   readonly secrets?: ReadonlyArray<string>;
   readonly config?: Partial<Pick<DomainConfigShape, "attachmentInlineMaxBytes" | "responseInlineMaxBytes">>;
   readonly principals: Readonly<Record<string, Principal>>;
+  /** More tool groups registered next to the read tools (as the send tools are). */
+  readonly groups?: ReadonlyArray<ToolGroup<ReadService | AuditLog | BoxRegistry | Redactor | DomainConfig>>;
 }
 
 export interface ToolResult {
@@ -153,13 +155,15 @@ export const startTools = async (options: StartOptions) => {
       }).pipe(Layer.provide(principalFromBearer(options.principals).layer));
     }),
   );
-  const tools = Layer.effectDiscard(readToolGroup.register(options.labels ?? boxes.map((box) => box.label)));
+  const groups = [readToolGroup, ...(options.groups ?? [])];
+  const labels = options.labels ?? boxes.map((box) => box.label);
+  const tools = Layer.effectDiscard(Effect.forEach(groups, (group) => group.register(labels), { discard: true }));
   const app = tools.pipe(
     Layer.provideMerge(mcp),
     Layer.provide(
       Layer.mergeAll(
         Layer.succeed(Resources, Resources.of({ list: Effect.succeed(resources), changes: Stream.empty })),
-        toolPolicyLayer(readToolGroup.specs),
+        toolPolicyLayer(groups.flatMap((group) => group.specs)),
       ),
     ),
     Layer.provide(Layer.succeedContext(context)),

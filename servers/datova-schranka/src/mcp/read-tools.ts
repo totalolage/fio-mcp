@@ -1,7 +1,7 @@
 import type { GuardSpec } from "@mcps/core/mcp/untrusted.js";
 import { Redactor } from "@mcps/core/redaction.js";
 import { Effect, Schema } from "effect";
-import { McpServer, Tool, Toolkit } from "effect/ai";
+import { Tool, Toolkit } from "effect/ai";
 import { AuditLog } from "../domain/audit-log.js";
 import { type Box, BoxRegistry } from "../domain/boxes.js";
 import { DomainConfig } from "../domain/config.js";
@@ -13,6 +13,7 @@ import { boxParameter } from "./box-param.js";
 import { authorizedBoxCall, authorizedCall, ToolError, toolActor, toolError, toolOutput } from "./call.js";
 import type { Caller } from "./caller.js";
 import { DOWNLOAD_SPEC, registerDownloadTool } from "./download-tool.js";
+import { registerAuditedToolkit } from "./input-audit.js";
 import { jsonObject, toJson } from "./json.js";
 import {
   annotateTool,
@@ -335,7 +336,7 @@ export const readToolGroup: ToolGroup<ReadToolServices> = {
   specs: READ_TOOL_SPECS,
   register: Effect.fn("ReadTools.register")(function* (labels: ReadonlyArray<string>) {
     const toolkit = makeReadToolkit(labels);
-    yield* McpServer.registerToolkit(toolkit).pipe(Effect.provide(toolkit.toLayer(makeReadHandlers(toolkit))));
+    yield* registerAuditedToolkit(toolkit).pipe(Effect.provide(toolkit.toLayer(makeReadHandlers(toolkit))));
     yield* registerDownloadTool(labels);
   }),
 };
