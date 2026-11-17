@@ -34,6 +34,12 @@ import type { RedactorShape } from "../redaction.js";
 
 const SSE_DATA = "data: ";
 
+/**
+ * How JSON.stringify (McpServer's encoder) writes an embedded resource's
+ * type; a line without it embeds no resource.
+ */
+const RESOURCE_TYPE = '"resource"';
+
 const decodeJson = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown));
 
 export interface FrameRedactorOptions {
@@ -74,18 +80,25 @@ export function makeFrameRedactor(redactor: RedactorShape, options: FrameRedacto
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
 
-  const protectMessage = (message: unknown): unknown => {
-    const redacted = redactor.redactDeep(message);
-    if (!embedsResource(message) || JSON.stringify(redacted) === JSON.stringify(message)) return redacted;
-    // The redacted id: a secret in a client-chosen id must not leak either.
-    return withheldResult(isRecord(redacted) ? redacted.id : undefined);
-  };
+  const protect = options.protectEmbeddedResources === true;
+
+  /** The withheld replacement for a resource-bearing message redaction would change. */
+  const withheld = (message: unknown): Option.Option<unknown> =>
+    isRecord(message) &&
+    embedsResource(message) &&
+    JSON.stringify(redactor.redactDeep(message)) !== JSON.stringify(message)
+      ? // The id is redacted on its own: redactDeep also redacts keys, so
+        // `id` itself could be renamed. A secret in a client-chosen id must
+        // not leak either.
+        Option.some(withheldResult(redactor.redactDeep(message.id)))
+      : Option.none();
+
+  const redactMessage = (message: unknown): unknown =>
+    protect ? Option.getOrElse(withheld(message), () => redactor.redactDeep(message)) : redactor.redactDeep(message);
 
   // A JSON-RPC batch (an array) is checked message by message.
-  const redactValue: (value: unknown) => unknown =
-    options.protectEmbeddedResources === true
-      ? (value) => (Array.isArray(value) ? value.map(protectMessage) : protectMessage(value))
-      : redactor.redactDeep;
+  const redactValue = (value: unknown): unknown =>
+    protect && Array.isArray(value) ? value.map(redactMessage) : redactMessage(value);
 
   const line = (raw: string): string => {
     const prefix = raw.startsWith(SSE_DATA) ? SSE_DATA : "";
@@ -95,8 +108,27 @@ export function makeFrameRedactor(redactor: RedactorShape, options: FrameRedacto
     });
   };
 
-  const text = (value: string): string =>
-    redactor.redact(value) === value ? value : value.split("\n").map(line).join("\n");
+  /**
+   * A line the raw check found nothing in. The app's extra scrubber may still
+   * change a decoded string (one spanning an escaped character, say), so a
+   * resource-bearing line is checked decoded; every other line stays as is.
+   */
+  const protectLine = (raw: string): string => {
+    if (!raw.includes(RESOURCE_TYPE)) return raw;
+    const prefix = raw.startsWith(SSE_DATA) ? SSE_DATA : "";
+    return Option.match(decodeJson(raw.slice(prefix.length)), {
+      onNone: () => raw,
+      onSome: (value) =>
+        (Array.isArray(value) ? value : [value]).some((message) => Option.isSome(withheld(message)))
+          ? `${prefix}${JSON.stringify(redactValue(value))}`
+          : raw,
+    });
+  };
+
+  const text = (value: string): string => {
+    if (redactor.redact(value) !== value) return value.split("\n").map(line).join("\n");
+    return protect && value.includes(RESOURCE_TYPE) ? value.split("\n").map(protectLine).join("\n") : value;
+  };
 
   function chunk(value: Uint8Array): Uint8Array;
   function chunk(value: string | Uint8Array): string | Uint8Array;
