@@ -4,11 +4,12 @@ import { WITHHELD_RESOURCES_TEXT } from "@mcps/core/transport/frame-redaction.js
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { Effect } from "effect";
 import { afterEach, describe, expect, it } from "vitest";
+import { MAX_MCP_BODY_BYTES } from "../../src/app/app.js";
 import { AuditLog } from "../../src/domain/audit-log.js";
 import { READ_SCOPE, SEND_SCOPE } from "../../src/mcp/tool-group.js";
 import { CONSENT_ACTION } from "../../src/oauth/app.js";
 import { type AppHarness, freePort, socketFetch, startApp } from "../support/app.js";
-import { type OAuthHarness, PUBLIC_URL, tokensFor } from "../support/oauth.js";
+import { type OAuthHarness, PUBLIC_URL, postMcp, tokensFor } from "../support/oauth.js";
 import {
   BLOB_TOOL,
   ECHO_TOOL,
@@ -64,7 +65,7 @@ describe("the composed HTTP app", () => {
     const result = (await client.callTool({ name: READ_TOOL, arguments: { box: "Main" } })) as CallToolResult;
     expect(result.isError ?? false).toBe(false);
     expect(textOf(result)).toBe("read Main");
-    // The consent's audit row was written by the app's AuditLog, in the grant's transaction.
+    // The consent wrote its audit row through the app's AuditLog, on the database the OAuth store uses.
     const { entries } = await harness.run(
       Effect.flatMap(Effect.service(AuditLog), (audit) => audit.list({ action: CONSENT_ACTION })),
     );
@@ -104,6 +105,28 @@ describe("the composed HTTP app", () => {
     const password = "secret-of-main-user";
     const box = (await client.callTool({ name: ECHO_TOOL, arguments: { text: `x ${password} y` } })) as CallToolResult;
     expect(textOf(box)).toBe(`x ${REDACTED} y`);
+  });
+
+  it("refuses /mcp without a token", async () => {
+    const harness = await start();
+    const response = await postMcp(harness);
+    expect(response.status).toBe(401);
+  });
+
+  it("accepts /mcp requests above core's 1 MiB default, up to the 32 MiB cap", async () => {
+    const harness = await start();
+    const tokens = await tokensFor(harness, { boxes: ["Main"], scopes: [READ_SCOPE] });
+    const client = await harness.mcp(tokens.access);
+    const large = "x".repeat(2 * 1024 * 1024);
+    const result = (await client.callTool({ name: ECHO_TOOL, arguments: { text: large } })) as CallToolResult;
+    expect(textOf(result)).toHaveLength(large.length);
+    const over = await postMcp(
+      harness,
+      { authorization: `Bearer ${tokens.access}` },
+      "/mcp",
+      JSON.stringify({ jsonrpc: "2.0", id: 9, method: "ping", params: { pad: "x".repeat(MAX_MCP_BODY_BYTES) } }),
+    );
+    expect(over.status).toBe(413);
   });
 
   it("withholds an embedded resource that redaction would alter, and passes others byte for byte", async () => {

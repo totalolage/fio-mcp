@@ -27,6 +27,8 @@ const program = command(process.argv.slice(2)).pipe(
   // lease's); this logger knows no secret yet, the server's own logs go
   // through AppLoggerLive.
   Effect.tapError((error) => Effect.logError(error.message)),
+  // A defect's cause may carry anything, so it is not printed; the exit code is non-zero.
+  Effect.tapDefect(() => Effect.logError("datova-schranka stopped on an unexpected internal error")),
   Effect.provide(Logger.layer([stderrLogger(makeRedactor([]), stripMarks)])),
 );
 

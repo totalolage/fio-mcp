@@ -46,6 +46,7 @@ export interface AppStartOptions {
   readonly boxes?: ReadonlyArray<{ readonly label: string; readonly username: string; readonly dbId: string }>;
 }
 
+/** OAuthHarness over the socket; its `clock` is inert (the app runs on real time). */
 export interface AppHarness extends OAuthHarness {
   /** The app's origin on loopback (PUBLIC_URL is only its configured public name). */
   readonly base: string;
@@ -164,6 +165,7 @@ export async function startApp(options: AppStartOptions = {}): Promise<AppHarnes
       added,
       dir,
       fetch: socketFetch(base),
+      // Not wired: the app and `run` use real time, so advancing it changes nothing.
       clock: new SkewedClock(),
       logs,
       store: (f) => run(Effect.flatMap(makeOAuthStore(undefined, grantSettings), f)),

@@ -62,7 +62,11 @@ export interface Features {
   readonly toolGroups: ReadonlyArray<ToolGroup<ExtensionRequirements>>;
   /** Admin tabs after core's built-in ones. */
   readonly adminTabs: Effect.Effect<ReadonlyArray<AdminTab>, never, ExtensionRequirements>;
-  /** Long-running work, built with the server, after the instance lease is held. */
+  /**
+   * Long-running work, built after the instance lease is held, concurrently
+   * with the listener: work that must finish before requests are served
+   * (e.g. startup recovery) belongs in ExtensionServicesLive instead.
+   */
   readonly background: Layer.Layer<never, never, ExtensionRequirements>;
 }
 
