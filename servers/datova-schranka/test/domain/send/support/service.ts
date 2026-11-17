@@ -252,8 +252,8 @@ export const makeSendHarness = Effect.fn("makeSendHarness")(function* (options: 
       }),
     advance: (millis: number): Effect.Effect<void> => TestClock.adjust(millis),
     /**
-     * Takes the harness box's permit (BoxClients.use) and keeps it until the returned effect
-     * runs, so concurrent calls queue at the permit.
+     * Takes the harness box's permit (BoxClients.use) and keeps it until `release` runs, so
+     * concurrent calls queue at the permit.
      */
     holdPermit: Effect.gen(function* () {
       const acquired = yield* Deferred.make<void>();
@@ -261,12 +261,13 @@ export const makeSendHarness = Effect.fn("makeSendHarness")(function* (options: 
         provide(
           Effect.gen(function* () {
             const clients = yield* BoxClients;
-            yield* clients.use(box.id, () => Effect.andThen(Deferred.succeed(acquired, undefined), Effect.never));
+            return yield* clients.use(box.id, () => Effect.andThen(Deferred.succeed(acquired, undefined), Effect.never));
           }),
         ),
       );
       yield* Deferred.await(acquired);
-      return Fiber.interrupt(held);
+      const release: Effect.Effect<void> = Fiber.interrupt(held);
+      return { release };
     }),
     /** Yields until `condition` succeeds with true (dies after 10 000 yields). */
     eventually: (condition: Effect.Effect<boolean>): Effect.Effect<void> =>

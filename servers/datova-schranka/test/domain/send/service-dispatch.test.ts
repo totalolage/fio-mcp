@@ -38,9 +38,19 @@ const ambiguous: ReadonlyArray<readonly [string, ScriptedReply]> = [
   ["a defect", () => Effect.die("transport exploded")],
 ];
 
-/** Replaces CreateMessage on the client with a failure the real client raises before the transport. */
-const failBeforeTransport = (error: unknown): IsdsClientShape["createMessage"] => () =>
-  Effect.fail(error) as unknown as ReturnType<IsdsClientShape["createMessage"]>;
+type CreateMessageError = Effect.Error<ReturnType<IsdsClientShape["createMessage"]>>;
+
+/**
+ * Replaces CreateMessage on the client with a failure the real client raises before the
+ * transport; IsdsConfigError and IsdsCredentialsError are outside its declared error type (the
+ * real client meets them building the transport), so they are cast in.
+ */
+const failBeforeTransport = (
+  error: CreateMessageError | IsdsConfigError | IsdsCredentialsError,
+): IsdsClientShape["createMessage"] => {
+  const fail = () => Effect.fail(error);
+  return fail as unknown as IsdsClientShape["createMessage"];
+};
 
 const preSend: ReadonlyArray<readonly [string, IsdsClientShape["createMessage"]]> = [
   ["IsdsInvalidRequest", failBeforeTransport(new IsdsInvalidRequest({ operation: "CreateMessage", detail: "bad" }))],

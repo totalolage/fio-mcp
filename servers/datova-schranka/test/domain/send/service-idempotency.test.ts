@@ -32,7 +32,7 @@ describe("SendService idempotency", () => {
         const before = yield* h.filing(sent.filingId);
         const calls = { check: h.calls("CheckDataBox"), create: h.calls("CreateMessage") };
 
-        const release = yield* h.holdPermit;
+        const { release } = yield* h.holdPermit;
         const replayed = yield* h.service.sendMessage(CALLER, h.request());
         yield* release;
 

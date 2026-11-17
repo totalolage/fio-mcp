@@ -13,7 +13,7 @@ import { ADMIN, askApproval, CALLER, dmIdOf, type StartedSendHarness, sendHarnes
  */
 const race = <A, E>(h: StartedSendHarness, ready: Effect.Effect<boolean>, a: Effect.Effect<A, E>, b: Effect.Effect<A, E>) =>
   Effect.gen(function* () {
-    const release = yield* h.holdPermit;
+    const { release } = yield* h.holdPermit;
     const fiber = yield* Effect.forkChild(Effect.all([a, b], { concurrency: "unbounded" }));
     yield* h.eventually(ready);
     yield* release;
@@ -54,8 +54,9 @@ describe("SendService concurrent claims", () => {
           h.service.sendMessage(CALLER, confirm),
         );
         assert.strictEqual(h.calls("CreateMessage"), 1);
-        const sent = { _tag: "Sent", filingId: first.filingId, dmID: dmIdOf(1) };
-        assert.deepInclude(results, sent);
+        assert.isTrue(
+          results.some((result) => result._tag === "Sent" && result.filingId === first.filingId && result.dmID === dmIdOf(1)),
+        );
         // The loser either replays the stored Sent or finds the nonce already used.
         for (const result of results) assert.include(["Sent", "Refused"], result._tag);
         assert.strictEqual((yield* h.filings).length, 1);

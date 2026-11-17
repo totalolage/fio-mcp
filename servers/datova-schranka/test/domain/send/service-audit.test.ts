@@ -20,7 +20,7 @@ describe("SendService audit", () => {
   it.effect("write one row per call with the outcome of its result", () =>
     Effect.gen(function* () {
       const h = yield* sendHarness({ tiers: { [RECIPIENT_DB_ID]: "full", [APPROVE_RECIPIENT]: "approve" } });
-      const expected: Array<readonly [string, string]> = [];
+      const expected: Array<Array<string>> = [];
       const expect = (action: string, outcome: string) => Effect.sync(() => expected.push([action, outcome]));
 
       const sent = yield* h.service.sendMessage(CALLER, h.request());
