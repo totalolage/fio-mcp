@@ -26,6 +26,7 @@ export const LEASE_KEY = "instance_lease";
 /** How often the holder refreshes the lease, and how old a heartbeat may get before the lease is free. */
 export interface LeaseTimings {
   readonly heartbeat: Duration.Duration;
+  /** Must exceed `heartbeat`: the holder stops once its last good beat is `stale - heartbeat` old. */
   readonly stale: Duration.Duration;
 }
 

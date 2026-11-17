@@ -170,6 +170,24 @@ describe("instance lease: server entrypoint", () => {
 
 // The test clock drives the production timings (30 s heartbeat, 90 s stale).
 describe("instance lease: heartbeats and expiry", () => {
+  it.effect("the held-lease message names the app and the holder, or only the app when the row is unreadable", () =>
+    Effect.gen(function* () {
+      const dir = freshDir();
+      yield* writeForeignLease(dir, 60_000);
+      assert.strictEqual(
+        assertHeld((yield* start(leased(dir))).exit).message,
+        "instance lease: another demo-mcp server (pid 4242 on elsewhere) is using this database (last heartbeat 60 s ago). " +
+          "Only one server may run on it. Stop the other server; if it is already gone, its lease expires in 30 s.",
+      );
+      yield* sqlOn(dir, (sql) => sql`UPDATE server_settings SET value = ${"not json"} WHERE key = ${LEASE_KEY}`);
+      assert.strictEqual(
+        assertHeld((yield* start(leased(dir))).exit).message,
+        "instance lease: another demo-mcp server is using this database (last heartbeat 60 s ago). " +
+          "Only one server may run on it. Stop the other server; if it is already gone, its lease expires in 30 s.",
+      );
+    }),
+  );
+
   it.effect("heartbeats keep the lease live well past 90 s", () =>
     Effect.gen(function* () {
       const dir = freshDir();
