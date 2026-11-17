@@ -182,6 +182,8 @@ export async function startOAuth(options: StartOptions = {}): Promise<OAuthHarne
     allowedHosts: [],
     trustedProxies,
     maxBodyBytes: options.maxBodyBytes,
+    // As the app serves /mcp (src/app/app.ts httpApp).
+    protectEmbeddedResources: true,
   };
   const clock = new SkewedClock();
   const scope = await Effect.runPromise(Scope.make());
