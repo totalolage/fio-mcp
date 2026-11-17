@@ -1,11 +1,11 @@
 import { assert, describe, it } from "@effect/vitest";
+import { LocalPrincipalLive } from "@mcps/core/transport/principal.js";
 import { Effect, Layer, Ref } from "effect";
 import { CACHE_DISABLED } from "../src/cache/service.js";
 import { type CacheError, InvalidInput, type PermissionDenied } from "../src/errors.js";
 import { makeCacheHandlers, makeCacheToolkit } from "../src/mcp/cache-tools.js";
 import { makeFioHandlers, makeFioToolkit } from "../src/mcp/fio-tools.js";
 import { RateLimiter } from "../src/rate-limiter.js";
-import { LocalPrincipalLive } from "../src/transport/principal.js";
 import {
   account,
   cacheLayer,

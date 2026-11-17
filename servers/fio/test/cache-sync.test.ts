@@ -19,7 +19,7 @@ import {
   TooManyItems,
 } from "../src/errors.js";
 import type { FioApi } from "../src/fio-api.js";
-import { Redactor } from "../src/redaction.js";
+import { RedactorDefault } from "../src/redaction.js";
 import {
   account,
   cacheLayer,
@@ -830,7 +830,7 @@ describe("retiring a token removed at /admin", () => {
     return Transactions.Default.pipe(
       Layer.provideMerge(Accounts.stored(ADMIN_KEY, accountSeedOf(cfg.accounts))),
       Layer.provideMerge(testDatabase(":memory:", SERVER_MIGRATIONS)),
-      Layer.provideMerge(Layer.mergeAll(Redactor.Default, fio)),
+      Layer.provideMerge(Layer.mergeAll(RedactorDefault, fio)),
       Layer.provideMerge(seededConfig(cfg)),
     );
   };

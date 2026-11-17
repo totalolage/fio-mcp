@@ -1,25 +1,24 @@
-import { Effect, Option, Predicate } from "effect";
+import { Effect, Predicate } from "effect";
 import { type McpProtocol, McpSchema } from "effect/ai";
-import type { Account } from "../accounts.js";
-import { AppConfig, type MarkerTools } from "../config.js";
-import { ACCOUNTLESS_TOOLS, coveredAccounts, holdsScopes, MARKER_TOOLS, toolScopes } from "../mcp/permissions.js";
+import { coveredResources, holdsScopes, isListed, type ToolPolicyShape } from "../mcp/grants.js";
+import type { Resource } from "../resources.js";
 import { CurrentPrincipal, type Principal } from "./principal.js";
 import type { ServerInfo } from "./server-info.js";
 
 /**
  * HTTP `tools/list` follows the session's grant: a tool is listed only when
- * the grant holds its scopes, the `account` enum names only the granted
- * accounts, and a tool that takes an account is left out when the grant
- * covers none. This is discovery only. Calls are still checked one by one
- * (src/mcp/permissions.ts), so a hidden tool called by name answers "You
- * don't have permissions to do that.", not "unknown tool".
+ * the grant holds its scopes (ToolPolicy), the resource parameter's enum
+ * names only the granted resources, and a tool that takes a resource is left
+ * out when the grant covers none. This is discovery only. The app's tool
+ * handlers still check every call (src/mcp/grants.ts), so a hidden tool
+ * called by name is denied by the app, not answered as "unknown tool".
  *
  * Effect registers tools once per server, not per session, and offers no
  * `tools/list` hook. Each protocol adapter installs its handlers on a core
  * it receives untyped; the wrapped adapter hands them a core whose
  * `tools.list` filters by the request's CurrentPrincipal. That API is
  * unstable: the core's shape is checked when the handlers install (server
- * start), and test/grant-tools.test.ts covers every offered protocol version.
+ * start), and the app's tests cover every protocol version it offers.
  *
  * HTTP only: its guard provides the principal per request. stdio provides it
  * at tool registration, so `tools/list` there would see the default
@@ -38,50 +37,47 @@ const isToolsCore = (core: unknown): core is ToolsCore =>
   Predicate.isFunction(core.tools.list);
 
 /**
- * The tools `principal` may see, with `account` enums narrowed to its
- * accounts. With FIO_MCP_MARKER_TOOLS=disabled the marker tools are hidden
- * from every grant; they stay registered so a call by name gets the same
- * PermissionDenied as any other hidden tool (SEC-10).
+ * The tools `principal` may see, with resource enums narrowed to its
+ * resources. A tool the policy does not list (ToolPolicyShape.listed) is
+ * hidden from every grant; it stays registered, so a call by name gets the
+ * app's denial like any other hidden tool.
  */
 export function grantedTools(
   tools: ToolList,
   principal: Principal,
-  accounts: ReadonlyArray<Account>,
-  markerTools: MarkerTools = "enabled",
+  resources: ReadonlyArray<Resource>,
+  policy: ToolPolicyShape,
 ): ToolList {
-  const granted = new Set(coveredAccounts(principal, accounts).map((account) => account.name));
+  const granted = new Set(coveredResources(principal, resources).map((resource) => resource.label));
+  const parameter = policy.resourceParameter;
   return tools.flatMap((tool) => {
-    if (markerTools === "disabled" && MARKER_TOOLS.has(tool.name)) return [];
-    if (!holdsScopes(principal, toolScopes(tool.name))) return [];
-    if (ACCOUNTLESS_TOOLS.has(tool.name)) return [tool];
+    if (!isListed(policy, tool.name)) return [];
+    if (!holdsScopes(principal, policy.scopes(tool.name))) return [];
+    if (policy.resourceless(tool.name)) return [tool];
     if (granted.size === 0) return [];
-    const account = tool.inputSchema.properties?.account;
-    // With one configured account there is no `account` parameter to narrow.
-    if (account === undefined) return [tool];
-    // Some other shape (a schema-generation change) could list ungranted names.
-    if (!Predicate.isObject(account) || !Array.isArray(account.enum)) return [];
-    const names = account.enum.filter((name) => granted.has(name));
-    if (names.length === 0) return [];
-    const properties = { ...tool.inputSchema.properties, account: { ...account, enum: names } };
+    const resource = tool.inputSchema.properties?.[parameter];
+    // With one configured resource there is no parameter to narrow.
+    if (resource === undefined) return [tool];
+    // Some other shape (a schema-generation change) could list ungranted labels.
+    if (!Predicate.isObject(resource) || !Array.isArray(resource.enum)) return [];
+    const labels = resource.enum.filter((label) => granted.has(label));
+    if (labels.length === 0) return [];
+    const properties = { ...tool.inputSchema.properties, [parameter]: { ...resource, enum: labels } };
     return [McpSchema.Tool.make({ ...tool, inputSchema: { ...tool.inputSchema, properties } })];
   });
 }
 
-/** The configured accounts as of this request; they change at runtime in HTTP mode with OAuth. */
-type CurrentAccounts = Effect.Effect<ReadonlyArray<Account>>;
+/** The resources as of this request; they may change at runtime. */
+type CurrentResources = Effect.Effect<ReadonlyArray<Resource>>;
 
-const grantCore = (core: ToolsCore, accounts: CurrentAccounts): ToolsCore => ({
+const grantCore = (core: ToolsCore, resources: CurrentResources, policy: ToolPolicyShape): ToolsCore => ({
   ...core,
   tools: {
     ...core.tools,
     list: (profile) =>
       Effect.flatMap(core.tools.list(profile), (tools) =>
         Effect.flatMap(CurrentPrincipal, (principal) =>
-          Effect.flatMap(Effect.serviceOption(AppConfig), (config) =>
-            Effect.map(accounts, (list) =>
-              grantedTools(tools, principal, list, Option.match(config, { onNone: () => "enabled", onSome: (c) => c.markerTools ?? "enabled" })),
-            ),
-          ),
+          Effect.map(resources, (list) => grantedTools(tools, principal, list, policy)),
         ),
       ),
   },
@@ -91,7 +87,11 @@ const grantCore = (core: ToolsCore, accounts: CurrentAccounts): ToolsCore => ({
 // provides them where it installs the handlers.
 const handlersOf = (adapter: McpProtocol.ProtocolAdapter) => adapter as McpProtocol.AnyProtocolAdapter<string, never>;
 
-const grantAdapter = (adapter: McpProtocol.ProtocolAdapter, accounts: CurrentAccounts): McpProtocol.ProtocolAdapter => ({
+const grantAdapter = (
+  adapter: McpProtocol.ProtocolAdapter,
+  resources: CurrentResources,
+  policy: ToolPolicyShape,
+): McpProtocol.ProtocolAdapter => ({
   ...adapter,
   installHandlers: (core, lifecycle, target) => {
     // Only the stateful revisions are offered and tested. Stateless ones read
@@ -102,12 +102,16 @@ const grantAdapter = (adapter: McpProtocol.ProtocolAdapter, accounts: CurrentAcc
     if (!isToolsCore(core)) {
       return Effect.die(`grant-tools: the MCP core for ${adapter.protocolVersion} no longer has tools.list; update src/transport/grant-tools.ts`);
     }
-    return handlersOf(adapter).installHandlers(grantCore(core, accounts), lifecycle, target);
+    return handlersOf(adapter).installHandlers(grantCore(core, resources, policy), lifecycle, target);
   },
 });
 
 /** `protocols` with each adapter's `tools/list` following the request's grant. */
-export function grantProtocols(protocols: ServerInfo["protocols"], accounts: CurrentAccounts): ServerInfo["protocols"] {
+export function grantProtocols(
+  protocols: ServerInfo["protocols"],
+  resources: CurrentResources,
+  policy: ToolPolicyShape,
+): ServerInfo["protocols"] {
   const [first, ...rest] = protocols;
-  return [grantAdapter(first, accounts), ...rest.map((adapter) => grantAdapter(adapter, accounts))];
+  return [grantAdapter(first, resources, policy), ...rest.map((adapter) => grantAdapter(adapter, resources, policy))];
 }

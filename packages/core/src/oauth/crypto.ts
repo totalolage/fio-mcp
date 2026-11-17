@@ -1,5 +1,6 @@
 import { createHash, createHmac, randomBytes, scrypt, timingSafeEqual } from "node:crypto";
 import { Effect, Redacted, Schema } from "effect";
+import type { AppIdentity } from "../app-identity.js";
 
 /**
  * Secrets the authorization server mints and checks: opaque tokens (stored
@@ -76,11 +77,11 @@ const FORMAT = /^\$scrypt\$ln=(\d{1,2}),r=(\d{1,2}),p=(\d{1,2})\$([A-Za-z0-9+/]{
 const memoryOf = ({ ln, r }: ScryptParams) => 128 * 2 ** ln * r;
 
 /** Parses and bounds-checks a hash line; the error never echoes the value. */
-export function parsePasswordHash(line: string): PasswordHash | PasswordHashError {
+export function parsePasswordHash(line: string, app: AppIdentity): PasswordHash | PasswordHashError {
   const match = FORMAT.exec(line.trim());
   if (match === null) {
     return new PasswordHashError({
-      detail: "is not a fio-mcp password hash ($scrypt$ln=…,r=…,p=…$salt$hash); create one with `fio-mcp hash-password`",
+      detail: `is not a ${app.name} password hash ($scrypt$ln=…,r=…,p=…$salt$hash); create one with \`${app.name} hash-password\``,
     });
   }
   const params = { ln: Number(match[1]), r: Number(match[2]), p: Number(match[3]) };

@@ -4,8 +4,8 @@ import { IpNetwork } from "effect/net";
 import { clientIp } from "./client-address.js";
 
 /**
- * The network allowlist for the admin UI and the OAuth sign-in pages
- * (FIO_MCP_ADMIN_ALLOWED_CIDRS). A request whose client address
+ * The network allowlist for the admin UI and the OAuth sign-in pages (an
+ * app setting). A request whose client address
  * (clientAddress rules, so trusted proxies apply) is outside the list is
  * answered 404 without a body, as if the route did not exist. An empty list
  * restricts nothing.

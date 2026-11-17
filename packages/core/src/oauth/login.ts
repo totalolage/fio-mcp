@@ -105,7 +105,7 @@ type Verdict<V> =
 
 /**
  * `expected` is read for every check: the admin password can change while
- * the server runs (/admin, `fio-mcp reset-admin-password`). When it fails,
+ * the server runs (/admin, `<app> reset-admin-password`). When it fails,
  * the attempt is Unavailable: no password is accepted.
  */
 export const makeLoginGuard = Effect.fn("LoginGuard.make")(function* (

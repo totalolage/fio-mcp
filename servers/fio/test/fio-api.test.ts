@@ -9,7 +9,7 @@ import { type AppConfigShape, MAX_RESPONSE_BYTES } from "../src/config.js";
 import { FioApi } from "../src/fio-api.js";
 import { DEFAULT_PAYMENT_LIMITS } from "../src/payment-limits.js";
 import { RateLimiter } from "../src/rate-limiter.js";
-import { Redactor } from "../src/redaction.js";
+import { RedactorDefault } from "../src/redaction.js";
 import { seededConfig } from "./support/config.js";
 import { FioHttp, html, json, text } from "./support/fio-http.js";
 
@@ -46,7 +46,7 @@ const testLayer = (config: Partial<AppConfigShape> = {}) =>
         FioHttp.layer({ tokens: [TOKEN], baseUrl: BASE_URL }),
         Accounts.Default,
         RateLimiter.Default,
-        Redactor.Default,
+        RedactorDefault,
       ),
     ),
     Layer.provideMerge(seededConfig({ ...baseConfig, ...config })),
@@ -582,7 +582,7 @@ describe("FioApi over fetch", () => {
   const liveLayer = (port: number, config: Partial<AppConfigShape> = {}) =>
     FioApi.Default.pipe(
       Layer.provide(FioApi.FetchClient),
-      Layer.provideMerge(Layer.mergeAll(Accounts.Default, RateLimiter.Default, Redactor.Default)),
+      Layer.provideMerge(Layer.mergeAll(Accounts.Default, RateLimiter.Default, RedactorDefault)),
       Layer.provideMerge(
         seededConfig({
           ...baseConfig,

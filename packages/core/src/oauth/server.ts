@@ -1,16 +1,13 @@
 import { ByteSize, Clock, Effect, Option, Redacted, Result, Schema } from "effect";
 import { Cookies, HttpServerRequest, HttpServerResponse } from "effect/http";
 import type { IpNetwork } from "effect/net";
-import { type Account, Accounts } from "../accounts.js";
 import { AdminPassword } from "../admin/password.js";
-import { AppConfig } from "../config.js";
-import { SCOPE_PAYMENTS, SCOPE_READ, SCOPES } from "../mcp/permissions.js";
-import { type PaymentFormValues, parsePaymentForm, paymentFormValues, readPaymentForm } from "../payment-form.js";
-import { DEFAULT_GRANT_PAYMENTS } from "../payment-limits.js";
+import { type Resource, Resources } from "../resources.js";
 import { AuthUnavailable, Unauthorized } from "../transport/auth-errors.js";
 import { clientAddress } from "../transport/client-address.js";
 import type { Principal } from "../transport/principal.js";
 import { restrictTo } from "../transport/restrict.js";
+import type { OAuthApp, ScopeCatalogue } from "./app.js";
 import { CODE_CHALLENGE, hashSecret, pkceMatches, randomId, randomSecret, safeEqual } from "./crypto.js";
 import {
   AccessDenied,
@@ -29,31 +26,32 @@ import {
   UnsupportedGrantType,
   UnsupportedResponseType,
 } from "./errors.js";
-import { consentPage, errorPage, loginPage, pageHeaders, redirectFormTarget } from "./pages.js";
+import { consentPage, errorPage, loginPage, pageHeaders, pageStyle, redirectFormTarget, styleHash } from "./pages.js";
 import { makeWindowLimiter } from "./rate-limit.js";
 import {
   type AuthSession,
   MAX_CONSENT_FORMS,
   makeSessions,
   type PendingAuthorization,
-  SESSION_COOKIE,
   SESSION_TTL_MS,
+  sessionCookieName,
 } from "./sessions.js";
 import { type Client, type Grant, makeOAuthStore, type OAuthStore } from "./store.js";
 import { isResource, MCP_RESOURCE_PATH, redirectUriMatches, redirectUriProblem, withParams } from "./urls.js";
 
 /**
  * The embedded OAuth 2.1 authorization server and the resource-server side
- * of /mcp (MCP authorization, revision 2026-07-28). fio-mcp is both: the
- * issuer is FIO_MCP_PUBLIC_URL and every token's audience is that origin
- * plus /mcp. It makes no outbound requests.
+ * of /mcp (MCP authorization, revision 2026-07-28). The server is both: the
+ * issuer is its public URL and every token's audience is that origin plus
+ * /mcp. It makes no outbound requests. The app it guards (OAuthApp) names
+ * it, its scopes and its resources.
  *
  *   GET  /.well-known/oauth-protected-resource[/mcp]  RFC 9728 metadata
  *   GET  /.well-known/oauth-authorization-server      RFC 8414 metadata
  *   POST /register   RFC 7591 dynamic registration (public clients only)
  *   GET  /authorize  authorization code request (PKCE S256, RFC 8707 resource)
  *   GET  /login, POST /login      admin password
- *   GET  /consent, POST /consent  scopes and accounts
+ *   GET  /consent, POST /consent  scopes and resources
  *   POST /token      authorization_code and refresh_token grants
  *   POST /revoke     RFC 7009 revocation
  */
@@ -93,23 +91,13 @@ const CORS_PATHS = [
 ] as const;
 
 /** The admin password and its sign-in throttling come from `AdminPassword` (src/admin/password.ts). */
-/** The consent form's payments box and settings as the owner submitted them. */
-interface ConsentPayments {
-  readonly checked: boolean;
-  readonly values: PaymentFormValues;
-}
-
 export interface OAuthSettings {
   readonly publicUrl: string;
   /** Proxies whose X-Forwarded-For names the client address (see clientAddress). */
   readonly trustedProxies?: ReadonlyArray<IpNetwork.IpNetwork> | undefined;
-  /** FIO_MCP_ADMIN_ALLOWED_CIDRS: only these clients reach /authorize, /login and /consent (404 otherwise); empty allows all. */
+  /** Only these clients reach /authorize, /login and /consent (404 otherwise); empty allows all. */
   readonly allowedNetworks?: ReadonlyArray<IpNetwork.IpNetwork> | undefined;
 }
-
-const ACCESS_PREFIX = "fio_at_";
-const REFRESH_PREFIX = "fio_rt_";
-const CODE_PREFIX = "fio_ac_";
 
 const BEARER = /^Bearer[ \t]+([A-Za-z0-9._~+/-]+=*)[ \t]*$/i;
 // Control and bidirectional-override characters are dropped from client names.
@@ -129,31 +117,32 @@ const errorJson = (error: OAuthError) => {
   return json({ error: code, error_description: error.description }, status, { ...NO_STORE, ...retry });
 };
 
-const html = (body: string, status = 200, formTargets: ReadonlyArray<string> = [], extra: Record<string, string> = {}) =>
-  HttpServerResponse.text(body, {
-    status,
-    contentType: "text/html; charset=utf-8",
-    headers: { ...pageHeaders(formTargets), ...extra },
-  });
+/** HTML responses whose CSP allows the pages' style block, hashed as `style`. */
+const htmlFor =
+  (style: string) =>
+  (body: string, status = 200, formTargets: ReadonlyArray<string> = [], extra: Record<string, string> = {}) =>
+    HttpServerResponse.text(body, {
+      status,
+      contentType: "text/html; charset=utf-8",
+      headers: { ...pageHeaders(formTargets, style), ...extra },
+    });
 
-const pageError = (error: PageError) =>
+const pageErrorFor = (app: OAuthApp, html: ReturnType<typeof htmlFor>) => (error: PageError) =>
   html(
-    errorPage(error.title, error.detail),
+    errorPage(app, error.title, error.detail),
     error.status,
     [],
     error.retryAfterSeconds === undefined ? {} : { "retry-after": String(error.retryAfterSeconds) },
   );
 
-const sessionCookie = (value: string, maxAgeMs: number) =>
-  Cookies.setUnsafe(Cookies.empty, SESSION_COOKIE, value, {
+const sessionCookieFor = (name: string) => (value: string, maxAgeMs: number) =>
+  Cookies.setUnsafe(Cookies.empty, name, value, {
     path: "/",
     httpOnly: true,
     secure: true,
     sameSite: "lax",
     maxAge: `${Math.max(0, Math.floor(maxAgeMs / 1000))} seconds`,
   });
-
-const expiredCookie = sessionCookie("", 0);
 
 const redirect = (location: string, cookies?: Cookies.Cookies) =>
   HttpServerResponse.redirect(location, { status: 303, headers: NO_STORE, cookies });
@@ -215,22 +204,34 @@ const decodeJson = Schema.decodeUnknownResult(Schema.fromJsonString(Schema.Unkno
 const decodeRegistration = Schema.decodeUnknownResult(RegistrationRequest);
 
 /** Scopes from an authorization or refresh request; offline_access is accepted and ignored. */
-const parseScopes = (raw: string | undefined): Result.Result<ReadonlyArray<string>, InvalidScope> => {
+const parseScopes = (
+  catalogue: ScopeCatalogue,
+  raw: string | undefined,
+): Result.Result<ReadonlyArray<string>, InvalidScope> => {
   const requested = (raw ?? "").split(" ").filter((scope) => scope !== "" && scope !== "offline_access");
-  const unknown = requested.filter((scope) => !(SCOPES as ReadonlyArray<string>).includes(scope));
+  const unknown = requested.filter((scope) => !catalogue.supported.includes(scope));
   if (unknown.length > 0) {
-    return Result.fail(new InvalidScope({ description: `unknown scope; supported scopes are ${SCOPES.join(" ")}` }));
+    return Result.fail(
+      new InvalidScope({ description: `unknown scope; supported scopes are ${catalogue.supported.join(" ")}` }),
+    );
   }
-  return Result.succeed(requested.length === 0 ? [SCOPE_READ] : [...new Set(requested)]);
+  return Result.succeed(requested.length === 0 ? [...catalogue.defaults] : [...new Set(requested)]);
 };
 
-export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings: OAuthSettings) {
-  const store: OAuthStore = yield* makeOAuthStore();
-  const accounts = yield* Accounts;
+type Handler<E> = (request: HttpServerRequest.HttpServerRequest) => Effect.Effect<HttpServerResponse.HttpServerResponse, E>;
+
+/** An endpoint of the authorization server, for the app's router. */
+export interface Route {
+  readonly method: "GET" | "POST" | "OPTIONS";
+  readonly path: `/${string}`;
+  readonly handler: Handler<never>;
+}
+
+export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (app: OAuthApp, settings: OAuthSettings) {
+  const store: OAuthStore = yield* makeOAuthStore(undefined, app.grantSettings);
+  const resources = yield* Resources;
   const sessions = yield* makeSessions();
   const password = yield* AdminPassword;
-  // Server defaults and ceilings of grant payment limits (SEC-26).
-  const { paymentLimits } = yield* AppConfig;
   const issuer = settings.publicUrl;
   const resource = `${issuer}${MCP_RESOURCE_PATH}`;
   const resourceMetadataUrl = `${issuer}${PROTECTED_RESOURCE_PATH}${MCP_RESOURCE_PATH}`;
@@ -244,9 +245,19 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
   });
   const trustedProxies = settings.trustedProxies ?? [];
   const addressOf = (request: HttpServerRequest.HttpServerRequest) => clientAddress(request, trustedProxies);
+  const { idPrefix } = app.identity;
+  const accessPrefix = `${idPrefix}_at_`;
+  const refreshPrefix = `${idPrefix}_rt_`;
+  const codePrefix = `${idPrefix}_ac_`;
+  const cookieName = sessionCookieName(app.identity);
+  const sessionCookie = sessionCookieFor(cookieName);
+  const expiredCookie = sessionCookie("", 0);
+  // The app's CSS joins the pages' style block before it is hashed for the CSP.
+  const html = htmlFor(styleHash(pageStyle(app)));
+  const pageError = pageErrorFor(app, html);
 
   const challenge = (error?: string) =>
-    `Bearer resource_metadata="${resourceMetadataUrl}", scope="${SCOPE_READ}"${error === undefined ? "" : `, error="${error}"`}`;
+    `Bearer resource_metadata="${resourceMetadataUrl}", scope="${app.scopes.challenge}"${error === undefined ? "" : `, error="${error}"`}`;
 
   const purge = Effect.flatMap(Clock.currentTimeMillis, (now) =>
     store.purge(now, { unusedClientMs: LIMITS.unusedClientMs, idleClientMs: LIMITS.idleClientMs }),
@@ -282,9 +293,9 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
     return {
       subject: grant.value.grantId,
       scopes: grant.value.scopes,
-      accountFingerprints: grant.value.accountFingerprints,
+      resources: grant.value.resources,
       clientId: grant.value.clientId,
-      payments: grant.value.payments,
+      settings: grant.value.settings,
     } satisfies Principal;
   });
 
@@ -294,9 +305,9 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
     {
       resource,
       authorization_servers: [issuer],
-      scopes_supported: SCOPES,
+      scopes_supported: app.scopes.supported,
       bearer_methods_supported: ["header"],
-      resource_name: "fio-mcp",
+      resource_name: app.identity.name,
     },
     200,
     { "cache-control": "max-age=300" },
@@ -309,7 +320,7 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
       token_endpoint: `${issuer}/token`,
       registration_endpoint: `${issuer}/register`,
       revocation_endpoint: `${issuer}/revoke`,
-      scopes_supported: SCOPES,
+      scopes_supported: app.scopes.supported,
       response_types_supported: ["code"],
       response_modes_supported: ["query"],
       grant_types_supported: ["authorization_code", "refresh_token"],
@@ -365,7 +376,7 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
     yield* purge;
     const name = client_name?.replace(UNSAFE_NAME_CHARS, "").trim().slice(0, LIMITS.maxClientName);
     const client: Client = {
-      clientId: yield* randomId("fio_client_"),
+      clientId: yield* randomId(`${idPrefix}_client_`),
       clientName: name === undefined || name === "" ? null : name,
       redirectUris: [...new Set(redirect_uris)],
       createdAt: now,
@@ -373,7 +384,7 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
     };
     if (!(yield* store.insertClient(client, LIMITS.maxClients))) {
       return yield* new TemporarilyUnavailable({
-        description: "the client registry is full; remove unused clients with `fio-mcp clients revoke <id>`",
+        description: `the client registry is full; remove unused clients with \`${app.identity.name} clients revoke <id>\``,
         retryAfterSeconds: LIMITS.unusedClientMs / 1000,
       });
     }
@@ -435,7 +446,7 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
     if (resources.length > 1 || !isResource(resources[0] ?? "", resource)) {
       return yield* new InvalidTarget({ description: `the only resource is ${resource}` });
     }
-    const scopes = parseScopes(yield* param(params, "scope"));
+    const scopes = parseScopes(app.scopes, yield* param(params, "scope"));
     if (Result.isFailure(scopes)) return yield* scopes.failure;
     return {
       clientId: client.clientId,
@@ -495,7 +506,7 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
   // -- Login and consent pages -----------------------------------------------
 
   const currentSession = Effect.fnUntraced(function* (request: HttpServerRequest.HttpServerRequest) {
-    const session = yield* sessions.find(request.cookies[SESSION_COOKIE]);
+    const session = yield* sessions.find(request.cookies[cookieName]);
     if (Option.isNone(session)) return yield* expired;
     // Signed in before the admin password changed: no longer.
     if (session.value.loggedIn) {
@@ -532,7 +543,7 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
 
   const renderLogin = (session: AuthSession, status = 200, error?: string, extra: Record<string, string> = {}) =>
     html(
-      loginPage({
+      loginPage(app, {
         clientName: session.request.clientName,
         redirectUri: session.request.redirectUri,
         csrf: Redacted.value(session.csrf),
@@ -545,34 +556,32 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
     );
 
   /**
-   * The consent page for the accounts configured now; the session remembers
-   * what this form showed. `payments` is the owner's own submission when the
-   * page is shown again after an error: the box is ticked only if it was.
+   * The consent page for the resources there are now; the session remembers
+   * what this form showed. `posted` is the owner's own submission when the
+   * page is shown again after an error, so the app's fields keep their values.
    */
   const renderConsent = Effect.fnUntraced(function* (
     session: AuthSession,
-    configured: ReadonlyArray<Account>,
+    configured: ReadonlyArray<Resource>,
     status = 200,
     error?: string,
-    payments?: ConsentPayments,
+    posted?: URLSearchParams,
   ) {
     const formId = yield* randomId("");
-    session.consentForms.set(formId, new Map(configured.map((account) => [account.name, account.tokenFingerprint])));
+    session.consentForms.set(formId, new Map(configured.map((item) => [item.label, item.id])));
     for (const old of [...session.consentForms.keys()].slice(0, Math.max(0, session.consentForms.size - MAX_CONSENT_FORMS))) {
       session.consentForms.delete(old);
     }
     return html(
-      consentPage({
+      consentPage(app, {
         formId,
         clientId: session.request.clientId,
         clientName: session.request.clientName,
         redirectUri: session.request.redirectUri,
         csrf: Redacted.value(session.csrf),
-        paymentsRequested: session.request.requestedScopes.includes(SCOPE_PAYMENTS),
-        paymentsChecked: payments?.checked ?? false,
-        payments: payments?.values ?? paymentFormValues(DEFAULT_GRANT_PAYMENTS, paymentLimits),
-        paymentCeiling: paymentLimits,
-        accounts: configured.map((account) => account.name),
+        requestedScopes: session.request.requestedScopes,
+        resources: configured.map((item) => item.label),
+        posted,
         error,
       }),
       status,
@@ -619,7 +628,7 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
   const showConsent = Effect.fnUntraced(function* (request: HttpServerRequest.HttpServerRequest) {
     const session = yield* currentSession(request);
     if (!session.loggedIn) return redirect("/login");
-    return yield* renderConsent(session, yield* accounts.list);
+    return yield* renderConsent(session, yield* resources.list);
   });
 
   const submitConsent = Effect.fnUntraced(function* (request: HttpServerRequest.HttpServerRequest) {
@@ -638,46 +647,32 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
         expiredCookie,
       );
     }
-    // Payments only when the owner ticked the box; their settings as typed, for a re-render.
-    const payments: ConsentPayments = {
-      checked: form.getAll("scope").includes(SCOPE_PAYMENTS),
-      values: readPaymentForm(form),
-    };
-    // The form carries names for display; the grant binds the tokens behind them.
-    const chosen = form.getAll("account");
-    const configured = yield* accounts.list;
-    // Only what the page showed, still behind the same token: a token
-    // replaced (or a name reused) at /admin since then is shown again.
+    const words = app.consent.resources;
+    // The form carries labels for display; the grant binds the ids behind them.
+    const chosen = form.getAll(words.field);
+    const configured = yield* resources.list;
+    // Only what the page showed, still behind the same id: a resource
+    // replaced (or a label reused) since then is shown again.
     const shown = session.consentForms.get(Result.getOrUndefined(single(form, "form")) ?? "");
-    const changed = shown === undefined || chosen.some((name) => {
-      const current = configured.find((account) => account.name === name);
-      return current === undefined || shown?.get(name) !== current.tokenFingerprint;
+    const changed = shown === undefined || chosen.some((label) => {
+      const current = configured.find((item) => item.label === label);
+      return current === undefined || shown?.get(label) !== current.id;
     });
-    if (changed) {
-      return yield* renderConsent(
-        session,
-        configured,
-        409,
-        "The accounts changed while this page was open. Review the selection and approve again.",
-        payments,
-      );
+    // Every page shown again carries the owner's submission (`form`).
+    if (changed) return yield* renderConsent(session, configured, 409, words.changed, form);
+    const chosenResources = configured.filter((item) => chosen.includes(item.label));
+    if (chosenResources.length === 0) {
+      return yield* renderConsent(session, configured, 400, configured.length === 0 ? words.none : words.noneSelected, form);
     }
-    const chosenAccounts = configured.filter((account) => chosen.includes(account.name));
-    if (chosenAccounts.length === 0) {
-      return yield* renderConsent(
-        session,
-        configured,
-        400,
-        configured.length === 0 ? "No FIO accounts are configured yet. Add one at /admin first." : "Select at least one account.",
-        payments,
-      );
+    const scopes = app.scopes.granted(form);
+    // The app's settings for the grant from the same form, validated by the app.
+    const grantSettings = app.grantSettings;
+    let appSettings: unknown;
+    if (grantSettings !== undefined) {
+      const parsed = yield* Effect.result(grantSettings.fromConsent(form, scopes));
+      if (Result.isFailure(parsed)) return yield* renderConsent(session, configured, 400, parsed.failure.message, form);
+      appSettings = parsed.success;
     }
-    // Explicit limits and allowlist as submitted, never above the ceilings (SEC-26, SEC-27).
-    const grantPayments = payments.checked ? parsePaymentForm(payments.values, paymentLimits) : Result.succeed(DEFAULT_GRANT_PAYMENTS);
-    if (Result.isFailure(grantPayments)) {
-      return yield* renderConsent(session, configured, 400, `Payment settings: ${grantPayments.failure}`, payments);
-    }
-    const scopes = payments.checked ? [SCOPE_READ, SCOPE_PAYMENTS] : [SCOPE_READ];
     const client = yield* store.client(pending.clientId).pipe(Effect.orElseSucceed(() => Option.none<Client>()));
     if (Option.isNone(client)) {
       yield* sessions.end(session);
@@ -687,16 +682,15 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
         detail: "The application's registration was revoked or expired. Connect again from the application.",
       });
     }
-    const code = yield* randomSecret(CODE_PREFIX);
+    const code = yield* randomSecret(codePrefix);
     const now = yield* Clock.currentTimeMillis;
     const grant: Grant = {
-      grantId: yield* randomId("fio_grant_"),
+      grantId: yield* randomId(`${idPrefix}_grant_`),
       clientId: pending.clientId,
       scopes,
-      accountFingerprints: [...new Set(chosenAccounts.map((account) => account.tokenFingerprint))],
+      resources: [...new Set(chosenResources.map((item) => item.id))],
       resource: pending.resource,
-      // Without fio:payments the settings are unused: server defaults, allowlist off.
-      payments: grantPayments.success,
+      ...(grantSettings === undefined ? {} : { settings: appSettings }),
     };
     yield* store
       .createGrant(
@@ -716,7 +710,7 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
         ),
       );
     yield* sessions.end(session);
-    yield* Effect.logInfo(`oauth: client ${pending.clientId} authorized (${scopes.join(" ")}; ${chosenAccounts.length} accounts)`);
+    yield* Effect.logInfo(`oauth: client ${pending.clientId} authorized (${scopes.join(" ")}; ${chosenResources.length} ${words.plural})`);
     return redirect(
       withParams(pending.redirectUri, { code: Redacted.value(code), state: pending.state, iss: issuer }),
       expiredCookie,
@@ -746,8 +740,8 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
   });
 
   const newPair = Effect.fnUntraced(function* () {
-    const access = yield* randomSecret(ACCESS_PREFIX);
-    const refresh = yield* randomSecret(REFRESH_PREFIX);
+    const access = yield* randomSecret(accessPrefix);
+    const refresh = yield* randomSecret(refreshPrefix);
     const now = yield* Clock.currentTimeMillis;
     return {
       access,
@@ -806,7 +800,7 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
     const token = yield* required(form, "refresh_token");
     yield* checkResource(form, true);
     const scope = yield* param(form, "scope");
-    const requested = scope === undefined ? undefined : parseScopes(scope);
+    const requested = scope === undefined ? undefined : parseScopes(app.scopes, scope);
     if (requested !== undefined && Result.isFailure(requested)) return yield* requested.failure;
     const issued = yield* newPair();
     const now = yield* Clock.currentTimeMillis;
@@ -861,13 +855,6 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
 
   // -- Routing -----------------------------------------------------------------
 
-  type Handler<E> = (request: HttpServerRequest.HttpServerRequest) => Effect.Effect<HttpServerResponse.HttpServerResponse, E>;
-  interface Route {
-    readonly method: "GET" | "POST" | "OPTIONS";
-    readonly path: `/${string}`;
-    readonly handler: Handler<never>;
-  }
-
   const jsonEndpoint = (handler: Handler<OAuthError>) => (request: HttpServerRequest.HttpServerRequest) =>
     handler(request).pipe(Effect.catch((error) => Effect.succeed(errorJson(error))));
 
@@ -884,7 +871,7 @@ export const makeOAuthServer = Effect.fn("OAuthServer.make")(function* (settings
     },
   });
 
-  // The browser sign-in routes answer 404 outside FIO_MCP_ADMIN_ALLOWED_CIDRS.
+  // The browser sign-in routes answer 404 outside settings.allowedNetworks.
   const restricted = restrictTo({ allowedNetworks: settings.allowedNetworks ?? [], trustedProxies });
 
   const routes: ReadonlyArray<Route> = [

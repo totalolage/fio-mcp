@@ -1,11 +1,10 @@
 import { Context, Layer } from "effect";
-import type { GrantPayments } from "../payment-limits.js";
 
 /**
  * Who is calling a tool. The HTTP guard provides it per request on /mcp from
  * `Auth.authenticate`; stdio provides LOCAL_PRINCIPAL when tools register.
  * Tool handlers read it with `yield* CurrentPrincipal` and check scopes and
- * accounts (src/mcp/permissions.ts).
+ * resources (src/mcp/grants.ts).
  *
  * A Reference, not a layer-provided service: `McpServer.toolkit` captures the
  * services present when tools are registered and lays them over each call,
@@ -17,24 +16,24 @@ import type { GrantPayments } from "../payment-limits.js";
 export interface Principal {
   readonly subject: string;
   readonly scopes: "all" | ReadonlyArray<string>;
-  /** Token fingerprints (Account.tokenFingerprint) of the granted accounts. */
-  readonly accountFingerprints: "all" | ReadonlyArray<string>;
+  /** Ids (Resource.id) of the granted resources. */
+  readonly resources: "all" | ReadonlyArray<string>;
   /** The OAuth client behind the grant; absent for local and unauthenticated callers. */
-  readonly clientId?: string;
+  readonly clientId?: string | undefined;
   /**
-   * The grant's payment limits and payee allowlist. Absent means server
-   * defaults with the allowlist off (LOCAL_PRINCIPAL, Auth.Open).
+   * The grant's app settings (OAuthApp.grantSettings, as decoded); absent
+   * for local and unauthenticated callers, whom the app gives its defaults.
    */
-  readonly payments?: GrantPayments;
+  readonly settings?: unknown;
 }
 
 /** The stdio client (the user's own process) and the unauthenticated HTTP mode. */
-export const LOCAL_PRINCIPAL: Principal = { subject: "local", scopes: "all", accountFingerprints: "all" };
+export const LOCAL_PRINCIPAL: Principal = { subject: "local", scopes: "all", resources: "all" };
 
-/** No identity: every scope and account check fails. */
-export const NO_PRINCIPAL: Principal = { subject: "none", scopes: [], accountFingerprints: [] };
+/** No identity: every scope and resource check fails. */
+export const NO_PRINCIPAL: Principal = { subject: "none", scopes: [], resources: [] };
 
-export const CurrentPrincipal = Context.Reference<Principal>("fio-mcp/transport/CurrentPrincipal", {
+export const CurrentPrincipal = Context.Reference<Principal>("mcps/transport/CurrentPrincipal", {
   defaultValue: () => NO_PRINCIPAL,
 });
 

@@ -1,16 +1,17 @@
+import { totpCode } from "@mcps/core/admin/totp.js";
+import { hashSecret, randomSecret } from "@mcps/core/oauth/crypto.js";
+import { DEFAULT_THROTTLE } from "@mcps/core/oauth/login.js";
+import { LIMITS } from "@mcps/core/oauth/server.js";
+import { MAX_BODY_BYTES, MAX_CONCURRENT_REQUESTS, SESSION_LIMITS } from "@mcps/core/transport/http.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { Clock, Effect, Option, Redacted } from "effect";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { tokenFingerprint } from "../src/accounts.js";
-import { totpCode } from "../src/admin/totp.js";
-import { hashSecret, randomSecret } from "../src/oauth/crypto.js";
-import { DEFAULT_THROTTLE } from "../src/oauth/login.js";
-import { LIMITS } from "../src/oauth/server.js";
+import { readGrantPayments } from "../src/oauth/grant-payments.js";
 import { DEFAULT_GRANT_PAYMENTS } from "../src/payment-limits.js";
 import { TRUSTED_PROXIES_EMPTY_WARNING } from "../src/transport/auth.js";
-import { MAX_BODY_BYTES, MAX_CONCURRENT_REQUESTS, SESSION_LIMITS } from "../src/transport/http.js";
 import {
   authorizationUrl,
   authorizeInBrowser,
@@ -187,7 +188,7 @@ describe("OAuth end to end with the MCP SDK client", () => {
     const grant = await harness.store((store) =>
       Effect.flatMap(Clock.currentTimeMillis, (now) => store.accessGrant(hashSecret(access), now)),
     );
-    expect(Option.getOrUndefined(grant)?.accountFingerprints).toEqual([tokenFingerprint(Redacted.make(FIO_TOKEN))]);
+    expect(Option.getOrUndefined(grant)?.resources).toEqual([tokenFingerprint(Redacted.make(FIO_TOKEN))]);
   });
 });
 
@@ -238,9 +239,9 @@ describe("metadata and the /mcp challenge", () => {
           grantId: "fio_grant_foreign",
           clientId,
           scopes: ["fio:read"],
-          accountFingerprints: ["main"],
+          resources: ["main"],
           resource: "https://other.example.test/mcp",
-          payments: DEFAULT_GRANT_PAYMENTS,
+          settings: DEFAULT_GRANT_PAYMENTS,
         };
         yield* store.createGrant(
           grant,
@@ -857,7 +858,8 @@ describe("login and consent pages", () => {
 
   const grantOf = async (clientId: string) => {
     const grants = await harness.store((store) => store.listGrants(harness.clock.currentTimeMillisUnsafe()));
-    return grants.find((grant) => grant.clientId === clientId);
+    const grant = grants.find((found) => found.clientId === clientId);
+    return grant === undefined ? undefined : { ...grant, payments: readGrantPayments(grant.settings) };
   };
 
   /** The payments checkbox tag. */

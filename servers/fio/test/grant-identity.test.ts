@@ -1,13 +1,14 @@
 
 import { assert, describe, it } from "@effect/vitest";
+import { makeOAuthStore } from "@mcps/core/oauth/store.js";
+import { CurrentPrincipal, type Principal } from "@mcps/core/transport/principal.js";
 import { Clock, Effect, Exit, Option, Redacted } from "effect";
 import { SqlClient } from "effect/sql";
 import { type Account, toAccount } from "../src/accounts.js";
 import { migrate, SERVER_MIGRATIONS } from "../src/cache/db.js";
 import { requireAccount, visibleAccounts } from "../src/mcp/permissions.js";
-import { makeOAuthStore } from "../src/oauth/store.js";
-import { DEFAULT_GRANT_PAYMENTS } from "../src/payment-limits.js";
-import { CurrentPrincipal, type Principal } from "../src/transport/principal.js";
+import { grantPaymentSettings } from "../src/oauth/grant-payments.js";
+import { DEFAULT_GRANT_PAYMENTS, DEFAULT_PAYMENT_LIMITS } from "../src/payment-limits.js";
 import { PAY_TOKEN, READ_TOKEN } from "./fixtures.js";
 import { memoryDatabase } from "./support/database.js";
 
@@ -27,7 +28,7 @@ const account = (name: string, token: string): Account =>
 
 /** Stores a grant for `accounts` with a live access token, as consent does. */
 const grantFor = Effect.fnUntraced(function* (accounts: ReadonlyArray<Account>) {
-  const store = yield* makeOAuthStore();
+  const store = yield* makeOAuthStore(undefined, grantPaymentSettings(DEFAULT_PAYMENT_LIMITS));
   const now = yield* Clock.currentTimeMillis;
   const clientId = "client_identity";
   yield* store.insertClient({ clientId, clientName: null, redirectUris: ["https://a.example/cb"], createdAt: now, lastUsedAt: null }, 10);
@@ -35,9 +36,9 @@ const grantFor = Effect.fnUntraced(function* (accounts: ReadonlyArray<Account>) 
     grantId: "fio_grant_identity",
     clientId,
     scopes: ["fio:read"],
-    accountFingerprints: accounts.map((a) => a.tokenFingerprint),
+    resources: accounts.map((a) => a.tokenFingerprint),
     resource: RESOURCE,
-    payments: DEFAULT_GRANT_PAYMENTS,
+    settings: DEFAULT_GRANT_PAYMENTS,
   };
   yield* store.createGrant(grant, { codeHash: "code_identity", clientId, redirectUri: "https://a.example/cb", codeChallenge: "x", expiresAt: now + 60_000 }, now);
   yield* store.insertTokens(grant.grantId, {
@@ -54,8 +55,8 @@ const reloadedPrincipal = Effect.gen(function* () {
   const now = yield* Clock.currentTimeMillis;
   const grant = yield* store.accessGrant("access_identity", now);
   assert.isTrue(Option.isSome(grant));
-  const { grantId, scopes, accountFingerprints } = Option.getOrThrow(grant);
-  return { subject: grantId, scopes, accountFingerprints } satisfies Principal;
+  const { grantId, scopes, resources } = Option.getOrThrow(grant);
+  return { subject: grantId, scopes, resources } satisfies Principal;
 });
 
 const allowed = (principal: Principal, target: Account) =>
@@ -75,8 +76,8 @@ describe("grant account identity", () => {
       const legacy = account("legacy", READ_TOKEN);
       yield* grantFor([legacy]);
       const principal = yield* reloadedPrincipal;
-      assert.deepStrictEqual(principal.accountFingerprints, [legacy.tokenFingerprint]);
-      assert.notInclude(principal.accountFingerprints, "legacy");
+      assert.deepStrictEqual(principal.resources, [legacy.tokenFingerprint]);
+      assert.notInclude(principal.resources, "legacy");
     }).pipe(Effect.provide(db)),
   );
 

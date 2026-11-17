@@ -1,4 +1,8 @@
 import { assert, describe, it } from "@effect/vitest";
+import { Auth, Unauthorized } from "@mcps/core/transport/auth.js";
+import { grantedTools, grantProtocols } from "@mcps/core/transport/grant-tools.js";
+import { serveHttp } from "@mcps/core/transport/http.js";
+import type { Principal } from "@mcps/core/transport/principal.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import {
   StreamableHTTPClientTransport,
@@ -8,16 +12,12 @@ import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 import { Cause, Context, Deferred, Effect, Exit, Layer, Redacted } from "effect";
 import { McpProtocol, McpSchema } from "effect/ai";
 import { HttpServer } from "effect/http";
-import { toAccount, tokenFingerprint } from "../src/accounts.js";
+import { toAccount, tokenFingerprint, toResources } from "../src/accounts.js";
 import { MCP_PROTOCOLS, SERVER_INFO, ToolsLive } from "../src/app.js";
-import type { AppConfigShape } from "../src/config.js";
+import type { AppConfigShape, HttpTransportConfig } from "../src/config.js";
 import { makeCacheToolkit } from "../src/mcp/cache-tools.js";
 import { makeFioToolkit } from "../src/mcp/fio-tools.js";
-import { ACCOUNTLESS_TOOLS, PAYMENT_TOOLS, SCOPE_PAYMENTS, SCOPE_READ } from "../src/mcp/permissions.js";
-import { Auth, Unauthorized } from "../src/transport/auth.js";
-import { grantedTools, grantProtocols } from "../src/transport/grant-tools.js";
-import { type HttpTransportConfig, serveHttp } from "../src/transport/http.js";
-import type { Principal } from "../src/transport/principal.js";
+import { ACCOUNTLESS_TOOLS, PAYMENT_TOOLS, SCOPE_PAYMENTS, SCOPE_READ, TOOL_POLICY } from "../src/mcp/permissions.js";
 import { ACCOUNT_NAMES, FIO_TOKEN, SAVINGS_TOKEN, testConfig, testServices } from "./support/transport.js";
 
 const MAIN = tokenFingerprint(Redacted.make(FIO_TOKEN));
@@ -26,11 +26,11 @@ const SAVINGS = tokenFingerprint(Redacted.make(SAVINGS_TOKEN));
 /** Bearer token → grant. */
 const PRINCIPALS: Record<string, Principal> = {
   // Read-only, main only.
-  alice: { subject: "alice", scopes: [SCOPE_READ], accountFingerprints: [MAIN] },
+  alice: { subject: "alice", scopes: [SCOPE_READ], resources: [MAIN] },
   // Everything.
-  bob: { subject: "bob", scopes: [SCOPE_READ, SCOPE_PAYMENTS], accountFingerprints: [MAIN, SAVINGS] },
+  bob: { subject: "bob", scopes: [SCOPE_READ, SCOPE_PAYMENTS], resources: [MAIN, SAVINGS] },
   // Granted a token that has since been rotated: no configured account left.
-  carol: { subject: "carol", scopes: [SCOPE_READ, SCOPE_PAYMENTS], accountFingerprints: ["0".repeat(32)] },
+  carol: { subject: "carol", scopes: [SCOPE_READ, SCOPE_PAYMENTS], resources: ["0".repeat(32)] },
 };
 
 const FakeAuth = Layer.succeed(
@@ -267,26 +267,26 @@ describe("grantedTools", () => {
   });
 
   it("hides a tool whose account parameter has no enum to narrow", () => {
-    const granted: Principal = { subject: "x", scopes: [SCOPE_READ], accountFingerprints: [MAIN] };
+    const granted: Principal = { subject: "x", scopes: [SCOPE_READ], resources: [MAIN] };
     const tools = [tool("get_last_statement", { account: { anyOf: [{ const: "main" }, { const: "savings" }] } })];
-    assert.deepStrictEqual(grantedTools(tools, granted, accounts), []);
+    assert.deepStrictEqual(grantedTools(tools, granted, toResources(accounts), TOOL_POLICY), []);
   });
 
   it("hides account tools without an account parameter when the only account is not granted", () => {
     const tools = [tool("get_last_statement"), tool("get_server_status")];
-    const rotated: Principal = { subject: "x", scopes: [SCOPE_READ], accountFingerprints: [SAVINGS] };
+    const rotated: Principal = { subject: "x", scopes: [SCOPE_READ], resources: [SAVINGS] };
     assert.deepStrictEqual(
-      grantedTools(tools, rotated, accounts).map((t) => t.name),
+      grantedTools(tools, rotated, toResources(accounts), TOOL_POLICY).map((t) => t.name),
       ["get_server_status"],
     );
-    const granted: Principal = { subject: "x", scopes: [SCOPE_READ], accountFingerprints: [MAIN] };
-    assert.deepStrictEqual(grantedTools(tools, granted, accounts), tools);
+    const granted: Principal = { subject: "x", scopes: [SCOPE_READ], resources: [MAIN] };
+    assert.deepStrictEqual(grantedTools(tools, granted, toResources(accounts), TOOL_POLICY), tools);
   });
 });
 
 describe("grantProtocols", () => {
   const install = (adapter: McpProtocol.ProtocolAdapter, core: unknown) => {
-    const [granted] = grantProtocols([adapter], Effect.succeed([]));
+    const [granted] = grantProtocols([adapter], Effect.succeed([]), TOOL_POLICY);
     // Only the guards run before the stock handlers would need their services.
     return Effect.exit((granted as McpProtocol.AnyProtocolAdapter<string, never>).installHandlers(core, undefined, undefined));
   };

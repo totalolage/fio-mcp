@@ -80,8 +80,11 @@ const workDirectory = mkdtempSync(join(tmpdir(), "fio-openapi-"));
 try {
   const generatorSpec = join(workDirectory, "fio-api.json");
   writeFileSync(generatorSpec, JSON.stringify(document));
+  // By name: `bun run generate` puts every node_modules/.bin up to the
+  // workspace root on PATH, and the workspace install hoists the generator
+  // to the root.
   const source = execFileSync(
-    join("node_modules", ".bin", "openapigen"),
+    "openapigen",
     ["--spec", generatorSpec, "--name", NAME, "--format", "httpclient"],
     { encoding: "utf8", stdio: ["ignore", "pipe", "inherit"], maxBuffer: 64 * 1024 * 1024 },
   );

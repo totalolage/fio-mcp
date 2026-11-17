@@ -1,9 +1,10 @@
 import { Clock, Effect, Option, Redacted } from "effect";
+import type { AppIdentity } from "../app-identity.js";
 import { hashSecret, newSigningKey, randomSecret, safeEqual, sign } from "../oauth/crypto.js";
 
 /**
  * Admin UI sessions, in memory only and separate from the OAuth sign-in
- * sessions. The browser holds `__Secure-fio-mcp-admin` (HttpOnly, Secure,
+ * sessions. The browser holds `__Secure-<name>-admin` (HttpOnly, Secure,
  * SameSite=Strict, Path=/admin): `<id>.<HMAC>`; the server keeps the
  * SHA-256 of the id.
  *
@@ -14,7 +15,8 @@ import { hashSecret, newSigningKey, randomSecret, safeEqual, sign } from "../oau
  * changes (their password stamp no longer matches).
  */
 
-export const ADMIN_COOKIE = "__Secure-fio-mcp-admin";
+/** The session cookie's name, after the app's name. */
+export const adminCookie = (app: AppIdentity): string => `__Secure-${app.name}-admin`;
 export const ADMIN_PATH = "/admin";
 export const ADMIN_IDLE_MS = 15 * 60_000;
 export const ADMIN_ABSOLUTE_MS = 8 * 60 * 60_000;

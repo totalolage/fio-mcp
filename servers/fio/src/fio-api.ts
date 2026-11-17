@@ -13,7 +13,7 @@ import {
 } from "./errors.js";
 import { type FioClient, make as makeFioClient } from "./generated/effect.gen.js";
 import { type Priority, RateLimiter } from "./rate-limiter.js";
-import { Redactor, type RedactorShape } from "./redaction.js";
+import { Redactor, RedactorLive, type RedactorShape } from "./redaction.js";
 import { type NormalizedStatement, normalizeStatement } from "./statement.js";
 
 /** Movement export formats (PDF §5). */
@@ -348,6 +348,6 @@ export class FioApi extends Context.Service<FioApi, FioApiShape>()("fio-mcp/FioA
 
   static readonly Live = FioApi.Default.pipe(
     Layer.provide(FioApi.FetchClient),
-    Layer.provide(Layer.mergeAll(Accounts.Live, RateLimiter.Live, Redactor.Live, AppConfig.Live)),
+    Layer.provide(Layer.mergeAll(Accounts.Live, RateLimiter.Live, RedactorLive, AppConfig.Live)),
   );
 }

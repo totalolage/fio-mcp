@@ -1,4 +1,5 @@
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import type { AppIdentity } from "../app-identity.js";
 
 /**
  * RFC 6238 TOTP for the optional admin second factor: HMAC-SHA1, 6 digits,
@@ -10,7 +11,7 @@ export const TOTP_PERIOD_SECONDS = 30;
 export const TOTP_DIGITS = 6;
 /** Steps accepted on either side of the current one. */
 export const TOTP_WINDOW = 1;
-/** `fio-mcp totp-init` secrets: 160 bits, the HMAC-SHA1 block RFC 4226 recommends. */
+/** `<name> totp-init` secrets: 160 bits, the HMAC-SHA1 block RFC 4226 recommends. */
 export const TOTP_SECRET_BYTES = 20;
 /** Shorter configured secrets are refused (RFC 4226 requires at least 128 bits). */
 export const MIN_TOTP_SECRET_BYTES = 16;
@@ -97,6 +98,11 @@ export const matchingTotpSteps = (secret: Uint8Array, code: string, unixSeconds:
 /** A fresh random secret of TOTP_SECRET_BYTES. */
 export const newTotpSecret = (): Uint8Array => new Uint8Array(randomBytes(TOTP_SECRET_BYTES));
 
-/** The `otpauth://` URI authenticator apps import (usually as a QR code). */
-export const otpauthUri = (secret: Uint8Array): string =>
-  `otpauth://totp/fio-mcp:admin?secret=${encodeBase32(secret)}&issuer=fio-mcp&algorithm=SHA1&digits=${TOTP_DIGITS}&period=${TOTP_PERIOD_SECONDS}`;
+/**
+ * The `otpauth://` URI authenticator apps import (usually as a QR code):
+ * label `<name>:admin`, issuer `<name>`.
+ */
+export const otpauthUri = (identity: AppIdentity, secret: Uint8Array): string => {
+  const issuer = encodeURIComponent(identity.name);
+  return `otpauth://totp/${issuer}:admin?secret=${encodeBase32(secret)}&issuer=${issuer}&algorithm=SHA1&digits=${TOTP_DIGITS}&period=${TOTP_PERIOD_SECONDS}`;
+};

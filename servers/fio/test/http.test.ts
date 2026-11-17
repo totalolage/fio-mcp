@@ -1,25 +1,25 @@
 import { request as nodeRequest } from "node:http";
 import { assert, describe, it } from "@effect/vitest";
+import { Auth, Unauthorized } from "@mcps/core/transport/auth.js";
+import { clientAddress } from "@mcps/core/transport/client-address.js";
+import { makeFrameRedactor } from "@mcps/core/transport/frame-redaction.js";
+import {
+  isAllowedHost,
+  MAX_BODY_BYTES,
+  makeSessionOwners,
+  serveHttp,
+} from "@mcps/core/transport/http.js";
+import { CurrentPrincipal } from "@mcps/core/transport/principal.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { Context, Deferred, Effect, Exit, Fiber, Layer, Schema } from "effect";
 import { McpServer, Tool, Toolkit } from "effect/ai";
 import { HttpRouter, HttpServer, HttpServerRequest, HttpServerResponse } from "effect/http";
 import { SERVER_INFO, ToolsLive } from "../src/app.js";
+import type { HttpTransportConfig } from "../src/config.js";
 import { makeCacheToolkit } from "../src/mcp/cache-tools.js";
 import { makeFioToolkit } from "../src/mcp/fio-tools.js";
 import { makeRedactor } from "../src/redaction.js";
-import { Auth, Unauthorized } from "../src/transport/auth.js";
-import { clientAddress } from "../src/transport/client-address.js";
-import { makeFrameRedactor } from "../src/transport/frame-redaction.js";
-import {
-  type HttpTransportConfig,
-  isAllowedHost,
-  MAX_BODY_BYTES,
-  makeSessionOwners,
-  serveHttp,
-} from "../src/transport/http.js";
-import { CurrentPrincipal } from "../src/transport/principal.js";
 import { ACCOUNT_NAMES, FIO_TOKEN, testConfig, testServices } from "./support/transport.js";
 
 const transport = (overrides: Partial<HttpTransportConfig> = {}): HttpTransportConfig => ({
@@ -42,7 +42,7 @@ const WhoAmILive = McpServer.toolkit(WhoAmIToolkit).pipe(
       whoami: () =>
         Effect.gen(function* () {
           const principal = yield* CurrentPrincipal;
-          return { subject: principal.subject, accounts: principal.accountFingerprints };
+          return { subject: principal.subject, accounts: principal.resources };
         }),
     }),
   ),
@@ -299,7 +299,7 @@ describe("HTTP transport", () => {
             const subject = /^Bearer (alice|bob)$/.exec(request.headers.authorization ?? "")?.[1];
             return subject === undefined
               ? Effect.fail(new Unauthorized({ challenge: 'Bearer resource_metadata="/.well-known/test"' }))
-              : Effect.succeed({ subject, scopes: ["fio:read"], accountFingerprints: [subject === "alice" ? "main" : "savings"] });
+              : Effect.succeed({ subject, scopes: ["fio:read"], resources: [subject === "alice" ? "main" : "savings"] });
           },
         }),
         HttpRouter.add("GET", "/.well-known/test", HttpServerResponse.text("metadata")),

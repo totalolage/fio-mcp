@@ -1,12 +1,13 @@
 import { createHash } from "node:crypto";
-import { Context, Effect, Layer, Redacted, Ref, type Stream, SubscriptionRef } from "effect";
+import { type Resource, Resources } from "@mcps/core/resources.js";
+import { Context, Effect, Layer, Redacted, Ref, Stream, SubscriptionRef } from "effect";
 import type { SqlClient } from "effect/sql";
 import { type AccountStoreError, loadStoredAccounts, makeAccountStore } from "./account-store.js";
 import { Database } from "./cache/db.js";
 import { type AccountConfig, type AccountSeed, AppConfig } from "./config.js";
 import { type ConfigError, InvalidInput } from "./errors.js";
 import type { Payer } from "./payments.js";
-import { Redactor } from "./redaction.js";
+import { Redactor, RedactorLive } from "./redaction.js";
 import type { StatementInfo } from "./statement.js";
 import type { DataKeyMismatch, TokenDecryptionFailed } from "./token-crypto.js";
 
@@ -56,6 +57,10 @@ export interface AccountsShape {
   /** The payer for payment orders; fails when the account number is not known yet. */
   readonly payer: (account: Account) => Effect.Effect<Payer, InvalidInput>;
 }
+
+/** Accounts as core resources, keyed by token fingerprint. */
+export const toResources = (accounts: ReadonlyArray<Account>): ReadonlyArray<Resource> =>
+  accounts.map((account) => ({ id: account.tokenFingerprint, label: account.name }));
 
 export function tokenFingerprint(token: Redacted.Redacted<string>): string {
   return createHash("sha256").update(`fio-mcp:${Redacted.value(token)}`).digest("hex").slice(0, 32);
@@ -175,6 +180,31 @@ export class Accounts extends Context.Service<Accounts, AccountsShape>()("fio-mc
     );
 
   /**
+   * The accounts as core's opaque resources: the id is the token
+   * fingerprint (what grants store), the label the account name.
+   */
+  static readonly resources: Layer.Layer<Resources, never, Accounts> = Layer.effect(
+    Resources,
+    Effect.gen(function* () {
+      const accounts = yield* Accounts;
+      // One resource list per account list: the value changes only when the
+      // accounts do, as Resources.list promises.
+      const mapped = new WeakMap<ReadonlyArray<Account>, ReadonlyArray<Resource>>();
+      const resourcesOf = (list: ReadonlyArray<Account>) => {
+        const known = mapped.get(list);
+        if (known !== undefined) return known;
+        const resources = toResources(list);
+        mapped.set(list, resources);
+        return resources;
+      };
+      return Resources.of({
+        list: Effect.map(accounts.list, resourcesOf),
+        changes: Stream.map(accounts.changes, resourcesOf),
+      });
+    }),
+  );
+
+  /**
    * The accounts from configuration: `stored` on the server's database in
    * HTTP mode with OAuth, otherwise `Default`.
    */
@@ -183,7 +213,7 @@ export class Accounts extends Context.Service<Accounts, AccountsShape>()("fio-mc
       const { transport } = yield* AppConfig;
       return transport.kind === "http" && transport.auth.kind === "oauth"
         ? Accounts.stored(transport.auth.dataKey, transport.auth.accountSeed).pipe(
-            Layer.provide(Layer.mergeAll(Database.Live, Redactor.Live)),
+            Layer.provide(Layer.mergeAll(Database.Live, RedactorLive)),
           )
         : Accounts.Default;
     }),

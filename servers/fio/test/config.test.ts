@@ -2,15 +2,15 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { assert, describe, it } from "@effect/vitest";
+import { hashPassword } from "@mcps/core/oauth/crypto.js";
 import { ConfigProvider, Effect, Layer, Logger, Redacted, Result } from "effect";
 import { HttpRouter } from "effect/http";
 import { TestClock } from "effect/testing";
 import { type AppConfigShape, MIN_RATE_LIMIT_INTERVAL_MS } from "../src/config.js";
 import { ConfigError } from "../src/errors.js";
-import { hashPassword } from "../src/oauth/crypto.js";
 import { type PaymentFormValues, parsePaymentForm } from "../src/payment-form.js";
-import { Redactor } from "../src/redaction.js";
-import { Auth, UNAUTHENTICATED_WARNING, unauthenticatedWarning } from "../src/transport/auth.js";
+import { RedactorLive } from "../src/redaction.js";
+import { authFromConfig, UNAUTHENTICATED_WARNING, unauthenticatedWarning } from "../src/transport/auth.js";
 import { loadConfigFrom, PAY_TOKEN, READ_TOKEN } from "./fixtures.js";
 
 const configError = (env: Record<string, string>) =>
@@ -195,8 +195,8 @@ describe("unauthenticated HTTP guard", () => {
       const env = { ...UNAUTHENTICATED, FIO_MCP_HOST: "0.0.0.0", FIO_MCP_ALLOW_UNAUTHENTICATED_ON_NETWORK: "true" };
       const config = yield* loadConfigFrom(env);
       assert.deepStrictEqual(config.transport.kind === "http" ? config.transport.auth : undefined, { kind: "unauthenticated", onNetwork: true });
-      const live = Auth.Live.pipe(
-        Layer.provide(Layer.merge(HttpRouter.layer, Redactor.Live)),
+      const live = authFromConfig.pipe(
+        Layer.provide(Layer.merge(HttpRouter.layer, RedactorLive)),
         Layer.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: { HOME: "/home/test", ...env } }))),
       );
       const { logs } = yield* withLogs(

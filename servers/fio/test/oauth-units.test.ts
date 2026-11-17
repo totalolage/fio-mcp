@@ -1,14 +1,31 @@
 
 import { assert, describe, it } from "@effect/vitest";
+import { decodeBase32, encodeBase32, matchingTotpSteps, newTotpSecret, totpCode } from "@mcps/core/admin/totp.js";
+import {
+  hashPassword,
+  hashSecret,
+  type PasswordHash,
+  PasswordHashError,
+  pkceMatches,
+  verifyPassword,
+} from "@mcps/core/oauth/crypto.js";
+import { DEFAULT_THROTTLE, delayAfter, makeLoginGuard } from "@mcps/core/oauth/login.js";
+import { consentPage, escapeHtml } from "@mcps/core/oauth/pages.js";
+import { makeWindowLimiter } from "@mcps/core/oauth/rate-limit.js";
+import { makeOAuthServer } from "@mcps/core/oauth/server.js";
+import { MAX_SESSIONS, makeSessions, type PendingAuthorization } from "@mcps/core/oauth/sessions.js";
+import { makeOAuthStore } from "@mcps/core/oauth/store.js";
+import { isResource, redirectUriMatches, redirectUriProblem } from "@mcps/core/oauth/urls.js";
 import { type Cause, Clock, Deferred, Effect, Fiber, Layer, Option, Queue, Redacted, Sink, Stdio, Stream, Terminal } from "effect";
 import { HttpServerRequest } from "effect/http";
 import { SqlClient } from "effect/sql";
 import { TestClock } from "effect/testing";
 import { makeSettingsStore, SETTING } from "../src/account-store.js";
 import { Accounts } from "../src/accounts.js";
-import { AdminPassword, makeAdminPassword } from "../src/admin/password.js";
-import { decodeBase32, encodeBase32, matchingTotpSteps, newTotpSecret, totpCode } from "../src/admin/totp.js";
+import { adminPasswordLayer, makeAdminPassword } from "../src/admin/live.js";
 import { SERVER_MIGRATIONS } from "../src/cache/db.js";
+import { parsePasswordHash, parsePublicUrl } from "../src/identity.js";
+import { fioOAuthApp } from "../src/oauth/app.js";
 import {
   CommandFailed,
   hashPasswordCommand,
@@ -17,24 +34,7 @@ import {
   revokeClientCommand,
   totpInitCommand,
 } from "../src/oauth/cli.js";
-import {
-  hashPassword,
-  hashSecret,
-  type PasswordHash,
-  PasswordHashError,
-  parsePasswordHash,
-  pkceMatches,
-  verifyPassword,
-} from "../src/oauth/crypto.js";
-import { DEFAULT_THROTTLE, delayAfter, makeLoginGuard } from "../src/oauth/login.js";
-import { consentPage, escapeHtml } from "../src/oauth/pages.js";
-import { makeWindowLimiter } from "../src/oauth/rate-limit.js";
-import { makeOAuthServer } from "../src/oauth/server.js";
-import { MAX_SESSIONS, makeSessions, type PendingAuthorization } from "../src/oauth/sessions.js";
-import { makeOAuthStore } from "../src/oauth/store.js";
-import { isResource, parsePublicUrl, redirectUriMatches, redirectUriProblem } from "../src/oauth/urls.js";
-import { paymentFormValues } from "../src/payment-form.js";
-import { DEFAULT_GRANT_PAYMENTS, DEFAULT_PAYMENT_LIMITS } from "../src/payment-limits.js";
+import { DEFAULT_PAYMENT_LIMITS } from "../src/payment-limits.js";
 import { testConfig } from "./fixtures.js";
 import { seededConfig } from "./support/config.js";
 import { memoryDatabase } from "./support/database.js";
@@ -91,17 +91,14 @@ describe("URL rules", () => {
   });
 
   it("escapes account names in consent checkbox labels and values", () => {
-    const html = consentPage({
+    const html = consentPage(fioOAuthApp(DEFAULT_PAYMENT_LIMITS), {
       formId: "form-1",
       clientId: "fio_client_test",
       clientName: null,
       redirectUri: "http://127.0.0.1:45678/callback",
       csrf: "csrf",
-      paymentsRequested: false,
-      paymentsChecked: false,
-      payments: paymentFormValues(DEFAULT_GRANT_PAYMENTS, DEFAULT_PAYMENT_LIMITS),
-      paymentCeiling: DEFAULT_PAYMENT_LIMITS,
-      accounts: ["<b>&"],
+      requestedScopes: [],
+      resources: ["<b>&"],
       error: undefined,
     });
     assert.include(html, 'value="&lt;b&gt;&amp;" checked> &lt;b&gt;&amp;</label>');
@@ -112,13 +109,13 @@ describe("URL rules", () => {
 describe("authorization endpoint request target", () => {
   const services = Layer.mergeAll(
     memoryDatabase(SERVER_MIGRATIONS),
-    Accounts.Default.pipe(Layer.provideMerge(seededConfig(testConfig([])))),
+    Accounts.resources.pipe(Layer.provide(Accounts.Default), Layer.provide(seededConfig(testConfig([])))),
   );
 
   it.effect("shows an error page for an absolute-form target that is not a URL", () =>
     Effect.gen(function* () {
-      const server = yield* makeOAuthServer({ publicUrl: "https://fio.example.net" }).pipe(
-        Effect.provide(AdminPassword.layer(Redacted.make(UNCHECKED_HASH))),
+      const server = yield* makeOAuthServer(fioOAuthApp(DEFAULT_PAYMENT_LIMITS), { publicUrl: "https://fio.example.net" }).pipe(
+        Effect.provide(adminPasswordLayer(Redacted.make(UNCHECKED_HASH))),
       );
       const authorize = server.routes.find((route) => route.method === "GET" && route.path === "/authorize");
       if (authorize === undefined) return assert.fail("no /authorize route");
@@ -440,7 +437,7 @@ describe("admin commands", () => {
       const now = yield* Clock.currentTimeMillis;
       const setup = Effect.fnUntraced(function* (clientId: string) {
         yield* store.insertClient({ clientId, clientName: null, redirectUris: ["https://a.example/cb"], createdAt: now, lastUsedAt: null }, 10);
-        const grant = { grantId: `grant_${clientId}`, clientId, scopes: ["fio:read"], accountFingerprints: ["main"], resource: "https://fio.example.test/mcp", payments: DEFAULT_GRANT_PAYMENTS };
+        const grant = { grantId: `grant_${clientId}`, clientId, scopes: ["fio:read"], resources: ["main"], resource: "https://fio.example.test/mcp" };
         yield* store.createGrant(grant, { codeHash: `c_${clientId}`, clientId, redirectUri: "https://a.example/cb", codeChallenge: "x", expiresAt: now + 60_000 }, now);
         yield* store.insertTokens(grant.grantId, pair(clientId, 0));
         return grant;
@@ -474,7 +471,7 @@ describe("admin commands", () => {
         yield* store.insertClient({ clientId, clientName: `App ${clientId}`, redirectUris: ["https://a.example/cb"], createdAt: now, lastUsedAt: null }, 10);
         const grantId = `grant_${clientId}`;
         yield* store.createGrant(
-          { grantId, clientId, scopes: ["fio:read"], accountFingerprints: ["main"], resource: "https://fio.example.test/mcp", payments: DEFAULT_GRANT_PAYMENTS },
+          { grantId, clientId, scopes: ["fio:read"], resources: ["main"], resource: "https://fio.example.test/mcp" },
           { codeHash: `code_${clientId}`, clientId, redirectUri: "https://a.example/cb", codeChallenge: "x", expiresAt: now + 60_000 },
           now,
         );

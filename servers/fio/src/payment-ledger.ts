@@ -17,9 +17,9 @@ import type { PayeeRecord, Usage } from "./payment-limits.js";
  */
 
 /**
- * Ids continue the shared sequence after the grants' 0008. They are spread
- * into OAUTH_MIGRATIONS (src/oauth/store.ts), so the database module's
- * merged map picks them up.
+ * Ids continue the shared sequence after the grants' 0008
+ * (GRANT_PAYMENT_MIGRATIONS, src/oauth/grant-payments.ts). The database
+ * module merges them into SERVER_MIGRATIONS (src/cache/db.ts).
  */
 export const PAYMENT_MIGRATIONS: Migrations = {
   "0009_payment_audit": Effect.gen(function* () {

@@ -1,26 +1,27 @@
 import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem";
 import * as NodeStdio from "@effect/platform-node/NodeStdio";
 import * as NodeTerminal from "@effect/platform-node/NodeTerminal";
+import { ToolListChangesLive } from "@mcps/core/mcp/registration.js";
+import { serveHttp } from "@mcps/core/transport/http.js";
+import { LocalPrincipalLive } from "@mcps/core/transport/principal.js";
+import type { ServerInfo } from "@mcps/core/transport/server-info.js";
+import { layerStdio } from "@mcps/core/transport/stdio.js";
 import { Effect, Layer } from "effect";
 import { McpProtocol } from "effect/ai";
 import { AccountChangesLive } from "./account-runtime.js";
 import { Accounts } from "./accounts.js";
 import { backupDatabase, Database } from "./cache/db.js";
 import { CacheSyncLive, Transactions } from "./cache/service.js";
-import { AppConfig } from "./config.js";
+import { AppConfig, type HttpTransportConfig } from "./config.js";
 import { FioApi } from "./fio-api.js";
 import { CACHE_INSTRUCTIONS, CacheToolsLive } from "./mcp/cache-tools.js";
 import { FioToolsLive, SERVER_INSTRUCTIONS } from "./mcp/fio-tools.js";
-import { ToolListChangesLive } from "./mcp/registration.js";
+import { ConfiguredToolPolicy } from "./mcp/tool-policy.js";
 import { listClientsCommand, resetAdminPasswordCommand, revokeAllTokensCommand, revokeClientCommand } from "./oauth/cli.js";
 import { PaymentControls } from "./payment-controls.js";
 import { RateLimiter } from "./rate-limiter.js";
-import { LoggerLive, Redactor } from "./redaction.js";
-import { Auth } from "./transport/auth.js";
-import { type HttpTransportConfig, serveHttp } from "./transport/http.js";
-import { LocalPrincipalLive } from "./transport/principal.js";
-import type { ServerInfo } from "./transport/server-info.js";
-import { layerStdio } from "./transport/stdio.js";
+import { LoggerLive, RedactorLive } from "./redaction.js";
+import { authFromConfig, TRUSTED_PROXIES_SETTING } from "./transport/auth.js";
 
 export { CommandFailed, hashPasswordCommand } from "./oauth/cli.js";
 
@@ -43,16 +44,19 @@ export const SERVER_INFO: ServerInfo = {
 /**
  * One instance per process: one rate limiter per token, one FIO client, one
  * SQLite cache. With FIO_CACHE_ENABLED=false the cache opens no database
- * (in HTTP mode with OAuth the accounts and Auth.Live still open it).
+ * (in HTTP mode with OAuth the accounts and authFromConfig still open it).
  * Every member closes its own requirements (mergeAll feeds no member from
- * another); they, and Auth.Live's OAuth server and admin UI, share one
+ * another); they, and authFromConfig's OAuth server and admin UI, share one
  * AppConfig, Accounts, RateLimiter, Transactions and database because one
- * build memoizes each layer by reference.
+ * build memoizes each layer by reference. Core sees the accounts as
+ * `Resources` and the tool scopes (and FIO_MCP_MARKER_TOOLS) as `ToolPolicy`.
  */
 export const ServicesLive = Layer.mergeAll(
   AppConfig.Live,
-  Redactor.Live,
+  RedactorLive,
   Accounts.Live,
+  Accounts.resources.pipe(Layer.provide(Accounts.Live)),
+  ConfiguredToolPolicy.pipe(Layer.provide(AppConfig.Live)),
   RateLimiter.Live,
   FioApi.Live,
   Transactions.Live,
@@ -84,7 +88,9 @@ export const StdioAppLive = withServices(
 );
 
 export const HttpAppLive = (config: HttpTransportConfig) =>
-  withServices(serveHttp(ToolsLive, Auth.Live, SERVER_INFO, config));
+  withServices(
+    serveHttp(ToolsLive, authFromConfig, SERVER_INFO, { ...config, trustedProxiesSetting: TRUSTED_PROXIES_SETTING }),
+  );
 
 /** The transport selected by FIO_MCP_TRANSPORT. */
 export const AppLive = Layer.unwrap(
@@ -113,4 +119,4 @@ export const resetAdminPassword = (set: boolean) =>
   withDatabase(resetAdminPasswordCommand(set)).pipe(Effect.provide(NodeTerminal.layer));
 
 /** The redacting stderr logger, for everything the app layers fork. */
-export const AppLoggerLive = LoggerLive.pipe(Layer.provide(Redactor.Live));
+export const AppLoggerLive = LoggerLive.pipe(Layer.provide(RedactorLive));

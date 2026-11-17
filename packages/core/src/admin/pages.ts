@@ -1,14 +1,11 @@
 import { DateTime } from "effect";
-import { escapeHtml, paymentSettingsFields, styleHash, TOTP_FIELD } from "../oauth/pages.js";
-import type { PaymentFormValues } from "../payment-form.js";
-import type { AuditRow } from "../payment-ledger.js";
-import { formatCents, type PaymentLimits } from "../payment-limits.js";
+import { escapeHtml, styleHash, TOTP_FIELD } from "../oauth/pages.js";
 
 /**
  * Server-rendered admin pages. Every interpolated value goes through
  * `escapeHtml`; the only style is one inline block allowed by its CSP hash;
- * there is no script. Tokens are never rendered, only their last four
- * characters.
+ * there is no script. The app names the pages (AdminShell) and adds its own
+ * tabs, rendered into the same shell with the helpers exported here.
  */
 
 const STYLE =
@@ -30,9 +27,10 @@ export const ADMIN_STYLE_HASH = styleHash(STYLE);
 const layout = (title: string, body: string) =>
   `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>${escapeHtml(title)}</title><style>${STYLE}</style></head><body>${body}</body></html>`;
 
-const csrfField = (csrf: string) => `<input type="hidden" name="csrf" value="${escapeHtml(csrf)}">`;
+/** The hidden CSRF field every form posts. */
+export const csrfField = (csrf: string) => `<input type="hidden" name="csrf" value="${escapeHtml(csrf)}">`;
 
-const hidden = (name: string, value: string) => `<input type="hidden" name="${escapeHtml(name)}" value="${escapeHtml(value)}">`;
+export const hidden = (name: string, value: string) => `<input type="hidden" name="${escapeHtml(name)}" value="${escapeHtml(value)}">`;
 
 export const formatTime = (millis: number | null) =>
   millis === null ? "never" : `${DateTime.formatIso(DateTime.makeUnsafe(millis)).slice(0, 16).replace("T", " ")} UTC`;
@@ -47,21 +45,33 @@ const flashBlock = (flash: Flash | undefined) =>
     ? ""
     : `<p class="${flash.kind === "ok" ? "ok" : "error"}" role="${flash.kind === "ok" ? "status" : "alert"}">${escapeHtml(flash.text)}</p>`;
 
-export type AdminTab = "accounts" | "clients" | "payments" | "password";
+/** A navigation entry of the signed-in pages. */
+export interface AdminNavTab {
+  readonly id: string;
+  readonly href: string;
+  readonly label: string;
+}
 
-const TABS: ReadonlyArray<readonly [AdminTab, string, string]> = [
-  ["accounts", "/admin", "Accounts"],
-  ["clients", "/admin/clients", "Connected clients"],
-  ["payments", "/admin/payments", "Payments"],
-  ["password", "/admin/password", "Admin password"],
-];
+/** What the pages name and link: the app's name and every tab, in nav order. */
+export interface AdminShell {
+  /** The app's name, as in "<name> admin". */
+  readonly name: string;
+  readonly tabs: ReadonlyArray<AdminNavTab>;
+  /** Heading of the column naming the resources a grant covers, e.g. "Projects". */
+  readonly resourcesHeading: string;
+  /** Where the bootstrap password hash comes from, e.g. an environment variable's name. */
+  readonly passwordHashSource: string;
+}
 
-const signedIn = (tab: AdminTab, csrf: string, flash: Flash | undefined, body: string) =>
+/** A signed-in page: nav with `tab` current, the one-shot message, then `body`. */
+export const signedInPage = (shell: AdminShell, tab: string, csrf: string, flash: Flash | undefined, body: string) =>
   layout(
-    `fio-mcp admin: ${TABS.find(([id]) => id === tab)?.[2] ?? ""}`,
-    `<nav><strong>fio-mcp admin</strong>${TABS.map(([id, href, label]) =>
-      id === tab ? `<span aria-current="page">${label}</span>` : `<a href="${href}">${label}</a>`,
-    ).join("")}<form method="post" action="/admin/logout">${csrfField(csrf)}<button type="submit">Sign out</button></form></nav>
+    `${shell.name} admin: ${shell.tabs.find(({ id }) => id === tab)?.label ?? ""}`,
+    `<nav><strong>${escapeHtml(shell.name)} admin</strong>${shell.tabs
+      .map(({ id, href, label }) =>
+        id === tab ? `<span aria-current="page">${escapeHtml(label)}</span>` : `<a href="${escapeHtml(href)}">${escapeHtml(label)}</a>`,
+      )
+      .join("")}<form method="post" action="/admin/logout">${csrfField(csrf)}<button type="submit">Sign out</button></form></nav>
 ${flashBlock(flash)}
 ${body}`,
   );
@@ -69,14 +79,14 @@ ${body}`,
 export interface AdminLoginPage {
   readonly csrf: string;
   readonly error: string | undefined;
-  /** Ask for the authenticator code too (FIO_MCP_ADMIN_TOTP_SECRET_FILE is set). */
+  /** Ask for the authenticator code too (a second factor is configured). */
   readonly totp?: boolean;
 }
 
-export const adminLoginPage = (page: AdminLoginPage): string =>
+export const adminLoginPage = (name: string, page: AdminLoginPage): string =>
   layout(
-    "fio-mcp admin sign-in",
-    `<h1>fio-mcp admin</h1>
+    `${name} admin sign-in`,
+    `<h1>${escapeHtml(name)} admin</h1>
 ${page.error === undefined ? "" : `<p class="error" role="alert">${escapeHtml(page.error)}</p>`}
 <form method="post" action="/admin/login">
 ${csrfField(page.csrf)}
@@ -87,92 +97,23 @@ ${page.totp === true ? TOTP_FIELD : ""}<p><button type="submit">Sign in</button>
 <p class="muted">Signed-in sessions end after 15 minutes without activity.</p>`,
   );
 
-export const adminRefusedPage = (): string =>
+export const adminRefusedPage = (name: string): string =>
   layout(
-    "fio-mcp admin",
+    `${name} admin`,
     `<h1>Request refused</h1><p class="error" role="alert">The form could not be verified. <a href="/admin">Reload the page</a> and try again.</p>`,
-  );
-
-export interface AccountRow {
-  readonly id: string;
-  readonly name: string;
-  /** Last four characters of the token. */
-  readonly tokenHint: string;
-  readonly accountNumber: string | undefined;
-  readonly currency: string | undefined;
-  readonly createdAt: number;
-  readonly tokenUpdatedAt: number;
-}
-
-const accountRow = (csrf: string, row: AccountRow) => `<tr>
-<td><strong>${escapeHtml(row.name)}</strong></td>
-<td><code>…${escapeHtml(row.tokenHint)}</code></td>
-<td>${escapeHtml(row.accountNumber ?? "learned from statements")}${row.currency === undefined ? "" : ` (${escapeHtml(row.currency)})`}</td>
-<td>${formatTime(row.createdAt)}<br><span class="muted">token set ${formatTime(row.tokenUpdatedAt)}</span></td>
-<td>
-<form method="post" action="/admin/accounts/test">${csrfField(csrf)}${hidden("id", row.id)}<button type="submit">Test token</button></form>
-<details><summary>Rename</summary><form method="post" action="/admin/accounts/rename">${csrfField(csrf)}${hidden("id", row.id)}
-<label>New name <input type="text" name="name" value="${escapeHtml(row.name)}" maxlength="256" required></label>
-<button type="submit">Rename</button><span class="muted">Connected clients keep access.</span></form></details>
-<details><summary>Replace token</summary><form method="post" action="/admin/accounts/rotate">${csrfField(csrf)}${hidden("id", row.id)}
-<label>New FIO token <input type="password" name="token" autocomplete="off" required></label>
-<button type="submit">Replace</button><span class="muted">Connected clients lose this account until they reconnect and select it again.</span></form></details>
-<details><summary class="danger">Remove</summary><form method="post" action="/admin/accounts/remove">${csrfField(csrf)}${hidden("id", row.id)}
-<label><input type="radio" name="cache" value="keep" checked> Keep cached transactions</label>
-<label><input type="radio" name="cache" value="purge"> Delete cached transactions</label>
-<label><input type="checkbox" name="confirm" value="yes" required> Remove “${escapeHtml(row.name)}”</label>
-<button type="submit">Remove</button></form></details>
-</td>
-</tr>`;
-
-export interface AccountsPage {
-  readonly csrf: string;
-  readonly flash: Flash | undefined;
-  readonly accounts: ReadonlyArray<AccountRow>;
-}
-
-export const accountsPage = (page: AccountsPage): string =>
-  signedIn(
-    "accounts",
-    page.csrf,
-    page.flash,
-    `<h1>FIO accounts</h1>
-<p class="muted">Tokens are stored encrypted and never shown; only their last four characters are. Renaming keeps every client's access; replacing a token removes the account from existing client authorizations.</p>
-${
-  page.accounts.length === 0
-    ? "<p>No accounts yet. Add one below.</p>"
-    : `<table><thead><tr><th>Name</th><th>Token</th><th>Account</th><th>Added</th><th>Actions</th></tr></thead><tbody>
-${page.accounts.map((row) => accountRow(page.csrf, row)).join("\n")}
-</tbody></table>`
-}
-<h2>Add an account</h2>
-<form method="post" action="/admin/accounts/add">
-${csrfField(page.csrf)}
-<label>Name <input type="text" name="name" maxlength="256" required></label>
-<label>FIO token <input type="password" name="token" autocomplete="off" required></label>
-<label>Account number (optional, without bank code) <input type="text" name="accountNumber" inputmode="numeric" maxlength="10"></label>
-<label>Currency (optional, e.g. CZK) <input type="text" name="currency" maxlength="3"></label>
-<p><button type="submit">Add account</button></p>
-</form>`,
   );
 
 export interface GrantRow {
   readonly grantId: string;
   readonly scopes: ReadonlyArray<string>;
-  /** Names of the configured accounts the grant covers. */
-  readonly accounts: ReadonlyArray<string>;
-  /** Granted tokens no configured account uses any more. */
-  readonly staleTokens: number;
+  /** Labels of the current resources the grant covers. */
+  readonly resources: ReadonlyArray<string>;
+  /** Granted resource ids no current resource has any more. */
+  readonly staleResources: number;
   readonly createdAt: number;
   readonly lastUsedAt: number | null;
-  /** The payment settings form, for a grant with fio:payments. */
-  readonly payments: GrantPaymentsRow | undefined;
-}
-
-export interface GrantPaymentsRow {
-  readonly values: PaymentFormValues;
-  /** The stored limits are null: the grant follows the server defaults. */
-  readonly followsDefaults: boolean;
+  /** The app's HTML (escaped) right after the grant's row (AdminGrantSettings.render); "" for none. */
+  readonly settings: string;
 }
 
 export interface ClientRow {
@@ -184,38 +125,30 @@ export interface ClientRow {
   readonly grants: ReadonlyArray<GrantRow>;
 }
 
-const grantAccounts = (grant: GrantRow) => {
-  const names = grant.accounts.map((name) => escapeHtml(name)).join(", ");
+const grantResources = (grant: GrantRow) => {
+  const names = grant.resources.map((name) => escapeHtml(name)).join(", ");
   const stale =
-    grant.staleTokens === 0 ? "" : `${names === "" ? "" : "; "}<span class="muted">${grant.staleTokens} replaced or removed</span>`;
+    grant.staleResources === 0 ? "" : `${names === "" ? "" : "; "}<span class="muted">${grant.staleResources} replaced or removed</span>`;
   return names === "" && stale === "" ? "none" : `${names}${stale}`;
 };
 
-const grantRow = (csrf: string, grant: GrantRow, ceiling: PaymentLimits) => `<tr>
+const grantRow = (csrf: string, grant: GrantRow) => `<tr>
 <td>${grant.scopes.map((scope) => `<code>${escapeHtml(scope)}</code>`).join(" ")}</td>
-<td>${grantAccounts(grant)}</td>
+<td>${grantResources(grant)}</td>
 <td>${formatTime(grant.createdAt)}</td>
 <td>${formatTime(grant.lastUsedAt)}</td>
 <td><form method="post" action="/admin/grants/revoke">${csrfField(csrf)}${hidden("grant", grant.grantId)}<button type="submit">Revoke</button></form></td>
-</tr>${grant.payments === undefined ? "" : grantPaymentsRow(csrf, grant.grantId, grant.payments, ceiling)}`;
+</tr>${grant.settings}`;
 
-const grantPaymentsRow = (csrf: string, grantId: string, payments: GrantPaymentsRow, ceiling: PaymentLimits) => `
-<tr><td colspan="5"><details><summary>Payment limits and payee allowlist (${escapeHtml(payments.values.mode)}${payments.followsDefaults ? ", limits follow the server defaults" : ""})</summary>
-<p class="muted">Grant <code>${escapeHtml(grantId)}</code>. Saving stores these limits for this grant; they never exceed the server ceilings.</p>
-<form method="post" action="/admin/grants/payments">${csrfField(csrf)}${hidden("grant", grantId)}
-${paymentSettingsFields(payments.values, ceiling)}
-<button type="submit">Save payment settings</button></form>
-<p><a href="/admin/payments?grant=${encodeURIComponent(grantId)}">Payment audit of this grant</a></p></details></td></tr>`;
-
-const clientBlock = (csrf: string, client: ClientRow, ceiling: PaymentLimits) => `<section>
+const clientBlock = (shell: AdminShell, csrf: string, client: ClientRow) => `<section>
 <h2>${client.clientName === null ? "Unnamed client" : `“${escapeHtml(client.clientName)}”`}</h2>
 <p class="muted">The name is supplied by the client and not verified. Client ID <code>${escapeHtml(client.clientId)}</code>. Registered ${formatTime(client.createdAt)}, last authorized ${formatTime(client.lastUsedAt)}.<br>
 Redirects to ${client.redirectUris.map((uri) => `<code>${escapeHtml(uri)}</code>`).join(", ")}</p>
 ${
   client.grants.length === 0
     ? "<p>No active authorization.</p>"
-    : `<table><thead><tr><th>Scopes</th><th>Accounts</th><th>Authorized</th><th>Last used</th><th></th></tr></thead><tbody>
-${client.grants.map((grant) => grantRow(csrf, grant, ceiling)).join("\n")}
+    : `<table><thead><tr><th>Scopes</th><th>${escapeHtml(shell.resourcesHeading)}</th><th>Authorized</th><th>Last used</th><th></th></tr></thead><tbody>
+${client.grants.map((grant) => grantRow(csrf, grant)).join("\n")}
 </tbody></table>`
 }
 <form method="post" action="/admin/clients/revoke">${csrfField(csrf)}${hidden("client", client.clientId)}<button type="submit">Remove client and revoke its access</button></form>
@@ -225,17 +158,17 @@ export interface ClientsPage {
   readonly csrf: string;
   readonly flash: Flash | undefined;
   readonly clients: ReadonlyArray<ClientRow>;
-  readonly paymentCeiling: PaymentLimits;
 }
 
-export const clientsPage = (page: ClientsPage): string =>
-  signedIn(
+export const clientsPage = (shell: AdminShell, page: ClientsPage): string =>
+  signedInPage(
+    shell,
     "clients",
     page.csrf,
     page.flash,
     `<h1>Connected clients</h1>
 <p class="muted">Revoking ends the client's tokens at once; it can connect again only through the sign-in and consent pages.</p>
-${page.clients.length === 0 ? "<p>No registered clients.</p>" : page.clients.map((client) => clientBlock(page.csrf, client, page.paymentCeiling)).join("\n")}
+${page.clients.length === 0 ? "<p>No registered clients.</p>" : page.clients.map((client) => clientBlock(shell, page.csrf, client)).join("\n")}
 <h2>Revoke everything</h2>
 <form method="post" action="/admin/clients/revoke-all">${csrfField(page.csrf)}
 <label><input type="checkbox" name="confirm" value="yes" required> Revoke every client's authorization</label>
@@ -247,13 +180,14 @@ export interface PasswordPage {
   readonly flash: Flash | undefined;
 }
 
-export const passwordPage = (page: PasswordPage): string =>
-  signedIn(
+export const passwordPage = (shell: AdminShell, page: PasswordPage): string =>
+  signedInPage(
+    shell,
     "password",
     page.csrf,
     page.flash,
     `<h1>Admin password</h1>
-<p class="muted">The password signs in here and on the authorization page MCP clients open. Changing it signs out every other admin session; it then replaces the hash in FIO_MCP_ADMIN_PASSWORD_HASH_FILE until <code>fio-mcp reset-admin-password</code> is run.</p>
+<p class="muted">The password signs in here and on the authorization page MCP clients open. Changing it signs out every other admin session; it then replaces the hash in ${escapeHtml(shell.passwordHashSource)} until <code>${escapeHtml(shell.name)} reset-admin-password</code> is run.</p>
 <form method="post" action="/admin/password">
 ${csrfField(page.csrf)}
 <label>Current password <input type="password" name="current" autocomplete="current-password" required></label>
@@ -261,117 +195,4 @@ ${csrfField(page.csrf)}
 <label>Repeat the new password <input type="password" name="confirm" autocomplete="new-password" minlength="12" required></label>
 <p><button type="submit">Change password</button></p>
 </form>`,
-  );
-
-const totalsText = (totals: Readonly<Record<string, number>>) =>
-  Object.keys(totals)
-    .sort()
-    .map((currency) => `${formatCents(totals[currency] ?? 0)} ${escapeHtml(currency)}`)
-    .join(", ") || "none";
-
-const payeeText = (payee: AuditRow["payees"][number]) =>
-  `<code>${escapeHtml(payee.payee)}</code>${payee.bankCode === null ? "" : ` (bank ${escapeHtml(payee.bankCode)})`}${
-    payee.bic === null ? "" : ` (BIC ${escapeHtml(payee.bic)})`
-  }: ${escapeHtml(payee.amount.toFixed(2))} ${escapeHtml(payee.currency)}${payee.vs === null ? "" : `, VS ${escapeHtml(payee.vs)}`}`;
-
-const auditRow = (row: AuditRow) => `<tr>
-<td>${formatTime(row.createdAt)}<br><span class="muted">${escapeHtml(row.pragueDay)} (Prague)</span></td>
-<td><a href="/admin/payments?grant=${encodeURIComponent(row.grantId)}"><code>${escapeHtml(row.grantId)}</code></a>${
-  row.clientId === null ? "" : `<br><span class="muted">client <code>${escapeHtml(row.clientId)}</code></span>`
-}</td>
-<td>${row.accountName === null ? "" : escapeHtml(row.accountName)}</td>
-<td><strong>${escapeHtml(row.outcome)}</strong>${row.reason === null ? "" : `<br><span class="muted">${escapeHtml(row.reason)}</span>`}${
-  row.fioErrorCode === null ? "" : `<br><span class="muted">${escapeHtml(row.fioErrorCode)}</span>`
-}</td>
-<td>${row.orderCount}<br>${totalsText(row.totals)}</td>
-<td>${row.payees.map(payeeText).join("<br>")}</td>
-<td>${row.batchIds.map((id) => `<code>${escapeHtml(id)}</code>`).join(", ")}${
-  row.idempotencyKey === null ? "" : `<br><span class="muted">key <code>${escapeHtml(row.idempotencyKey)}</code></span>`
-}</td>
-</tr>`;
-
-export interface PaymentsPage {
-  readonly csrf: string;
-  readonly flash: Flash | undefined;
-  /** Newest first. */
-  readonly rows: ReadonlyArray<AuditRow>;
-  /** The grant filter, if any. */
-  readonly grant: string | undefined;
-  /** The link to the next (older) page, when this one is full. */
-  readonly older: string | undefined;
-}
-
-export const paymentsPage = (page: PaymentsPage): string =>
-  signedIn(
-    "payments",
-    page.csrf,
-    page.flash,
-    `<h1>Payment audit</h1>
-<p>Batches held for approval: <a href="/admin/payments/pending">pending payments</a>.</p>
-<p class="muted">Every <code>submit_payment_orders</code> call that passed validation, newest first. Accepted, unknown and held batches count towards the daily limits. Rows are kept at least 365 days; <code>fio-mcp payments purge --before YYYY-MM-DD</code> deletes older ones.</p>
-${page.grant === undefined ? "" : `<p>Showing grant <code>${escapeHtml(page.grant)}</code> only. <a href="/admin/payments">Show all</a></p>`}
-${
-  page.rows.length === 0
-    ? "<p>No payment submissions.</p>"
-    : `<table><thead><tr><th>Submitted</th><th>Grant</th><th>Account</th><th>Outcome</th><th>Orders</th><th>Payees</th><th>Batch</th></tr></thead><tbody>
-${page.rows.map(auditRow).join("\n")}
-</tbody></table>`
-}
-${page.older === undefined ? "" : `<p><a href="${escapeHtml(page.older)}">Older submissions</a></p>`}`,
-  );
-
-export interface PendingRow {
-  readonly pendingId: string;
-  readonly accountName: string | null;
-  readonly xml: string;
-  readonly xmlSha256: string;
-  readonly expiresAt: number;
-  readonly audit: AuditRow;
-  /** Payees not on the grant's allowlist; undefined when the grant is no longer active. */
-  readonly unlisted: ReadonlyArray<string> | undefined;
-}
-
-export interface PendingPage {
-  readonly csrf: string;
-  readonly flash: Flash | undefined;
-  readonly rows: ReadonlyArray<PendingRow>;
-  /** Approving asks for the admin's authentication code (SEC-03). */
-  readonly secondFactor: boolean;
-}
-
-const payeeMark = (unlisted: ReadonlyArray<string> | undefined, payee: string) => {
-  if (unlisted === undefined) return "";
-  return unlisted.includes(payee) ? ` <span class="unlisted">not on the allowlist</span>` : ` <span class="muted">listed</span>`;
-};
-
-const pendingPayee = (row: PendingRow, payee: AuditRow["payees"][number]) =>
-  `<li>${payeeText(payee)}${payeeMark(row.unlisted, payee.payee)}</li>`;
-
-const pendingBlock = (csrf: string, secondFactor: boolean, row: PendingRow) => `<section>
-<h2>Batch <code>${escapeHtml(row.pendingId)}</code></h2>
-<p>Account ${row.accountName === null ? "(unnamed)" : `“${escapeHtml(row.accountName)}”`}; grant <code>${escapeHtml(row.audit.grantId)}</code>${
-  row.audit.clientId === null ? "" : `, client <code>${escapeHtml(row.audit.clientId)}</code>`
-}; submitted ${formatTime(row.audit.createdAt)}; dropped unless approved by <strong>${formatTime(row.expiresAt)}</strong>.</p>
-${row.unlisted === undefined ? `<p class="error">The authorization that submitted this batch is no longer active, so approving it uploads nothing. Decline it to clear it.</p>` : ""}
-<p>${row.audit.orderCount} orders, total ${totalsText(row.audit.totals)}.</p>
-<ul>${row.audit.payees.map((payee) => pendingPayee(row, payee)).join("")}</ul>
-<p>SHA-256 of the XML uploaded on approval: <code>${escapeHtml(row.xmlSha256)}</code></p>
-<details><summary>Exact XML</summary><pre>${escapeHtml(row.xml)}</pre></details>
-<form method="post" action="/admin/payments/pending/approve">${csrfField(csrf)}${hidden("pending", row.pendingId)}${
-  secondFactor
-    ? `<label>Authentication code <input type="text" name="totp" inputmode="numeric" autocomplete="one-time-code" required></label>`
-    : ""
-}<button type="submit">Approve and upload to FIO</button></form>
-<form method="post" action="/admin/payments/pending/decline">${csrfField(csrf)}${hidden("pending", row.pendingId)}<button type="submit">Decline</button></form>
-</section>`;
-
-export const pendingPage = (page: PendingPage): string =>
-  signedIn(
-    "payments",
-    page.csrf,
-    page.flash,
-    `<h1>Pending payments</h1>
-<p><a href="/admin/payments">Payment audit</a></p>
-<p class="muted">Batches from grants whose payee allowlist is in confirm mode wait here for approval. Approving uploads exactly the XML shown; the batch must then still be signed in FIO Internetbanking. Batches not approved within 24 hours are dropped.</p>
-${page.rows.length === 0 ? "<p>No batches are waiting.</p>" : page.rows.map((row) => pendingBlock(page.csrf, page.secondFactor, row)).join("\n")}`,
   );

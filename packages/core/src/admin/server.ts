@@ -1,65 +1,64 @@
-import { ByteSize, Clock, Effect, Layer, Option, Redacted, Result, type Scope } from "effect";
+import { ByteSize, Clock, Effect, Layer, Option, Redacted, type Scope } from "effect";
 import { Cookies, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 import type { IpNetwork } from "effect/net";
 import type { SqlClient } from "effect/sql";
-import { Accounts, tokenHint } from "../accounts.js";
-import type { Transactions } from "../cache/service.js";
-import { AppConfig } from "../config.js";
-import type { FioApi } from "../fio-api.js";
-import { SCOPE_PAYMENTS } from "../mcp/permissions.js";
 import { safeEqual } from "../oauth/crypto.js";
 import type { LoginResult } from "../oauth/login.js";
 import { pageHeaders } from "../oauth/pages.js";
 import { makeWindowLimiter } from "../oauth/rate-limit.js";
 import { makeOAuthStore } from "../oauth/store.js";
-import { PaymentControls } from "../payment-controls.js";
-import { parsePaymentForm, paymentFormValues, readPaymentForm } from "../payment-form.js";
-import { formatAuditCursor, parseAuditCursor } from "../payment-ledger.js";
-import { unlistedPayees } from "../payment-limits.js";
+import { Resources } from "../resources.js";
 import { clientAddress } from "../transport/client-address.js";
 import { restrictRoutes } from "../transport/restrict.js";
-import { makeAccountAdmin, type RemovedCache } from "./accounts.js";
 import {
   ADMIN_STYLE_HASH,
-  accountsPage,
+  type AdminShell,
   adminLoginPage,
   adminRefusedPage,
   type ClientRow,
   clientsPage,
   type Flash,
-  type PendingRow,
   passwordPage,
-  paymentsPage,
-  pendingPage,
+  signedInPage,
 } from "./pages.js";
 import { AdminPassword, checkNewPassword } from "./password.js";
-import { ADMIN_ABSOLUTE_MS, ADMIN_COOKIE, ADMIN_PATH, ADMIN_PRELOGIN_MS, type AdminSession, makeAdminSessions } from "./sessions.js";
+import { ADMIN_ABSOLUTE_MS, ADMIN_PATH, ADMIN_PRELOGIN_MS, type AdminSession, adminCookie, makeAdminSessions } from "./sessions.js";
+import {
+  type AdminActionContext,
+  type AdminApp,
+  type AdminTab,
+  type AdminTabAction,
+  type AdminTabRequest,
+  type AdminTabView,
+  field,
+} from "./tab.js";
 
 /**
- * The admin UI at /admin (HTTP mode with OAuth): FIO accounts and tokens,
+ * The admin UI at /admin (HTTP mode with OAuth): the app's tabs (tab.ts),
  * connected OAuth clients, and the admin password.
  *
  * Separate from OAuth: only the admin session cookie (src/admin/sessions.ts)
  * signs in here; the Authorization header is never read, so an MCP bearer
  * token grants nothing. Sign-in uses the shared admin password check
- * (throttling, lockout, one scrypt at a time). Every state change is a POST
- * with the session's CSRF token (compared in constant time) and, when the
- * browser sends Origin, the public origin; results come back on the next
- * page as a one-shot message held in the session (Post/Redirect/Get), never
- * in the URL. Pages carry the strict headers of the sign-in pages (CSP
- * without scripts, frame-ancestors 'none', no-store).
+ * (throttling, lockout, one scrypt at a time, the optional authenticator
+ * code). Every state change is a POST with the session's CSRF token
+ * (compared in constant time) and, when the browser sends Origin, the public
+ * origin; results come back on the next page as a one-shot message held in
+ * the session (Post/Redirect/Get), never in the URL. Pages carry the strict
+ * headers of the sign-in pages (CSP without scripts, frame-ancestors 'none',
+ * no-store). Every route sits behind the admin allowed-networks restriction
+ * (`adminRoutes`).
  */
 
-/** Checks the second factor of a payment approval (see `verifySecondFactor`). */
+/** Checks the second factor of a verified form (see `verifySecondFactor`). */
 export type SecondFactorCheck = (request: Request, form: URLSearchParams) => Effect.Effect<LoginResult<void>>;
 
 export interface AdminSettings {
   readonly publicUrl: string;
-  readonly dataKey: Redacted.Redacted<Uint8Array>;
   readonly trustedProxies?: ReadonlyArray<IpNetwork.IpNetwork> | undefined;
-  /** FIO_MCP_ADMIN_ALLOWED_CIDRS: only these clients reach any /admin route (404 otherwise); empty allows all. */
+  /** Only these clients reach any /admin route (404 otherwise); empty allows all. */
   readonly allowedNetworks?: ReadonlyArray<IpNetwork.IpNetwork> | undefined;
-  /** Replaces the built-in second-factor check of payment approvals (tests). */
+  /** Replaces the built-in second-factor check of tab actions (tests). */
   readonly secondFactor?: SecondFactorCheck | undefined;
 }
 
@@ -77,16 +76,14 @@ const html = (body: string, status = 200, extra: Record<string, string> = {}, co
     cookies,
   });
 
-const sessionCookie = (value: string, maxAgeMs: number) =>
-  Cookies.setUnsafe(Cookies.empty, ADMIN_COOKIE, value, {
+const sessionCookie = (name: string, value: string, maxAgeMs: number) =>
+  Cookies.setUnsafe(Cookies.empty, name, value, {
     path: ADMIN_PATH,
     httpOnly: true,
     secure: true,
     sameSite: "strict",
     maxAge: `${Math.max(0, Math.floor(maxAgeMs / 1000))} seconds`,
   });
-
-const clearedCookie = sessionCookie("", 0);
 
 const redirect = (location: string, cookies?: Cookies.Cookies) =>
   HttpServerResponse.redirect(location, { status: 303, headers: NO_STORE, cookies });
@@ -106,65 +103,49 @@ const readForm = (request: Request): Effect.Effect<Form> => {
   );
 };
 
-/** The one value of `name`; repeated or missing is undefined. */
-const field = (form: URLSearchParams, name: string) => {
-  const values = form.getAll(name);
-  return values.length === 1 ? values[0] : undefined;
-};
-
-const refused = html(adminRefusedPage(), 403);
-
-/** Audit rows per page of /admin/payments. */
-const AUDIT_PAGE_ROWS = 100;
-
 /** The query string of a GET (request.url is the path and query). */
 const queryOf = (request: Request) => {
   const start = request.url.indexOf("?");
   return new URLSearchParams(start < 0 ? "" : request.url.slice(start + 1));
 };
 
-const quoted = (names: ReadonlyArray<string>) => names.map((name) => `“${name}”`).join(", ");
-
-/** `accounts` kept data because a token they have, or had, is bound to the same bank account. */
-const purgedText = (deleted: number, accounts: ReadonlyArray<string>): string => {
-  const holders = `${quoted(accounts)} ${accounts.length === 1 ? "has or had a token" : "have or had tokens"} for the same bank account`;
-  if (deleted > 0 && accounts.length > 0) return `Its cached transactions were deleted, except where ${holders}.`;
-  if (deleted > 0) return "Its cached transactions were deleted.";
-  if (accounts.length > 0) return `Its cached transactions were kept: ${holders}.`;
-  return "Nothing was cached under its tokens, so nothing was deleted.";
-};
-
-const removedCacheText = (cache: RemovedCache): string => {
-  switch (cache.kind) {
-    case "kept":
-      return "Its cached transactions were kept.";
-    case "purged": {
-      const text = purgedText(cache.deleted, cache.accounts);
-      if (cache.unattributed === 0) return text;
-      const one = cache.unattributed === 1;
-      const which = one ? "1 cached bank account" : `${cache.unattributed} cached bank accounts`;
-      return `${text} ${which} could not be linked to any configured account and ${one ? "was" : "were"} not touched.`;
-    }
-  }
-};
-
-export const makeAdminServer = Effect.fn("AdminServer.make")(function* (settings: AdminSettings) {
+export const makeAdminServer = Effect.fn("AdminServer.make")(function* (
+  settings: AdminSettings,
+  app: AdminApp,
+  tabs: ReadonlyArray<AdminTab>,
+) {
   const password = yield* AdminPassword;
-  const accounts = yield* Accounts;
+  const resources = yield* Resources;
   const sessions = yield* makeAdminSessions();
-  const admin = yield* makeAccountAdmin(settings.dataKey);
-  const oauth = yield* makeOAuthStore();
-  const payments = yield* PaymentControls;
-  // Server defaults and ceilings of grant payment limits (SEC-26).
-  const { paymentLimits } = yield* AppConfig;
+  const grantSettings = app.grantSettings;
+  // Grants are read with the app's settings codec, so each carries its decoded settings.
+  const oauth = yield* makeOAuthStore(undefined, grantSettings?.codec);
   const issuer = settings.publicUrl;
   const trustedProxies = settings.trustedProxies ?? [];
   // Anyone can open the sign-in form; each holds a session for a while.
   const formsByAddress = makeWindowLimiter({ limit: 20, windowMs: 10 * 60_000, maxKeys: 10_000 });
+  const name = app.identity.name;
+  const cookieName = adminCookie(app.identity);
+  const cookie = (value: string, maxAgeMs: number) => sessionCookie(cookieName, value, maxAgeMs);
+  const clearedCookie = cookie("", 0);
+  const refused = html(adminRefusedPage(name), 403);
+  const CLIENTS = `${ADMIN_PATH}/clients`;
+  const navEntry = (tab: AdminTab) => ({ id: tab.id, href: tab.path, label: tab.label });
+  const shell: AdminShell = {
+    name,
+    tabs: [
+      ...tabs.filter((tab) => (tab.nav ?? "first") === "first").map(navEntry),
+      { id: "clients", href: CLIENTS, label: "Connected clients" },
+      ...tabs.filter((tab) => tab.nav === "after-clients").map(navEntry),
+      { id: "password", href: `${ADMIN_PATH}/password`, label: "Admin password" },
+    ],
+    resourcesHeading: app.resourcesHeading,
+    passwordHashSource: app.passwordHashSource,
+  };
 
   /** The signed-in session the cookie names, unless the password changed since its sign-in. */
   const signedIn = Effect.fnUntraced(function* (request: Request) {
-    const session = yield* sessions.find(request.cookies[ADMIN_COOKIE]);
+    const session = yield* sessions.find(request.cookies[cookieName]);
     if (Option.isNone(session) || !session.value.signedIn) return Option.none<AdminSession>();
     const stamp = yield* password.stamp.pipe(Effect.orElseSucceed(() => undefined));
     if (stamp === undefined || stamp !== session.value.passwordStamp) {
@@ -195,27 +176,27 @@ export const makeAdminServer = Effect.fn("AdminServer.make")(function* (settings
     error?: string,
     extra: Record<string, string> = {},
     cookies?: Cookies.Cookies,
-  ) => html(adminLoginPage({ csrf: Redacted.value(csrf), error, totp: password.totpEnabled }), status, extra, cookies);
+  ) => html(adminLoginPage(name, { csrf: Redacted.value(csrf), error, totp: password.totpEnabled }), status, extra, cookies);
 
   const showLogin = Effect.fnUntraced(function* (request: Request) {
     if (Option.isSome(yield* signedIn(request))) return redirect(ADMIN_PATH);
-    const existing = yield* sessions.find(request.cookies[ADMIN_COOKIE]);
+    const existing = yield* sessions.find(request.cookies[cookieName]);
     if (Option.isSome(existing) && !existing.value.signedIn) return renderLogin(existing.value.csrf, 200);
     const address = clientAddress(request, trustedProxies);
     const now = yield* Clock.currentTimeMillis;
     const wait = formsByAddress.retryAfter(address, now);
     if (wait > 0) {
-      return html(adminLoginPage({ csrf: "", error: `Too many sign-in forms were opened. Try again in ${wait} s.` }), 429, {
+      return html(adminLoginPage(name, { csrf: "", error: `Too many sign-in forms were opened. Try again in ${wait} s.` }), 429, {
         "retry-after": String(wait),
       });
     }
     formsByAddress.record(address, now);
     const started = yield* sessions.start();
-    return renderLogin(started.session.csrf, 200, undefined, {}, sessionCookie(Redacted.value(started.cookie), ADMIN_PRELOGIN_MS));
+    return renderLogin(started.session.csrf, 200, undefined, {}, cookie(Redacted.value(started.cookie), ADMIN_PRELOGIN_MS));
   });
 
   const submitLogin = Effect.fnUntraced(function* (request: Request) {
-    const found = yield* sessions.find(request.cookies[ADMIN_COOKIE]);
+    const found = yield* sessions.find(request.cookies[cookieName]);
     // Expired or never started: back to the form, whose sessions are limited per address.
     if (Option.isNone(found) || found.value.signedIn) return redirect(`${ADMIN_PATH}/login`);
     const form = yield* readForm(request);
@@ -228,7 +209,7 @@ export const makeAdminServer = Effect.fn("AdminServer.make")(function* (settings
         // Bound to the hash the password matched: a change in between ends this session.
         const next = yield* sessions.signIn(session, result.value);
         yield* Effect.logInfo("admin: signed in");
-        return redirect(ADMIN_PATH, sessionCookie(Redacted.value(next.cookie), ADMIN_ABSOLUTE_MS));
+        return redirect(ADMIN_PATH, cookie(Redacted.value(next.cookie), ADMIN_ABSOLUTE_MS));
       }
       case "Rejected":
         return renderLogin(session.csrf, 401, password.totpEnabled ? "Wrong password or code." : "Wrong password.");
@@ -247,9 +228,11 @@ export const makeAdminServer = Effect.fn("AdminServer.make")(function* (settings
 
   /** GET: the page for a signed-in session, else the sign-in page. */
   const page =
-    (render: (session: AdminSession) => Effect.Effect<Response>) =>
+    (render: (session: AdminSession, request: Request) => Effect.Effect<Response>) =>
     (request: Request): Effect.Effect<Response> =>
-      Effect.flatMap(signedIn(request), (session) => (Option.isNone(session) ? Effect.succeed(toLogin) : render(session.value)));
+      Effect.flatMap(signedIn(request), (session) =>
+        Option.isNone(session) ? Effect.succeed(toLogin) : render(session.value, request),
+      );
 
   /**
    * POST: a verified form from a signed-in session; `act` returns the
@@ -275,139 +258,98 @@ export const makeAdminServer = Effect.fn("AdminServer.make")(function* (settings
         return redirect(back);
       });
 
-  const showAccounts = page((session) =>
-    admin.records.pipe(
-      Effect.map((records) =>
-        records.map((record) => ({
-          id: record.account.id,
-          name: record.account.name,
-          tokenHint: tokenHint(record.account.token),
-          accountNumber: record.account.configuredAccountNumber,
-          currency: record.account.configuredCurrency,
-          createdAt: record.createdAt,
-          tokenUpdatedAt: record.tokenUpdatedAt,
-        })),
-      ),
-      Effect.map((rows) => ({ rows, error: undefined as Flash | undefined })),
-      Effect.catch((error) => Effect.succeed({ rows: [], error: { kind: "error", text: error.message } as Flash })),
-      Effect.map(({ rows, error }) =>
-        html(accountsPage({ csrf: Redacted.value(session.csrf), flash: error ?? takeFlash(session), accounts: rows })),
-      ),
-    ),
-  );
+  // -- App tabs ------------------------------------------------------------------
 
-  const idOf = (form: URLSearchParams) => field(form, "id") ?? "";
+  /**
+   * The second factor of a verified form (for example approving a held
+   * operation): the single place a tab action is checked beyond the signed-in session,
+   * Origin and CSRF.
+   *
+   * `settings.secondFactor` replaces the check (tests). Otherwise, with an
+   * authenticator secret configured, the form's `totp` code is checked like
+   * a sign-in code: it fails closed (a missing, wrong or already used code
+   * is Rejected, and counts as a failure for this client address). Without
+   * one, every form is Accepted.
+   */
+  const verifySecondFactor: SecondFactorCheck = (request, form) => {
+    if (settings.secondFactor !== undefined) return settings.secondFactor(request, form);
+    if (!password.totpEnabled) return Effect.succeed({ _tag: "Accepted", value: undefined });
+    return password.verifyTotp(clientAddress(request, trustedProxies), field(form, "totp") ?? "");
+  };
 
-  const addAccount = action(ADMIN_PATH, (form) =>
-    admin
-      .add({
-        name: field(form, "name") ?? "",
-        token: field(form, "token") ?? "",
-        accountNumber: field(form, "accountNumber"),
-        currency: field(form, "currency"),
-      })
-      .pipe(Effect.map((name): Flash => ({ kind: "ok", text: `Added “${name}”. Connected clients see it after they reconnect and select it.` }))),
-  );
+  /** Built only for a verified form; nothing is checked or counted unless the action runs it. */
+  const actionContext = (request: Request, form: URLSearchParams): AdminActionContext => ({
+    checkSecondFactor: Effect.suspend(() => verifySecondFactor(request, form)),
+  });
 
-  const renameAccount = action(ADMIN_PATH, (form) =>
-    admin
-      .rename(idOf(form), field(form, "name") ?? "")
-      .pipe(Effect.map((name): Flash => ({ kind: "ok", text: `Renamed to “${name}”.` }))),
-  );
+  /** A tab action as a POST route; its message shows once on `back`, else on `fallback`. */
+  const tabAction = (act: AdminTabAction, fallback: string) =>
+    action(act.back ?? fallback, (form, _session, request) => act.run(form, actionContext(request, form)));
 
-  const rotateToken = action(ADMIN_PATH, (form) =>
-    admin.rotate(idOf(form), field(form, "token") ?? "").pipe(
-      Effect.map(
-        (name): Flash => ({
-          kind: "ok",
-          text: `Replaced the token of “${name}”. Clients authorized before must reconnect and select the account again.`,
-        }),
-      ),
-    ),
-  );
+  const tabRequest = (request: Request): AdminTabRequest => ({ query: queryOf(request), secondFactor: password.totpEnabled });
 
-  const removeAccount = action(ADMIN_PATH, (form) => {
-    if (field(form, "confirm") !== "yes") return Effect.succeed<Flash>({ kind: "error", text: "Tick the box to confirm the removal." });
-    return admin.remove(idOf(form), field(form, "cache") === "purge").pipe(
-      Effect.map(({ name, cache }): Flash => ({ kind: "ok", text: `Removed “${name}”. ${removedCacheText(cache)}` })),
+  /** A tab's page, with the tab current in the nav. */
+  const showTabPage = (tab: AdminTab, render: (csrf: string, request: AdminTabRequest) => Effect.Effect<AdminTabView>) =>
+    page((session, request) => {
+      const csrf = Redacted.value(session.csrf);
+      return Effect.map(render(csrf, tabRequest(request)), (view) =>
+        // A page's own error leaves the session's message for the next page.
+        html(signedInPage(shell, tab.id, csrf, view.error ?? takeFlash(session), view.body), view.status ?? 200),
+      );
+    });
+
+  // -- Connected clients ---------------------------------------------------------
+
+  /** Registered clients with their live grants, resources by current label, and the app's part of each grant's row. */
+  const clientRows = Effect.fnUntraced(function* (csrf: string) {
+    const now = yield* Clock.currentTimeMillis;
+    const clients = yield* oauth.listClients(now);
+    const grants = yield* oauth.listGrants(now);
+    const current = yield* resources.list;
+    const known = new Set(current.map((resource) => resource.id));
+    return clients.map(
+      (client): ClientRow => ({
+        clientId: client.clientId,
+        clientName: client.clientName,
+        redirectUris: client.redirectUris,
+        createdAt: client.createdAt,
+        lastUsedAt: client.lastUsedAt,
+        grants: grants
+          .filter((grant) => grant.clientId === client.clientId)
+          .map((grant) => ({
+            grantId: grant.grantId,
+            scopes: grant.scopes,
+            resources: current.filter((resource) => grant.resources.includes(resource.id)).map((resource) => resource.label),
+            staleResources: grant.resources.filter((id) => !known.has(id)).length,
+            createdAt: grant.createdAt,
+            lastUsedAt: grant.lastUsedAt,
+            settings:
+              grantSettings === undefined
+                ? ""
+                : grantSettings.render(
+                    {
+                      grantId: grant.grantId,
+                      clientId: grant.clientId,
+                      scopes: grant.scopes,
+                      resources: grant.resources,
+                      settings: grant.settings,
+                    },
+                    csrf,
+                  ),
+          })),
+      }),
     );
   });
 
-  const testToken = action(ADMIN_PATH, (form) =>
-    admin.test(idOf(form)).pipe(
-      Effect.map(
-        ({ name, latestStatement }): Flash => ({
-          kind: "ok",
-          text: `FIO accepted the token of “${name}” for reading${latestStatement === undefined ? "" : ` (latest statement ${latestStatement})`}. This does not show whether it may submit payment orders.`,
-        }),
-      ),
-    ),
-  );
-
-  /** Registered clients with their live grants, accounts by current name. */
-  const clientRows = Effect.gen(function* () {
-      const now = yield* Clock.currentTimeMillis;
-      const clients = yield* oauth.listClients(now);
-      const grants = yield* oauth.listGrants(now);
-      const configured = yield* accounts.list;
-      const rows = clients.map(
-        (client): ClientRow => ({
-          clientId: client.clientId,
-          clientName: client.clientName,
-          redirectUris: client.redirectUris,
-          createdAt: client.createdAt,
-          lastUsedAt: client.lastUsedAt,
-          grants: grants
-            .filter((grant) => grant.clientId === client.clientId)
-            .map((grant) => {
-              const covered = configured.filter((account) => grant.accountFingerprints.includes(account.tokenFingerprint));
-              const known = new Set(configured.map((account) => account.tokenFingerprint));
-              return {
-                grantId: grant.grantId,
-                scopes: grant.scopes,
-                accounts: covered.map((account) => account.name),
-                staleTokens: grant.accountFingerprints.filter((fingerprint) => !known.has(fingerprint)).length,
-                createdAt: grant.createdAt,
-                lastUsedAt: grant.lastUsedAt,
-                payments: grant.scopes.includes(SCOPE_PAYMENTS)
-                  ? { values: paymentFormValues(grant.payments, paymentLimits), followsDefaults: grant.payments.limits === null }
-                  : undefined,
-              };
-            }),
-        }),
-      );
-      return rows;
-  });
-
-  const showClients = page((session) =>
-    clientRows.pipe(
-      Effect.map((rows) =>
-        html(
-          clientsPage({
-            csrf: Redacted.value(session.csrf),
-            flash: takeFlash(session),
-            clients: rows,
-            paymentCeiling: paymentLimits,
-          }),
-        ),
-      ),
+  const showClients = page((session) => {
+    const csrf = Redacted.value(session.csrf);
+    return clientRows(csrf).pipe(
+      Effect.map((rows) => html(clientsPage(shell, { csrf, flash: takeFlash(session), clients: rows }))),
       Effect.catch((error) =>
-        Effect.succeed(
-          html(
-            clientsPage({
-              csrf: Redacted.value(session.csrf),
-              flash: { kind: "error", text: error.description },
-              clients: [],
-              paymentCeiling: paymentLimits,
-            }),
-            500,
-          ),
-        ),
+        Effect.succeed(html(clientsPage(shell, { csrf, flash: { kind: "error", text: error.description }, clients: [] }), 500)),
       ),
-    ),
-  );
-
-  const CLIENTS = `${ADMIN_PATH}/clients`;
+    );
+  });
 
   const revokeClient = action(CLIENTS, (form) =>
     oauth.deleteClient(field(form, "client") ?? "").pipe(
@@ -434,166 +376,10 @@ export const makeAdminServer = Effect.fn("AdminServer.make")(function* (settings
     );
   });
 
-  /** A live grant's payment limits and allowlist, never above the ceilings (SEC-26, SEC-27). */
-  const updateGrantPayments = action(
-    CLIENTS,
-    Effect.fnUntraced(function* (form: URLSearchParams) {
-      const grantId = field(form, "grant") ?? "";
-      const parsed = parsePaymentForm(readPaymentForm(form), paymentLimits);
-      if (Result.isFailure(parsed)) return { kind: "error", text: `Payment settings not saved: ${parsed.failure}` } satisfies Flash;
-      const now = yield* Clock.currentTimeMillis;
-      const grant = (yield* oauth.listGrants(now)).find((candidate) => candidate.grantId === grantId);
-      if (grant === undefined || !grant.scopes.includes(SCOPE_PAYMENTS)) {
-        return { kind: "error", text: "That authorization is no longer active or cannot submit payments." } satisfies Flash;
-      }
-      if (!(yield* oauth.updateGrantPayments(grantId, parsed.success, now))) {
-        return { kind: "error", text: "That authorization is no longer active." } satisfies Flash;
-      }
-      yield* Effect.logInfo(`admin: changed the payment settings of a grant (allowlist ${parsed.success.allowlist.mode})`);
-      return { kind: "ok", text: "Saved the payment limits and payee allowlist." } satisfies Flash;
-    }, Effect.mapError((error) => ({ message: error.description }))),
-  );
-
-  // -- Payments (SEC-27, SEC-29) ---------------------------------------------
-
-  const PAYMENTS = `${ADMIN_PATH}/payments`;
-  const PENDING = `${PAYMENTS}/pending`;
-
-  /**
-   * The second factor for approving a held payment batch (SEC-27 confirm,
-   * SEC-03): the single place an approval is checked beyond the signed-in
-   * session, Origin and CSRF. Nothing is uploaded unless it is Accepted.
-   *
-   * `settings.secondFactor` replaces the check (tests). Otherwise, with
-   * FIO_MCP_ADMIN_TOTP_SECRET_FILE set, the form's `totp` code is checked
-   * like a sign-in code: it fails closed (a missing, wrong or already used
-   * code is Rejected, and counts as a failure for this client address).
-   * Without TOTP, every approval is Accepted.
-   */
-  const verifySecondFactor: SecondFactorCheck = (request, form) => {
-    if (settings.secondFactor !== undefined) return settings.secondFactor(request, form);
-    if (!password.totpEnabled) return Effect.succeed({ _tag: "Accepted", value: undefined });
-    return password.verifyTotp(clientAddress(request, trustedProxies), field(form, "totp") ?? "");
-  };
-  /** The pending page asks for an authentication code (`totp`). */
-  const secondFactor = password.totpEnabled;
-
-  /** Audit rows newest first, `?grant=` filters, `?before=` pages back. */
-  const showPayments = (request: Request) => {
-    const query = queryOf(request);
-    const grant = query.get("grant") || undefined;
-    // A malformed or legacy cursor shows the first page.
-    const before = parseAuditCursor(query.get("before") ?? "");
-    return page((session) =>
-      payments.listAudit({ limit: AUDIT_PAGE_ROWS, ...(grant === undefined ? {} : { grantId: grant }), ...(before === undefined ? {} : { before }) }).pipe(
-        Effect.map((rows) => {
-          const last = rows.at(-1);
-          const older =
-            rows.length < AUDIT_PAGE_ROWS || last === undefined
-              ? undefined
-              : `${PAYMENTS}?${new URLSearchParams({ ...(grant === undefined ? {} : { grant }), before: formatAuditCursor(last) })}`;
-          return html(paymentsPage({ csrf: Redacted.value(session.csrf), flash: takeFlash(session), rows, grant, older }));
-        }),
-        Effect.catch((error) =>
-          Effect.succeed(
-            html(
-              paymentsPage({
-                csrf: Redacted.value(session.csrf),
-                flash: { kind: "error", text: error.message },
-                rows: [],
-                grant,
-                older: undefined,
-              }),
-              500,
-            ),
-          ),
-        ),
-      ),
-    )(request);
-  };
-
-  /** Held batches (the service drops expired ones first), payees marked against the grant's allowlist now. */
-  const pendingRows = Effect.gen(function* () {
-    const views = yield* payments.listPending;
-    const grants = yield* oauth
-      .listGrants(yield* Clock.currentTimeMillis)
-      .pipe(Effect.mapError((error) => ({ message: error.description })));
-    return views.map(({ batch, audit }): PendingRow => {
-      const grant = grants.find((candidate) => candidate.grantId === batch.grantId);
-      return {
-        pendingId: batch.pendingId,
-        accountName: batch.accountName,
-        xml: batch.xml,
-        xmlSha256: batch.xmlSha256,
-        expiresAt: batch.expiresAt,
-        audit,
-        unlisted: grant === undefined ? undefined : unlistedPayees(grant.payments.allowlist, audit.payees),
-      };
-    });
-  });
-
-  const showPending = page((session) =>
-    pendingRows.pipe(
-      Effect.map((rows) => html(pendingPage({ csrf: Redacted.value(session.csrf), flash: takeFlash(session), rows, secondFactor }))),
-      Effect.catch((error) =>
-        Effect.succeed(
-          html(
-            pendingPage({ csrf: Redacted.value(session.csrf), flash: { kind: "error", text: error.message }, rows: [], secondFactor }),
-            500,
-          ),
-        ),
-      ),
-    ),
-  );
-
-  /** Uploads the held batch's exact XML once, after the second factor (SEC-27 confirm). */
-  const approvePayment = action(
-    PENDING,
-    Effect.fnUntraced(function* (form: URLSearchParams, _session: AdminSession, request: Request) {
-      const factor = yield* verifySecondFactor(request, form);
-      switch (factor._tag) {
-        case "Rejected":
-          return { kind: "error", text: "The authentication code is wrong. Nothing was uploaded." } satisfies Flash;
-        case "Throttled":
-          return {
-            kind: "error",
-            text: `Too many failed attempts. Try again in ${factor.retryAfterSeconds} s. Nothing was uploaded.`,
-          } satisfies Flash;
-        case "Unavailable":
-          return { kind: "error", text: "The authentication code could not be checked. Nothing was uploaded." } satisfies Flash;
-        case "Accepted":
-          break;
-      }
-      // Checked again under the grant's lock: a grant revoked after the
-      // page loaded makes the approval upload nothing.
-      const grantLive = (grantId: string) =>
-        Effect.flatMap(Clock.currentTimeMillis, (now) => oauth.listGrants(now)).pipe(
-          Effect.map((grants) => grants.some((grant) => grant.grantId === grantId)),
-          Effect.mapError((error) => ({ message: error.description })),
-        );
-      const result = yield* payments.approvePending(field(form, "pending") ?? "", grantLive);
-      yield* Effect.logInfo(`admin: approved a held payment batch (${result.outcome})`);
-      return {
-        kind: result.outcome === "accepted" ? "ok" : "error",
-        text: `Batch ${result.pendingId}: ${result.outcome}. ${result.message}`,
-      } satisfies Flash;
-    }),
-  );
-
-  const declinePayment = action(PENDING, (form) =>
-    payments.declinePending(field(form, "pending") ?? "").pipe(
-      Effect.tap((declined) => (declined ? Effect.logInfo("admin: declined a held payment batch") : Effect.void)),
-      Effect.map(
-        (declined): Flash =>
-          declined
-            ? { kind: "ok", text: "Declined the batch; nothing was sent to FIO." }
-            : { kind: "error", text: "That batch is no longer pending (approved, declined or expired)." },
-      ),
-    ),
-  );
+  // -- Admin password --------------------------------------------------------------
 
   const showPassword = page((session) =>
-    Effect.succeed(html(passwordPage({ csrf: Redacted.value(session.csrf), flash: takeFlash(session) }))),
+    Effect.succeed(html(passwordPage(shell, { csrf: Redacted.value(session.csrf), flash: takeFlash(session) }))),
   );
 
   const changePassword = action(
@@ -618,7 +404,7 @@ export const makeAdminServer = Effect.fn("AdminServer.make")(function* (settings
           const renewed = yield* sessions.signIn(session, result.value);
           yield* sessions.endOthers(renewed.session);
           renewed.session.flash = { kind: "ok", text: "Password changed. Every other admin session was signed out." };
-          return redirect(`${ADMIN_PATH}/password`, sessionCookie(Redacted.value(renewed.cookie), ADMIN_ABSOLUTE_MS));
+          return redirect(`${ADMIN_PATH}/password`, cookie(Redacted.value(renewed.cookie), ADMIN_ABSOLUTE_MS));
         }
       }
     }),
@@ -633,29 +419,26 @@ export const makeAdminServer = Effect.fn("AdminServer.make")(function* (settings
     return redirect(`${ADMIN_PATH}/login`, clearedCookie);
   });
 
+  // -- Routes ----------------------------------------------------------------------
+
   const routes: ReadonlyArray<{
     readonly method: "GET" | "POST";
     readonly path: `/${string}`;
     readonly handler: (request: Request) => Effect.Effect<Response, never, Scope.Scope>;
   }> = [
-    { method: "GET", path: ADMIN_PATH, handler: showAccounts },
+    ...tabs.map((tab) => ({ method: "GET" as const, path: tab.path, handler: showTabPage(tab, tab.render) })),
+    ...tabs.flatMap((tab) =>
+      (tab.pages ?? []).map((sub) => ({ method: "GET" as const, path: sub.path, handler: showTabPage(tab, sub.render) })),
+    ),
     { method: "GET", path: `${ADMIN_PATH}/login`, handler: showLogin },
     { method: "POST", path: `${ADMIN_PATH}/login`, handler: submitLogin },
     { method: "POST", path: `${ADMIN_PATH}/logout`, handler: logout },
-    { method: "POST", path: `${ADMIN_PATH}/accounts/add`, handler: addAccount },
-    { method: "POST", path: `${ADMIN_PATH}/accounts/rename`, handler: renameAccount },
-    { method: "POST", path: `${ADMIN_PATH}/accounts/rotate`, handler: rotateToken },
-    { method: "POST", path: `${ADMIN_PATH}/accounts/remove`, handler: removeAccount },
-    { method: "POST", path: `${ADMIN_PATH}/accounts/test`, handler: testToken },
+    ...tabs.flatMap((tab) => tab.actions.map((act) => ({ method: "POST" as const, path: act.path, handler: tabAction(act, tab.path) }))),
     { method: "GET", path: CLIENTS, handler: showClients },
     { method: "POST", path: `${CLIENTS}/revoke`, handler: revokeClient },
     { method: "POST", path: `${ADMIN_PATH}/grants/revoke`, handler: revokeGrant },
     { method: "POST", path: `${CLIENTS}/revoke-all`, handler: revokeAll },
-    { method: "POST", path: `${ADMIN_PATH}/grants/payments`, handler: updateGrantPayments },
-    { method: "GET", path: PAYMENTS, handler: showPayments },
-    { method: "GET", path: PENDING, handler: showPending },
-    { method: "POST", path: `${PENDING}/approve`, handler: approvePayment },
-    { method: "POST", path: `${PENDING}/decline`, handler: declinePayment },
+    ...(grantSettings?.actions ?? []).map((act) => ({ method: "POST" as const, path: act.path, handler: tabAction(act, CLIENTS) })),
     { method: "GET", path: `${ADMIN_PATH}/password`, handler: showPassword },
     { method: "POST", path: `${ADMIN_PATH}/password`, handler: changePassword },
   ];
@@ -665,9 +448,9 @@ export const makeAdminServer = Effect.fn("AdminServer.make")(function* (settings
 
 /**
  * Admin routes: every route `routes` adds to the router answers 404 to
- * clients outside `settings.allowedNetworks` (FIO_MCP_ADMIN_ALLOWED_CIDRS).
- * The restriction is route middleware over the whole layer, so a route
- * registered here is covered without being listed anywhere.
+ * clients outside `settings.allowedNetworks`. The restriction is route
+ * middleware over the whole layer, so a route registered here (an app tab's
+ * page or form among them) is covered without being listed anywhere.
  */
 export const adminRoutes = <E, R>(settings: AdminSettings, routes: Layer.Layer<never, E, R>) =>
   routes.pipe(
@@ -676,19 +459,21 @@ export const adminRoutes = <E, R>(settings: AdminSettings, routes: Layer.Layer<n
     ),
   );
 
-/** Registers the admin routes on the router (HTTP mode with OAuth), behind `adminRoutes`. */
-export const AdminLive = (
+/**
+ * Registers the admin routes on the router (HTTP mode with OAuth), behind
+ * `adminRoutes`, with the app's tabs in the nav where each asks; `tabs` is
+ * built once, with the layer.
+ */
+export const AdminLive = <R>(
   settings: AdminSettings,
-): Layer.Layer<
-  never,
-  never,
-  HttpRouter.HttpRouter | SqlClient.SqlClient | Accounts | AdminPassword | FioApi | Transactions | PaymentControls | AppConfig
-> =>
+  app: AdminApp,
+  tabs: Effect.Effect<ReadonlyArray<AdminTab>, never, R>,
+): Layer.Layer<never, never, HttpRouter.HttpRouter | SqlClient.SqlClient | Resources | AdminPassword | R> =>
   adminRoutes(
     settings,
     Layer.effectDiscard(
       Effect.gen(function* () {
-        const server = yield* makeAdminServer(settings);
+        const server = yield* makeAdminServer(settings, app, yield* tabs);
         const router = yield* HttpRouter.HttpRouter;
         for (const route of server.routes) yield* router.add(route.method, route.path, route.handler);
       }),

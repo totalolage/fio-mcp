@@ -7,7 +7,7 @@ import { Transactions } from "../src/cache/service.js";
 import { accountSeedOf } from "../src/config.js";
 import { FioBadRequest } from "../src/errors.js";
 import { RateLimiter } from "../src/rate-limiter.js";
-import { Redactor } from "../src/redaction.js";
+import { RedactorDefault } from "../src/redaction.js";
 import { account, config, serveFrom, setNow } from "./support/cache.js";
 import { seededConfig } from "./support/config.js";
 import { testDatabase } from "./support/database.js";
@@ -27,7 +27,7 @@ describe("token test at /admin", () => {
       const layer = Transactions.Default.pipe(
         Layer.provideMerge(Accounts.stored(ADMIN_KEY, accountSeedOf(cfg.accounts))),
         Layer.provideMerge(testDatabase(":memory:", SERVER_MIGRATIONS)),
-        Layer.provideMerge(Layer.mergeAll(Redactor.Default, fio.layer, RateLimiter.Default)),
+        Layer.provideMerge(Layer.mergeAll(RedactorDefault, fio.layer, RateLimiter.Default)),
         Layer.provideMerge(seededConfig(cfg)),
       );
       yield* Effect.gen(function* () {

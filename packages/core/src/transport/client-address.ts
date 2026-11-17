@@ -5,7 +5,7 @@ import { IpNetwork, NetAddress } from "effect/net";
 /**
  * The client address used to throttle logins and authorization requests.
  *
- * Without trusted proxies (FIO_MCP_TRUSTED_PROXIES empty) it is the socket
+ * Without trusted proxies (none configured) it is the socket
  * peer and forwarding headers are ignored. When the peer is a trusted proxy,
  * X-Forwarded-For is walked from the right past trusted proxies; the first
  * address that is not one is the client (entries further left were written
@@ -26,7 +26,7 @@ const parseAddress = (input: string): NetAddress.IpAddress | undefined => {
 };
 
 /**
- * A FIO_MCP_TRUSTED_PROXIES entry: an IP address or a CIDR network.
+ * A trusted proxy entry: an IP address or a CIDR network.
  * IPv4-mapped IPv6 networks are refused (peers are matched as IPv4, so they
  * would never match); write them as IPv4.
  */
@@ -74,11 +74,19 @@ export const clientAddress = (
   return ip === undefined ? UNKNOWN_ADDRESS : NetAddress.formatIp(ip);
 };
 
-export const UNTRUSTED_FORWARDING_WARNING =
-  "X-Forwarded-For received from an untrusted peer; set FIO_MCP_TRUSTED_PROXIES to the proxy's address.";
+/**
+ * The warning about X-Forwarded-For from an untrusted peer. `setting` names
+ * the app's trusted-proxy setting (an environment variable, for example).
+ */
+export const untrustedForwardingWarning = (setting: string): string =>
+  `X-Forwarded-For received from an untrusted peer; set ${setting} to the proxy's address.`;
+
+/** untrustedForwardingWarning for an app that names no setting. */
+export const UNTRUSTED_FORWARDING_WARNING = untrustedForwardingWarning("the trusted proxies");
 
 /**
- * A check that logs UNTRUSTED_FORWARDING_WARNING the first time a request
+ * A check that logs untrustedForwardingWarning(setting) (default
+ * UNTRUSTED_FORWARDING_WARNING) the first time a request
  * carries X-Forwarded-For from a socket peer outside `trustedProxies` (a
  * reverse proxy that is not configured as trusted, so every client shares
  * its address for sign-in throttling). It warns once per check; no address
@@ -86,7 +94,9 @@ export const UNTRUSTED_FORWARDING_WARNING =
  */
 export const makeUntrustedForwardingCheck = (
   trustedProxies: ReadonlyArray<IpNetwork.IpNetwork>,
+  setting?: string,
 ): ((request: HttpServerRequest.HttpServerRequest) => Effect.Effect<void>) => {
+  const warning = setting === undefined ? UNTRUSTED_FORWARDING_WARNING : untrustedForwardingWarning(setting);
   let warned = false;
   return (request) =>
     Effect.suspend(() => {
@@ -94,6 +104,6 @@ export const makeUntrustedForwardingCheck = (
       const peer = Option.getOrUndefined(Option.map(request.remoteAddress, parseAddress));
       if (peer !== undefined && trustedProxies.some((network) => IpNetwork.contains(network, peer))) return Effect.void;
       warned = true;
-      return Effect.logWarning(UNTRUSTED_FORWARDING_WARNING);
+      return Effect.logWarning(warning);
     });
 };

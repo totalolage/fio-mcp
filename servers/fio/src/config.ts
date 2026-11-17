@@ -1,10 +1,11 @@
 import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem";
+import { decodeBase32, MIN_TOTP_SECRET_BYTES } from "@mcps/core/admin/totp.js";
+import { type PasswordHash, PasswordHashError } from "@mcps/core/oauth/crypto.js";
+import { parseTrustedProxy } from "@mcps/core/transport/client-address.js";
 import { Config, Context, Effect, FileSystem, Layer, Option, Predicate, Redacted, Result, Schema } from "effect";
 import type { IpNetwork } from "effect/net";
-import { decodeBase32, MIN_TOTP_SECRET_BYTES } from "./admin/totp.js";
 import { ConfigError } from "./errors.js";
-import { type PasswordHash, PasswordHashError, parsePasswordHash } from "./oauth/crypto.js";
-import { parseFioBaseUrl, parsePublicUrl } from "./oauth/urls.js";
+import { parseFioBaseUrl, parsePasswordHash, parsePublicUrl } from "./identity.js";
 import {
   type CurrencyAmounts,
   DEFAULT_PAYMENT_LIMITS,
@@ -14,7 +15,6 @@ import {
   toCents,
 } from "./payment-limits.js";
 import { parseDataKey } from "./token-crypto.js";
-import { parseTrustedProxy } from "./transport/client-address.js";
 
 /**
  * Configuration from the environment, through Effect's ConfigProvider.
@@ -81,6 +81,9 @@ export type TransportConfig =
        */
       readonly adminListener?: { readonly host: string; readonly port: number } | undefined;
     };
+
+/** The HTTP transport settings; core's HttpTransportConfig is a subset. */
+export type HttpTransportConfig = Extract<TransportConfig, { readonly kind: "http" }>;
 
 /**
  * How /mcp is protected. `oauth`: the embedded authorization server

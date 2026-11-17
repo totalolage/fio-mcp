@@ -4,8 +4,9 @@ import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import { ByteSize, Clock, Effect, Exit, Fiber, Layer, Predicate, Result, Schema, type Scope, type Types } from "effect";
 import { McpServer } from "effect/ai";
 import { Headers, HttpEffect, HttpMiddleware, HttpRouter, type HttpServerError, HttpServerRequest, HttpServerResponse } from "effect/http";
-import { Accounts } from "../accounts.js";
-import type { TransportConfig } from "../config.js";
+import type { IpNetwork } from "effect/net";
+import { ToolPolicy } from "../mcp/grants.js";
+import { Resources } from "../resources.js";
 import { Auth } from "./auth.js";
 import { grantProtocols } from "./grant-tools.js";
 import { guard, HEALTH_PATH, InternalRequest } from "./guard.js";
@@ -21,11 +22,29 @@ import type { ServerInfo } from "./server-info.js";
  * rejects foreign Origin headers. Every response body is redacted on the
  * way out.
  * /healthz bypasses the guard so container and proxy probes work with any
- * Host header and without credentials; it touches neither FIO nor the
- * network.
+ * Host header and without credentials; it touches neither upstream services
+ * nor the network.
  */
 
-export type HttpTransportConfig = Extract<TransportConfig, { readonly kind: "http" }>;
+/** The HTTP transport's settings; the app loads them from its configuration. */
+export interface HttpTransportConfig {
+  readonly host: string;
+  readonly port: number;
+  /** Exact Origin values accepted on /mcp. Requests without Origin are accepted. */
+  readonly allowedOrigins: ReadonlyArray<string>;
+  /** Accepted Host header values (host or host:port). Empty accepts any. */
+  readonly allowedHosts: ReadonlyArray<string>;
+  /**
+   * Reverse proxies whose X-Forwarded-For names the client address for
+   * login and authorization throttling. Empty trusts no one.
+   */
+  readonly trustedProxies: ReadonlyArray<IpNetwork.IpNetwork>;
+  /**
+   * The name of the app's trusted-proxy setting, for the warning about
+   * X-Forwarded-For from an untrusted peer (client-address.ts).
+   */
+  readonly trustedProxiesSetting?: string | undefined;
+}
 
 export { HEALTH_PATH, isAllowedHost, redactResponse } from "./guard.js";
 
@@ -291,7 +310,7 @@ const mcpAuth = HttpRouter.middleware(
     const terminate = (session: string, protocolVersion: string | undefined) => {
       // @effect-diagnostics-next-line anyUnknownInErrorContext:off
       routed ??= Effect.exit(router.asHttpEffect());
-      const request = HttpServerRequest.fromWeb(new Request(`http://fio-mcp.internal${MCP_PATH}`, { method: "DELETE" })).modify({
+      const request = HttpServerRequest.fromWeb(new Request(`http://mcps.internal${MCP_PATH}`, { method: "DELETE" })).modify({
         headers: Headers.fromInput({
           [MCP_SESSION_HEADER]: session,
           ...(protocolVersion === undefined ? {} : { [MCP_PROTOCOL_VERSION_HEADER]: protocolVersion }),
@@ -416,7 +435,8 @@ const mcpAuth = HttpRouter.middleware(
  * The router app: `app` (tool registrations and anything else that needs
  * `McpServer`) at /mcp, with /healthz and the guards. `auth` is built inside
  * it, so it may add routes of its own (those pass the Host allowlist but not
- * `Auth`). `tools/list` follows each request's grant (grant-tools.ts).
+ * `Auth`). `tools/list` follows each request's grant (grant-tools.ts): the
+ * app's `Resources` and `ToolPolicy`.
  * Usable with `HttpRouter.serve` or `HttpRouter.toWebHandler`.
  */
 export const httpRouterApp = <A, E, R, EA, RA>(
@@ -425,14 +445,15 @@ export const httpRouterApp = <A, E, R, EA, RA>(
   info: ServerInfo,
   config: HttpTransportConfig,
 ) =>
-  Layer.mergeAll(app, HealthRoute, guard(config.allowedHosts, config.trustedProxies)).pipe(
+  Layer.mergeAll(app, HealthRoute, guard(config.allowedHosts, config.trustedProxies, config.trustedProxiesSetting)).pipe(
     Layer.provideMerge(
       Layer.unwrap(
         Effect.gen(function* () {
-          const accounts = yield* Accounts;
+          const resources = yield* Resources;
+          const policy = yield* ToolPolicy;
           return McpServer.layerHttp({
             ...info,
-            protocols: grantProtocols(info.protocols, accounts.list),
+            protocols: grantProtocols(info.protocols, resources.list, policy),
             path: MCP_PATH,
             allowedOrigins: config.allowedOrigins,
             allowSessionTermination: true,

@@ -1,0 +1,27 @@
+{
+  "name": "@mcps/core",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Shared MCP server scaffolding: transports, OAuth, admin shell and grants",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    "./*.js": {
+      "types": "./dist/*.d.ts",
+      "default": "./dist/*.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22.13"
+  },
+  "dependencies": {
+    "@effect/platform-node": "4.0.6",
+    "effect": "4.0.6"
+  },
+  "devDependencies": {
+    "@effect/sql-sqlite-node": "4.0.6"
+  }
+}

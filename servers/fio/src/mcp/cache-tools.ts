@@ -12,9 +12,8 @@ import {
 import { AppConfig } from "../config.js";
 import { InvalidInput } from "../errors.js";
 import { Redactor } from "../redaction.js";
-import { annotateTool, DateParam, guardedOutput, JsonObject, ToolFailure, withAccount } from "./common.js";
+import { annotateTool, DateParam, guardedOutput, JsonObject, ToolFailure, toolsForAccounts, withAccount } from "./common.js";
 import { permittedAccount, READ, requireScopes, visibleAccounts } from "./permissions.js";
-import { toolsForAccounts } from "./registration.js";
 import { CURRENCY, G, type GuardSpec, markLegacyExcerpt, STATEMENT_GUARD } from "./untrusted.js";
 
 /**

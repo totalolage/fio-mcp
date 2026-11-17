@@ -16,13 +16,15 @@ The API reference this server is built against is in [docs/fio-api.md](docs/fio-
 
 ## Install and build
 
+fio-mcp is the `servers/fio` workspace of this repository; `@mcps/core` (`packages/core`) holds the parts shared with other MCP servers. Run the commands from the repository root:
+
 ```sh
-bun install          # also patches TypeScript for Effect diagnostics and builds dist/
-bun run build        # compiles to dist/
+bun install          # also patches TypeScript for Effect diagnostics and builds packages/core/dist/ and servers/fio/dist/
+bun run build        # compiles both to their dist/
 bun run test
 ```
 
-Run it with `node dist/main.js` or, once installed as a package, `bunx fio-mcp`. By default it speaks MCP over stdio and logs only to stderr. See [HTTP transport and OAuth](#http-transport-and-oauth) for running it as a network service.
+Run it with `node servers/fio/dist/main.js` or, once installed as a package, `bunx fio-mcp`. By default it speaks MCP over stdio and logs only to stderr. See [HTTP transport and OAuth](#http-transport-and-oauth) for running it as a network service.
 
 | Command | What it does |
 |---|---|
@@ -149,7 +151,7 @@ Claude Desktop (`claude_desktop_config.json`) or any client that uses the same f
   "mcpServers": {
     "fio": {
       "command": "node",
-      "args": ["/path/to/fio-mcp/dist/main.js"],
+      "args": ["/path/to/fio-mcp/servers/fio/dist/main.js"],
       "env": {
         "FIO_TOKEN": "your-64-character-token"
       }
@@ -365,7 +367,7 @@ By default the cache stores movements in plaintext, which suits a database on en
 The cache is not fully reproducible: history older than 90 days needs a fresh Internetbanking authorization to download again. Back it up with:
 
 ```sh
-fio-mcp backup /path/to/fio-backup.sqlite          # or: node dist/main.js backup …
+fio-mcp backup /path/to/fio-backup.sqlite          # or: node servers/fio/dist/main.js backup …
 docker exec <container> node dist/main.js backup /data/fio-backup-$(date +%F).sqlite
 ```
 
@@ -576,7 +578,7 @@ Traefik appends the client's address to `X-Forwarded-For`; addresses a client ad
 
 ## Container and NAS deployment
 
-The [Dockerfile](Dockerfile) builds from a clean clone with only `docker build .` (multi-stage, Node 24 LTS pinned by digest, linux/amd64). The runtime image has production dependencies and `dist/` only, serves HTTP on port 3000, and keeps its database in `/data`:
+The [Dockerfile](Dockerfile) builds from a clean clone with only `docker build -f servers/fio/Dockerfile .`, run at the repository root (multi-stage, Node 24 LTS pinned by digest, linux/amd64). The runtime image has production dependencies and the compiled `dist/` of fio-mcp and `@mcps/core` only, serves HTTP on port 3000, and keeps its database in `/data`:
 
 - Defaults: `FIO_MCP_TRANSPORT=http`, `FIO_DB_PATH=/data/fio.sqlite`.
 - Runs as any non-root UID with a read-only root filesystem, no capabilities and `no-new-privileges`. Nothing is written outside `/data`, including SQLite's temporary data (`temp_store=MEMORY`) and its WAL files.
@@ -648,7 +650,7 @@ To fill in history older than 90 days after an Internetbanking unlock, restart t
 
 ### Shipping the image to your server
 
-Images never go through a registry. [scripts/ship-image.sh](scripts/ship-image.sh) builds the image on your machine and streams it to the docker host over ssh (`docker save | gzip | ssh <host> "sudo -n docker load"`). Docker load reads gzip-compressed tar input directly. There is no CI.
+Images never go through a registry. [scripts/ship-image.sh](../../scripts/ship-image.sh) builds the image on your machine and streams it to the docker host over ssh (`docker save | gzip | ssh <host> "sudo -n docker load"`). Docker load reads gzip-compressed tar input directly. CI ([.github/workflows/ci.yml](../../.github/workflows/ci.yml)) only runs the checks; it never builds or ships the image.
 
 Prerequisites:
 
@@ -712,11 +714,11 @@ bun run check        # all three
 
 ### Effect diagnostics in tsc
 
-`bun install` runs `prepare`, which calls `effect-tsgo patch --typescript --no-oxlint` (from `@effect/tsgo`, as in deskohub). It patches the TypeScript 7 compiler so `tsc` also reports the Effect language-service diagnostics configured in `tsconfig.json`'s `@effect/language-service` plugin block. Floating Effects, unhandled errors or requirements, `any`/`unknown` in error channels, global `fetch`, `try/catch` inside generators and similar are errors, and warnings fail the build too. If `bun run typecheck` stops reporting `effect(...)` diagnostics, run `bunx effect-tsgo patch --typescript --no-oxlint` again. Editors need the same patched TypeScript or the Effect language-service extension.
+`bun install` runs `prepare`, which calls `effect-tsgo patch --typescript --no-oxlint` (from `@effect/tsgo`, as in deskohub). It patches the TypeScript 7 compiler so `tsc` also reports the Effect language-service diagnostics configured in the `@effect/language-service` plugin block of the root `tsconfig.base.json`. Floating Effects, unhandled errors or requirements, `any`/`unknown` in error channels, global `fetch`, `try/catch` inside generators and similar are errors, and warnings fail the build too. If `bun run typecheck` stops reporting `effect(...)` diagnostics, run `bunx effect-tsgo patch --typescript --no-oxlint` again. Editors need the same patched TypeScript or the Effect language-service extension.
 
 ### Dependencies
 
-`bunfig.toml` and `package.json` set the install policy:
+The root `bunfig.toml` and `package.json` set the install policy for every workspace:
 
 - `minimumReleaseAge = 604800`: `bun install` and `bun update` only resolve versions published at least 7 days earlier. There are no exceptions (`minimumReleaseAgeExcludes`): if the code needs a newer release, wait until it is 7 days old.
 - `"trustedDependencies": []`: no dependency's `preinstall`, `install` or `postinstall` script runs, including the packages Bun would otherwise trust by default. Only this project's own `prepare` runs. `bun pm untrusted` lists dependencies whose scripts were skipped.
@@ -725,20 +727,21 @@ bun run check        # all three
 
 ### Lint rules
 
-Biome runs its recommended rules (with `noExplicitAny` and `noConsole` as errors) plus Grit plugins in `lint/`:
+Biome runs its recommended rules (with `noExplicitAny` and `noConsole` as errors) plus Grit plugins in the root `lint/`:
 
-| Rule | Forbids in `src/` |
+| Rule | Forbids in each workspace's `src/` |
 |---|---|
 | `no-throw-in-effect-modules` | `throw`: model failures as tagged errors |
 | `no-promise-in-effect-modules` | `new Promise` and `await`: use Effect values |
 | `no-direct-effect-runs` | `Effect.run*` outside `src/main.ts` |
 | `no-direct-process-env` | `process.env`: read configuration through Effect `Config` |
 | `prefer-effect-fn` | arrow functions that only wrap `Effect.gen`: use `Effect.fn` |
+| `core-import-boundary` | in `packages/core` (tests included): importing `fio-mcp`, anything under `servers/`, or a relative path outside the package |
 | `no-standalone-capability-layers` | a standalone `FooDefault`/`FooLive` constant for a `Context.Service` `Foo` (in tests too): use the static `Foo.Default` (requirements open) and `Foo.Live` (fully wired) |
 
 ### OpenAPI spec and the generated client
 
-FIO's REST API is described in [openapi/fio-api.yaml](openapi/fio-api.yaml) (OpenAPI 3.1, written from FIO's PDF v1.9; see docs/fio-api.md). `src/generated/effect.gen.ts` is generated from it with `@effect/openapi-generator` and committed, as in deskohub; never edit it by hand.
+FIO's REST API is described in [openapi/fio-api.yaml](openapi/fio-api.yaml) (OpenAPI 3.1, written from FIO's PDF v1.9; see [docs/fio-api.md](docs/fio-api.md)). `src/generated/effect.gen.ts` is generated from it with `@effect/openapi-generator` and committed, as in deskohub; never edit it by hand.
 
 1. Edit `openapi/fio-api.yaml`.
 2. Run `bun run generate` (`scripts/generate-fio-client.ts`, run by Node's TypeScript type stripping).
@@ -748,26 +751,29 @@ The generator only decodes JSON success bodies. Operations that FioApi reads as 
 
 ### Layout
 
+Paths are relative to `servers/fio`. Transports, OAuth, the admin shell and grant handling shared with other servers live in [`packages/core`](../../packages/core); the repository root holds the workspace tooling (`bun.lock`, Biome and its `lint/` rules, `tsconfig.base.json`) and `scripts/ship-image.sh`.
+
 ```
 src/
   main.ts               entry point (bin): serve and the CLI commands
   app.ts                layer composition: services, tools, background sync, transports
   config.ts             AppConfig from the environment and *_FILE secrets
+  identity.ts           the app identity (`fio-mcp`, `fio` ID prefix) core derives cookie names, page titles and token prefixes from
   errors.ts             tagged errors and HTTP status mapping
-  redaction.ts          Redactor service and the redacting stderr logger
+  redaction.ts          Redactor service with the FIO token path scrubber (core has the redactor and the redacting stderr logger)
   rate-limiter.ts       per-token dispatcher with interactive and background queues
   accounts.ts           the accounts (from the environment, or stored and changeable at runtime), token fingerprints, learned payer details
   account-store.ts      encrypted accounts and server settings in SQLite, import from the environment
   account-migrations.ts the account store's tables
   account-runtime.ts    sync jobs and rate limiters following account changes
-  token-crypto.ts       data key and AES-256-GCM token encryption
+  token-crypto.ts       data key and token encryption on core's AES-256-GCM seal
   instance-lease.ts     single-instance lease in the database
   payment-limits.ts     server ceilings, grant limits and payee allowlist rules
   payment-controls.ts   limits, allowlist, provenance and idempotency around submit; held batches
   payment-ledger.ts     payment audit log, idempotency records and held batches in SQLite
   payment-form.ts       the payment settings form of the consent and clients pages
   payment-cli.ts        `payments purge`
-  admin/                admin UI: sessions, pages, account changes, admin password, TOTP, payments
+  admin/                the admin UI's FIO accounts and payments tabs and their wiring into core's admin (core has the login, sessions, admin password, TOTP and page shell)
   fio-api.ts            FioApi service: interface and adapter on the generated client
   generated/            generated OpenAPI client (do not edit)
   statement.ts          JSON statement normalisation
@@ -775,11 +781,14 @@ src/
   fio-countries.ts      country codes from the XSD's country_type enumeration
   import-response.ts    import response parser
   cache/                SQLite database, migrations, store, sync engine, Transactions service, encryption at rest
-  mcp/                  tool definitions and handlers (FIO tools, cache tools), bank-text guards, registration that follows the accounts
-  transport/            stdio and HTTP transports, auth seam, Host check, admin network allowlist and listener, frame redaction, grant-filtered tools/list
+  mcp/                  tool definitions and handlers (FIO tools, cache tools), their scopes and the bank-text guards (core registers them as the accounts change)
+  oauth/                the OAuth scopes and consent choices, and the client and token admin commands
+  transport/            the auth layer for fio's accounts (core has the stdio and HTTP transports, Host check, admin network allowlist and listener, frame redaction, grant-filtered tools/list)
 openapi/fio-api.yaml    FIO REST API spec
-scripts/                client generator, image ship script
-lint/                   Biome Grit rules
+docs/fio-api.md         FIO API reference
+assets/icon.svg         icon
+scripts/                OpenAPI client generator
+Dockerfile              image build (context: repository root)
 test/                   vitest + @effect/vitest suites
 ```
 

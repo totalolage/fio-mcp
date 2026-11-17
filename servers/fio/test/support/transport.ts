@@ -4,10 +4,11 @@ import { Transactions } from "../../src/cache/service.js";
 import { type AppConfig, type AppConfigShape, MAX_RESPONSE_BYTES, type TransportConfig } from "../../src/config.js";
 import type { CacheError } from "../../src/errors.js";
 import type { FioApi, FioApiShape } from "../../src/fio-api.js";
+import { ConfiguredToolPolicy } from "../../src/mcp/tool-policy.js";
 import type { PaymentControls } from "../../src/payment-controls.js";
 import { DEFAULT_PAYMENT_LIMITS } from "../../src/payment-limits.js";
 import { RateLimiter } from "../../src/rate-limiter.js";
-import { Redactor } from "../../src/redaction.js";
+import { type Redactor, RedactorDefault } from "../../src/redaction.js";
 import { seededConfig } from "./config.js";
 import { slotHoldingFio } from "./fio-api.js";
 import { memoryPaymentControls } from "./payments.js";
@@ -69,7 +70,8 @@ export const testServices = <E = never, R = never, PE = never, PR = never>(
 ) =>
   Layer.mergeAll(Transactions.Disabled, payments).pipe(
     Layer.provideMerge(slotHoldingFio(release, fio)),
+    Layer.provideMerge(Layer.mergeAll(Accounts.resources, ConfiguredToolPolicy)),
     Layer.provideMerge(Layer.mergeAll(accounts, RateLimiter.Default)),
-    Layer.provideMerge(Redactor.Default),
+    Layer.provideMerge(RedactorDefault),
     Layer.provideMerge(seededConfig(config)),
   );

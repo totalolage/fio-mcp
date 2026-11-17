@@ -1,8 +1,10 @@
+import { MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH } from "@mcps/core/admin/password.js";
+import { encodeBase32, newTotpSecret, otpauthUri } from "@mcps/core/admin/totp.js";
+import { hashPassword, type ScryptParams } from "@mcps/core/oauth/crypto.js";
+import { makeOAuthStore } from "@mcps/core/oauth/store.js";
 import { Clock, DateTime, Effect, Queue, Redacted, Schema, Stdio, Stream, Terminal } from "effect";
 import { makeSettingsStore, SETTING } from "../account-store.js";
-import { encodeBase32, newTotpSecret, otpauthUri } from "../admin/totp.js";
-import { hashPassword, type ScryptParams } from "./crypto.js";
-import { makeOAuthStore } from "./store.js";
+import { FIO_APP } from "../identity.js";
 
 /**
  * Admin commands: `hash-password` and `totp-init` (need no configuration) and the OAuth
@@ -13,9 +15,6 @@ import { makeOAuthStore } from "./store.js";
 export class CommandFailed extends Schema.TaggedError<CommandFailed>()("CommandFailed", {
   message: Schema.String,
 }) {}
-
-export const MIN_PASSWORD_LENGTH = 12;
-export const MAX_PASSWORD_LENGTH = 1024;
 
 const write = (sink: "stdout" | "stderr", text: string) =>
   Effect.flatMap(Stdio.Stdio, (stdio) =>
@@ -71,7 +70,7 @@ export const hashPasswordCommand = Effect.fn("cli.hashPassword")(function* (para
  */
 export const totpInitCommand = Effect.fn("cli.totpInit")(function* () {
   const secret = yield* Effect.sync(newTotpSecret);
-  yield* write("stdout", `${encodeBase32(secret)}\n${otpauthUri(secret)}\n`);
+  yield* write("stdout", `${encodeBase32(secret)}\n${otpauthUri(FIO_APP, secret)}\n`);
   yield* write(
     "stderr",
     "Line 1 is the secret: store it in the file FIO_MCP_ADMIN_TOTP_SECRET_FILE names (e.g. `fio-mcp totp-init | head -n 1 > totp_secret`).\nLine 2 is the URI to add to an authenticator app (as a QR code or by hand). Nothing was stored.\n",

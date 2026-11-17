@@ -75,11 +75,13 @@ if [ -n "$compress" ] && [ -z "$dry_run" ] && ! command -v gzip >/dev/null 2>&1;
   exit 2
 fi
 
-version=$(node -p "require('./package.json').version")
+# The image ships the fio server, so its workspace manifest carries the
+# version; the root package.json is the private workspace root.
+version=$(node -p "require('./servers/fio/package.json').version")
 sha=$(git rev-parse --short HEAD)
 case $version in
   '' | [!0-9A-Za-z]* | *[!0-9A-Za-z._-]*)
-    echo "error: package.json version '$version' is not usable in a docker tag" >&2
+    echo "error: servers/fio/package.json version '$version' is not usable in a docker tag" >&2
     exit 2
     ;;
 esac
@@ -107,6 +109,7 @@ trap 'handle_signal 143' TERM
 if docker buildx version >/dev/null 2>&1; then
   docker buildx build \
     --platform linux/amd64 \
+    --file servers/fio/Dockerfile \
     --tag "$tag" \
     --tag "fio-mcp:$version" \
     --load \
@@ -115,6 +118,7 @@ else
   echo "docker buildx is not available; building with docker build" >&2
   docker build \
     --platform linux/amd64 \
+    --file servers/fio/Dockerfile \
     --tag "$tag" \
     --tag "fio-mcp:$version" \
     . >&2
@@ -133,10 +137,11 @@ if ! docker run --rm --network none --entrypoint sh "$tag" \
   echo "error: $tag contains node_modules/redis or node_modules/@redis" >&2
   exit 1
 fi
-# Every compiled module except the entrypoint must still resolve without the
-# omitted peers. main.js is left out because importing it starts the server.
+# Every compiled module except the entrypoint, in the server's dist and in
+# the core workspace's, must still resolve without the omitted peers.
+# main.js is left out because importing it starts the server.
 if ! docker run --rm --network none --entrypoint node "$tag" --input-type=module \
-  -e 'for (const f of (await import("node:fs")).readdirSync("/app/dist", { recursive: true })) if (f.endsWith(".js") && f !== "main.js") await import(`/app/dist/${f}`);' >&2; then
+  -e 'for (const d of ["/app/dist", "/app/packages/core/dist"]) for (const f of (await import("node:fs")).readdirSync(d, { recursive: true })) if (f.endsWith(".js") && !(d === "/app/dist" && f === "main.js")) await import(`${d}/${f}`);' >&2; then
   echo "error: $tag cannot load its modules; a dependency is missing from node_modules" >&2
   exit 1
 fi

@@ -7,7 +7,7 @@ import { SERVER_MIGRATIONS } from "../src/cache/db.js";
 import { Transactions } from "../src/cache/service.js";
 import { accountSeedOf } from "../src/config.js";
 import { RateLimiter } from "../src/rate-limiter.js";
-import { Redactor } from "../src/redaction.js";
+import { RedactorDefault } from "../src/redaction.js";
 import { account, config, setNow, settle, TOKEN_A, TOKEN_B } from "./support/cache.js";
 import { seededConfig } from "./support/config.js";
 import { testDatabase } from "./support/database.js";
@@ -57,7 +57,7 @@ describe("following account changes made at /admin", () => {
         Layer.provideMerge(Transactions.Default),
         Layer.provideMerge(Accounts.stored(ADMIN_KEY, accountSeedOf(cfg.accounts))),
         Layer.provideMerge(testDatabase(":memory:", SERVER_MIGRATIONS)),
-        Layer.provideMerge(Layer.mergeAll(Redactor.Default, fio.layer, limiter)),
+        Layer.provideMerge(Layer.mergeAll(RedactorDefault, fio.layer, limiter)),
         Layer.provideMerge(seededConfig(cfg)),
       );
       yield* Effect.gen(function* () {

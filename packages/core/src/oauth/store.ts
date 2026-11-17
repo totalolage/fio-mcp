@@ -1,15 +1,8 @@
 import { Clock, Effect, Option, Schema } from "effect";
 import { SqlClient } from "effect/sql";
-import type { Migrations } from "../cache/db.js";
-import { PAYMENT_MIGRATIONS } from "../payment-ledger.js";
-import {
-  DEFAULT_GRANT_PAYMENTS,
-  type GrantPayments,
-  OFF_ALLOWLIST,
-  PayeeAllowlistSchema,
-  PaymentLimitsSchema,
-} from "../payment-limits.js";
+import type { Migrations } from "../migrations.js";
 import { ServerError } from "./errors.js";
+import { type GrantSettings, GrantSettingsError } from "./grant-settings.js";
 
 /**
  * Persistent OAuth state in the server's SQLite file: registered clients,
@@ -19,11 +12,10 @@ import { ServerError } from "./errors.js";
  */
 
 /**
- * Ids share one sequence with the cache's migrations (the migrator skips ids
- * at or below the latest applied one): 0002 follows the cache's 0001, 0004
- * its 0003, 0006 the accounts' 0005, 0008 the accounts' 0007. The payment
- * ledger's 0009/0010 are spread in here so src/cache/db.ts, which merges the
- * module migration maps, needs no change.
+ * Ids share one sequence with the app's other migrations (the migrator skips
+ * ids at or below the latest applied one): the other ids belong to the app,
+ * which merges this set into its own in id order. Columns of the app's grant
+ * settings (GrantSettings) come from the app's migrations too.
  */
 export const OAUTH_MIGRATIONS: Migrations = {
   "0002_create_oauth": Effect.gen(function* () {
@@ -71,31 +63,21 @@ export const OAUTH_MIGRATIONS: Migrations = {
     `;
     yield* sql`CREATE INDEX oauth_tokens_by_grant ON oauth_tokens (grant_id)`;
   }),
-  // Grants named accounts by display name, so a rename could hand a grant to
-  // another token's account. They now hold token fingerprints; every older
-  // grant is revoked and its clients authorize again.
+  // Grants named resources by display label, so a relabel could hand a grant
+  // to another resource. They now hold resource ids (the column keeps this
+  // name); every older grant is revoked and its clients authorize again.
   "0004_grant_account_fingerprints": Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     const now = yield* Clock.currentTimeMillis;
     yield* sql`UPDATE oauth_grants SET revoked_at = ${now} WHERE revoked_at IS NULL`;
     yield* sql`ALTER TABLE oauth_grants RENAME COLUMN accounts_json TO account_fingerprints_json`;
   }),
-  // 0005 is the accounts table (src/account-store.ts). When a grant was last
-  // used on /mcp, for the admin page (written at most once a minute).
+  // When a grant was last used on /mcp, for the admin page (written at most
+  // once a minute).
   "0006_grant_last_used": Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     yield* sql`ALTER TABLE oauth_grants ADD COLUMN last_used_at INTEGER`;
   }),
-  // 0007 is the account token history (src/account-migrations.ts). A grant's
-  // payment limits and payee allowlist (SEC-26/27). NULL limits follow the
-  // server defaults; a NULL allowlist is mode "off", so grants from before
-  // this migration keep working under the server-default limits.
-  "0008_grant_payment_settings": Effect.gen(function* () {
-    const sql = yield* SqlClient.SqlClient;
-    yield* sql`ALTER TABLE oauth_grants ADD COLUMN payment_limits_json TEXT`;
-    yield* sql`ALTER TABLE oauth_grants ADD COLUMN payee_allowlist_json TEXT`;
-  }),
-  ...PAYMENT_MIGRATIONS,
 };
 
 export interface Client {
@@ -115,11 +97,12 @@ export interface Grant {
   readonly grantId: string;
   readonly clientId: string;
   readonly scopes: ReadonlyArray<string>;
-  /** Token fingerprints (Account.tokenFingerprint) of the consented accounts, never names. */
-  readonly accountFingerprints: ReadonlyArray<string>;
+  /** Ids (Resource.id) of the consented resources, never labels. */
+  readonly resources: ReadonlyArray<string>;
+  /** The audience: the protected resource URL (RFC 8707) the grant's tokens are bound to. */
   readonly resource: string;
-  /** Payment limits and payee allowlist; DEFAULT_GRANT_PAYMENTS when never set. */
-  readonly payments: GrantPayments;
+  /** The app's settings for the grant (GrantSettings); absent when the app keeps none. */
+  readonly settings?: unknown;
 }
 
 /** A live grant as /admin lists it. */
@@ -179,10 +162,8 @@ export const MAX_ROTATIONS = 5000;
 const StringList = Schema.fromJsonString(Schema.Array(Schema.String));
 const decodeList = Schema.decodeUnknownSync(StringList);
 const encodeList = Schema.encodeSync(StringList);
-const LimitsJson = Schema.fromJsonString(PaymentLimitsSchema);
-const AllowlistJson = Schema.fromJsonString(PayeeAllowlistSchema);
-const encodeLimits = Schema.encodeSync(LimitsJson);
-const encodeAllowlist = Schema.encodeSync(AllowlistJson);
+// Column names are spliced into SQL: plain identifiers only.
+const COLUMN = /^[a-z_][a-z0-9_]*$/;
 
 const failure =
   (operation: string) =>
@@ -207,8 +188,8 @@ interface GrantRow {
   readonly scopes: string;
   readonly account_fingerprints_json: string;
   readonly resource: string;
-  readonly payment_limits_json: string | null;
-  readonly payee_allowlist_json: string | null;
+  /** The app's grant settings columns (GrantSettings.columns). */
+  readonly [column: string]: unknown;
 }
 
 const toClient = (row: ClientRow): Client => ({
@@ -219,39 +200,56 @@ const toClient = (row: ClientRow): Client => ({
   lastUsedAt: row.last_used_at,
 });
 
+
 /**
- * A stored payment setting that does not decode fails the operation (a
- * logged ServerError via `failure`); it never falls back to something more
- * permissive.
+ * `settings` is the app's grant settings codec (OAuthApp.grantSettings):
+ * without one, grants carry no settings and no extra columns are touched.
  */
-const toGrant = Effect.fnUntraced(function* (row: GrantRow) {
-  const limits =
-    row.payment_limits_json === null ? null : yield* Schema.decodeUnknownEffect(LimitsJson)(row.payment_limits_json);
-  const allowlist =
-    row.payee_allowlist_json === null
-      ? OFF_ALLOWLIST
-      : yield* Schema.decodeUnknownEffect(AllowlistJson)(row.payee_allowlist_json);
-  return {
-    grantId: row.grant_id,
-    clientId: row.client_id,
-    scopes: row.scopes.split(" ").filter((s) => s !== ""),
-    accountFingerprints: decodeList(row.account_fingerprints_json),
-    resource: row.resource,
-    payments: limits === null && allowlist === OFF_ALLOWLIST ? DEFAULT_GRANT_PAYMENTS : { limits, allowlist },
-  } satisfies Grant;
-});
-
-/** Column values for a grant's payment settings; defaults stay NULL. */
-const paymentColumns = (payments: GrantPayments) => ({
-  payment_limits_json: payments.limits === null ? null : encodeLimits(payments.limits),
-  payee_allowlist_json:
-    payments.allowlist.mode === "off" && payments.allowlist.entries.length === 0
-      ? null
-      : encodeAllowlist(payments.allowlist),
-});
-
-export const makeOAuthStore = Effect.fn("OAuthStore.make")(function* (maxRotations: number = MAX_ROTATIONS) {
+export const makeOAuthStore = Effect.fn("OAuthStore.make")(function* (
+  maxRotations: number = MAX_ROTATIONS,
+  settings?: GrantSettings,
+) {
   const sql = yield* SqlClient.SqlClient;
+  const columns = settings?.columns ?? [];
+  const badColumn = columns.find((column) => !COLUMN.test(column));
+  if (badColumn !== undefined) return yield* Effect.die(new Error(`oauth: invalid grant settings column ${badColumn}`));
+  /** `, g.<column>` for each settings column, appended to the grant SELECTs. */
+  const settingsSelect = sql.literal(columns.map((column) => `, g.${column}`).join(""));
+
+  /**
+   * A stored setting that does not decode, or a declared column the row
+   * lacks, fails the operation (a logged ServerError via `failure`); it never
+   * falls back to another value.
+   */
+  const toGrant = Effect.fnUntraced(function* (row: GrantRow) {
+    let value: unknown;
+    if (settings !== undefined) {
+      const stored: Record<string, unknown> = {};
+      for (const column of columns) {
+        if (!(column in row)) return yield* new GrantSettingsError({ message: `the grant row lacks settings column ${column}` });
+        stored[column] = row[column];
+      }
+      value = yield* settings.decode(stored);
+    }
+    return {
+      grantId: row.grant_id,
+      clientId: row.client_id,
+      scopes: row.scopes.split(" ").filter((s) => s !== ""),
+      resources: decodeList(row.account_fingerprints_json),
+      resource: row.resource,
+      settings: value,
+    } satisfies Grant;
+  });
+
+  /** Column values of a grant's settings: exactly the declared columns. */
+  const settingsColumns = (value: unknown): Effect.Effect<Readonly<Record<string, string | null>>> => {
+    if (settings === undefined) return Effect.succeed({});
+    const encoded = settings.encode(value);
+    const keys = Object.keys(encoded);
+    return keys.length === columns.length && columns.every((column) => Object.hasOwn(encoded, column))
+      ? Effect.succeed(encoded)
+      : Effect.die(new Error(`oauth: grant settings encoded ${keys.join(",")}, expected ${columns.join(",")}`));
+  };
 
   const liveGrant = (now: number) => sql`
     g.revoked_at IS NULL AND (
@@ -328,9 +326,9 @@ export const makeOAuthStore = Effect.fn("OAuthStore.make")(function* (maxRotatio
               grant_id: grant.grantId,
               client_id: grant.clientId,
               scopes: grant.scopes.join(" "),
-              account_fingerprints_json: encodeList(grant.accountFingerprints),
+              account_fingerprints_json: encodeList(grant.resources),
               resource: grant.resource,
-              ...paymentColumns(grant.payments),
+              ...(yield* settingsColumns(grant.settings)),
               created_at: now,
               revoked_at: null,
             })}
@@ -365,7 +363,7 @@ export const makeOAuthStore = Effect.fn("OAuthStore.make")(function* (maxRotatio
           const [row] = yield* sql<
             GrantRow & { redirect_uri: string; code_challenge: string; expires_at: number; used_at: number | null; revoked_at: number | null }
           >`
-            SELECT g.grant_id, g.client_id, g.scopes, g.account_fingerprints_json, g.resource, g.payment_limits_json, g.payee_allowlist_json, g.revoked_at,
+            SELECT g.grant_id, g.client_id, g.scopes, g.account_fingerprints_json, g.resource${settingsSelect}, g.revoked_at,
                    c.redirect_uri, c.code_challenge, c.expires_at, c.used_at
             FROM oauth_codes c JOIN oauth_grants g ON g.grant_id = c.grant_id
             WHERE c.code_hash = ${codeHash}
@@ -416,7 +414,7 @@ export const makeOAuthStore = Effect.fn("OAuthStore.make")(function* (maxRotatio
       .withTransaction(
         Effect.gen(function* () {
           const [row] = yield* sql<GrantRow & { expires_at: number; rotated_at: number | null; revoked_at: number | null }>`
-            SELECT g.grant_id, g.client_id, g.scopes, g.account_fingerprints_json, g.resource, g.payment_limits_json, g.payee_allowlist_json, g.revoked_at, t.expires_at, t.rotated_at
+            SELECT g.grant_id, g.client_id, g.scopes, g.account_fingerprints_json, g.resource${settingsSelect}, g.revoked_at, t.expires_at, t.rotated_at
             FROM oauth_tokens t JOIN oauth_grants g ON g.grant_id = t.grant_id
             WHERE t.token_hash = ${refreshHash} AND t.kind = 'refresh'
           `;
@@ -458,7 +456,7 @@ export const makeOAuthStore = Effect.fn("OAuthStore.make")(function* (maxRotatio
   /** The grant behind a live, unexpired access token. */
   const accessGrant = (accessHash: string, now: number) =>
     sql<GrantRow>`
-      SELECT g.grant_id, g.client_id, g.scopes, g.account_fingerprints_json, g.resource, g.payment_limits_json, g.payee_allowlist_json
+      SELECT g.grant_id, g.client_id, g.scopes, g.account_fingerprints_json, g.resource${settingsSelect}
       FROM oauth_tokens t JOIN oauth_grants g ON g.grant_id = t.grant_id
       WHERE t.token_hash = ${accessHash} AND t.kind = 'access' AND t.expires_at > ${now} AND g.revoked_at IS NULL
     `.pipe(
@@ -483,7 +481,7 @@ export const makeOAuthStore = Effect.fn("OAuthStore.make")(function* (maxRotatio
   /** Every live grant (not revoked, with a usable token or code), oldest first. */
   const listGrants = (now: number) =>
     sql<GrantRow & { created_at: number; last_used_at: number | null }>`
-      SELECT g.grant_id, g.client_id, g.scopes, g.account_fingerprints_json, g.resource, g.payment_limits_json, g.payee_allowlist_json, g.created_at, g.last_used_at
+      SELECT g.grant_id, g.client_id, g.scopes, g.account_fingerprints_json, g.resource${settingsSelect}, g.created_at, g.last_used_at
       FROM oauth_grants g WHERE ${liveGrant(now)} ORDER BY g.created_at
     `.pipe(
       Effect.flatMap((rows) =>
@@ -498,19 +496,24 @@ export const makeOAuthStore = Effect.fn("OAuthStore.make")(function* (maxRotatio
     );
 
   /**
-   * Replaces a live grant's payment settings (admin, SEC-26/27). The caller
-   * validates them against the ceilings first. False when the grant is not
-   * live (revoked, unknown or without a usable token or code).
+   * Replaces a live grant's settings (admin). The caller validates the value
+   * first. False when the grant is not live (revoked, unknown or without a
+   * usable token or code), or when the app keeps no grant settings.
    */
-  const updateGrantPayments = (grantId: string, payments: GrantPayments, now: number) =>
-    sql<{ grant_id: string }>`
-      UPDATE oauth_grants SET ${sql.update(paymentColumns(payments))}
-      WHERE grant_id = ${grantId} AND grant_id IN (SELECT g.grant_id FROM oauth_grants g WHERE ${liveGrant(now)})
-      RETURNING grant_id
-    `.pipe(
-      Effect.map((rows) => rows.length > 0),
-      failure("update the grant's payment settings"),
-    );
+  const updateGrantSettings = (grantId: string, value: unknown, now: number) =>
+    settings === undefined
+      ? Effect.succeed(false)
+      : settingsColumns(value).pipe(
+          Effect.flatMap(
+            (values) => sql<{ grant_id: string }>`
+              UPDATE oauth_grants SET ${sql.update(values)}
+              WHERE grant_id = ${grantId} AND grant_id IN (SELECT g.grant_id FROM oauth_grants g WHERE ${liveGrant(now)})
+              RETURNING grant_id
+            `,
+          ),
+          Effect.map((rows) => rows.length > 0),
+          failure(`update the grant's ${settings.label ?? "settings"}`),
+        );
 
   /** Records a use of the grant on /mcp. */
   const touchGrant = (grantId: string, now: number) =>
@@ -569,7 +572,7 @@ export const makeOAuthStore = Effect.fn("OAuthStore.make")(function* (maxRotatio
     revokeGrant,
     revokeAll,
     listGrants,
-    updateGrantPayments,
+    updateGrantSettings,
     touchGrant,
     purge,
   };

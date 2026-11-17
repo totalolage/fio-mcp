@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { Principal } from "@mcps/core/transport/principal.js";
 import { Clock, Context, Effect, Layer, Option, Schema, Semaphore } from "effect";
 import { type Account, Accounts } from "./accounts.js";
 import { addDays, pragueDateOf } from "./cache/dates.js";
@@ -17,6 +18,7 @@ import { FioApi } from "./fio-api.js";
 import { type ImportResult, looksLikeMissingPaymentPermission, parseImportResponse } from "./import-response.js";
 import { ToolFailure } from "./mcp/common.js";
 import { markUntrusted } from "./mcp/untrusted.js";
+import { readGrantPayments } from "./oauth/grant-payments.js";
 import {
   type AuditOutcome,
   type AuditQuery,
@@ -28,7 +30,6 @@ import {
 } from "./payment-ledger.js";
 import {
   type AllowlistMode,
-  DEFAULT_GRANT_PAYMENTS,
   effectiveLimits,
   evaluateLimits,
   type GrantPayments,
@@ -41,8 +42,7 @@ import {
 } from "./payment-limits.js";
 import { type Payer, type PaymentOrder, summarizeOrders } from "./payments.js";
 import { isConflictRefusal } from "./rate-limiter.js";
-import { Redactor } from "./redaction.js";
-import type { Principal } from "./transport/principal.js";
+import { Redactor, RedactorLive } from "./redaction.js";
 
 /**
  * Payment controls (SEC-06, SEC-26..29): per-grant limits, payee allowlist
@@ -185,7 +185,8 @@ export interface PaymentControlsShape {
 /** The grant id the audit and the lock use: the OAuth grant, or "local". */
 export const auditGrantId = (principal: Principal): string => principal.subject;
 
-export const grantPaymentsOf = (principal: Principal): GrantPayments => principal.payments ?? DEFAULT_GRANT_PAYMENTS;
+/** The caller's grant payment settings; the stdio and unauthenticated principals get the defaults. */
+export const grantPaymentsOf = (principal: Principal): GrantPayments => readGrantPayments(principal.settings);
 
 export const sha256Hex = (text: string): string => createHash("sha256").update(text, "utf8").digest("hex");
 
@@ -747,5 +748,5 @@ export class PaymentControls extends Context.Service<PaymentControls, PaymentCon
       const ledger = opensDatabase ? PaymentLedger.Default.pipe(Layer.provide(Database.Live)) : LazyLedgerLive;
       return PaymentControls.Default.pipe(Layer.provideMerge(ledger));
     }),
-  ).pipe(Layer.provide(Layer.mergeAll(AppConfig.Live, FioApi.Live, Redactor.Live, Accounts.Live)));
+  ).pipe(Layer.provide(Layer.mergeAll(AppConfig.Live, FioApi.Live, RedactorLive, Accounts.Live)));
 }

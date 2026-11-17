@@ -1,8 +1,8 @@
 import { assert, describe, it } from "@effect/vitest";
+import { layerStdio } from "@mcps/core/transport/stdio.js";
 import { Deferred, Effect, Fiber, Layer, Queue, Sink, Stdio, Stream } from "effect";
 import { SERVER_INFO, ToolsLive } from "../src/app.js";
 import type { MarkerTools } from "../src/config.js";
-import { layerStdio } from "../src/transport/stdio.js";
 import { testConfig, testServices } from "./support/transport.js";
 
 const MARKER = ["get_new_transactions", "set_download_marker"];

@@ -62,9 +62,9 @@ const forbidden = HttpServerResponse.empty({ status: 403 });
 /**
  * Set on requests the HTTP transport dispatches itself (ending a session
  * through McpServer's DELETE handling); they skip the Host allowlist and
- * `Auth`. Only src/transport/http.ts sets it.
+ * `Auth`. Only transport/http.ts sets it.
  */
-export const InternalRequest = Context.Reference<boolean>("fio-mcp/transport/http/InternalRequest", {
+export const InternalRequest = Context.Reference<boolean>("mcps/transport/http/InternalRequest", {
   defaultValue: () => false,
 });
 
@@ -72,13 +72,18 @@ export const InternalRequest = Context.Reference<boolean>("fio-mcp/transport/htt
  * Every route: response redaction, and (except /healthz) the Host allowlist.
  * Paths are compared literally; any other spelling of /healthz is checked.
  * Also warns once per listener about X-Forwarded-For from an untrusted peer
- * (makeUntrustedForwardingCheck).
+ * (makeUntrustedForwardingCheck; `trustedProxiesSetting` names the app's
+ * setting in that warning).
  */
-export const guard = (allowedHosts: ReadonlyArray<string>, trustedProxies: ReadonlyArray<IpNetwork.IpNetwork>) =>
+export const guard = (
+  allowedHosts: ReadonlyArray<string>,
+  trustedProxies: ReadonlyArray<IpNetwork.IpNetwork>,
+  trustedProxiesSetting?: string,
+) =>
   HttpRouter.middleware(
     Effect.gen(function* () {
       const frames = makeFrameRedactor(yield* Redactor);
-      const checkForwarding = makeUntrustedForwardingCheck(trustedProxies);
+      const checkForwarding = makeUntrustedForwardingCheck(trustedProxies, trustedProxiesSetting);
       return Effect.fnUntraced(function* (
         httpEffect: Effect.Effect<HttpServerResponse.HttpServerResponse, Types.unhandled>,
       ) {

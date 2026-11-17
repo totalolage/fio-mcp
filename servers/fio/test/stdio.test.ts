@@ -1,9 +1,9 @@
 import { assert, describe, it } from "@effect/vitest";
+import { layerStdio } from "@mcps/core/transport/stdio.js";
 import { Deferred, Effect, Fiber, Layer, Queue, Sink, Stdio, Stream } from "effect";
 import { SERVER_INFO, ToolsLive } from "../src/app.js";
 import { makeCacheToolkit } from "../src/mcp/cache-tools.js";
 import { makeFioToolkit } from "../src/mcp/fio-tools.js";
-import { layerStdio } from "../src/transport/stdio.js";
 import { ACCOUNT_NAMES, FIO_TOKEN, testConfig, testServices } from "./support/transport.js";
 
 const encoder = new TextEncoder();

@@ -1,8 +1,6 @@
 import { createHash } from "node:crypto";
 import { Clock, Context, Effect, Layer, Option, Redacted, Schema } from "effect";
-import type { SqlClient } from "effect/sql";
-import { makeSettingsStore, SETTING } from "../account-store.js";
-import { MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH } from "../oauth/cli.js";
+import type { AppIdentity } from "../app-identity.js";
 import {
   DEFAULT_SCRYPT,
   formatPasswordHash,
@@ -20,16 +18,16 @@ import { matchingTotpSteps, TOTP_WINDOW, totpStep } from "./totp.js";
  * (/admin): one LoginGuard, so both count failures per address together and
  * share the one-at-a-time scrypt slot.
  *
- * Source: the hash stored in the database once the password was changed at
- * /admin (or set with `fio-mcp reset-admin-password --set`), otherwise the
- * bootstrap hash from FIO_MCP_ADMIN_PASSWORD_HASH_FILE. Read on every check,
- * so a change or a CLI reset applies at once.
+ * Source: the hash in the app's PasswordStore once the password was changed
+ * at /admin (or set with `<name> reset-admin-password --set`), otherwise the
+ * bootstrap hash the app read at start-up. Read on every check, so a change
+ * or a CLI reset applies at once.
  *
  * `stamp` identifies the current hash. Signed-in sessions (admin and OAuth)
  * remember it and end when it changes: changing the password signs out
  * every other session.
  *
- * With FIO_MCP_ADMIN_TOTP_SECRET_FILE set, a sign-in also needs the current
+ * With a TOTP secret configured (`totpSecret`), a sign-in also needs the current
  * RFC 6238 code, checked in the same permit right after the password. A
  * wrong or missing code is a counted failure, and an accepted code (its
  * 30 s step) is never accepted again by `signIn` or `verifyTotp`.
@@ -41,6 +39,31 @@ export class InvalidNewPassword extends Schema.TaggedError<InvalidNewPassword>()
   override get message(): string {
     return this.detail;
   }
+}
+
+/** The bounds `hash-password`, `reset-admin-password --set` and /admin enforce. */
+export const MIN_PASSWORD_LENGTH = 12;
+export const MAX_PASSWORD_LENGTH = 1024;
+
+/**
+ * Where a changed admin password's hash line lives (the app's settings
+ * table, say). Errors are logged by their message; none holds a secret.
+ */
+export interface PasswordStore {
+  /** The stored hash line, if the password was changed. */
+  readonly get: Effect.Effect<Option.Option<string>, { readonly message: string }>;
+  readonly put: (line: string) => Effect.Effect<void, { readonly message: string }>;
+}
+
+export interface AdminPasswordOptions {
+  readonly app: AppIdentity;
+  /** The hash used until a changed one is stored. */
+  readonly bootstrap: Redacted.Redacted<PasswordHash>;
+  readonly throttle?: ThrottlePolicy | undefined;
+  /** Parameters for hashing a changed password; tests pass cheaper ones. */
+  readonly scrypt?: ScryptParams | undefined;
+  /** RFC 6238 secret; when set, sign-ins and `verifyTotp` need a current code. */
+  readonly totpSecret?: Redacted.Redacted<Uint8Array> | undefined;
 }
 
 /** Hashing or storing the new password failed; the cause is logged. */
@@ -70,7 +93,7 @@ export interface AdminPasswordShape {
     current: Redacted.Redacted<string>,
     next: Redacted.Redacted<string>,
   ) => Effect.Effect<LoginResult<string>, PasswordChangeFailed>;
-  /** True when FIO_MCP_ADMIN_TOTP_SECRET_FILE is configured. */
+  /** True when a TOTP secret is configured. */
   readonly totpEnabled: boolean;
   /**
    * Second factor on its own, for an already signed-in admin action.
@@ -95,25 +118,22 @@ export const checkNewPassword = (next: string, confirm: string): InvalidNewPassw
 const stampOfLine = (line: string) => createHash("sha256").update(line).digest("hex").slice(0, 32);
 const stampOf = (hash: PasswordHash) => stampOfLine(formatPasswordHash(hash));
 
-/**
- * `scrypt` hashes a changed password; tests pass cheaper parameters.
- * `totpSecret` (FIO_MCP_ADMIN_TOTP_SECRET_FILE) turns on the second factor.
- */
+/** `options.totpSecret` turns on the second factor. */
 export const makeAdminPassword = Effect.fn("AdminPassword.make")(function* (
-  bootstrap: Redacted.Redacted<PasswordHash>,
-  throttle: ThrottlePolicy = DEFAULT_THROTTLE,
-  scrypt: ScryptParams = DEFAULT_SCRYPT,
-  totpSecret?: Redacted.Redacted<Uint8Array>,
+  settings: PasswordStore,
+  options: AdminPasswordOptions,
 ) {
-  const settings = yield* makeSettingsStore();
+  const { app, bootstrap, totpSecret } = options;
+  const throttle = options.throttle ?? DEFAULT_THROTTLE;
+  const scrypt = options.scrypt ?? DEFAULT_SCRYPT;
 
   const current = Effect.gen(function* () {
-    const stored = yield* settings.get(SETTING.adminPasswordHash).pipe(Effect.mapError(() => new PasswordUnavailable()));
+    const stored = yield* settings.get.pipe(Effect.mapError(() => new PasswordUnavailable()));
     if (Option.isNone(stored)) return bootstrap;
-    const parsed = parsePasswordHash(stored.value);
+    const parsed = parsePasswordHash(stored.value, app);
     if (parsed instanceof PasswordHashError) {
       yield* Effect.logError(
-        `admin password: the hash stored in the database ${parsed.detail}; run \`fio-mcp reset-admin-password\``,
+        `admin password: the hash stored in the database ${parsed.detail}; run \`${app.name} reset-admin-password\``,
       );
       return yield* new PasswordUnavailable();
     }
@@ -159,7 +179,7 @@ export const makeAdminPassword = Effect.fn("AdminPassword.make")(function* (
   /** Hashes and stores `next`; returns its stamp. */
   const store = (next: Redacted.Redacted<string>) =>
     hashPassword(next, scrypt).pipe(
-      Effect.tap((line) => settings.put(SETTING.adminPasswordHash, line)),
+      Effect.tap((line) => settings.put(line)),
       Effect.map(stampOfLine),
       Effect.tapError((error) => Effect.logError(`admin password: the change failed: ${error.message}`)),
       Effect.mapError(() => new PasswordChangeFailed()),
@@ -174,12 +194,17 @@ export const makeAdminPassword = Effect.fn("AdminPassword.make")(function* (
   return { signIn, stamp, change, totpEnabled: totpSecret !== undefined, verifyTotp } satisfies AdminPasswordShape;
 });
 
-export class AdminPassword extends Context.Service<AdminPassword, AdminPasswordShape>()("fio-mcp/admin/AdminPassword") {
-  static readonly layer = (
-    bootstrap: Redacted.Redacted<PasswordHash>,
-    throttle?: ThrottlePolicy,
-    scrypt?: ScryptParams,
-    totpSecret?: Redacted.Redacted<Uint8Array>,
-  ): Layer.Layer<AdminPassword, never, SqlClient.SqlClient> =>
-    Layer.effect(AdminPassword, Effect.map(makeAdminPassword(bootstrap, throttle, scrypt, totpSecret), AdminPassword.of));
+export class AdminPassword extends Context.Service<AdminPassword, AdminPasswordShape>()("mcps/admin/AdminPassword") {
+  /** `store` is built once, with the layer. */
+  static readonly layer = <R>(
+    store: Effect.Effect<PasswordStore, never, R>,
+    options: AdminPasswordOptions,
+  ): Layer.Layer<AdminPassword, never, R> =>
+    Layer.effect(
+      AdminPassword,
+      store.pipe(
+        Effect.flatMap((settings) => makeAdminPassword(settings, options)),
+        Effect.map(AdminPassword.of),
+      ),
+    );
 }

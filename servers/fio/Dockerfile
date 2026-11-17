@@ -1,11 +1,16 @@
 # fio-mcp: MCP server for FIO Bank, Streamable HTTP on port 3000 by default.
-# Build: docker build --platform linux/amd64 -t fio-mcp .
+# Build from the repository root (the build context is the Bun workspace):
+#   docker build --platform linux/amd64 -f servers/fio/Dockerfile -t fio-mcp .
 # HTTP mode requires FIO_MCP_PUBLIC_URL (the https origin clients use) and
 # FIO_MCP_ADMIN_PASSWORD_HASH_FILE (from `docker run --rm -it <image> hash-password`);
 # it refuses to start without them unless FIO_MCP_ALLOW_UNAUTHENTICATED=true.
 # The base images are pinned by digest; bump NODE_IMAGE and BUN_IMAGE
 # deliberately. Bun only installs dependencies and builds; the server runs on
 # Node and the final image has no Bun.
+# Each install stage copies the root workspace files and the manifests of the
+# workspaces this image needs (fio and @mcps/core) at their repository paths,
+# then installs with --filter fio-mcp: that workspace, the workspaces it
+# depends on and the root dev tools, but no other server's dependencies.
 
 ARG NODE_IMAGE=node:24.22.1-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205
 ARG BUN_IMAGE=oven/bun:1.4.2-slim@sha256:cb3bbbb08e13a4a2ff400f24c7a2a1d5efa83f6ef8544d52d95a519631e2fc61
@@ -16,23 +21,31 @@ FROM ${NODE_IMAGE} AS build
 COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
 WORKDIR /app
 COPY package.json bun.lock bunfig.toml ./
-RUN bun install --frozen-lockfile --ignore-scripts
-COPY tsconfig.json tsconfig.build.json ./
-COPY src ./src
-# Patches TypeScript with the Effect language service, then builds dist/.
+COPY packages/core/package.json ./packages/core/
+COPY servers/fio/package.json ./servers/fio/
+RUN bun install --frozen-lockfile --ignore-scripts --filter fio-mcp
+COPY tsconfig.base.json ./
+COPY packages/core/tsconfig.build.json ./packages/core/
+COPY packages/core/src ./packages/core/src
+COPY servers/fio/tsconfig.build.json ./servers/fio/
+COPY servers/fio/src ./servers/fio/src
+# Patches TypeScript with the Effect language service, then builds
+# packages/core/dist/ and servers/fio/dist/.
 RUN bun run prepare
 
 FROM ${NODE_IMAGE} AS deps
 COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
 WORKDIR /app
 COPY package.json bun.lock bunfig.toml ./
+COPY packages/core/package.json ./packages/core/
+COPY servers/fio/package.json ./servers/fio/
 # --omit=peer keeps out redis and @redis/*, the peer of @effect/platform-node
 # that only its NodeRedis module loads. The source imports platform-node
 # subpaths, never the index that re-exports NodeRedis (biome.json enforces
 # it). The peers the server needs (effect) are direct dependencies.
 # peer = false in bunfig.toml would also drop vitest's vite from the dev
 # install.
-RUN bun install --frozen-lockfile --production --omit=peer --ignore-scripts
+RUN bun install --frozen-lockfile --production --omit=peer --ignore-scripts --filter fio-mcp
 
 FROM ${NODE_IMAGE}
 ENV NODE_ENV=production \
@@ -42,8 +55,15 @@ WORKDIR /app
 RUN mkdir /data \
  && chmod 1777 /data
 COPY package.json ./
+COPY packages/core/package.json ./packages/core/
+COPY servers/fio/package.json ./servers/fio/
+# Hoisted install: node_modules/@mcps/core links to ../../packages/core.
 COPY --from=deps /app/node_modules ./node_modules
-COPY --from=build /app/dist ./dist
+COPY --from=build /app/packages/core/dist ./packages/core/dist
+COPY --from=build /app/servers/fio/dist ./servers/fio/dist
+# Keeps /app/dist/main.js (the entrypoint, and `node dist/main.js` in
+# `docker exec`) working. Node resolves imports from the link's target.
+RUN ln -s servers/fio/dist dist
 # Runs as any UID (Compose `user:`); nothing is written outside /data, so the
 # root filesystem can be read-only.
 USER node

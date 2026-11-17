@@ -1,7 +1,13 @@
+import {
+  coversResource,
+  requireScopes as requireGrantedScopes,
+  requireResource,
+  type ToolPolicyShape,
+} from "@mcps/core/mcp/grants.js";
+import { CurrentPrincipal, type Principal } from "@mcps/core/transport/principal.js";
 import { Effect } from "effect";
 import type { Account, AccountsShape } from "../accounts.js";
 import { PermissionDenied } from "../errors.js";
-import { CurrentPrincipal, type Principal } from "../transport/principal.js";
 
 /**
  * Authorization of tool calls against the caller's grant. Every call is
@@ -17,7 +23,8 @@ import { CurrentPrincipal, type Principal } from "../transport/principal.js";
  * rotated token drops the account from existing grants until the user
  * consents again.
  *
- * HTTP sessions list only what the grant allows (src/transport/grant-tools.ts):
+ * HTTP sessions list only what the grant allows (core's transport/grant-tools.ts,
+ * driven by ConfiguredToolPolicy in tool-policy.ts):
  * tools whose scopes it lacks are left out, the `account` enum names only the
  * granted accounts, and tools that take an account are left out when it
  * covers none. stdio lists every tool.
@@ -56,37 +63,38 @@ export const ACCOUNTLESS_TOOLS: ReadonlySet<string> = new Set(["get_server_statu
 /** The scopes a tool needs to be listed and called. */
 export const toolScopes = (name: string): ReadonlyArray<string> => (PAYMENT_TOOLS.has(name) ? PAYMENTS : READ);
 
-const allows = (granted: Principal["scopes"] | Principal["accountFingerprints"], item: string) =>
-  granted === "all" || granted.includes(item);
+/** For HTTP `tools/list`: the scopes above, ACCOUNTLESS_TOOLS, and the `account` parameter. */
+export const TOOL_POLICY: ToolPolicyShape = {
+  scopes: toolScopes,
+  resourceless: (name) => ACCOUNTLESS_TOOLS.has(name),
+  resourceParameter: "account",
+};
 
-/** Whether `principal` holds every scope in `scopes`. */
-export const holdsScopes = (principal: Principal, scopes: ReadonlyArray<string>) =>
-  scopes.every((scope) => allows(principal.scopes, scope));
+export { holdsScopes } from "@mcps/core/mcp/grants.js";
 
-/** The accounts in `list` that `principal`'s grant covers. */
+/** The accounts in `list` that `principal`'s grant covers (by token fingerprint, the resource id). */
 export const coveredAccounts = (principal: Principal, list: ReadonlyArray<Account>) =>
-  list.filter((account) => allows(principal.accountFingerprints, account.tokenFingerprint));
+  list.filter((account) => coversResource(principal, account.tokenFingerprint));
 
 /** Fails unless the caller holds every scope in `scopes`. */
-export const requireScopes = Effect.fnUntraced(function* (scopes: ReadonlyArray<string>) {
-  const principal = yield* CurrentPrincipal;
-  const missing = scopes.filter((scope) => !allows(principal.scopes, scope));
-  if (missing.length > 0) {
-    return yield* new PermissionDenied({
-      detail: `This client's authorization does not include ${missing.join(" and ")}. Reconnect the client to fio-mcp and grant it on the consent page.`,
-    });
-  }
-});
+export const requireScopes = (scopes: ReadonlyArray<string>) =>
+  requireGrantedScopes(
+    scopes,
+    (missing) =>
+      new PermissionDenied({
+        detail: `This client's authorization does not include ${missing.join(" and ")}. Reconnect the client to fio-mcp and grant it on the consent page.`,
+      }),
+  );
 
 /** Fails unless the caller's grant covers `account`. */
-export const requireAccount = Effect.fnUntraced(function* (account: Account) {
-  const principal = yield* CurrentPrincipal;
-  if (!allows(principal.accountFingerprints, account.tokenFingerprint)) {
-    return yield* new PermissionDenied({
-      detail: `This client's authorization does not cover the account "${account.name}". Reconnect the client to fio-mcp and select the account on the consent page.`,
-    });
-  }
-});
+export const requireAccount = (account: Account) =>
+  requireResource(
+    account.tokenFingerprint,
+    () =>
+      new PermissionDenied({
+        detail: `This client's authorization does not cover the account "${account.name}". Reconnect the client to fio-mcp and select the account on the consent page.`,
+      }),
+  );
 
 /**
  * The account a tool call names (or the only configured one), after the

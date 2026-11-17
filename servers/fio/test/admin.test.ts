@@ -1,3 +1,8 @@
+import { MAX_ADMIN_SESSIONS } from "@mcps/core/admin/sessions.js";
+import { totpCode } from "@mcps/core/admin/totp.js";
+import { DEFAULT_THROTTLE, type LoginResult } from "@mcps/core/oauth/login.js";
+import { escapeHtml } from "@mcps/core/oauth/pages.js";
+import type { Principal } from "@mcps/core/transport/principal.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { type CallToolResult, ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
@@ -6,15 +11,11 @@ import { HttpRouter, HttpServerResponse } from "effect/http";
 import { SqlClient } from "effect/sql";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { tokenFingerprint } from "../src/accounts.js";
-import { MAX_ADMIN_SESSIONS } from "../src/admin/sessions.js";
-import { totpCode } from "../src/admin/totp.js";
 import { makeCacheStore } from "../src/cache/store.js";
 import { resetAdminPasswordCommand } from "../src/oauth/cli.js";
-import { DEFAULT_THROTTLE, type LoginResult } from "../src/oauth/login.js";
-import { escapeHtml } from "../src/oauth/pages.js";
+import { readGrantPayments } from "../src/oauth/grant-payments.js";
 import { PENDING_TTL_MS, sha256Hex } from "../src/payment-controls.js";
 import { buildImportXml, type Payer, PaymentOrders } from "../src/payments.js";
-import type { Principal } from "../src/transport/principal.js";
 import { IMPORT_OK_XML } from "./fixtures.js";
 import { NOW, statement, TODAY, tx } from "./support/cache.js";
 import { LAST_STATEMENT } from "./support/fio-api.js";
@@ -736,13 +737,13 @@ describe("payments at /admin", () => {
       paymentSettings: { payAllowlistMode: "confirm", payAllowlist: `${LISTED}, Landlord` },
     });
     const grant = await grantOfClient(clientId);
-    expect(grant.payments.allowlist.mode).toBe("confirm");
+    expect(readGrantPayments(grant.settings).allowlist.mode).toBe("confirm");
     return {
       subject: grant.grantId,
       scopes: grant.scopes,
-      accountFingerprints: grant.accountFingerprints,
+      resources: grant.resources,
       clientId,
-      payments: grant.payments,
+      settings: grant.settings,
     };
   };
 
@@ -782,7 +783,7 @@ describe("payments at /admin", () => {
   it("lists audit rows newest first, only to a signed-in admin, filtered by grant", async () => {
     const admin = new Admin();
     await admin.signIn();
-    const principal = (subject: string): Principal => ({ subject, scopes: "all", accountFingerprints: "all" });
+    const principal = (subject: string): Principal => ({ subject, scopes: "all", resources: "all" });
     // Above the default 50000 CZK per order: refused rows, nothing sent.
     expect(Exit.isFailure((await submitAs(principal("fio_grant_a"), [domestic(60_000)])).exit)).toBe(true);
     harness.clock.advance(1_000);
@@ -830,20 +831,20 @@ describe("payments at /admin", () => {
       limits: { maxPerOrder: { CZK: 100 }, maxPerDay: { CZK: 300 }, maxOrdersPerDay: 2 },
       allowlist: { mode: "enforce", entries: [{ account: "DE89370400440532013000", label: "Hans" }] },
     };
-    expect((await grantOfClient(payments.clientId)).payments).toEqual(saved);
+    expect(readGrantPayments((await grantOfClient(payments.clientId)).settings)).toEqual(saved);
     expect((await admin.page("/admin/clients")).html).toContain('name="payMaxPerOrder" value="CZK:100"');
 
     const above = await admin.act("/admin/grants/payments", { ...fields, payMaxPerDay: "CZK:100001" });
     expect(above.message).toContain("above the server ceiling");
     const unknownCurrency = await admin.act("/admin/grants/payments", { ...fields, payMaxPerOrder: "USD:1", payMaxPerDay: "USD:1" });
     expect(unknownCurrency.message).toContain("not allowed by the server");
-    expect((await grantOfClient(payments.clientId)).payments).toEqual(saved);
+    expect(readGrantPayments((await grantOfClient(payments.clientId)).settings)).toEqual(saved);
 
     const notPayments = await admin.act("/admin/grants/payments", { ...fields, grant: (await grantOfClient(readOnly.clientId)).grantId });
     expect(notPayments.message).toContain("cannot submit payments");
     // Without CSRF nothing changes.
     expect((await admin.post("/admin/grants/payments", { ...fields, payMaxOrdersPerDay: "1" }, { csrf: undefined })).status).toBe(403);
-    expect((await grantOfClient(payments.clientId)).payments).toEqual(saved);
+    expect(readGrantPayments((await grantOfClient(payments.clientId)).settings)).toEqual(saved);
   });
 
   it("uploads a held batch's exact XML only after the admin approves it", async () => {

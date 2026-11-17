@@ -1,9 +1,16 @@
-# Allowlist: only what the image build reads. Keeps .env files, local
-# databases, worktrees and node_modules out of the build context.
+# Allowlist: only what the image builds read. Keeps .env files, local
+# databases, worktrees, node_modules and dist out of the build context.
+# Images build from the repository root: docker build -f servers/<name>/Dockerfile .
+# Paths are spelled out: the legacy builder (no buildx) ignores exceptions
+# with a wildcard in their directory part, such as servers/*/src/.
 *
 !package.json
 !bun.lock
 !bunfig.toml
-!tsconfig.json
-!tsconfig.build.json
-!src/
+!tsconfig.base.json
+!packages/core/package.json
+!packages/core/tsconfig.build.json
+!packages/core/src/
+!servers/fio/package.json
+!servers/fio/tsconfig.build.json
+!servers/fio/src/

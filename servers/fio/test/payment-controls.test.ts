@@ -2,6 +2,7 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { assert, describe, it } from "@effect/vitest";
+import type { Principal } from "@mcps/core/transport/principal.js";
 import { ConfigProvider, Effect, Exit, Fiber, Layer, Redacted, Schema } from "effect";
 import { SqlClient } from "effect/sql";
 import { TestClock } from "effect/testing";
@@ -22,8 +23,7 @@ import {
 } from "../src/payment-limits.js";
 import { buildImportXml, type Payer, type PaymentOrder, PaymentOrders } from "../src/payments.js";
 import { RateLimiter } from "../src/rate-limiter.js";
-import { Redactor } from "../src/redaction.js";
-import type { Principal } from "../src/transport/principal.js";
+import { RedactorDefault } from "../src/redaction.js";
 import { IMPORT_ERROR_XML, IMPORT_OK_XML, IMPORT_PERMISSION_XML } from "./fixtures.js";
 import { seededConfig } from "./support/config.js";
 import { memoryDatabase } from "./support/database.js";
@@ -67,7 +67,7 @@ const testLayer = (paymentLimits?: PaymentLimits) =>
         FioHttp.layer({ tokens: [TOKEN], baseUrl: BASE_URL }),
         Accounts.Default,
         RateLimiter.Default,
-        Redactor.Default,
+        RedactorDefault,
         memoryDatabase(SERVER_MIGRATIONS),
       ),
     ),
@@ -97,9 +97,9 @@ const euro = (amount: number, accountTo = IBAN) => ({
 const principal = (payments?: GrantPayments, subject = "fio_grant_1"): Principal => ({
   subject,
   scopes: "all",
-  accountFingerprints: "all",
+  resources: "all",
   clientId: "client_1",
-  ...(payments === undefined ? {} : { payments }),
+  ...(payments === undefined ? {} : { settings: payments }),
 });
 
 const limited = (limits: PaymentLimits): GrantPayments => ({ limits, allowlist: OFF_ALLOWLIST });
@@ -300,7 +300,7 @@ describe("PaymentControls.submit", () => {
 
   it.effect("limits local callers (no grant) by the server defaults", () =>
     Effect.gen(function* () {
-      const local: Principal = { subject: "local", scopes: "all", accountFingerprints: "all" };
+      const local: Principal = { subject: "local", scopes: "all", resources: "all" };
       const error = yield* failureOf(submit([domestic(60_000)], { principal: local }));
       assert.strictEqual(tagOf(error), "PermissionDenied");
       const [row] = yield* auditRows("local");

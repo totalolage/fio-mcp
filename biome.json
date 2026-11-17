@@ -7,7 +7,7 @@
   },
   "files": {
     "ignoreUnknown": false,
-    "includes": ["**/*.ts", "**/*.json", "!**/generated", "!dist", "!openapi"]
+    "includes": ["**/*.ts", "**/*.json", "!**/generated", "!**/dist", "!**/openapi"]
   },
   "formatter": {
     "enabled": false
@@ -18,7 +18,8 @@
     "./lint/no-throw-in-effect-modules.grit",
     "./lint/no-promise-in-effect-modules.grit",
     "./lint/prefer-effect-fn.grit",
-    "./lint/no-standalone-capability-layers.grit"
+    "./lint/no-standalone-capability-layers.grit",
+    "./lint/core-import-boundary.grit"
   ],
   "linter": {
     "rules": {
@@ -46,7 +47,7 @@
   },
   "overrides": [
     {
-      "includes": ["test/**", "scripts/**"],
+      "includes": ["**/test/**", "**/scripts/**"],
       "linter": {
         "rules": {
           "suspicious": {

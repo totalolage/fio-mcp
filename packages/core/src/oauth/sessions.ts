@@ -1,4 +1,5 @@
 import { Clock, Effect, Option, Redacted } from "effect";
+import type { AppIdentity } from "../app-identity.js";
 import { hashSecret, newSigningKey, randomSecret, safeEqual, sign } from "./crypto.js";
 
 /**
@@ -9,7 +10,8 @@ import { hashSecret, newSigningKey, randomSecret, safeEqual, sign } from "./cryp
  * ten minutes, end at the redirect, and change id at login.
  */
 
-export const SESSION_COOKIE = "__Host-fio-mcp-auth";
+/** The session cookie's name: `__Host-<app name>-auth`. */
+export const sessionCookieName = (app: AppIdentity): string => `__Host-${app.name}-auth`;
 export const SESSION_TTL_MS = 10 * 60_000;
 /**
  * Sessions held at once. Anyone can start one, so sign-ins in progress are
@@ -44,9 +46,9 @@ export interface AuthSession {
   readonly passwordStamp: string | undefined;
   readonly expiresAt: number;
   /**
-   * What each rendered consent form showed, by its form id: account name →
-   * token fingerprint. A submit is accepted only for its own form's accounts,
-   * unchanged (an account renamed or given a new token in between is shown
+   * What each rendered consent form showed, by its form id: resource label →
+   * resource id. A submit is accepted only for its own form's resources,
+   * unchanged (a resource relabelled or given a new id in between is shown
    * again instead). The newest MAX_CONSENT_FORMS forms are kept.
    */
   readonly consentForms: Map<string, ReadonlyMap<string, string>>;

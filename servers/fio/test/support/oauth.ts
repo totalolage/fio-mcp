@@ -8,6 +8,13 @@
  */
 
 import { createHash, randomBytes } from "node:crypto";
+import { AdminPassword, type AdminPasswordShape } from "@mcps/core/admin/password.js";
+import { adminRoutes, type SecondFactorCheck } from "@mcps/core/admin/server.js";
+import { hashPassword, type PasswordHash } from "@mcps/core/oauth/crypto.js";
+import type { ThrottlePolicy } from "@mcps/core/oauth/login.js";
+import { makeOAuthStore, type OAuthStore } from "@mcps/core/oauth/store.js";
+import { parseTrustedProxy } from "@mcps/core/transport/client-address.js";
+import { httpRouterApp } from "@mcps/core/transport/http.js";
 import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 import type {
   OAuthClientInformationMixed,
@@ -19,22 +26,18 @@ import { HttpRouter, HttpServer, HttpServerRequest } from "effect/http";
 import type { SqlClient } from "effect/sql";
 import { AccountChangesLive } from "../../src/account-runtime.js";
 import { Accounts, type AccountsShape } from "../../src/accounts.js";
-import { AdminPassword, type AdminPasswordShape } from "../../src/admin/password.js";
-import { AdminLive, adminRoutes, type SecondFactorCheck } from "../../src/admin/server.js";
+import { AdminLive, adminPasswordLayer } from "../../src/admin/live.js";
 import { SERVER_INFO, ToolsLive } from "../../src/app.js";
 import { SERVER_MIGRATIONS } from "../../src/cache/db.js";
-import { type AppConfigShape, accountSeedOf, type HttpAuthConfig } from "../../src/config.js";
+import { type AppConfigShape, accountSeedOf, type HttpAuthConfig, type HttpTransportConfig } from "../../src/config.js";
 import type { FioApiShape } from "../../src/fio-api.js";
-import { hashPassword, type PasswordHash, parsePasswordHash } from "../../src/oauth/crypto.js";
-import type { ThrottlePolicy } from "../../src/oauth/login.js";
-import { makeOAuthStore, type OAuthStore } from "../../src/oauth/store.js";
+import { parsePasswordHash } from "../../src/identity.js";
+import { grantPaymentSettings } from "../../src/oauth/grant-payments.js";
 import { PaymentControls, type PaymentControlsShape } from "../../src/payment-controls.js";
 import { PAYMENT_FIELDS, paymentFormValues } from "../../src/payment-form.js";
 import { PaymentLedger } from "../../src/payment-ledger.js";
 import { DEFAULT_GRANT_PAYMENTS, DEFAULT_PAYMENT_LIMITS, type PaymentLimits } from "../../src/payment-limits.js";
-import { Auth } from "../../src/transport/auth.js";
-import { parseTrustedProxy } from "../../src/transport/client-address.js";
-import { type HttpTransportConfig, httpRouterApp } from "../../src/transport/http.js";
+import { fioOAuth } from "../../src/transport/auth.js";
 import { testDatabase } from "./database.js";
 import { testConfig, testServices } from "./transport.js";
 
@@ -102,7 +105,8 @@ export interface InProcessHarness extends OAuthHarness {
 /** Requests carrying this header appear to come from that socket peer address. */
 export const PEER_HEADER = "x-test-peer";
 
-const adminPasswordLayer = <E, R>(
+/** `real`, with the test's replacements of its parts (options.adminPassword). */
+const wrapAdminPassword = <E, R>(
   real: Layer.Layer<AdminPassword, E, R>,
   wrap: ((real: AdminPasswordShape) => AdminPasswordShape) | undefined,
 ): Layer.Layer<AdminPassword, E, R> =>
@@ -173,12 +177,20 @@ export async function startOAuth(
   const capture = Logger.make<unknown, void>((entry) => {
     logs.push(Logger.formatLogFmt.log(entry));
   });
-  // As Auth.Live builds it, with the test's throttling and scrypt parameters.
+  // As authFromConfig builds it, with the test's throttling and scrypt parameters.
   const oauth = Layer.mergeAll(
-    Auth.oauth({ publicUrl: PUBLIC_URL, trustedProxies, allowedNetworks }),
+    fioOAuth({ publicUrl: PUBLIC_URL, trustedProxies, allowedNetworks }),
     AdminLive({ ...adminSettings, secondFactor: options.secondFactor }),
     options.extraAdminRoutes === undefined ? Layer.empty : adminRoutes(adminSettings, options.extraAdminRoutes),
-  ).pipe(Layer.provide(adminPasswordLayer(AdminPassword.layer(Redacted.make(hash), options.throttle, FAST_SCRYPT, options.totpSecret), options.adminPassword)));
+  ).pipe(
+    Layer.provide(
+      wrapAdminPassword(
+        adminPasswordLayer(Redacted.make(hash), options.throttle, FAST_SCRYPT, options.totpSecret),
+        options.adminPassword,
+      ),
+    ),
+    Layer.provide(Accounts.resources),
+  );
   let accounts: AccountsShape | undefined;
   const captureAccounts = Layer.effectDiscard(
     Effect.map(Effect.service(Accounts), (service) => {
@@ -233,7 +245,7 @@ export async function startOAuth(
     logs,
     store: (f) =>
       Effect.runPromise(
-        Effect.flatMap(makeOAuthStore(), f).pipe(Effect.provide(Layer.succeedContext(db)), Effect.provideService(Clock.Clock, clock)),
+        Effect.flatMap(makeOAuthStore(undefined, grantPaymentSettings(config.paymentLimits)), f).pipe(Effect.provide(Layer.succeedContext(db)), Effect.provideService(Clock.Clock, clock)),
       ),
     sql: (effect) => Effect.runPromise(effect.pipe(Effect.provide(Layer.succeedContext(db)), Effect.provideService(Clock.Clock, clock))),
     accounts: () => {

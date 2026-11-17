@@ -1,4 +1,5 @@
 import { assert, describe, it } from "@effect/vitest";
+import { LocalPrincipalLive } from "@mcps/core/transport/principal.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { Effect, Layer, Logger, References, Schema } from "effect";
 import { Accounts } from "../src/accounts.js";
@@ -6,8 +7,7 @@ import { Transactions } from "../src/cache/service.js";
 import { FioApi } from "../src/fio-api.js";
 import { makeFioHandlers, makeFioToolkit } from "../src/mcp/fio-tools.js";
 import { RateLimiter } from "../src/rate-limiter.js";
-import { makeRedactor, Redactor, stderrLogger } from "../src/redaction.js";
-import { LocalPrincipalLive } from "../src/transport/principal.js";
+import { makeRedactor, RedactorDefault, stderrLogger } from "../src/redaction.js";
 import { payAccount, READ_TOKEN, readAccount, STATEMENT_JSON, testConfig } from "./fixtures.js";
 import { seededConfig } from "./support/config.js";
 import {
@@ -311,7 +311,7 @@ const inProcess = (route: FioHttpHandler) => {
   const cfg = testConfig([readAccount()]);
   return Layer.mergeAll(Transactions.Disabled, memoryPaymentControls()).pipe(
     Layer.provideMerge(FioApi.Default),
-    Layer.provideMerge(Layer.mergeAll(Redactor.Default, Accounts.Default, RateLimiter.Default)),
+    Layer.provideMerge(Layer.mergeAll(RedactorDefault, Accounts.Default, RateLimiter.Default)),
     Layer.provideMerge(seededConfig(cfg)),
     Layer.provide(FioHttp.layer({ tokens: [READ_TOKEN], baseUrl: cfg.baseUrl, handler: route })),
     Layer.merge(LocalPrincipalLive),

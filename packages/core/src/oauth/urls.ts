@@ -1,3 +1,5 @@
+import type { AppIdentity } from "../app-identity.js";
+
 /**
  * URL rules of the authorization server: the public origin (issuer), the
  * resource identifier tokens are bound to, and client redirect URIs.
@@ -13,13 +15,14 @@ export const MCP_RESOURCE_PATH = "/mcp";
 const parse = (raw: string): URL | undefined => (URL.canParse(raw) ? new URL(raw) : undefined);
 
 /**
- * FIO_MCP_PUBLIC_URL: an https origin (http only for loopback hosts, for
- * local testing) without path, query, fragment, or credentials. Returns the
- * canonical origin, or a problem description that does not echo the value.
+ * The server's public URL: an https origin (http only for loopback hosts,
+ * for local testing) without path, query, fragment, or credentials. Returns
+ * the canonical origin, or a problem description that does not echo the
+ * value; its example origin is `https://<app idPrefix>.example.net`.
  */
-export function parsePublicUrl(raw: string): { readonly origin: string } | { readonly problem: string } {
+export function parsePublicUrl(raw: string, app: AppIdentity): { readonly origin: string } | { readonly problem: string } {
   const url = parse(raw);
-  if (url === undefined) return { problem: "must be an absolute URL such as https://fio.example.net" };
+  if (url === undefined) return { problem: `must be an absolute URL such as https://${app.idPrefix}.example.net` };
   if (url.protocol !== "https:" && !(url.protocol === "http:" && LOOPBACK_HOSTS.has(url.hostname))) {
     return { problem: "must use https (http is accepted only for 127.0.0.1, [::1] and localhost)" };
   }
@@ -28,24 +31,6 @@ export function parsePublicUrl(raw: string): { readonly origin: string } | { rea
     return { problem: "must be an origin without path, query, or fragment (the server answers at the root)" };
   }
   return { origin: url.origin };
-}
-
-/**
- * FIO_API_BASE_URL: an https URL whose host is fio.cz or ends in .fio.cz,
- * without credentials, query or fragment. With `allowTest`
- * (FIO_API_ALLOW_TEST_BASE_URL) http on 127.0.0.1, [::1] and localhost is
- * accepted too. Returns the normalized URL without trailing slashes, or
- * undefined; the caller's message must not echo the value.
- */
-export function parseFioBaseUrl(raw: string, allowTest: boolean): string | undefined {
-  const url = parse(raw);
-  if (url === undefined) return undefined;
-  const onFio = url.protocol === "https:" && (url.hostname === "fio.cz" || url.hostname.endsWith(".fio.cz"));
-  const testServer = allowTest && url.protocol === "http:" && LOOPBACK_HOSTS.has(url.hostname);
-  if (!onFio && !testServer) return undefined;
-  if (url.username !== "" || url.password !== "") return undefined;
-  if (url.search !== "" || url.hash !== "" || raw.includes("?") || raw.includes("#")) return undefined;
-  return url.href.replace(/\/+$/, "");
 }
 
 /**

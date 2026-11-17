@@ -1,9 +1,11 @@
 import { assert, describe, it } from "@effect/vitest";
+import { type Grant, makeOAuthStore } from "@mcps/core/oauth/store.js";
 import { Clock, Effect, Exit, Option } from "effect";
 import { SqlClient } from "effect/sql";
 import { SERVER_MIGRATIONS } from "../src/cache/db.js";
-import { type Grant, makeOAuthStore } from "../src/oauth/store.js";
-import { DEFAULT_GRANT_PAYMENTS, type GrantPayments } from "../src/payment-limits.js";
+import { grantPaymentSettings, readGrantPayments } from "../src/oauth/grant-payments.js";
+import { grantPaymentsOf } from "../src/payment-controls.js";
+import { DEFAULT_GRANT_PAYMENTS, DEFAULT_PAYMENT_LIMITS, type GrantPayments } from "../src/payment-limits.js";
 import { memoryDatabase } from "./support/database.js";
 
 const RESOURCE = "https://fio.example.test/mcp";
@@ -14,7 +16,7 @@ const PAYMENTS: GrantPayments = {
 };
 
 const setup = Effect.fnUntraced(function* (payments: GrantPayments) {
-  const store = yield* makeOAuthStore();
+  const store = yield* makeOAuthStore(undefined, grantPaymentSettings(DEFAULT_PAYMENT_LIMITS));
   const now = yield* Clock.currentTimeMillis;
   const clientId = "client_payments";
   yield* store.insertClient(
@@ -25,9 +27,9 @@ const setup = Effect.fnUntraced(function* (payments: GrantPayments) {
     grantId: "fio_grant_payments",
     clientId,
     scopes: ["fio:read", "fio:payments"],
-    accountFingerprints: ["fp"],
+    resources: ["fp"],
     resource: RESOURCE,
-    payments,
+    settings: payments,
   };
   yield* store.createGrant(
     grant,
@@ -47,7 +49,7 @@ describe("grant payment settings (migration 0008)", () => {
       `;
       assert.deepStrictEqual(row, { payment_limits_json: null, payee_allowlist_json: null });
       const [grant] = yield* store.listGrants(now);
-      assert.deepStrictEqual(grant?.payments, DEFAULT_GRANT_PAYMENTS);
+      assert.deepStrictEqual(grant?.settings, DEFAULT_GRANT_PAYMENTS);
     }).pipe(Effect.provide(memoryDatabase(SERVER_MIGRATIONS))),
   );
 
@@ -55,19 +57,19 @@ describe("grant payment settings (migration 0008)", () => {
     Effect.gen(function* () {
       const { store, now } = yield* setup(PAYMENTS);
       const [grant] = yield* store.listGrants(now);
-      assert.deepStrictEqual(grant?.payments, PAYMENTS);
+      assert.deepStrictEqual(grant?.settings, PAYMENTS);
     }).pipe(Effect.provide(memoryDatabase(SERVER_MIGRATIONS))),
   );
 
   it.effect("updates a live grant's settings, and refuses a revoked one", () =>
     Effect.gen(function* () {
       const { store, now, grant } = yield* setup(DEFAULT_GRANT_PAYMENTS);
-      assert.isTrue(yield* store.updateGrantPayments(grant.grantId, PAYMENTS, now));
+      assert.isTrue(yield* store.updateGrantSettings(grant.grantId, PAYMENTS, now));
       const [updated] = yield* store.listGrants(now);
-      assert.deepStrictEqual(updated?.payments, PAYMENTS);
+      assert.deepStrictEqual(updated?.settings, PAYMENTS);
       yield* store.revokeGrant(grant.grantId, now);
-      assert.isFalse(yield* store.updateGrantPayments(grant.grantId, DEFAULT_GRANT_PAYMENTS, now));
-      assert.isFalse(yield* store.updateGrantPayments("fio_grant_unknown", PAYMENTS, now));
+      assert.isFalse(yield* store.updateGrantSettings(grant.grantId, DEFAULT_GRANT_PAYMENTS, now));
+      assert.isFalse(yield* store.updateGrantSettings("fio_grant_unknown", PAYMENTS, now));
     }).pipe(Effect.provide(memoryDatabase(SERVER_MIGRATIONS))),
   );
 
@@ -82,4 +84,22 @@ describe("grant payment settings (migration 0008)", () => {
       assert.isTrue(Exit.isSuccess(access) && Option.isNone(access.value));
     }).pipe(Effect.provide(memoryDatabase(SERVER_MIGRATIONS))),
   );
+});
+
+describe("grant payment settings on the principal (readGrantPayments)", () => {
+  it("gives callers without settings the server defaults with the allowlist off", () => {
+    assert.strictEqual(readGrantPayments(undefined), DEFAULT_GRANT_PAYMENTS);
+    assert.strictEqual(grantPaymentsOf({ subject: "local", scopes: "all", resources: "all" }), DEFAULT_GRANT_PAYMENTS);
+  });
+
+  it("returns a grant's valid settings as they are", () => {
+    assert.strictEqual(readGrantPayments(PAYMENTS), PAYMENTS);
+    assert.strictEqual(grantPaymentsOf({ subject: "g", scopes: [], resources: [], clientId: "c", settings: PAYMENTS }), PAYMENTS);
+  });
+
+  it("refuses malformed settings instead of reading them as something more permissive", () => {
+    for (const malformed of [null, {}, { limits: null }, { ...PAYMENTS, allowlist: { mode: "open", entries: [] } }]) {
+      assert.throws(() => readGrantPayments(malformed));
+    }
+  });
 });

@@ -7,7 +7,7 @@ import { FioApi } from "../src/fio-api.js";
 import { parsePurgeArgs, purgePaymentsCommand } from "../src/payment-cli.js";
 import { AUDIT_RETENTION_DAYS, PaymentControls } from "../src/payment-controls.js";
 import { type NewAuditRow, PaymentLedger } from "../src/payment-ledger.js";
-import { Redactor } from "../src/redaction.js";
+import { RedactorDefault } from "../src/redaction.js";
 import { seededConfig } from "./support/config.js";
 import { memoryDatabase } from "./support/database.js";
 import { testConfig } from "./support/transport.js";
@@ -26,7 +26,7 @@ const testLayer = Layer.mergeAll(
   PaymentControls.Default.pipe(
     Layer.provideMerge(PaymentLedger.Default),
     Layer.provideMerge(
-      Layer.mergeAll(Layer.mock(FioApi, {}), Accounts.Default, Redactor.Default, memoryDatabase(SERVER_MIGRATIONS)),
+      Layer.mergeAll(Layer.mock(FioApi, {}), Accounts.Default, RedactorDefault, memoryDatabase(SERVER_MIGRATIONS)),
     ),
     Layer.provideMerge(seededConfig(testConfig())),
   ),

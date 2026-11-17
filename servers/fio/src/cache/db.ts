@@ -1,12 +1,15 @@
 import { dirname } from "node:path";
 import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem";
 import { SqliteClient, SqliteMigrator } from "@effect/sql-sqlite-node";
+import type { Migrations } from "@mcps/core/migrations.js";
+import { OAUTH_MIGRATIONS } from "@mcps/core/oauth/store.js";
 import { Effect, FileSystem, Layer } from "effect";
-import { Migrator, SqlClient, type SqlError } from "effect/sql";
+import { Migrator, SqlClient } from "effect/sql";
 import { ACCOUNT_MIGRATIONS } from "../account-migrations.js";
 import { AppConfig } from "../config.js";
 import { CacheError, InvalidInput } from "../errors.js";
-import { OAUTH_MIGRATIONS } from "../oauth/store.js";
+import { GRANT_PAYMENT_MIGRATIONS } from "../oauth/grant-payments.js";
+import { PAYMENT_MIGRATIONS } from "../payment-ledger.js";
 
 /**
  * The server's SQLite file (FIO_DB_PATH). It holds the transaction cache,
@@ -31,7 +34,7 @@ export const cacheFailure =
     );
 
 /** A migration: an Effect keyed `<id>_<name>`, run once in id order. */
-export type Migrations = Record<string, Effect.Effect<void, SqlError.SqlError, SqlClient.SqlClient>>;
+export type { Migrations };
 
 /**
  * Cache migrations. Other modules contribute their own record, merged as
@@ -196,7 +199,13 @@ const layer = (
 };
 
 /** Every module's migrations, in one id sequence. */
-export const SERVER_MIGRATIONS: Migrations = { ...CACHE_MIGRATIONS, ...OAUTH_MIGRATIONS, ...ACCOUNT_MIGRATIONS };
+export const SERVER_MIGRATIONS: Migrations = {
+  ...CACHE_MIGRATIONS,
+  ...OAUTH_MIGRATIONS,
+  ...ACCOUNT_MIGRATIONS,
+  ...GRANT_PAYMENT_MIGRATIONS,
+  ...PAYMENT_MIGRATIONS,
+};
 
 /**
  * The server's database (`SqlClient`). Not a `Context.Service`: `SqlClient`

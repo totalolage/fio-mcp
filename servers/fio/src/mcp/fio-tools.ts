@@ -1,3 +1,4 @@
+import { CurrentPrincipal } from "@mcps/core/transport/principal.js";
 import { Effect, Schema } from "effect";
 import { McpServer, Tool, Toolkit } from "effect/ai";
 import { type Account, Accounts } from "../accounts.js";
@@ -10,8 +11,7 @@ import { buildImportXml, PaymentOrders, summarizeOrders } from "../payments.js";
 import { RateLimiter } from "../rate-limiter.js";
 import { Redactor } from "../redaction.js";
 import { parseLastStatement } from "../statement.js";
-import { CurrentPrincipal } from "../transport/principal.js";
-import { annotateTool, DateParam, guardedOutput, JsonObject, ToolFailure, withAccount } from "./common.js";
+import { annotateTool, DateParam, guardedOutput, JsonObject, ToolFailure, toolsForAccounts, withAccount } from "./common.js";
 import {
   MARKER_TOOLS,
   PAYMENTS,
@@ -21,7 +21,6 @@ import {
   requireScopes,
   visibleAccounts,
 } from "./permissions.js";
-import { toolsForAccounts } from "./registration.js";
 import { CURRENCY, G, STATEMENT_GUARD } from "./untrusted.js";
 
 /** SEC-28 provenance rule, shared by the payment tool descriptions and SERVER_INSTRUCTIONS. */
@@ -371,8 +370,8 @@ export const FioToolsLive = toolsForAccounts(
     const toolkit = makeFioToolkit(names);
     // FIO_MCP_MARKER_TOOLS=disabled (SEC-10). stdio has no tools/list filter, so
     // the marker tools are not registered there (a call gets "Tool not found").
-    // HTTP keeps them registered and hides them in its grant filter
-    // (src/transport/grant-tools.ts); a call by name gets PermissionDenied.
+    // HTTP keeps them registered and hides them in its grant filter (the tool
+    // policy's `listed`, src/mcp/tool-policy.ts); a call by name gets PermissionDenied.
     const registered =
       config.markerTools === "disabled" && config.transport.kind === "stdio"
         ? Toolkit.make(...Object.values(toolkit.tools).filter((tool) => !MARKER_TOOLS.has(tool.name)))

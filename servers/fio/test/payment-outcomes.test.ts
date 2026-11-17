@@ -1,4 +1,5 @@
 import { assert, describe, it } from "@effect/vitest";
+import type { Principal } from "@mcps/core/transport/principal.js";
 import { Effect, Exit, Layer, Logger, Redacted, References, Schema } from "effect";
 import { SqlClient } from "effect/sql";
 import { type Account, Accounts } from "../src/accounts.js";
@@ -11,8 +12,7 @@ import { PaymentLedger } from "../src/payment-ledger.js";
 import { DEFAULT_PAYMENT_LIMITS } from "../src/payment-limits.js";
 import { buildImportXml, type Payer, type PaymentOrder, PaymentOrders } from "../src/payments.js";
 import { RateLimiter } from "../src/rate-limiter.js";
-import { Redactor } from "../src/redaction.js";
-import type { Principal } from "../src/transport/principal.js";
+import { RedactorDefault } from "../src/redaction.js";
 import { IMPORT_ERROR_XML } from "./fixtures.js";
 import { seededConfig } from "./support/config.js";
 import { memoryDatabase } from "./support/database.js";
@@ -53,14 +53,14 @@ const testLayer = PaymentControls.Default.pipe(
       FioHttp.layer({ tokens: [TOKEN], baseUrl: BASE_URL }),
       Accounts.Default,
       RateLimiter.Default,
-      Redactor.Default,
+      RedactorDefault,
       memoryDatabase(SERVER_MIGRATIONS),
     ),
   ),
   Layer.provideMerge(seededConfig(config)),
 );
 
-const principal: Principal = { subject: "fio_grant_1", scopes: "all", accountFingerprints: "all", clientId: "client_1" };
+const principal: Principal = { subject: "fio_grant_1", scopes: "all", resources: "all", clientId: "client_1" };
 
 const account: Effect.Effect<Account, InvalidInput, Accounts> = Effect.flatMap(Effect.service(Accounts), (accounts) =>
   accounts.resolve("main"),

@@ -4,6 +4,9 @@
  * nothing listens on a port; FIO is the scripted `FioHttp` client.
  */
 
+import { Auth } from "@mcps/core/transport/auth.js";
+import { httpRouterApp } from "@mcps/core/transport/http.js";
+import type { Principal } from "@mcps/core/transport/principal.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
@@ -14,13 +17,11 @@ import { SERVER_INFO, ToolsLive } from "../../src/app.js";
 import { Transactions } from "../../src/cache/service.js";
 import type { AppConfigShape } from "../../src/config.js";
 import { FioApi } from "../../src/fio-api.js";
+import { ConfiguredToolPolicy } from "../../src/mcp/tool-policy.js";
 import { PaymentControls } from "../../src/payment-controls.js";
 import { type AuditRow, PAYMENT_MIGRATIONS, PaymentLedger } from "../../src/payment-ledger.js";
 import { RateLimiter } from "../../src/rate-limiter.js";
-import { Redactor } from "../../src/redaction.js";
-import { Auth } from "../../src/transport/auth.js";
-import { httpRouterApp } from "../../src/transport/http.js";
-import type { Principal } from "../../src/transport/principal.js";
+import { RedactorDefault } from "../../src/redaction.js";
 import { seededConfig } from "./config.js";
 import { memoryDatabase, testDatabase } from "./database.js";
 import { FioHttp, type FioHttpHandler, type FioHttpReply, type RecordedRequest } from "./fio-http.js";
@@ -71,7 +72,8 @@ export async function connect(
     : Transactions.Disabled;
   const ServicesLive = Layer.mergeAll(cache, PaymentControls.Default.pipe(Layer.provide(Layer.succeedContext(ledger)))).pipe(
     Layer.provideMerge(FioApi.Default),
-    Layer.provideMerge(Layer.mergeAll(Redactor.Default, Accounts.Default, RateLimiter.Default)),
+    Layer.provideMerge(Layer.mergeAll(Accounts.resources, ConfiguredToolPolicy)),
+    Layer.provideMerge(Layer.mergeAll(RedactorDefault, Accounts.Default, RateLimiter.Default)),
     Layer.provideMerge(seededConfig(config)),
     Layer.provide(Layer.succeedContext(fioHttp)),
   );

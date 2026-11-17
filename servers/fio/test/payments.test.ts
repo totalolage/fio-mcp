@@ -1,3 +1,4 @@
+import type { Principal } from "@mcps/core/transport/principal.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { Effect, Result, Schema } from "effect";
 import { afterEach, describe, expect, it } from "vitest";
@@ -15,7 +16,6 @@ import {
   PaymentOrders,
   summarizeOrders,
 } from "../src/payments.js";
-import type { Principal } from "../src/transport/principal.js";
 import { IMPORT_OK_XML, IMPORT_PERMISSION_XML, PAY_TOKEN, payAccount, testConfig } from "./fixtures.js";
 import { type FioHttpHandler, type FioHttpReply, text as fioHttpText } from "./support/fio-http.js";
 import { connect, type Harness, text } from "./support/mcp.js";
@@ -423,9 +423,9 @@ const LIMITS = { maxPerOrder: { CZK: 1000, EUR: 100 }, maxPerDay: { CZK: 5000, E
 const grant = (payments: GrantPayments): Principal => ({
   subject: "grant-pay",
   scopes: "all",
-  accountFingerprints: "all",
+  resources: "all",
   clientId: "client-pay",
-  payments,
+  settings: payments,
 });
 
 /** Allowlist with the euro payee, entered in lower case and with spaces. */

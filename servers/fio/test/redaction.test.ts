@@ -2,7 +2,7 @@ import { assert, describe, it } from "@effect/vitest";
 import { ConfigProvider, Effect, Layer, Logger } from "effect";
 import { FioBadRequest } from "../src/errors.js";
 import { makeGuard, markUntrusted, preambleFor } from "../src/mcp/untrusted.js";
-import { makeRedactor, Redactor, stderrLogger } from "../src/redaction.js";
+import { makeRedactor, Redactor, RedactorLive, stderrLogger } from "../src/redaction.js";
 import { PAY_TOKEN, READ_TOKEN } from "./fixtures.js";
 
 describe("token redaction", () => {
@@ -104,7 +104,7 @@ describe("tokens added at runtime", () => {
       const env = ConfigProvider.layer(ConfigProvider.fromEnv({ env: { HOME: "/home/test", FIO_TOKEN: READ_TOKEN } }));
       const grab = (set: (redactor: Redactor["Service"]) => void) =>
         Layer.effectDiscard(Effect.map(Effect.service(Redactor), set)).pipe(
-          Layer.provide(Redactor.Live),
+          Layer.provide(RedactorLive),
           Layer.provide(env),
         );
       const innerBuild = Effect.scoped(

@@ -1,3 +1,4 @@
+import { toolsForResources } from "@mcps/core/mcp/registration.js";
 import { Effect, Schema } from "effect";
 import { Tool } from "effect/ai";
 import {
@@ -122,3 +123,10 @@ export function annotateTool<T extends Tool.Any>(tool: T, hints: ToolHints): T {
     .annotate(Tool.OpenWorld, hints.openWorld)
     .annotate(Tool.Strict, true) as T;
 }
+
+/**
+ * Registers tools built for the account names (core's resource labels, see
+ * Accounts.resources), and again whenever the names change.
+ */
+export const toolsForAccounts = <E, R>(register: (accountNames: ReadonlyArray<string>) => Effect.Effect<void, E, R>) =>
+  toolsForResources(register, "mcp: could not update the tools after an account change");

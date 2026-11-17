@@ -12,7 +12,7 @@ const networks = (...entries: Array<string>) => entries.flatMap((entry) => parse
 
 const request = (peer: string | undefined, forwardedFor?: string) => {
   const web = HttpServerRequest.fromWeb(
-    new Request("http://fio.example.test/login", {
+    new Request("http://mcp.example.test/login", {
       headers: forwardedFor === undefined ? {} : { "x-forwarded-for": forwardedFor },
     }),
   );
@@ -68,13 +68,13 @@ describe("parseTrustedProxy", () => {
 describe("makeUntrustedForwardingCheck", () => {
   const traefik = networks("172.18.0.0/16");
   /** Runs the requests through one check with a test logger; returns the log lines. */
-  const logsOf = (requests: ReadonlyArray<HttpServerRequest.HttpServerRequest>) =>
+  const logsOf = (requests: ReadonlyArray<HttpServerRequest.HttpServerRequest>, setting?: string) =>
     Effect.gen(function* () {
       const logs: Array<string> = [];
       const capture = Logger.make<unknown, void>((entry) => {
         logs.push(Logger.formatLogFmt.log(entry));
       });
-      const check = makeUntrustedForwardingCheck(traefik);
+      const check = makeUntrustedForwardingCheck(traefik, setting);
       yield* Effect.forEach(requests, check, { discard: true }).pipe(Effect.provide(Logger.layer([capture])));
       return logs;
     });
@@ -90,6 +90,17 @@ describe("makeUntrustedForwardingCheck", () => {
       assert.strictEqual(logs.length, 1);
       assert.include(logs[0], UNTRUSTED_FORWARDING_WARNING);
       assert.notMatch(logs[0] ?? "", /203\.0\.113|198\.51\.100|192\.0\.2/);
+    }),
+  );
+
+  it.effect("names the app's trusted-proxy setting in the warning", () =>
+    Effect.gen(function* () {
+      const logs = yield* logsOf([request("203.0.113.9", "198.51.100.7")], "DEMO_TRUSTED_PROXIES");
+      assert.strictEqual(logs.length, 1);
+      assert.include(
+        logs[0],
+        "X-Forwarded-For received from an untrusted peer; set DEMO_TRUSTED_PROXIES to the proxy's address.",
+      );
     }),
   );
 
