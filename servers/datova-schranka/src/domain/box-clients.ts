@@ -52,12 +52,13 @@ const make = Effect.gen(function* () {
     });
   });
 
-  /** Closes the slot's client, if any. Under the slot's permit. */
+  /** Closes the slot's client, if any, without leaving it half-dropped. Under the slot's permit. */
   const discard = (slot: BoxSlot) =>
     Ref.getAndSet(slot.built, Option.none()).pipe(
       Effect.flatMap(
         Option.match({ onNone: () => Effect.void, onSome: ({ scope }) => Scope.close(scope, Exit.void) }),
       ),
+      Effect.uninterruptible,
     );
 
   /** Drops a removed box's slot and closes its client. Under the slot's permit. */
@@ -71,24 +72,45 @@ const make = Effect.gen(function* () {
           return next;
         }),
       ),
+      Effect.uninterruptible,
     );
 
   /**
+   * Closes the slot's old client and builds one over `credentials` in a new child of the layer
+   * scope. Runs uninterruptibly except for the build itself (`restore`), so the slot ends up
+   * either empty with the new scope closed, or holding the new client with its scope open.
+   */
+  const rebuild = Effect.fn("BoxClients.rebuild")(function* (
+    slot: BoxSlot,
+    credentials: IsdsCredentials,
+    restore: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>,
+  ) {
+    yield* discard(slot);
+    const scope = yield* Scope.fork(layerScope);
+    const exit = yield* Effect.exit(
+      restore(
+        makeIsdsClient(boxClientConfig(config, credentials)).pipe(
+          Scope.provide(scope),
+          Effect.provideService(IsdsTransports, transports),
+        ),
+      ),
+    );
+    if (Exit.isFailure(exit)) {
+      yield* Scope.close(scope, exit);
+      return yield* Effect.failCause(exit.cause);
+    }
+    yield* Ref.set(slot.built, Option.some({ credentials, client: exit.value, scope }));
+    return exit.value;
+  });
+
+  /**
    * The slot's client when it was built from this very credentials object (the registry keeps
-   * the reference until the credentials are replaced), else a new one; the old one is closed
-   * first. A failed build closes its scope and leaves the slot empty. Under the slot's permit.
+   * the reference until the credentials are replaced), else a new one. Under the slot's permit.
    */
   const clientFor = Effect.fn("BoxClients.clientFor")(function* (slot: BoxSlot, credentials: IsdsCredentials) {
     const built = yield* Ref.get(slot.built);
     if (Option.isSome(built) && built.value.credentials === credentials) return built.value.client;
-    yield* discard(slot);
-    const scope = yield* Scope.fork(layerScope);
-    return yield* makeIsdsClient(boxClientConfig(config, credentials)).pipe(
-      Scope.provide(scope),
-      Effect.provideService(IsdsTransports, transports),
-      Effect.tap((client) => Ref.set(slot.built, Option.some({ credentials, client, scope }))),
-      Effect.onExit((exit) => (Exit.isSuccess(exit) ? Effect.void : Scope.close(scope, exit))),
-    );
+    return yield* Effect.uninterruptibleMask((restore) => rebuild(slot, credentials, restore));
   });
 
   const use = Effect.fn("BoxClients.use")(function* <A, E>(

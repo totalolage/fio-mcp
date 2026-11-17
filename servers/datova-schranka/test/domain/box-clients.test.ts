@@ -17,11 +17,16 @@ const entry = (id: string, username = `user-${id}`): FakeBoxEntry => ({
   credentials: passwordCredentials(username),
 });
 
+interface SetupOptions extends FakeIsdsOptions {
+  /** Runs once a transport is made and its close is tracked, while the client is still being built. */
+  readonly afterMake?: (config: IsdsClientConfig) => Effect.Effect<void>;
+}
+
 /**
  * BoxClients.layer over a fake registry and fake transports, built in a scope the test closes
  * (`closeLayer`). Every transport's scope close is recorded in `closed` and offered to `closes`.
  */
-const setup = Effect.fn("setup")(function* (entries: ReadonlyArray<FakeBoxEntry>, options: FakeIsdsOptions = {}) {
+const setup = Effect.fn("setup")(function* (entries: ReadonlyArray<FakeBoxEntry>, options: SetupOptions = {}) {
   const registry = yield* makeFakeBoxRegistry(entries);
   const isds = fakeIsdsTransports(loginResponder({}), options);
   const closed: Array<IsdsClientConfig> = [];
@@ -38,6 +43,7 @@ const setup = Effect.fn("setup")(function* (entries: ReadonlyArray<FakeBoxEntry>
                 Effect.sync(() => closed.push(config)).pipe(Effect.andThen(Queue.offer(closes, config))),
               ),
             ),
+            Effect.tap(() => options.afterMake?.(config) ?? Effect.void),
           ),
       });
     }),
@@ -221,6 +227,34 @@ describe("BoxClients", () => {
     ),
   );
 
+  it.effect("closes a box removed during a use only after that use finishes", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const b1 = entry("b1");
+        const { clients, registry, closed, nextClose } = yield* setup([b1]);
+        const closedWhileHeld: Array<number> = [];
+        const first = yield* holding();
+
+        const a = yield* clients
+          .use("b1", () =>
+            first.body([], "a").pipe(Effect.andThen(Effect.sync(() => closedWhileHeld.push(closed.length)))),
+          )
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(first.entered);
+        yield* registry.remove("b1");
+        // Let the registry's change reach BoxClients, which must wait for the running use.
+        yield* Effect.repeat(Effect.yieldNow, { times: 20 });
+
+        yield* first.release.open;
+        yield* Fiber.join(a);
+        const config = yield* nextClose;
+
+        assert.deepStrictEqual(closedWhileHeld, [0]);
+        assert.strictEqual(config.credentials, b1.credentials);
+      }),
+    ),
+  );
+
   it.effect("closes a removed box's transport without waiting for its next use", () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -276,6 +310,49 @@ describe("BoxClients", () => {
         yield* registry.replaceCredentials("b1", readable);
         yield* clients.use("b1", (client) => client.ping());
         assert.strictEqual(made[0]?.credentials, readable);
+      }),
+    ),
+  );
+
+  it.effect("closes the transport of an interrupted build and builds again on the next use", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const building = yield* Deferred.make<void>();
+        let attempts = 0;
+        const { clients, made, closed } = yield* setup([entry("b1")], {
+          afterMake: () =>
+            Effect.suspend(() => {
+              attempts++;
+              return attempts === 1 ? Deferred.succeed(building, undefined).pipe(Effect.andThen(Effect.never)) : Effect.void;
+            }),
+        });
+
+        const a = yield* clients.use("b1", (client) => client.ping()).pipe(Effect.forkChild);
+        yield* Deferred.await(building);
+        yield* Fiber.interrupt(a);
+        assert.strictEqual(closed.length, 1);
+
+        yield* clients.use("b1", (client) => client.ping());
+        yield* clients.use("b1", (client) => client.ping());
+        assert.strictEqual(made.length, 2);
+        assert.strictEqual(closed.length, 1);
+      }),
+    ),
+  );
+
+  it.effect("releases the box when a use is interrupted and keeps its client", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { clients, made, closed } = yield* setup([entry("b1")]);
+        const first = yield* holding();
+
+        const a = yield* clients.use("b1", () => first.body([], "a")).pipe(Effect.forkChild);
+        yield* Deferred.await(first.entered);
+        yield* Fiber.interrupt(a);
+        yield* clients.use("b1", (client) => client.ping());
+
+        assert.strictEqual(made.length, 1);
+        assert.strictEqual(closed.length, 0);
       }),
     ),
   );
