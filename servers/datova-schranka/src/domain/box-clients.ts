@@ -1,7 +1,8 @@
-import { Context, Effect, Exit, Layer, Option, Ref, Scope, Semaphore, Stream } from "effect";
+import { Context, Effect, Exit, Layer, Ref, Scope, Stream } from "effect";
 import type { IsdsClientShape } from "../isds/client.js";
 import type { IsdsCredentials } from "../isds/config.js";
 import type { IsdsConfigError, IsdsCredentialsError } from "../isds/errors.js";
+import { BoxLocks } from "./box-locks.js";
 import { type BoxCredentialsUnreadable, BoxRegistry } from "./boxes.js";
 import { DomainConfig } from "./config.js";
 import type { BoxNotFound } from "./errors.js";
@@ -10,9 +11,10 @@ import { boxClientConfig, IsdsTransports, makeIsdsClient } from "./isds-transpor
 /**
  * One IsdsClient per loaded box, over its decrypted credentials and the
  * configured environment and request timeout. `use` holds the box's
- * semaphore for the whole of `f`, so ISDS calls for one box never overlap
- * (ISDS rejects parallel list/download, status 3008) while different
- * boxes run concurrently. Replaced credentials apply from the next `use`;
+ * BoxLocks permit for the whole of `f`, so ISDS calls for one box never
+ * overlap, here or in the registry's credential replacement and connection
+ * test (ISDS rejects parallel list/download, status 3008), while different
+ * boxes run concurrently. `f` must not take the same box's permit again. Replaced credentials apply from the next `use`;
  * a removed box fails with BoxNotFound.
  */
 export type BoxClientError = BoxNotFound | BoxCredentialsUnreadable | IsdsCredentialsError | IsdsConfigError;
@@ -31,61 +33,39 @@ interface BuiltClient {
   readonly scope: Scope.Closeable;
 }
 
-/** Per box: the permit every `use` holds, and the client last built. `built` changes only under the permit. */
-interface BoxSlot {
-  readonly permit: Semaphore.Semaphore;
-  readonly built: Ref.Ref<Option.Option<BuiltClient>>;
-}
-
 const make = Effect.gen(function* () {
   const registry = yield* BoxRegistry;
+  const locks = yield* BoxLocks;
   const transports = yield* IsdsTransports;
   const config = yield* DomainConfig;
   const layerScope = yield* Scope.Scope;
-  const slots = yield* Ref.make<ReadonlyMap<string, BoxSlot>>(new Map());
+  /** The client last built per box. A box's entry is read and changed only under its BoxLocks permit. */
+  const built = yield* Ref.make<ReadonlyMap<string, BuiltClient>>(new Map());
 
-  const slotFor = Effect.fn("BoxClients.slotFor")(function* (boxId: string) {
-    const fresh: BoxSlot = { permit: yield* Semaphore.make(1), built: yield* Ref.make(Option.none<BuiltClient>()) };
-    return yield* Ref.modify(slots, (current): readonly [BoxSlot, ReadonlyMap<string, BoxSlot>] => {
+  /** Drops the box's client, if any, and closes its scope, without leaving it half-dropped. Under the box's permit. */
+  const discard = (boxId: string) =>
+    Ref.modify(built, (current): readonly [BuiltClient | undefined, ReadonlyMap<string, BuiltClient>] => {
       const existing = current.get(boxId);
-      return existing === undefined ? [fresh, new Map(current).set(boxId, fresh)] : [existing, current];
-    });
-  });
-
-  /** Closes the slot's client, if any, without leaving it half-dropped. Under the slot's permit. */
-  const discard = (slot: BoxSlot) =>
-    Ref.getAndSet(slot.built, Option.none()).pipe(
-      Effect.flatMap(
-        Option.match({ onNone: () => Effect.void, onSome: ({ scope }) => Scope.close(scope, Exit.void) }),
-      ),
-      Effect.uninterruptible,
-    );
-
-  /** Drops a removed box's slot and closes its client. Under the slot's permit. */
-  const forget = (boxId: string, slot: BoxSlot) =>
-    discard(slot).pipe(
-      Effect.andThen(
-        Ref.update(slots, (current) => {
-          if (current.get(boxId) !== slot) return current;
-          const next = new Map(current);
-          next.delete(boxId);
-          return next;
-        }),
-      ),
+      if (existing === undefined) return [undefined, current];
+      const next = new Map(current);
+      next.delete(boxId);
+      return [existing, next];
+    }).pipe(
+      Effect.flatMap((existing) => (existing === undefined ? Effect.void : Scope.close(existing.scope, Exit.void))),
       Effect.uninterruptible,
     );
 
   /**
-   * Closes the slot's old client and builds one over `credentials` in a new child of the layer
-   * scope. Runs uninterruptibly except for the build itself (`restore`), so the slot ends up
-   * either empty with the new scope closed, or holding the new client with its scope open.
+   * Closes the box's old client and builds one over `credentials` in a new child of the layer
+   * scope. Runs uninterruptibly except for the build itself (`restore`), so the box ends up
+   * either with no client and the new scope closed, or holding the new client with its scope open.
    */
   const rebuild = Effect.fn("BoxClients.rebuild")(function* (
-    slot: BoxSlot,
+    boxId: string,
     credentials: IsdsCredentials,
     restore: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>,
   ) {
-    yield* discard(slot);
+    yield* discard(boxId);
     const scope = yield* Scope.fork(layerScope);
     const exit = yield* Effect.exit(
       restore(
@@ -99,49 +79,50 @@ const make = Effect.gen(function* () {
       yield* Scope.close(scope, exit);
       return yield* Effect.failCause(exit.cause);
     }
-    yield* Ref.set(slot.built, Option.some({ credentials, client: exit.value, scope }));
+    yield* Ref.update(built, (current) => new Map(current).set(boxId, { credentials, client: exit.value, scope }));
     return exit.value;
   });
 
   /**
-   * The slot's client when it was built from this very credentials object (the registry keeps
-   * the reference until the credentials are replaced), else a new one. Under the slot's permit.
+   * The box's client when it was built from this very credentials object (the registry keeps
+   * the reference until the credentials are replaced), else a new one. Under the box's permit.
    */
-  const clientFor = Effect.fn("BoxClients.clientFor")(function* (slot: BoxSlot, credentials: IsdsCredentials) {
-    const built = yield* Ref.get(slot.built);
-    if (Option.isSome(built) && built.value.credentials === credentials) return built.value.client;
-    return yield* Effect.uninterruptibleMask((restore) => rebuild(slot, credentials, restore));
+  const clientFor = Effect.fn("BoxClients.clientFor")(function* (boxId: string, credentials: IsdsCredentials) {
+    const existing = (yield* Ref.get(built)).get(boxId);
+    if (existing !== undefined && existing.credentials === credentials) return existing.client;
+    return yield* Effect.uninterruptibleMask((restore) => rebuild(boxId, credentials, restore));
   });
 
   const use = Effect.fn("BoxClients.use")(function* <A, E>(
     boxId: string,
     f: (client: IsdsClientShape) => Effect.Effect<A, E>,
   ) {
-    const slot = yield* slotFor(boxId);
-    return yield* slot.permit.withPermit(
+    return yield* locks.withBox(
+      boxId,
       Effect.gen(function* () {
         const credentials = yield* registry
           .credentials(boxId)
-          .pipe(Effect.tapError((error) => (error._tag === "BoxNotFound" ? forget(boxId, slot) : Effect.void)));
-        const client = yield* clientFor(slot, credentials);
+          .pipe(Effect.tapError((error) => (error._tag === "BoxNotFound" ? discard(boxId) : Effect.void)));
+        const client = yield* clientFor(boxId, credentials);
         return yield* f(client);
       }),
     );
   });
 
   /** Closes a box's client once the registry no longer has it, waiting for a running `use`. */
-  const dropIfRemoved = (boxId: string, slot: BoxSlot) =>
-    slot.permit.withPermit(
-      registry.get(boxId).pipe(Effect.matchEffect({ onFailure: () => forget(boxId, slot), onSuccess: () => Effect.void })),
+  const dropIfRemoved = (boxId: string) =>
+    locks.withBox(
+      boxId,
+      registry.get(boxId).pipe(Effect.matchEffect({ onFailure: () => discard(boxId), onSuccess: () => Effect.void })),
     );
 
   yield* registry.changes.pipe(
     Stream.runForEach((boxes) =>
-      Ref.get(slots).pipe(
+      Ref.get(built).pipe(
         Effect.flatMap((current) => {
           const present = new Set(boxes.map((box) => box.id));
-          const removed = [...current].filter(([boxId]) => !present.has(boxId));
-          return Effect.forEach(removed, ([boxId, slot]) => Effect.forkIn(dropIfRemoved(boxId, slot), layerScope), {
+          const removed = [...current.keys()].filter((boxId) => !present.has(boxId));
+          return Effect.forEach(removed, (boxId) => Effect.forkIn(dropIfRemoved(boxId), layerScope), {
             discard: true,
           });
         }),
@@ -155,9 +136,7 @@ const make = Effect.gen(function* () {
 });
 
 export class BoxClients extends Context.Service<BoxClients, BoxClientsShape>()("datova-schranka/BoxClients") {
-  /** Clients built lazily per box, each transport in a scope the layer owns. */
-  static readonly Default: Layer.Layer<BoxClients, never, BoxRegistry | IsdsTransports | DomainConfig> = Layer.effect(
-    BoxClients,
-    make,
-  );
+  /** Clients built lazily per box, each transport in a scope the layer owns. Needs the BoxLocks the registry uses. */
+  static readonly Default: Layer.Layer<BoxClients, never, BoxRegistry | BoxLocks | IsdsTransports | DomainConfig> =
+    Layer.effect(BoxClients, make);
 }

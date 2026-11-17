@@ -1,6 +1,7 @@
 import { assert, describe, it } from "@effect/vitest";
 import { Context, Deferred, Effect, Exit, Fiber, Latch, Layer, Queue, Schema, Scope } from "effect";
 import { BoxClients } from "../../src/domain/box-clients.js";
+import { BoxLocks } from "../../src/domain/box-locks.js";
 import { BoxCredentialsUnreadable } from "../../src/domain/boxes.js";
 import { DomainConfig } from "../../src/domain/config.js";
 import { BoxNotFound } from "../../src/domain/errors.js";
@@ -52,7 +53,7 @@ const setup = Effect.fn("setup")(function* (entries: ReadonlyArray<FakeBoxEntry>
   yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
   const context = yield* Layer.buildWithScope(
     BoxClients.Default.pipe(
-      Layer.provide(Layer.mergeAll(registry.layer, tracked, DomainConfig.layer({ dataDir: "/unused" }))),
+      Layer.provide(Layer.mergeAll(registry.layer, tracked, DomainConfig.layer({ dataDir: "/unused" }), BoxLocks.Default)),
     ),
     scope,
   );

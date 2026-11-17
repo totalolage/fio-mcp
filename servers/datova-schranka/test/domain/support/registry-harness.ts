@@ -1,6 +1,7 @@
 import { makeRedactor, Redactor } from "@mcps/core/redaction.js";
 import { Context, Effect, Layer, Logger, Redacted } from "effect";
 import { SqlClient } from "effect/sql";
+import { BoxLocks } from "../../../src/domain/box-locks.js";
 import { BoxRegistry } from "../../../src/domain/boxes.js";
 import { DataKey, DomainConfig } from "../../../src/domain/config.js";
 import type { IsdsEnvironment } from "../../../src/isds/config.js";
@@ -40,6 +41,7 @@ export const startRegistry = Effect.fn("startRegistry")(function* (options: Star
     Layer.provide(Layer.succeed(Redactor, redactor)),
     Layer.provide(DataKey.layer(DATA_KEY)),
     Layer.provide(DomainConfig.layer({ dataDir: "/nonexistent", environment: options.environment ?? "production" })),
+    Layer.provideMerge(BoxLocks.Default),
   );
   const context = yield* Layer.build(layer).pipe(Effect.provide(Logger.layer([capture])));
   return { registry: Context.get(context, BoxRegistry), context, isds, registered, logs, redactor: base };

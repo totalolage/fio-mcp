@@ -333,7 +333,7 @@ describe("ReadService.downloadMessage", () => {
     }),
   );
 
-  it.effect("rejects a malformed dmID before auditing or calling ISDS", () =>
+  it.effect("refuses a malformed dmID in an audited row, without calling ISDS", () =>
     Effect.gen(function* () {
       for (const dmId of ["", "12a", "../x", "123456789012345678901"]) {
         const h = setup();
@@ -341,8 +341,33 @@ describe("ReadService.downloadMessage", () => {
         assert.strictEqual(error._tag, "InvalidIdentifier");
         if (error._tag !== "InvalidIdentifier") return;
         assert.strictEqual(error.kind, "messageId");
-        assert.deepStrictEqual(h.log, []);
+        assert.deepStrictEqual(h.log, ["audit.start download_message", "audit.finish refused"]);
+        assert.strictEqual(h.requests.length, 0);
+        const [start, finish] = h.audit;
+        assert.strictEqual(start?.kind, "start");
+        if (start?.kind !== "start") return;
+        assert.deepStrictEqual(start.input.detail, { dmId });
+        assert.strictEqual(finish?.kind, "finish");
+        if (finish?.kind !== "finish") return;
+        assert.deepStrictEqual(finish.detail, { dmId, error: "InvalidIdentifier" });
       }
+    }),
+  );
+
+  it.effect("audits a long malformed dmID cut to 64 characters", () =>
+    Effect.gen(function* () {
+      const h = setup();
+      const dmId = "9".repeat(10_000);
+      const error = yield* Effect.flip(withService(h, (s) => s.downloadMessage(actor, BOX_ID, dmId)));
+      assert.strictEqual(error._tag, "InvalidIdentifier");
+      assert.deepStrictEqual(h.log, ["audit.start download_message", "audit.finish refused"]);
+      const [start, finish] = h.audit;
+      assert.strictEqual(start?.kind, "start");
+      if (start?.kind !== "start") return;
+      assert.deepStrictEqual(start.input.detail, { dmId: "9".repeat(64) });
+      assert.strictEqual(finish?.kind, "finish");
+      if (finish?.kind !== "finish") return;
+      assert.deepStrictEqual(finish.detail, { dmId: "9".repeat(64), error: "InvalidIdentifier" });
     }),
   );
 
@@ -404,14 +429,20 @@ describe("ReadService.getMessageEnvelope and getDeliveryInfo", () => {
     }),
   );
 
-  it.effect("reject a malformed dmID before auditing", () =>
+  it.effect("refuse a malformed dmID in an audited row, without calling ISDS", () =>
     Effect.gen(function* () {
       const h = setup();
       const a = yield* Effect.flip(withService(h, (s) => s.getMessageEnvelope(actor, BOX_ID, "x")));
       const b = yield* Effect.flip(withService(h, (s) => s.getDeliveryInfo(actor, BOX_ID, "x")));
       assert.strictEqual(a._tag, "InvalidIdentifier");
       assert.strictEqual(b._tag, "InvalidIdentifier");
-      assert.deepStrictEqual(h.log, []);
+      assert.deepStrictEqual(h.log, [
+        "audit.start get_message",
+        "audit.finish refused",
+        "audit.start get_delivery_info",
+        "audit.finish refused",
+      ]);
+      assert.strictEqual(h.requests.length, 0);
     }),
   );
 });
@@ -447,16 +478,21 @@ describe("ReadService list, search and check operations", () => {
     }),
   );
 
-  it.effect("findDataBox rejects a malformed dbID or dbUpperID before auditing", () =>
+  it.effect("findDataBox refuses a malformed dbID or dbUpperID in an audited row, without calling ISDS", () =>
     Effect.gen(function* () {
       const h = setup();
-      for (const query of [{ dbID: "ABC1234" }, { dbType: "OVM", firmName: "Úřad", dbUpperID: "x/../yz" }] as const) {
+      const long = "x".repeat(100);
+      const queries = [{ dbID: "ABC1234" }, { dbType: "OVM", firmName: "Úřad", dbUpperID: "x/../yz" }, { dbID: long }] as const;
+      for (const query of queries) {
         const error = yield* Effect.flip(withService(h, (s) => s.findDataBox(actor, BOX_ID, query)));
         assert.strictEqual(error._tag, "InvalidIdentifier");
         if (error._tag !== "InvalidIdentifier") return;
         assert.strictEqual(error.kind, "dataBoxId");
       }
-      assert.deepStrictEqual(h.log, []);
+      assert.deepStrictEqual(h.log, queries.flatMap(() => ["audit.start find_data_box", "audit.finish refused"]));
+      assert.strictEqual(h.requests.length, 0);
+      const starts = h.audit.flatMap((event) => (event.kind === "start" ? [event.input.detail] : []));
+      assert.deepStrictEqual(starts, [queries[0], queries[1], { dbID: "x".repeat(64) }]);
     }),
   );
 
@@ -474,16 +510,18 @@ describe("ReadService list, search and check operations", () => {
     }),
   );
 
-  it.effect("checkDataBox rejects a malformed dbID before auditing", () =>
+  it.effect("checkDataBox refuses a malformed dbID in an audited row, without calling ISDS", () =>
     Effect.gen(function* () {
       const h = setup();
-      for (const dbId of ["ABC1234", "abc123", "abc12345", "abc-123"]) {
+      const dbIds = ["ABC1234", "abc123", "abc12345", "abc-123"];
+      for (const dbId of dbIds) {
         const error = yield* Effect.flip(withService(h, (s) => s.checkDataBox(actor, BOX_ID, dbId)));
         assert.strictEqual(error._tag, "InvalidIdentifier");
         if (error._tag !== "InvalidIdentifier") return;
         assert.strictEqual(error.kind, "dataBoxId");
       }
-      assert.deepStrictEqual(h.log, []);
+      assert.deepStrictEqual(h.log, dbIds.flatMap(() => ["audit.start check_data_box", "audit.finish refused"]));
+      assert.strictEqual(h.requests.length, 0);
     }),
   );
 
