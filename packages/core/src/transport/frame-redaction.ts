@@ -21,11 +21,45 @@ import type { RedactorShape } from "../redaction.js";
  * - Lines that are not JSON (SSE keep-alive comments, blank separators) get
  *   plain redaction. No secret contains whitespace (config rejects it), so a
  *   replacement never spans a line break and the SSE event structure stays.
+ *
+ * With `protectEmbeddedResources`, a JSON-RPC result whose `content` embeds a
+ * resource (an item of type "resource") is never sent with redacted strings:
+ * if redaction would change anything in that message, it is replaced, under
+ * the same id, by a tool error without resources (withheldResult). A resource
+ * blob is the base64 of exact bytes, and a URI or MIME type names them, so a
+ * redacted one is a corrupt resource, not a safe one. The tool handler is
+ * expected to withhold such resources itself; this catches what it could not
+ * see, such as a secret registered after it ran.
  */
 
 const SSE_DATA = "data: ";
 
 const decodeJson = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown));
+
+export interface FrameRedactorOptions {
+  /** Withholds resource-bearing results that redaction would change. Off by default. */
+  readonly protectEmbeddedResources?: boolean | undefined;
+}
+
+/** The tool error text that replaces a withheld resource-bearing result. */
+export const WITHHELD_RESOURCES_TEXT = "The result was withheld: output redaction would alter its embedded resources.";
+
+/** The JSON-RPC response that replaces a withheld result with this id. */
+export const withheldResult = (id: unknown) => ({
+  jsonrpc: "2.0",
+  id,
+  result: { isError: true, content: [{ type: "text", text: WITHHELD_RESOURCES_TEXT }] },
+});
+
+const isRecord = (value: unknown): value is { readonly [key: string]: unknown } =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+/** A JSON-RPC message whose result content embeds at least one resource. */
+const embedsResource = (message: unknown): boolean =>
+  isRecord(message) &&
+  isRecord(message.result) &&
+  Array.isArray(message.result.content) &&
+  message.result.content.some((item) => isRecord(item) && item.type === "resource");
 
 export interface FrameRedactor {
   readonly text: (text: string) => string;
@@ -36,15 +70,28 @@ export interface FrameRedactor {
   };
 }
 
-export function makeFrameRedactor(redactor: RedactorShape): FrameRedactor {
+export function makeFrameRedactor(redactor: RedactorShape, options: FrameRedactorOptions = {}): FrameRedactor {
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
+
+  const protectMessage = (message: unknown): unknown => {
+    const redacted = redactor.redactDeep(message);
+    if (!embedsResource(message) || JSON.stringify(redacted) === JSON.stringify(message)) return redacted;
+    // The redacted id: a secret in a client-chosen id must not leak either.
+    return withheldResult(isRecord(redacted) ? redacted.id : undefined);
+  };
+
+  // A JSON-RPC batch (an array) is checked message by message.
+  const redactValue: (value: unknown) => unknown =
+    options.protectEmbeddedResources === true
+      ? (value) => (Array.isArray(value) ? value.map(protectMessage) : protectMessage(value))
+      : redactor.redactDeep;
 
   const line = (raw: string): string => {
     const prefix = raw.startsWith(SSE_DATA) ? SSE_DATA : "";
     return Option.match(decodeJson(raw.slice(prefix.length)), {
       onNone: () => redactor.redact(raw),
-      onSome: (value) => `${prefix}${JSON.stringify(redactor.redactDeep(value))}`,
+      onSome: (value) => `${prefix}${JSON.stringify(redactValue(value))}`,
     });
   };
 

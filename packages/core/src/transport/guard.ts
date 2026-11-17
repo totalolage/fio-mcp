@@ -3,7 +3,7 @@ import { HttpBody, HttpRouter, HttpServerRequest, HttpServerResponse } from "eff
 import type { IpNetwork } from "effect/net";
 import { Redactor } from "../redaction.js";
 import { makeUntrustedForwardingCheck } from "./client-address.js";
-import { type FrameRedactor, makeFrameRedactor } from "./frame-redaction.js";
+import { type FrameRedactor, type FrameRedactorOptions, makeFrameRedactor } from "./frame-redaction.js";
 
 /**
  * The global middleware of every HTTP listener (the main one and the
@@ -73,16 +73,18 @@ export const InternalRequest = Context.Reference<boolean>("mcps/transport/http/I
  * Paths are compared literally; any other spelling of /healthz is checked.
  * Also warns once per listener about X-Forwarded-For from an untrusted peer
  * (makeUntrustedForwardingCheck; `trustedProxiesSetting` names the app's
- * setting in that warning).
+ * setting in that warning). `frameOptions` configures response redaction
+ * (makeFrameRedactor).
  */
 export const guard = (
   allowedHosts: ReadonlyArray<string>,
   trustedProxies: ReadonlyArray<IpNetwork.IpNetwork>,
   trustedProxiesSetting?: string,
+  frameOptions?: FrameRedactorOptions,
 ) =>
   HttpRouter.middleware(
     Effect.gen(function* () {
-      const frames = makeFrameRedactor(yield* Redactor);
+      const frames = makeFrameRedactor(yield* Redactor, frameOptions);
       const checkForwarding = makeUntrustedForwardingCheck(trustedProxies, trustedProxiesSetting);
       return Effect.fnUntraced(function* (
         httpEffect: Effect.Effect<HttpServerResponse.HttpServerResponse, Types.unhandled>,
