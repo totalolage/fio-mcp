@@ -1,5 +1,5 @@
 import { type GrantSettings, GrantSettingsError } from "@mcps/core/oauth/grant-settings.js";
-import { DateTime, Effect, Schema } from "effect";
+import { DateTime, Effect, Option, Schema } from "effect";
 import { READ_SCOPE } from "../mcp/tool-group.js";
 import { DELIVERY_CONSENT_FIELD, DELIVERY_CONSENT_VERSION, DELIVERY_CONSENT_VERSION_PATTERN } from "./consent.js";
 
@@ -18,9 +18,12 @@ export interface DeliveryConsentSettings {
 // As DateTime.formatIso writes it: UTC with milliseconds.
 const ISO_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 
-const IsoTimestamp = Schema.String.check(
-  Schema.makeFilter((text) => (ISO_UTC.test(text) && !Number.isNaN(Date.parse(text))) || "an ISO 8601 UTC timestamp"),
-);
+// Exactly what formatting its instant gives back, so impossible dates (February 30) fail.
+const isIsoUtc = (text: string): boolean =>
+  ISO_UTC.test(text) &&
+  Option.match(DateTime.make(text), { onNone: () => false, onSome: (time) => DateTime.formatIso(time) === text });
+
+const IsoTimestamp = Schema.String.check(Schema.makeFilter((text) => isIsoUtc(text) || "an ISO 8601 UTC timestamp"));
 
 const ConsentVersion = Schema.String.check(
   Schema.makeFilter((text) => DELIVERY_CONSENT_VERSION_PATTERN.test(text) || "a delivery consent version"),
