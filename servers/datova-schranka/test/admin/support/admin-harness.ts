@@ -164,9 +164,9 @@ export class AdminBrowser {
 
   private async absorb(response: Response): Promise<Page> {
     for (const header of response.headers.getSetCookie()) {
-      const [pair] = header.split(";");
-      const at = (pair ?? "").indexOf("=");
-      if (pair !== undefined && pair.slice(0, at).endsWith("-admin")) this.cookie = pair.slice(at + 1) === "" ? undefined : pair;
+      const pair = header.split(";")[0] ?? "";
+      const at = pair.indexOf("=");
+      if (at > 0 && pair.slice(0, at).endsWith("-admin")) this.cookie = pair.slice(at + 1) === "" ? undefined : pair;
     }
     const html = await response.text();
     this.pages.push(html);
