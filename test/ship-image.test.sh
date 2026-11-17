@@ -133,12 +133,16 @@ EOF
 chmod +x "$work/bin/docker" "$work/remote-bin/docker" "$work/bin/ssh" "$work/bin/gzip" "$work/bin/sudo"
 
 # A throwaway clean repository holding the script, the private workspace
-# root manifest and the fio server manifest that carries the version.
+# root manifest and the server manifests that name the image and carry the
+# version (fio is the default server).
 repo=$work/repo
-mkdir -p "$repo/scripts" "$repo/servers/fio"
+mkdir -p "$repo/scripts" "$repo/servers/fio" "$repo/servers/datova-schranka" "$repo/servers/scoped" "$repo/servers/nameless"
 cp "$ship_script" "$repo/scripts/ship-image.sh"
 echo '{ "name": "mcps", "private": true, "version": "9.9.9" }' >"$repo/package.json"
 echo '{ "name": "fio-mcp", "version": "1.2.3" }' >"$repo/servers/fio/package.json"
+echo '{ "name": "datova-schranka", "version": "0.0.4" }' >"$repo/servers/datova-schranka/package.json"
+echo '{ "name": "@mcps/scoped", "version": "1.0.0" }' >"$repo/servers/scoped/package.json"
+echo '{ "version": "1.0.0" }' >"$repo/servers/nameless/package.json"
 git -C "$repo" init -q
 git -C "$repo" add .
 git -C "$repo" -c user.name=test -c user.email=test@example.invalid commit -qm init
@@ -381,6 +385,61 @@ expect_status 1
 expect_err "uncommitted or untracked"
 [ ! -s "$work/log/docker.log" ] || fail "docker was called: $(cat "$work/log/docker.log")"
 [ ! -e "$work/log/ssh.log" ] || fail "ssh was called"
+
+case_name="ships the server named by --server under its own image name"
+ds_tag=datova-schranka:0.0.4-$sha
+ship --server datova-schranka
+expect_status 0
+printf 'tag=%s\nimage_id=%s\n' "$ds_tag" "$local_id" >"$work/expected"
+cmp -s "$work/expected" "$work/out" || fail "stdout was: $(cat "$work/out")"
+grep -Fqx "build --platform linux/amd64 --file servers/datova-schranka/Dockerfile --tag $ds_tag --tag datova-schranka:0.0.4 ." "$work/log/docker.log" ||
+  fail "build call: $(cat "$work/log/docker.log")"
+grep -Fq "run --rm --network none --entrypoint node $ds_tag " "$work/log/docker.log" || fail "did not check the modules of $ds_tag"
+expect_ssh_call "[-o][BatchMode=yes][nas][sudo -n docker image inspect --format '{{.Id}}' $ds_tag]"
+if grep -Fq 'fio' "$work/log/docker.log"; then fail "fio leaked into the build: $(cat "$work/log/docker.log")"; fi
+
+case_name="--server=<name> with --dry-run builds that server without ssh"
+ship --dry-run --server=datova-schranka
+expect_status 0
+printf 'tag=%s\nimage_id=%s\n' "$ds_tag" "$local_id" >"$work/expected"
+cmp -s "$work/expected" "$work/out" || fail "stdout was: $(cat "$work/out")"
+[ ! -e "$work/log/ssh.log" ] || fail "ssh was called: $(cat "$work/log/ssh.log")"
+
+case_name="--server builds with buildx when it is installed"
+SHIM_BUILDX=1 ship --server datova-schranka --dry-run
+expect_status 0
+grep -Fqx "buildx build --platform linux/amd64 --file servers/datova-schranka/Dockerfile --tag $ds_tag --tag datova-schranka:0.0.4 --load ." "$work/log/docker.log" ||
+  fail "buildx call: $(cat "$work/log/docker.log")"
+
+case_name="--server fio is the default"
+ship --server fio --dry-run
+expect_status 0
+expect_stdout_result
+
+case_name="rejects a missing, unknown or path-like server"
+for args in '--server' '--server nope' '--server ../fio' '--server --dry-run' '--server=' '--server Fio'; do
+  # shellcheck disable=SC2086 # split on purpose
+  ship $args
+  expect_status 2
+  [ ! -s "$work/log/docker.log" ] || fail "$args: docker was called: $(cat "$work/log/docker.log")"
+done
+expect_err "server 'Fio' is not a directory name under servers/"
+ship --server
+expect_err "--server needs a server name"
+ship --server ../fio
+expect_err "server '../fio' is not a directory name under servers/"
+ship --server nope
+expect_err "servers/nope/package.json does not exist"
+
+case_name="rejects a package name that is not a docker image name"
+ship --server scoped --dry-run
+expect_status 2
+expect_err "name '@mcps/scoped' is not usable as a docker image name"
+[ ! -s "$work/log/docker.log" ] || fail "docker was called: $(cat "$work/log/docker.log")"
+ship --server nameless --dry-run
+expect_status 2
+expect_err "name '' is not usable as a docker image name"
+[ ! -s "$work/log/docker.log" ] || fail "docker was called: $(cat "$work/log/docker.log")"
 
 case_name="rejects unknown arguments and option-like hosts"
 ship --push

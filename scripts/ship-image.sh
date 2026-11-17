@@ -1,14 +1,17 @@
 #!/bin/sh
-# Builds the linux/amd64 image from a clean checkout, tags it
-# fio-mcp:<package.json version>-<short git sha> and fio-mcp:<version>, and
+# Builds a server's linux/amd64 image from a clean checkout, tags it
+# <name>:<version>-<short git sha> and <name>:<version>, where name and
+# version come from servers/<server>/package.json (fio: fio-mcp), and
 # streams it to a docker host over ssh (docker save | gzip | ssh ... docker
 # load). No registry is involved. Before shipping (and in a dry run) it
 # checks that the image has no redis packages and that its compiled modules
 # other than main.js load. Afterwards it checks that the remote image ID
 # matches the local one.
 #
-# Usage: bun run ship:image -- [--dry-run] [--no-compress]
+# Usage: bun run ship:image -- [--server <server>] [--dry-run] [--no-compress]
 #
+# --server picks the directory under servers/ to build from its Dockerfile
+# (default: fio), e.g. --server datova-schranka.
 # FIO_MCP_SSH_HOST       ssh destination, usually a host alias from
 #                        ~/.ssh/config (default: nas). ssh runs with
 #                        BatchMode=yes, so the key must come from the ssh
@@ -29,16 +32,33 @@ case ${DRY_RUN:-} in
   *) dry_run=1 ;;
 esac
 compress=1
-for arg; do
-  case $arg in
+server=fio
+while [ $# -gt 0 ]; do
+  case $1 in
     --dry-run) dry_run=1 ;;
     --no-compress) compress= ;;
+    --server)
+      if [ $# -lt 2 ]; then
+        echo "error: --server needs a server name" >&2
+        exit 2
+      fi
+      server=$2
+      shift
+      ;;
+    --server=*) server=${1#--server=} ;;
     *)
-      echo "error: unknown argument '$arg'" >&2
+      echo "error: unknown argument '$1'" >&2
       exit 2
       ;;
   esac
+  shift
 done
+case $server in
+  '' | [!a-z0-9]* | *[!a-z0-9-]*)
+    echo "error: server '$server' is not a directory name under servers/" >&2
+    exit 2
+    ;;
+esac
 
 host=${FIO_MCP_SSH_HOST:-nas}
 remote_docker=${FIO_MCP_REMOTE_DOCKER:-sudo -n docker}
@@ -75,17 +95,31 @@ if [ -n "$compress" ] && [ -z "$dry_run" ] && ! command -v gzip >/dev/null 2>&1;
   exit 2
 fi
 
-# The image ships the fio server, so its workspace manifest carries the
-# version; the root package.json is the private workspace root.
-version=$(node -p "require('./servers/fio/package.json').version")
+# The server's workspace manifest names the image and carries the version;
+# the root package.json is the private workspace root.
+manifest=servers/$server/package.json
+if [ ! -f "$manifest" ]; then
+  echo "error: no server '$server': $manifest does not exist" >&2
+  exit 2
+fi
+# A missing field prints as '' instead of 'undefined', so the checks below
+# reject it.
+image=$(node -p "require('./$manifest').name ?? ''")
+version=$(node -p "require('./$manifest').version ?? ''")
 sha=$(git rev-parse --short HEAD)
-case $version in
-  '' | [!0-9A-Za-z]* | *[!0-9A-Za-z._-]*)
-    echo "error: servers/fio/package.json version '$version' is not usable in a docker tag" >&2
+case $image in
+  '' | [!a-z0-9]* | *[!a-z0-9] | *[!a-z0-9._-]* | *[._-][._]*)
+    echo "error: $manifest name '$image' is not usable as a docker image name" >&2
     exit 2
     ;;
 esac
-tag=fio-mcp:$version-$sha
+case $version in
+  '' | [!0-9A-Za-z]* | *[!0-9A-Za-z._-]*)
+    echo "error: $manifest version '$version' is not usable in a docker tag" >&2
+    exit 2
+    ;;
+esac
+tag=$image:$version-$sha
 
 tmp=$(mktemp -d)
 cleanup() {
@@ -109,18 +143,18 @@ trap 'handle_signal 143' TERM
 if docker buildx version >/dev/null 2>&1; then
   docker buildx build \
     --platform linux/amd64 \
-    --file servers/fio/Dockerfile \
+    --file "servers/$server/Dockerfile" \
     --tag "$tag" \
-    --tag "fio-mcp:$version" \
+    --tag "$image:$version" \
     --load \
     . >&2
 else
   echo "docker buildx is not available; building with docker build" >&2
   docker build \
     --platform linux/amd64 \
-    --file servers/fio/Dockerfile \
+    --file "servers/$server/Dockerfile" \
     --tag "$tag" \
-    --tag "fio-mcp:$version" \
+    --tag "$image:$version" \
     . >&2
 fi
 
