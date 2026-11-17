@@ -108,6 +108,32 @@ export class BoxCredentialsUnreadable extends Schema.TaggedError<BoxCredentialsU
   }
 }
 
+/** The shortest box password or certificate passphrase accepted (ISDS passwords are at least 8 characters). */
+export const MIN_BOX_SECRET_LENGTH = 8;
+
+/** The password or certificate passphrase is shorter than MIN_BOX_SECRET_LENGTH characters; refused before any ISDS call. */
+export class BoxSecretTooShort extends Schema.TaggedError<BoxSecretTooShort>()("BoxSecretTooShort", {
+  secret: Schema.Literals(["password", "passphrase"]),
+  minimum: Schema.Number,
+}) {
+  override get message(): string {
+    return this.secret === "password"
+      ? `The ISDS password must be at least ${this.minimum} characters long.`
+      : `The certificate passphrase must be at least ${this.minimum} characters long.`;
+  }
+}
+
+/** Fails with BoxSecretTooShort when the credentials' password or passphrase is too short (counted in code points). */
+const checkSecretLength = (credentials: IsdsCredentials): Effect.Effect<void, BoxSecretTooShort> => {
+  const [secret, value] =
+    credentials._tag === "Password"
+      ? (["password", credentials.password] as const)
+      : (["passphrase", credentials.passphrase] as const);
+  return Array.from(Redacted.value(value)).length < MIN_BOX_SECRET_LENGTH
+    ? Effect.fail(new BoxSecretTooShort({ secret, minimum: MIN_BOX_SECRET_LENGTH }))
+    : Effect.void;
+};
+
 /** What logging in with the given credentials can fail with (GetOwnerInfoFromLogin or DummyOperation). */
 export type BoxLoginError = IsdsCredentialsError | IsdsConfigError | IsdsCallError;
 
@@ -134,7 +160,7 @@ export interface BoxRegistryShape {
     input: AddBoxInput,
   ) => Effect.Effect<
     Box,
-    InvalidIdentifier | BoxLabelTaken | BoxAlreadyAdded | BoxEnvironmentMismatch | BoxLoginError | DomainStoreError
+    InvalidIdentifier | BoxLabelTaken | BoxAlreadyAdded | BoxEnvironmentMismatch | BoxSecretTooShort | BoxLoginError | DomainStoreError
   >;
   readonly relabel: (
     boxId: string,
@@ -147,7 +173,7 @@ export interface BoxRegistryShape {
   readonly replaceCredentials: (
     boxId: string,
     credentials: IsdsCredentials,
-  ) => Effect.Effect<Box, BoxNotFound | BoxIdentityMismatch | BoxLoginError | DomainStoreError>;
+  ) => Effect.Effect<Box, BoxNotFound | BoxIdentityMismatch | BoxSecretTooShort | BoxLoginError | DomainStoreError>;
   /** DummyOperation with the stored credentials, under the box's BoxLocks permit. */
   readonly testConnection: (boxId: string) => Effect.Effect<void, BoxNotFound | BoxCredentialsUnreadable | BoxLoginError>;
   /** Deletes the box, its credentials and recipient tiers; expires its open filings; keeps audit rows. */
@@ -405,6 +431,7 @@ const makeBoxRegistry = Effect.gen(function* () {
     }
     const taken = yield* labelTaken(label, undefined).pipe(storeFailure("check the data box label"));
     if (taken !== undefined) return yield* taken;
+    yield* checkSecretLength(input.credentials);
     redactor.register(secretsOf(input.credentials));
     const { owner, dbId } = yield* login(input.credentials);
     return yield* exclusive(
@@ -470,6 +497,7 @@ const makeBoxRegistry = Effect.gen(function* () {
     credentials: IsdsCredentials,
   ) {
     yield* find(boxId);
+    yield* checkSecretLength(credentials);
     redactor.register(secretsOf(credentials));
     // Under the box's permit, so this login never overlaps another ISDS call for the box.
     const { owner, dbId } = yield* locks.withBox(boxId, login(credentials));
