@@ -78,6 +78,8 @@ describe("send tool specs and descriptions", () => {
 describe("send_message input schema", () => {
   it("accepts a minimal message and every optional envelope field", () => {
     assert.isTrue(decodes(sendParams, VALID));
+    assert.isTrue(decodes(sendParams, { ...VALID, annotation: "" }));
+    assert.isTrue(decodes(sendParams, { ...VALID, annotation: "a".repeat(255) }));
     assert.isTrue(
       decodes(sendParams, {
         ...VALID,
@@ -108,7 +110,6 @@ describe("send_message input schema", () => {
     ["a 101-character idempotencyKey", { idempotencyKey: "k".repeat(101) }],
     ["an uppercase recipient", { recipient: "XYZ9876" }],
     ["a 6-character recipient", { recipient: "xyz987" }],
-    ["an empty annotation", { annotation: "" }],
     ["a 256-character annotation", { annotation: "a".repeat(256) }],
     ["a 31-character toHands", { toHands: "x".repeat(31) }],
     ["a 51-character senderRefNumber", { senderRefNumber: "r".repeat(51) }],

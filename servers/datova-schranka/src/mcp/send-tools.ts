@@ -101,9 +101,7 @@ const SEND_MESSAGE_FIELDS = {
   recipient: Schema.String.pipe(Schema.check(Schema.isPattern(/^[a-z0-9]{7}$/))).annotate({
     description: "The recipient's data box ID (dbID): 7 lowercase letters and digits.",
   }),
-  annotation: Schema.String.pipe(Schema.check(Schema.isBetweenLength(1, 255))).annotate({
-    description: "The message subject (dmAnnotation), 1-255 characters.",
-  }),
+  annotation: text(255, "The message subject (dmAnnotation), at most 255 characters."),
   toHands: Schema.optional(text(30, "For the attention of (k rukám), at most 30 characters.")),
   recipientRefNumber: Schema.optional(text(50, "The recipient's reference number (naše č.j. of the recipient).")),
   senderRefNumber: Schema.optional(text(50, "Your reference number (č.j.).")),
