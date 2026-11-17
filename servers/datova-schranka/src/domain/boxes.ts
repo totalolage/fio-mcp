@@ -11,6 +11,7 @@ import {
   IsdsInvalidRequest,
   IsdsInvalidResponse,
 } from "../isds/errors.js";
+import { BoxLocks } from "./box-locks.js";
 import { DataKey, DomainConfig } from "./config.js";
 import { BoxNotFound, type DomainStoreError, InvalidIdentifier, storeFailure } from "./errors.js";
 import { isDataBoxId, newBoxId } from "./ids.js";
@@ -121,7 +122,11 @@ export interface BoxRegistryShape {
   readonly list: Effect.Effect<ReadonlyArray<Box>>;
   /** The current list, then every new one. */
   readonly changes: Stream.Stream<ReadonlyArray<Box>>;
-  /** Stored boxes not loaded because their environment differs from the configured one. */
+  /**
+   * Stored boxes not loaded because their environment differs from the configured one.
+   * This process cannot relabel, re-credential, test or remove them; restart the server
+   * under the box's original environment to administer one.
+   */
   readonly skipped: Effect.Effect<ReadonlyArray<SkippedBox>>;
   readonly get: (boxId: string) => Effect.Effect<Box, BoxNotFound>;
   /** Logs in (GetOwnerInfoFromLogin), then stores the box under a new id. */
@@ -135,12 +140,15 @@ export interface BoxRegistryShape {
     boxId: string,
     label: string,
   ) => Effect.Effect<Box, BoxNotFound | InvalidIdentifier | BoxLabelTaken | DomainStoreError>;
-  /** Logs in with the new credentials; they must resolve to the same dbID. Keeps the id (grants keep the box). */
+  /**
+   * Logs in with the new credentials, under the box's BoxLocks permit; they must resolve to
+   * the same dbID. Keeps the id (grants keep the box).
+   */
   readonly replaceCredentials: (
     boxId: string,
     credentials: IsdsCredentials,
   ) => Effect.Effect<Box, BoxNotFound | BoxIdentityMismatch | BoxLoginError | DomainStoreError>;
-  /** DummyOperation with the stored credentials. */
+  /** DummyOperation with the stored credentials, under the box's BoxLocks permit. */
   readonly testConnection: (boxId: string) => Effect.Effect<void, BoxNotFound | BoxCredentialsUnreadable | BoxLoginError>;
   /** Deletes the box, its credentials and recipient tiers; expires its open filings; keeps audit rows. */
   readonly remove: (boxId: string) => Effect.Effect<RemovedBox, BoxNotFound | DomainStoreError>;
@@ -249,6 +257,7 @@ const makeBoxRegistry = Effect.gen(function* () {
   const config = yield* DomainConfig;
   const transports = yield* IsdsTransports;
   const redactor = yield* Redactor;
+  const locks = yield* BoxLocks;
 
   const rows = yield* sql`SELECT * FROM boxes ORDER BY created_at, rowid`.pipe(
     Effect.flatMap(decodeRows),
@@ -276,6 +285,8 @@ const makeBoxRegistry = Effect.gen(function* () {
     return { box, credentials: credentialsOfStored(stored.success) } satisfies Entry;
   });
 
+  // Skipped boxes stay in the database untouched; they are administered by
+  // restarting the server under their original environment.
   const skipped: ReadonlyArray<SkippedBox> = rows
     .filter((row) => row.environment !== config.environment)
     .map((row) => ({ id: row.id, dbId: row.db_id, label: row.label, environment: row.environment }));
@@ -460,7 +471,8 @@ const makeBoxRegistry = Effect.gen(function* () {
   ) {
     yield* find(boxId);
     redactor.register(secretsOf(credentials));
-    const { owner, dbId } = yield* login(credentials);
+    // Under the box's permit, so this login never overlaps another ISDS call for the box.
+    const { owner, dbId } = yield* locks.withBox(boxId, login(credentials));
     return yield* exclusive(
       Effect.gen(function* () {
         const entry = yield* find(boxId);
@@ -483,15 +495,17 @@ const makeBoxRegistry = Effect.gen(function* () {
   const credentials = (boxId: string): Effect.Effect<IsdsCredentials, BoxNotFound> =>
     Effect.map(find(boxId), (entry) => entry.credentials);
 
-  const testConnection = Effect.fn("BoxRegistry.testConnection")(
-    function* (boxId: string) {
-      const entry = yield* find(boxId);
-      const client = yield* makeIsdsClient(boxClientConfig(config, entry.credentials));
-      yield* noInvalidRequest(client.ping());
-    },
-    Effect.scoped,
-    Effect.provideService(IsdsTransports, transports),
-  );
+  /** Pings with the box's current credentials, under the box's permit like every other ISDS call for it. */
+  const testConnection = Effect.fn("BoxRegistry.testConnection")(function* (boxId: string) {
+    yield* locks.withBox(
+      boxId,
+      Effect.gen(function* () {
+        const entry = yield* find(boxId);
+        const client = yield* makeIsdsClient(boxClientConfig(config, entry.credentials));
+        yield* noInvalidRequest(client.ping());
+      }).pipe(Effect.scoped, Effect.provideService(IsdsTransports, transports)),
+    );
+  });
 
   const remove = Effect.fn("BoxRegistry.remove")(function* (boxId: string) {
     return yield* exclusive(
@@ -536,15 +550,18 @@ const makeBoxRegistry = Effect.gen(function* () {
 export class BoxRegistry extends Context.Service<BoxRegistry, BoxRegistryShape>()("datova-schranka/BoxRegistry") {
   /**
    * The boxes stored in the database. Boxes of the other ISDS environment are
-   * not loaded (see `skipped`); a box whose credentials do not decrypt fails
-   * startup. Passwords and passphrases are registered with the Redactor.
+   * not loaded (see `skipped`) and are administered by restarting the server
+   * under their original environment; a box whose credentials do not decrypt
+   * fails startup. Replacing credentials and testing the connection take the
+   * box's BoxLocks permit, the one BoxClients holds, so they never overlap
+   * another ISDS call for the box; call neither inside BoxClients.use. Passwords and passphrases are registered with the Redactor.
    * Each change runs its own transaction and publishes once it commits, so
    * do not call one inside an outer `withTransaction`.
    */
   static readonly Default: Layer.Layer<
     BoxRegistry,
     BoxCredentialsUnreadable | DomainStoreError,
-    SqlClient.SqlClient | DataKey | DomainConfig | IsdsTransports | Redactor
+    SqlClient.SqlClient | DataKey | DomainConfig | IsdsTransports | Redactor | BoxLocks
   > = Layer.effect(BoxRegistry, makeBoxRegistry);
 
   /** The loaded boxes as core Resources (id = box id); the same array value until the boxes change. */

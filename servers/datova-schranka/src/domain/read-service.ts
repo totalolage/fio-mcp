@@ -17,7 +17,7 @@ import type {
   MessageStateChangesInput,
 } from "../isds/message-lists.js";
 import type { MessageEnvelope } from "../isds/models.js";
-import { type AuditActor, AuditLog, type AuditLogShape, audited } from "./audit-log.js";
+import { type AuditActor, AuditLog, type AuditLogShape, audited, defaultFailureOutcome } from "./audit-log.js";
 import { type BoxClientError, BoxClients } from "./box-clients.js";
 import { BoxRegistry } from "./boxes.js";
 import { DomainConfig, type DomainConfigShape } from "./config.js";
@@ -28,11 +28,15 @@ import { type StoredZfo, ZfoStore, type ZfoWriteFailed } from "./zfo-store.js";
 /**
  * The isds:read operations on one box, through BoxClients (so serialised
  * per box). Results are domain values: ISDS text stays plain here and the
- * tool layer guards it. Every operation is audited here: intent
- * ("started") before its first ISDS call, the outcome after (timeouts
- * after the request was sent → "uncertain"), with the box id and the
- * actor; the tool layer must not write a second row for these calls.
- * If the intent cannot be written, ISDS is not called.
+ * tool layer guards it. Every operation is audited here, refusals
+ * included: intent ("started") first, then the identifiers are validated
+ * and ISDS is called, and the outcome is recorded after (a malformed
+ * dmID or dbID → "refused" without an ISDS call; a timeout after the
+ * request was sent → "uncertain"), with the box id and the actor; the
+ * tool layer must not write a second row for these calls. An identifier
+ * in the intent's detail is cut to MAX_AUDITED_ID_LENGTH characters,
+ * since it is not yet validated. If the intent cannot be written,
+ * nothing is validated and ISDS is not called.
  */
 
 /** 1222: the message is not legally delivered yet; the received list delivers it. */
@@ -171,7 +175,20 @@ const auditedRead = <A, E extends Tagged>(
   audited({ actor, action, boxId, detail }, effect, {
     okDetail: (value) => ({ ...detail, ...okDetail(value) }),
     errorDetail: (error) => ({ ...detail, ...failureDetail(error) }),
+    classify: (error) => (error._tag === "InvalidIdentifier" ? "refused" : defaultFailureOutcome(error)),
   }).pipe(Effect.provideService(AuditLog, audit));
+
+/** Unvalidated identifiers go into the audit detail cut to this many characters. */
+const MAX_AUDITED_ID_LENGTH = 64;
+
+const auditedId = (id: string): string => (id.length > MAX_AUDITED_ID_LENGTH ? id.slice(0, MAX_AUDITED_ID_LENGTH) : id);
+
+/** The query as audited: its dbID and dbUpperID cut like any unvalidated identifier. */
+const auditedQuery = (query: FindDataBoxesQuery): FindDataBoxesQuery => ({
+  ...query,
+  ...(query.dbID === undefined ? {} : { dbID: auditedId(query.dbID) }),
+  ...(query.dbUpperID === undefined ? {} : { dbUpperID: auditedId(query.dbUpperID) }),
+});
 
 const requireMessageId = (dmId: string): Effect.Effect<void, InvalidIdentifier> =>
   isMessageId(dmId) ? Effect.void : Effect.fail(new InvalidIdentifier({ kind: "messageId", rule: "1-20 digits" }));
@@ -306,32 +323,41 @@ const makeReadService = Effect.gen(function* () {
       boxId: string,
       dmId: string,
     ) {
-      yield* requireMessageId(dmId);
       return yield* auditedRead(
         audit,
         actor,
         "get_message",
         boxId,
-        { dmId },
-        clients.use(boxId, (client) => client.downloadMessageEnvelope({ dmID: dmId })),
+        { dmId: auditedId(dmId) },
+        Effect.andThen(
+          requireMessageId(dmId),
+          clients.use(boxId, (client) => client.downloadMessageEnvelope({ dmID: dmId })),
+        ),
         () => ({}),
       ).pipe(notDeliveredYet(dmId));
     }),
     downloadMessage: Effect.fn("ReadService.downloadMessage")(function* (actor: AuditActor, boxId: string, dmId: string) {
-      yield* requireMessageId(dmId);
-      return yield* auditedRead(audit, actor, "download_message", boxId, { dmId }, download(boxId, dmId), downloadDetail).pipe(
-        notDeliveredYet(dmId),
-      );
+      return yield* auditedRead(
+        audit,
+        actor,
+        "download_message",
+        boxId,
+        { dmId: auditedId(dmId) },
+        Effect.andThen(requireMessageId(dmId), download(boxId, dmId)),
+        downloadDetail,
+      ).pipe(notDeliveredYet(dmId));
     }),
     getDeliveryInfo: Effect.fn("ReadService.getDeliveryInfo")(function* (actor: AuditActor, boxId: string, dmId: string) {
-      yield* requireMessageId(dmId);
       return yield* auditedRead(
         audit,
         actor,
         "get_delivery_info",
         boxId,
-        { dmId },
-        clients.use(boxId, (client) => client.getDeliveryInfo({ dmID: dmId })),
+        { dmId: auditedId(dmId) },
+        Effect.andThen(
+          requireMessageId(dmId),
+          clients.use(boxId, (client) => client.getDeliveryInfo({ dmID: dmId })),
+        ),
         (info) => ({ events: info.dmEvents.length }),
       ).pipe(notDeliveredYet(dmId));
     }),
@@ -355,27 +381,30 @@ const makeReadService = Effect.gen(function* () {
       boxId: string,
       query: FindDataBoxesQuery,
     ) {
-      yield* requireDataBoxId(query.dbID);
-      yield* requireDataBoxId(query.dbUpperID);
       return yield* auditedRead(
         audit,
         actor,
         "find_data_box",
         boxId,
-        query,
-        clients.use(boxId, (client) => client.findDataBoxes(query)),
+        auditedQuery(query),
+        requireDataBoxId(query.dbID).pipe(
+          Effect.andThen(requireDataBoxId(query.dbUpperID)),
+          Effect.andThen(clients.use(boxId, (client) => client.findDataBoxes(query))),
+        ),
         (result) => ({ outcome: result.outcome, boxes: result.boxes.length }),
       );
     }),
     checkDataBox: Effect.fn("ReadService.checkDataBox")(function* (actor: AuditActor, boxId: string, dbId: string) {
-      yield* requireDataBoxId(dbId);
       return yield* auditedRead(
         audit,
         actor,
         "check_data_box",
         boxId,
-        { dbId },
-        clients.use(boxId, (client) => client.checkDataBox({ dbID: dbId })),
+        { dbId: auditedId(dbId) },
+        Effect.andThen(
+          requireDataBoxId(dbId),
+          clients.use(boxId, (client) => client.checkDataBox({ dbID: dbId })),
+        ),
         (result) => ({ dbState: result.dbState }),
       );
     }),

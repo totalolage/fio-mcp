@@ -339,6 +339,9 @@ const makeAuditLog = Effect.gen(function* () {
   return AuditLog.of({ start, finish, record, list, purgeBefore });
 });
 
+/** `audited`'s default failure outcome: "uncertain" for an IsdsTimeoutError sent before it timed out, else "error". */
+export const defaultFailureOutcome = (error: unknown): AuditFinalOutcome => (isSentTimeout(error) ? "uncertain" : "error");
+
 const isSentTimeout = (error: unknown): boolean =>
   typeof error === "object" &&
   error !== null &&
@@ -372,7 +375,7 @@ const finalOf = <A, E>(
   const failure = Cause.findError(exit.cause);
   if (Result.isSuccess(failure)) {
     const error = failure.success;
-    const classify = options.classify ?? ((e: E): AuditFinalOutcome => (isSentTimeout(e) ? "uncertain" : "error"));
+    const classify = options.classify ?? defaultFailureOutcome;
     return Effect.all({
       // A classify that throws says nothing about the call, so its outcome is unknown.
       outcome: mapped((): AuditFinalOutcome => classify(error), "uncertain"),

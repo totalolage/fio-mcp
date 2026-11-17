@@ -7,6 +7,7 @@ import { Context, Deferred, Effect, Fiber, FileSystem, Layer, Scheduler } from "
 import { SqlClient } from "effect/sql";
 import { type AuditActor, AuditLog, audited } from "../../src/domain/audit-log.js";
 import { BoxClients } from "../../src/domain/box-clients.js";
+import { BoxLocks } from "../../src/domain/box-locks.js";
 import { BoxRegistry } from "../../src/domain/boxes.js";
 import { DataKey, DomainConfig } from "../../src/domain/config.js";
 import { ReadService } from "../../src/domain/read-service.js";
@@ -61,6 +62,7 @@ const servicesLayer = (respond: FakeRespond, dataDir: string) => {
     DataKey.layer(DATA_KEY),
     DomainConfig.layer({ dataDir }),
     NodeFileSystem.layer,
+    BoxLocks.Default,
   );
   const registry = BoxRegistry.Default.pipe(Layer.provideMerge(infrastructure));
   const services = Layer.mergeAll(BoxClients.Default, AuditLog.Default, ZfoStore.Default, RecipientTiers.Default).pipe(
