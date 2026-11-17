@@ -178,7 +178,11 @@ export const G = {
   text: (cap: number = FREE_TEXT_CAP): GuardSpec => ({ _tag: "Text", cap, keepLayout: false }),
   /** Raw export or statement content: keeps `\n` and `\t`. */
   raw: (cap: number): GuardSpec => ({ _tag: "Text", cap, keepLayout: true }),
-  /** Unguarded while it matches `pattern`, guarded as free text otherwise. */
+  /**
+   * Unguarded while it matches `pattern`, guarded as free text otherwise. The
+   * pattern must be anchored and stateless (no `g` or `y` flag): it is tested
+   * once per pass, and both passes must agree.
+   */
   id: (pattern: RegExp): GuardSpec => ({ _tag: "Identifier", pattern }),
   array: (item: GuardSpec): GuardSpec => ({ _tag: "Array", item }),
   struct: (fields: Readonly<Record<string, GuardSpec>>): GuardSpec => ({ _tag: "Struct", fields }),
@@ -314,8 +318,10 @@ export const guardFailure = <E>(error: E): Effect.Effect<E> => {
  * The output path of every tool: redact, guard untrusted text, redact again.
  * Guarding runs inside redaction, so a token in untrusted text is still `***`
  * inside its guard; redaction never touches guard tags. Failures keep their
- * type and have their marked excerpts guarded. Without a spec only marked
- * excerpts are guarded.
+ * type and have their marked excerpts guarded but are not redacted here: the
+ * caller redacts failure text where it leaves. Without a spec only marked
+ * excerpts are guarded. `redactDeep` must leave excerpt marks, guard tags and
+ * nonce hex untouched.
  */
 export const guardedOutput =
   (redactDeep: <T>(value: T) => T) =>
