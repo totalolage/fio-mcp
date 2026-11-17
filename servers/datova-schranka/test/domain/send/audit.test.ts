@@ -5,6 +5,7 @@ import { DomainStoreError } from "../../../src/domain/errors.js";
 import type { FilingPreview, SendResult as SendResultType } from "../../../src/domain/send/api.js";
 import { SendResult } from "../../../src/domain/send/api.js";
 import { auditedSend, sendDetail, sendResultOutcome } from "../../../src/domain/send/audit.js";
+import { IsdsTimeoutError } from "../../../src/isds/errors.js";
 import { type ReadAuditEvent, readAuditLog } from "../support/read-audit-log.js";
 
 const input: AuditEventInput = {
@@ -191,6 +192,45 @@ describe("auditedSend", () => {
       );
       assert.strictEqual(error._tag, "Refusal");
       assert.deepStrictEqual(finishes(audit.events), [{ outcome: "refused", detail: { reason: "TOTP missing" } }]);
+    }).pipe(Effect.provide(audit.layer));
+  });
+
+  it.effect("by default records a timeout sent before it timed out as uncertain, else error", () => {
+    const audit = readAuditLog([]);
+    return Effect.gen(function* () {
+      for (const requestSent of [true, false]) {
+        const timeout = new IsdsTimeoutError({
+          service: "operations",
+          operation: "CreateMessage",
+          timeoutMillis: 60_000,
+          requestSent,
+        });
+        yield* Effect.flip(auditedSend(input, () => Effect.fail(timeout), { outcomeOf: () => "ok" }));
+      }
+      assert.deepStrictEqual(
+        finishes(audit.events).map((finish) => finish.outcome),
+        ["uncertain", "error"],
+      );
+    }).pipe(Effect.provide(audit.layer));
+  });
+
+  it.effect("records a throwing classify as uncertain and a throwing errorDetail as no detail, keeping the failure", () => {
+    const audit = readAuditLog([]);
+    return Effect.gen(function* () {
+      const failure = new Refusal({ reason: "TOTP missing" });
+      const error = yield* Effect.flip(
+        auditedSend(input, () => Effect.fail(failure), {
+          outcomeOf: () => "ok",
+          classify: () => {
+            throw new Error("mapper bug");
+          },
+          errorDetail: () => {
+            throw new Error("mapper bug");
+          },
+        }),
+      );
+      assert.strictEqual(error, failure);
+      assert.deepStrictEqual(finishes(audit.events), [{ outcome: "uncertain", detail: undefined }]);
     }).pipe(Effect.provide(audit.layer));
   });
 
