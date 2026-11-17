@@ -1030,27 +1030,43 @@ export const makeSendService = Effect.gen(function* () {
     }),
   ).pipe(Effect.withSpan("SendService.expireDue"));
 
+  /**
+   * Reads the filing an admin call is about before its audit row starts, so the row gets the
+   * filing's box. A failed read does not skip the audit: `body` gets no box and a `found` that
+   * fails with the read's error, which the call then fails with inside its audit window.
+   */
+  const withFilingRead = <A, E>(
+    filingId: string,
+    body: (
+      boxId: string | undefined,
+      found: Effect.Effect<Option.Option<Filing>, DomainStoreError>,
+    ) => Effect.Effect<A, E | DomainStoreError>,
+  ): Effect.Effect<A, E | DomainStoreError> =>
+    Effect.flatMap(Effect.result(store.byId(filingId)), (read) =>
+      Result.isSuccess(read)
+        ? body(Option.isSome(read.success) ? read.success.value.boxId : undefined, Effect.succeed(read.success))
+        : body(undefined, Effect.fail(read.failure)),
+    );
+
   /** An admin decision audited once under `action`; FilingNotFound/FilingStateConflict/DmIdLinked are "refused". */
   const auditedDecision = <A, E extends { readonly _tag: string }>(
     admin: AuditActor,
     action: string,
-    found: Option.Option<Filing>,
+    filingId: string,
     detail: Record<string, unknown>,
-    run: Effect.Effect<A, E>,
+    run: (found: Option.Option<Filing>) => Effect.Effect<A, E>,
     options: {
       readonly outcomeOf?: (value: A) => "ok" | "refused";
       readonly okDetail?: (value: A) => unknown;
-      readonly classify?: (error: E) => "refused" | "error";
+      readonly classify?: (error: E | DomainStoreError) => "refused" | "error";
     } = {},
-  ) =>
-    audited(
-      { actor: admin, action, boxId: Option.isSome(found) ? found.value.boxId : undefined, detail },
-      () => run,
-      {
+  ): Effect.Effect<A, E | DomainStoreError> =>
+    withFilingRead(filingId, (boxId, found) =>
+      audited({ actor: admin, action, boxId, detail }, () => Effect.flatMap(found, run), {
         outcomeOf: options.outcomeOf ?? (() => "ok"),
         okDetail: options.okDetail ?? (() => detail),
         classify: options.classify ?? ((error) => (error._tag === "DmIdLinked" ? "refused" : refusalOutcome(error))),
-      },
+      }),
     );
 
   const audited = <A, E>(
@@ -1111,15 +1127,11 @@ export const makeSendService = Effect.gen(function* () {
       ),
 
     approve: (admin: AuditActor, filingId) =>
-      Effect.flatMap(store.byId(filingId), (found) =>
+      withFilingRead(filingId, (boxId, read) =>
         audited(
-          {
-            actor: admin,
-            action: "filing.approve",
-            boxId: Option.isSome(found) ? found.value.boxId : undefined,
-            detail: { filingId },
-          },
-          (claim) => trackClaims(claim, (tracked) => approveFlow(found, filingId, tracked)),
+          { actor: admin, action: "filing.approve", boxId, detail: { filingId } },
+          (claim) =>
+            Effect.flatMap(read, (found) => trackClaims(claim, (tracked) => approveFlow(found, filingId, tracked))),
           {
             outcomeOf: (answer: Answer) => sendResultOutcome(answer.result),
             okDetail: (answer: Answer): SendDetail =>
@@ -1131,36 +1143,33 @@ export const makeSendService = Effect.gen(function* () {
 
     reject: (admin: AuditActor, filingId, reason) => {
       const stated = reason?.trim() === "" ? undefined : reason?.trim();
-      return Effect.flatMap(store.byId(filingId), (found) =>
-        auditedDecision(
-          admin,
-          "filing.reject",
-          found,
-          stated === undefined ? { filingId } : { filingId, reason: stated },
+      return auditedDecision(
+        admin,
+        "filing.reject",
+        filingId,
+        stated === undefined ? { filingId } : { filingId, reason: stated },
+        (found) =>
           adminDecision(found, filingId, "pending_admin", "admin_rejected", {
             reason: stated,
             clearPayload: true,
             burnNonces: true,
           }),
-        ),
       ).pipe(Effect.asVoid);
     },
 
     reconcileNow: (admin: AuditActor, filingId) =>
-      Effect.flatMap(store.byId(filingId), (found) =>
-        auditedDecision(admin, "filing.reconcile", found, { filingId }, reconcile(filingId), {
-          outcomeOf: reconcileOutcomeOf,
-          okDetail: (outcome) => reconcileDetail(filingId, outcome),
-        }),
-      ),
+      auditedDecision(admin, "filing.reconcile", filingId, { filingId }, () => reconcile(filingId), {
+        outcomeOf: reconcileOutcomeOf,
+        okDetail: (outcome) => reconcileDetail(filingId, outcome),
+      }),
 
     markSent: (admin: AuditActor, filingId, dmId) =>
-      Effect.flatMap(store.byId(filingId), (found) =>
-        auditedDecision(
-          admin,
-          "filing.mark_sent",
-          found,
-          { filingId, dmId },
+      auditedDecision(
+        admin,
+        "filing.mark_sent",
+        filingId,
+        { filingId, dmId },
+        (found) =>
           validMessageId(dmId).pipe(
             Effect.flatMap((valid) =>
               adminDecision(found, filingId, "outcome_unknown", "sent", {
@@ -1176,23 +1185,16 @@ export const makeSendService = Effect.gen(function* () {
                 : Effect.void,
             ),
           ),
-          // The only SendUnavailable here is the dmID check: a refused decision, nothing changed.
-          { classify: (error) => (error._tag === "DomainStoreError" ? "error" : "refused") },
-        ),
-      ).pipe(Effect.asVoid),
+        // The only SendUnavailable here is the dmID check: a refused decision, nothing changed.
+        { classify: (error) => (error._tag === "DomainStoreError" ? "error" : "refused") },
+      ),
 
     confirmNotSent: (admin: AuditActor, filingId) =>
-      Effect.flatMap(store.byId(filingId), (found) =>
-        auditedDecision(
-          admin,
-          "filing.confirm_not_sent",
-          found,
-          { filingId },
-          adminDecision(found, filingId, "outcome_unknown", "not_sent", {
-            reason: "an administrator confirmed it was not sent",
-            clearPayload: true,
-          }),
-        ),
+      auditedDecision(admin, "filing.confirm_not_sent", filingId, { filingId }, (found) =>
+        adminDecision(found, filingId, "outcome_unknown", "not_sent", {
+          reason: "an administrator confirmed it was not sent",
+          clearPayload: true,
+        }),
       ).pipe(Effect.asVoid),
 
     reconcileRecovered,

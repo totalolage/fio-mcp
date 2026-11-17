@@ -369,3 +369,32 @@ describe("SendService admin decisions on a removed box (D4)", () => {
     }).pipe(Effect.scoped),
   );
 });
+
+describe("SendService admin decisions when the filing cannot be read", () => {
+  it.effect("each call fails DomainStoreError and is still audited once as error", () =>
+    Effect.gen(function* () {
+      const h = yield* sendHarness();
+      const filingId = yield* unknownSend(h, "key-1");
+      yield* h.exec("ALTER TABLE filings RENAME TO filings_unreadable");
+      const calls: ReadonlyArray<readonly [string, Effect.Effect<void, { readonly _tag: string }>]> = [
+        ["filing.approve", Effect.asVoid(h.service.approve(ADMIN, filingId))],
+        ["filing.reject", h.service.reject(ADMIN, filingId)],
+        ["filing.reconcile", Effect.asVoid(h.service.reconcileNow(ADMIN, filingId))],
+        ["filing.mark_sent", h.service.markSent(ADMIN, filingId, "7654321")],
+        ["filing.confirm_not_sent", h.service.confirmNotSent(ADMIN, filingId)],
+      ];
+      for (const [action, call] of calls) {
+        const error = yield* Effect.flip(call);
+        assert.strictEqual(error._tag, "DomainStoreError", action);
+        const rows = yield* h.audit(action);
+        assert.deepStrictEqual(
+          rows.map((row) => [row.actor_kind, row.outcome, row.box_id]),
+          [["admin", "error", null]],
+          action,
+        );
+      }
+      yield* h.exec("ALTER TABLE filings_unreadable RENAME TO filings");
+      assert.strictEqual((yield* h.filing(filingId)).state, "outcome_unknown");
+    }).pipe(Effect.scoped),
+  );
+});
