@@ -1121,8 +1121,21 @@ describe("admin TOTP second factor at /login (SEC-03)", () => {
     await harness.close();
     harness = await startOAuth({ throttle: { ...DEFAULT_THROTTLE, freeFailures: 1 }, totpSecret: Redacted.make(SECRET) });
     const { browser, csrf, html } = await loginForm();
-    expect(html).toContain('name="totp"');
-    expect(html).toContain('autocomplete="one-time-code"');
+    expect(html).toContain('<label for="totp">6-digit code from your authenticator app</label>');
+    const codeInput = /<input\b[^>]*\bname="totp"[^>]*>/.exec(html)?.[0] ?? "";
+    expect(codeInput).toContain('type="text"');
+    expect(codeInput).toContain('inputmode="numeric"');
+    expect(codeInput).toContain('autocomplete="one-time-code"');
+    expect(codeInput).not.toContain("maxlength");
+    const pattern = /\bpattern="([^"]+)"/.exec(codeInput)?.[1];
+    expect(pattern).toBeDefined();
+    // HTML compiles the pattern with full-value anchors and the v flag.
+    const codePattern = new RegExp(`^(?:${pattern})$`, "v");
+    expect("012345").toMatch(codePattern);
+    expect(" 012\u00a0345 ").toMatch(codePattern);
+    expect("12345").not.toMatch(codePattern);
+    expect("1234567").not.toMatch(codePattern);
+    expect("12345a").not.toMatch(codePattern);
 
     const missing = await browser.post("/login", { csrf, password: PASSWORD });
     expect(missing.status).toBe(401);
@@ -1135,7 +1148,8 @@ describe("admin TOTP second factor at /login (SEC-03)", () => {
     harness.clock.advance(1000);
 
     const code = codeNow();
-    expect((await browser.post("/login", { csrf, password: PASSWORD, totp: code })).status).toBe(303);
+    const pasted = ` ${code.slice(0, 3)} ${code.slice(3)} `;
+    expect((await browser.post("/login", { csrf, password: PASSWORD, totp: pasted })).status).toBe(303);
     // The same code again, in another sign-in: refused.
     const other = await loginForm();
     expect((await other.browser.post("/login", { csrf: other.csrf, password: PASSWORD, totp: code })).status).toBe(401);

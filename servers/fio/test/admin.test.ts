@@ -823,6 +823,7 @@ describe("admin TOTP second factor at /admin/login (SEC-03)", () => {
     const { html } = await admin.page("/admin/login");
     expect(html).toContain('name="totp"');
     expect(html).toContain('autocomplete="one-time-code"');
+    expect(html).toContain('<label for="totp">6-digit code from your authenticator app</label>');
 
     const missing = await admin.post("/admin/login", { password: PASSWORD });
     expect(missing.status).toBe(401);
@@ -833,7 +834,8 @@ describe("admin TOTP second factor at /admin/login (SEC-03)", () => {
     harness.clock.advance(1000);
 
     const code = codeNow();
-    expect((await admin.post("/admin/login", { password: PASSWORD, totp: code })).status).toBe(303);
+    const pasted = ` ${code.slice(0, 3)}\u00a0${code.slice(3)} `;
+    expect((await admin.post("/admin/login", { password: PASSWORD, totp: pasted })).status).toBe(303);
     expect((await admin.get("/admin")).status).toBe(200);
     // The same code in another sign-in, here or at /login: refused.
     const again = new Admin();
