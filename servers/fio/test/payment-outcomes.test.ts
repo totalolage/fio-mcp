@@ -9,7 +9,6 @@ import type { InvalidInput } from "../src/errors.js";
 import { FioApi } from "../src/fio-api.js";
 import { NEW_KEY_ADVICE, PaymentControls } from "../src/payment-controls.js";
 import { PaymentLedger } from "../src/payment-ledger.js";
-import { DEFAULT_PAYMENT_LIMITS } from "../src/payment-limits.js";
 import { buildImportXml, type Payer, type PaymentOrder, PaymentOrders } from "../src/payments.js";
 import { RateLimiter } from "../src/rate-limiter.js";
 import { RedactorDefault } from "../src/redaction.js";
@@ -42,7 +41,6 @@ const config: AppConfigShape = {
     encrypt: false,
     dataKey: undefined,
   },
-  paymentLimits: DEFAULT_PAYMENT_LIMITS,
 };
 
 const testLayer = PaymentControls.Default.pipe(

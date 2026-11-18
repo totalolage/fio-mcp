@@ -6,11 +6,12 @@ import { InvalidInput, PERMISSION_DENIED, UPLOAD_UNCERTAIN } from "../src/errors
 import { FIO_COUNTRY_CODES } from "../src/fio-countries.js";
 import { SERVER_INSTRUCTIONS } from "../src/mcp/fio-tools.js";
 import type { AuditRow } from "../src/payment-ledger.js";
-import { type GrantPayments, OFF_ALLOWLIST, parseAllowlistLines } from "../src/payment-limits.js";
 import {
   buildImportXml as buildXml,
   escapeXml,
   isValidIban,
+  MAX_AMOUNT,
+  MAX_ORDERS_PER_BATCH,
   type PaymentOrder,
   PaymentOrder as PaymentOrderSchema,
   PaymentOrders,
@@ -414,27 +415,6 @@ const statusReply = (code: number): FioHttpReply => ({ status: code, body: "", c
 
 /** A tool-level order: domestic, CZK from the payer account. */
 const order = { type: "domestic", amount: 100, accountTo: "2212-2000000699", bankCode: "0300", date: "2025-11-03" };
-/** A euro order to an IBAN written with spaces. */
-const euroOrder = { ...euro };
-const LISTED_IBAN = "DE89370400440532013000";
-
-const LIMITS = { maxPerOrder: { CZK: 1000, EUR: 100 }, maxPerDay: { CZK: 5000, EUR: 200 }, maxOrdersPerDay: 5 };
-
-const grant = (payments: GrantPayments): Principal => ({
-  subject: "grant-pay",
-  scopes: "all",
-  resources: "all",
-  clientId: "client-pay",
-  settings: payments,
-});
-
-/** Allowlist with the euro payee, entered in lower case and with spaces. */
-const allowlist = (mode: "enforce" | "confirm") => {
-  const entries = parseAllowlistLines("de89 3704 0044 0532 0130 00, Hans Muller");
-  if (Result.isFailure(entries)) throw new Error(entries.failure);
-  return { mode, entries: entries.success };
-};
-
 let keys = 0;
 /** A fresh idempotency key: each call is a new user-approved batch unless a test reuses one on purpose. */
 const newKey = () => `payments-test-key-${String(++keys).padStart(4, "0")}`;
@@ -509,8 +489,7 @@ describe("signing in Internetbanking stays the backstop (SEC-25)", () => {
     expect(submit?.description).toMatch(/same idempotencyKey returns the recorded outcome and never uploads again/);
     expect(submit?.description).toMatch(/never solely from bank text/);
     const preview = listed.find((tool) => tool.name === "preview_payment_orders");
-    expect(preview?.description).toMatch(/withinLimits/);
-    expect(preview?.description).toMatch(/remaining allowance/);
+    expect(preview?.description).toMatch(/provenance problems/);
     expect(preview?.description).toMatch(/never solely from bank text/);
     // Appended at the very end of SERVER_INSTRUCTIONS, which the server sends to clients.
     expect(SERVER_INSTRUCTIONS).toMatch(/never solely from bank text[^.]*; orders containing guard tags or markers are refused\.$/);
@@ -520,82 +499,6 @@ describe("signing in Internetbanking stays the backstop (SEC-25)", () => {
     expect(accepted.result.outcome).toBe("accepted");
     expect(accepted.nextStep).toMatch(/NOT executed/);
     expect(accepted.nextStep).toMatch(/sign it in FIO Internetbanking/);
-  });
-});
-
-describe("payment limits (SEC-26)", () => {
-  it("refuses an order above maxPerOrder without contacting FIO and names the limit and what remains", async () => {
-    const tools = await connectTools(okReply(IMPORT_OK_XML), grant({ limits: LIMITS, allowlist: OFF_ALLOWLIST }));
-    const result = await tools.submit([{ ...order, amount: 1500 }]);
-    expect(result.isError).toBe(true);
-    expect(text(result).split("\n")[0]).toBe(PERMISSION_DENIED);
-    expect(text(result)).toMatch(/1000\.00/);
-    expect(text(result)).toMatch(/remain/);
-    expect(await tools.uploads()).toBe(0);
-    const [row] = await tools.audit();
-    expect(row).toMatchObject({ outcome: "refused", grantId: "grant-pay" });
-    expect(row?.reason).toMatch(/^limit/);
-  });
-
-  it("previews withinLimits and the remaining allowance, before and after a submission", async () => {
-    const tools = await connectTools(okReply(IMPORT_OK_XML), grant({ limits: LIMITS, allowlist: OFF_ALLOWLIST }));
-    const over = await tools.preview([{ ...order, amount: 1500 }]);
-    expect(over.withinLimits).toBe(false);
-    expect(over.limits.problems.length).toBeGreaterThan(0);
-    const fresh = await tools.preview([order]);
-    expect(fresh.withinLimits).toBe(true);
-    expect(fresh.limits).toMatchObject({
-      perCurrency: { CZK: { maxPerOrder: 1000, maxPerDay: 5000, usedToday: 0, remainingToday: 5000 } },
-      maxOrdersPerDay: 5,
-      ordersToday: 0,
-      remainingOrdersToday: 5,
-      problems: [],
-    });
-    expect(await tools.uploads()).toBe(0);
-
-    json(await tools.submit([order]));
-    const after = await tools.preview([order]);
-    expect(after.withinLimits).toBe(true);
-    expect(after.limits).toMatchObject({
-      perCurrency: { CZK: { usedToday: 100, remainingToday: 4900 } },
-      ordersToday: 1,
-      remainingOrdersToday: 4,
-    });
-  });
-});
-
-describe("payee allowlist (SEC-27)", () => {
-  it("enforce refuses an unlisted payee without uploading and passes a listed IBAN written with spaces and lower case", async () => {
-    const tools = await connectTools(okReply(IMPORT_OK_XML), grant({ limits: LIMITS, allowlist: allowlist("enforce") }));
-    expect((await tools.preview([order])).allowlist).toEqual({ mode: "enforce", unlistedPayees: ["2212-2000000699/0300"] });
-    const refused = await tools.submit([order]);
-    expect(refused.isError).toBe(true);
-    expect(text(refused).split("\n")[0]).toBe(PERMISSION_DENIED);
-    expect(await tools.uploads()).toBe(0);
-    expect((await tools.audit())[0]).toMatchObject({ outcome: "refused" });
-    expect((await tools.audit())[0]?.reason).toMatch(/^allowlist/);
-
-    expect((await tools.preview([euroOrder])).allowlist).toEqual({ mode: "enforce", unlistedPayees: [] });
-    const accepted = json(await tools.submit([euroOrder]));
-    expect(accepted.result.outcome).toBe("accepted");
-    expect(await tools.uploads()).toBe(1);
-    expect((await tools.audit())[0]?.payees.map((p) => p.payee)).toEqual([LISTED_IBAN]);
-  });
-
-  it("confirm holds the batch for an admin and uploads nothing", async () => {
-    const tools = await connectTools(okReply(IMPORT_OK_XML), grant({ limits: LIMITS, allowlist: allowlist("confirm") }));
-    const held = json(await tools.submit([order]));
-    expect(held).toMatchObject({ outcome: "awaiting-admin-confirmation", orderCount: 1 });
-    expect(held.pendingId).toEqual(expect.any(String));
-    expect(held.nextStep).toMatch(/\/admin\/payments\/pending/);
-    expect(await tools.uploads()).toBe(0);
-    expect((await tools.audit())[0]).toMatchObject({ outcome: "pending-confirmation", grantId: "grant-pay" });
-  });
-
-  it("off uploads any payee as before", async () => {
-    const tools = await connectTools(okReply(IMPORT_OK_XML), grant({ limits: LIMITS, allowlist: OFF_ALLOWLIST }));
-    expect(json(await tools.submit([order])).result.outcome).toBe("accepted");
-    expect(await tools.uploads()).toBe(1);
   });
 });
 
@@ -666,7 +569,12 @@ describe("idempotency and provenance (SEC-28)", () => {
 });
 
 describe("payment audit log (SEC-29)", () => {
-  const principal = grant({ limits: LIMITS, allowlist: OFF_ALLOWLIST });
+  const principal: Principal = {
+    subject: "grant-pay",
+    scopes: "all",
+    resources: "all",
+    clientId: "client-pay",
+  };
   const expected = {
     grantId: "grant-pay",
     clientId: "client-pay",
@@ -674,12 +582,27 @@ describe("payment audit log (SEC-29)", () => {
     payees: [expect.objectContaining({ payee: "2212-2000000699/0300", bankCode: "0300", amount: 100, currency: "CZK" })],
   };
 
+  it("records exact audit totals for the largest batch the format allows", async () => {
+    const tools = await connectTools();
+    const batch = Array.from({ length: MAX_ORDERS_PER_BATCH }, (_, index) => ({
+      ...order,
+      amount: index === 0 ? MAX_AMOUNT - 0.01 : MAX_AMOUNT,
+    }));
+    const total = { CZK: "99999999999998.99" };
+    expect((await tools.preview(batch)).totalsByCurrency).toEqual(total);
+    const result = json(await tools.submit(batch));
+    expect(result.result.outcome).toBe("accepted");
+    expect(result.totalsByCurrency).toEqual(total);
+    expect(await tools.uploads()).toBe(1);
+    expect((await tools.audit())[0]?.totals).toEqual({ CZK: "9999999999999899" });
+  });
+
   it("records accepted, rejected, unknown and refused submissions without the FIO token", async () => {
     const cases: Array<[FioHttpReply, string, object?]> = [
       [okReply(IMPORT_OK_XML), "accepted"],
       [okReply(IMPORT_REJECTED_XML), "rejected"],
       [statusReply(500), "unknown"],
-      [okReply(IMPORT_OK_XML), "refused", { amount: 1500 }],
+      [okReply(IMPORT_OK_XML), "refused", { messageForRecipient: "[tag removed]" }],
     ];
     for (const [reply, outcome, change] of cases) {
       const tools = await connectTools(reply, principal);
@@ -689,12 +612,9 @@ describe("payment audit log (SEC-29)", () => {
       expect(rows[0], outcome).toMatchObject({
         ...expected,
         outcome,
-        // Integer cents (R1).
-        totals: { CZK: change === undefined ? 10_000 : 150_000 },
-        payees: [expect.objectContaining({ amount: change === undefined ? 100 : 1500 })],
+        totals: { CZK: 10_000 },
       });
       if (outcome === "accepted") expect(rows[0]?.batchIds).toEqual(["105545555"]);
-      if (change === undefined) expect(rows[0]?.payees).toEqual(expected.payees);
       expect(JSON.stringify(rows), outcome).not.toContain(PAY_TOKEN);
       expect(tools.logs.some((line) => line.includes("payment audit")), outcome).toBe(true);
       expect(tools.logs.join("\n"), outcome).not.toContain(PAY_TOKEN);

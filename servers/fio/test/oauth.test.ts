@@ -9,8 +9,6 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { Clock, Effect, Option, Redacted } from "effect";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { tokenFingerprint } from "../src/accounts.js";
-import { readGrantPayments } from "../src/oauth/grant-payments.js";
-import { DEFAULT_GRANT_PAYMENTS } from "../src/payment-limits.js";
 import { TRUSTED_PROXIES_EMPTY_WARNING } from "../src/transport/auth.js";
 import {
   authorizationUrl,
@@ -18,7 +16,6 @@ import {
   Browser,
   codeFor,
   csrfOf,
-  DEFAULT_PAYMENT_FORM,
   LOOPBACK_REDIRECT,
   type OAuthHarness,
   PASSWORD,
@@ -241,7 +238,6 @@ describe("metadata and the /mcp challenge", () => {
           scopes: ["fio:read"],
           resources: ["main"],
           resource: "https://other.example.test/mcp",
-          settings: DEFAULT_GRANT_PAYMENTS,
         };
         yield* store.createGrant(
           grant,
@@ -837,7 +833,6 @@ describe("login and consent pages", () => {
       form: /name="form" value="([^"]+)"/.exec(html)?.[1] ?? "",
       decision: "approve",
       account: ["main", "savings"],
-      ...DEFAULT_PAYMENT_FORM,
       ...fields,
     });
 
@@ -859,7 +854,7 @@ describe("login and consent pages", () => {
   const grantOf = async (clientId: string) => {
     const grants = await harness.store((store) => store.listGrants(harness.clock.currentTimeMillisUnsafe()));
     const grant = grants.find((found) => found.clientId === clientId);
-    return grant === undefined ? undefined : { ...grant, payments: readGrantPayments(grant.settings) };
+    return grant;
   };
 
   /** The payments checkbox tag. */
@@ -870,13 +865,8 @@ describe("login and consent pages", () => {
     expect(paymentsBox(flow.html)).not.toBe("");
     expect(paymentsBox(flow.html)).not.toContain("checked");
     expect(flow.html).toContain("create real batches at FIO that must still be signed in Internetbanking");
-    expect(flow.html).toContain("payment limits and payee allowlist");
-    // The settings are pre-filled with the server defaults; enforce is recommended.
-    expect(flow.html).toContain('name="payMaxPerOrder" value="CZK:50000,EUR:2000"');
-    expect(flow.html).toContain('name="payMaxPerDay" value="CZK:100000,EUR:4000"');
-    expect(flow.html).toContain('name="payMaxOrdersPerDay" value="20"');
-    expect(flow.html).toMatch(/name="payAllowlistMode" value="off" checked/);
-    expect(flow.html).toContain("Recommended for AI agents");
+    expect(flow.html).toMatch(/<input type="checkbox" checked disabled>[^<]*<code>fio:read<\/code>/);
+    expect(flow.html).not.toMatch(/payMax|payAllowlist|Maximum per order|Maximum per day|Maximum orders per day|Payee allowlist/);
     // Without the request there is no notice, and the box can still be ticked.
     const plain = await consentFor("fio:read");
     expect(plain.html).not.toContain("create real batches at FIO");
@@ -887,47 +877,16 @@ describe("login and consent pages", () => {
   it("grants fio:payments only when the box is ticked", async () => {
     const flow = await consentFor("fio:read fio:payments");
     expect(await grantedScope(flow, await approve(flow, flow.html, {}))).toBe("fio:read");
-    expect((await grantOf(flow.clientId))?.payments).toEqual(DEFAULT_GRANT_PAYMENTS);
-  });
+    expect((await grantOf(flow.clientId))?.scopes).toEqual(["fio:read"]);
 
-  it("stores the limits and allowlist submitted with the ticked box", async () => {
-    const flow = await consentFor("fio:read fio:payments");
-    const response = await approve(flow, flow.html, {
+    const paymentFlow = await consentFor("fio:read fio:payments");
+    const approved = await approve(paymentFlow, paymentFlow.html, {
       scope: "fio:payments",
-      payMaxPerOrder: "CZK:1000",
-      payMaxPerDay: " CZK:5000.50 ",
-      payMaxOrdersPerDay: "3",
-      payAllowlistMode: "enforce",
-      payAllowlist: "de89 3704 0044 0532 0130 00, Supplier\n000123-0000456/0800",
+      payMaxPerOrder: "invalid",
+      payAllowlistMode: "confirm",
     });
-    expect(await grantedScope(flow, response)).toBe("fio:read fio:payments");
-    expect((await grantOf(flow.clientId))?.payments).toEqual({
-      limits: { maxPerOrder: { CZK: 1000 }, maxPerDay: { CZK: 5000.5 }, maxOrdersPerDay: 3 },
-      allowlist: {
-        mode: "enforce",
-        entries: [{ account: "DE89370400440532013000", label: "Supplier" }, { account: "123-456/0800" }],
-      },
-    });
-  });
-
-  it("refuses payment limits above the ceiling or invalid, keeping the owner's values", async () => {
-    const flow = await consentFor("fio:read fio:payments");
-    const above = await approve(flow, flow.html, { scope: "fio:payments", payMaxPerOrder: "CZK:60000" });
-    expect(above.status).toBe(400);
-    const html = await above.text();
-    expect(html).toContain("above the server ceiling");
-    expect(html).toContain('name="payMaxPerOrder" value="CZK:60000"');
-    expect(paymentsBox(html)).toContain("checked");
-    const invalid = await approve(flow, html, { scope: "fio:payments", payMaxOrdersPerDay: "0", payAllowlist: "not an account" });
-    expect(invalid.status).toBe(400);
-    const second = await invalid.text();
-    expect(second).toContain("Maximum orders per day");
-    expect(second).toContain("Line 1");
-    // Nothing was granted; the corrected form goes through.
-    expect(await grantOf(flow.clientId)).toBeUndefined();
-    const fixed = await approve(flow, second, { scope: "fio:payments", payMaxPerOrder: "EUR:100", payMaxPerDay: "EUR:100" });
-    expect(await grantedScope(flow, fixed)).toBe("fio:read fio:payments");
-    expect((await grantOf(flow.clientId))?.payments.limits?.maxPerOrder).toEqual({ EUR: 100 });
+    expect(await grantedScope(paymentFlow, approved)).toBe("fio:read fio:payments");
+    expect((await grantOf(paymentFlow.clientId))?.settings).toBeUndefined();
   });
 
   it("keeps the owner's own payments choice on a re-render after a conflict", async () => {
@@ -939,12 +898,10 @@ describe("login and consent pages", () => {
     expect(paymentsBox(untickedHtml)).not.toContain("checked");
     const ticked = await approve(flow, untickedHtml.replace(/name="form" value="[^"]+"/, 'name="form" value="stale"'), {
       scope: "fio:payments",
-      payMaxOrdersPerDay: "7",
     });
     expect(ticked.status).toBe(409);
     const tickedHtml = await ticked.text();
     expect(paymentsBox(tickedHtml)).toContain("checked");
-    expect(tickedHtml).toContain('name="payMaxOrdersPerDay" value="7"');
     // No accounts selected (400) keeps the choice as well.
     const none = await approve(flow, tickedHtml, { account: [] });
     expect(none.status).toBe(400);

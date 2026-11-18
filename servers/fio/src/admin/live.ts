@@ -7,30 +7,24 @@ import { type AdminSettings, AdminLive as CoreAdminLive } from "@mcps/core/admin
 import type { AdminApp } from "@mcps/core/admin/tab.js";
 import type { PasswordHash, ScryptParams } from "@mcps/core/oauth/crypto.js";
 import type { ThrottlePolicy } from "@mcps/core/oauth/login.js";
-import { makeOAuthStore } from "@mcps/core/oauth/store.js";
 import { Effect, Layer, type Redacted } from "effect";
 import type { HttpRouter } from "effect/http";
 import type { SqlClient } from "effect/sql";
 import { makeSettingsStore } from "../account-store.js";
 import { Accounts } from "../accounts.js";
 import type { Transactions } from "../cache/service.js";
-import { AppConfig } from "../config.js";
 import type { FioApi } from "../fio-api.js";
 import { FIO_APP } from "../identity.js";
-import { grantPaymentSettings } from "../oauth/grant-payments.js";
 import type { PaymentControls } from "../payment-controls.js";
 import { makeAccountsTab } from "./accounts-tab.js";
-import { makeGrantPaymentSettings } from "./grant-settings.js";
 import { makePaymentsTab } from "./payments-tab.js";
 
 /**
  * fio-mcp's admin UI: core's sign-in, clients and password tabs, named for
  * fio-mcp, plus the Fio accounts tab (first), the payments tab (after the
- * clients) and each payments grant's settings on the clients tab; the
- * admin password's changed hash lives in `server_settings`.
+ * clients). The changed admin password hash lives in `server_settings`.
  */
 
-/** fio-mcp's admin app; `AdminLive` adds the payments grant settings, which need the ceilings. */
 export const FIO_ADMIN: AdminApp = {
   identity: FIO_APP,
   resourcesHeading: "Accounts",
@@ -48,19 +42,12 @@ export const AdminLive = (
 ): Layer.Layer<
   never,
   never,
-  HttpRouter.HttpRouter | SqlClient.SqlClient | Accounts | AdminPassword | FioApi | Transactions | PaymentControls | AppConfig
+  HttpRouter.HttpRouter | SqlClient.SqlClient | Accounts | AdminPassword | FioApi | Transactions | PaymentControls
 > =>
-  Layer.unwrap(
-    Effect.gen(function* () {
-      const { paymentLimits } = yield* AppConfig;
-      const codec = grantPaymentSettings(paymentLimits);
-      const oauth = yield* makeOAuthStore(undefined, codec);
-      return CoreAdminLive(
-        settings,
-        { ...FIO_ADMIN, grantSettings: makeGrantPaymentSettings(oauth, codec, paymentLimits) },
-        Effect.all([makeAccountsTab(settings.dataKey), makePaymentsTab(oauth)]),
-      );
-    }),
+  CoreAdminLive(
+    settings,
+    FIO_ADMIN,
+    Effect.all([makeAccountsTab(settings.dataKey), makePaymentsTab()]),
   ).pipe(Layer.provide(Accounts.resources));
 
 /** The changed admin password's hash, as the `admin_password_hash` setting. */
@@ -69,7 +56,7 @@ const passwordStore = Effect.map(makeSettingsStore(), settingsPasswordStore);
 /**
  * `scrypt` hashes a changed password; tests pass cheaper parameters.
  * `totpSecret` (FIO_MCP_ADMIN_TOTP_SECRET_FILE) adds the authenticator
- * code to sign-in and payment approval.
+ * code to sign-in.
  */
 export const makeAdminPassword = Effect.fn("FioAdminPassword.make")(function* (
   bootstrap: Redacted.Redacted<PasswordHash>,

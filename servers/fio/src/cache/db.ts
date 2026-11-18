@@ -8,7 +8,6 @@ import { SqlClient } from "effect/sql";
 import { ACCOUNT_MIGRATIONS } from "../account-migrations.js";
 import { AppConfig } from "../config.js";
 import { CacheError, InvalidInput } from "../errors.js";
-import { GRANT_PAYMENT_MIGRATIONS } from "../oauth/grant-payments.js";
 import { PAYMENT_MIGRATIONS } from "../payment-ledger.js";
 
 /**
@@ -167,7 +166,11 @@ export const SERVER_MIGRATIONS: Migrations = {
   ...CACHE_MIGRATIONS,
   ...OAUTH_MIGRATIONS,
   ...ACCOUNT_MIGRATIONS,
-  ...GRANT_PAYMENT_MIGRATIONS,
+  "0008_grant_payment_settings": Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`ALTER TABLE oauth_grants ADD COLUMN payment_limits_json TEXT`;
+    yield* sql`ALTER TABLE oauth_grants ADD COLUMN payee_allowlist_json TEXT`;
+  }),
   ...PAYMENT_MIGRATIONS,
 };
 

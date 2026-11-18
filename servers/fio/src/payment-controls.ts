@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { markUntrusted } from "@mcps/core/mcp/untrusted.js";
 import type { Principal } from "@mcps/core/transport/principal.js";
 import { Clock, Context, Effect, Layer, Option, Schema, Semaphore } from "effect";
-import { type Account, Accounts } from "./accounts.js";
+import type { Account } from "./accounts.js";
 import { addDays, pragueDateOf } from "./cache/dates.js";
 import { Database } from "./cache/db.js";
 import { AppConfig } from "./config.js";
@@ -18,7 +18,7 @@ import {
 import { FioApi } from "./fio-api.js";
 import { type ImportResult, looksLikeMissingPaymentPermission, parseImportResponse } from "./import-response.js";
 import { ToolFailure } from "./mcp/common.js";
-import { readGrantPayments } from "./oauth/grant-payments.js";
+import { type PayeeRecord, payeeOf, provenanceProblems } from "./payment-details.js";
 import {
   type AuditOutcome,
   type AuditQuery,
@@ -26,33 +26,10 @@ import {
   type NewAuditRow,
   PaymentLedger,
   type PaymentLedgerShape,
-  type PendingBatch,
 } from "./payment-ledger.js";
-import {
-  type AllowlistMode,
-  effectiveLimits,
-  evaluateLimits,
-  type GrantPayments,
-  type LimitEvaluation,
-  type PayeeRecord,
-  payeeOf,
-  provenanceProblems,
-  toCents,
-  unlistedPayees,
-} from "./payment-limits.js";
-import { type Payer, type PaymentOrder, summarizeOrders } from "./payments.js";
+import { type Payer, type PaymentOrder, summarizeOrders, toCents } from "./payments.js";
 import { isConflictRefusal } from "./rate-limiter.js";
 import { Redactor, RedactorLive } from "./redaction.js";
-
-/**
- * Payment controls (SEC-06, SEC-26..29): per-grant limits, payee allowlist
- * with admin confirmation, idempotency keys, provenance checks and the audit
- * log around every upload. The submit tool and the admin routes only call
- * this service.
- */
-
-/** How long a batch held for admin confirmation waits before it is dropped. */
-export const PENDING_TTL_MS = 24 * 60 * 60 * 1000;
 
 /** Audit rows (and so idempotency keys) are kept at least this long; purge refuses later cut-offs. */
 export const AUDIT_RETENTION_DAYS = 365;
@@ -69,23 +46,7 @@ const IN_PROGRESS = new UploadOutcomeUnknown({
   detail: "The upload started but its outcome was never recorded (the server stopped or failed during the upload).",
 });
 
-const EXPIRED = new PermissionDenied({
-  detail: `The admin did not approve this batch within 24 hours, so it was dropped and nothing was sent to FIO. ${NEW_KEY_ADVICE}`,
-});
-
-const GRANT_GONE = new PermissionDenied({
-  detail: `The authorization that submitted this batch is no longer active (revoked or expired), so the approval was refused and nothing was sent to FIO. ${NEW_KEY_ADVICE}`,
-});
-
-const ACCOUNT_GONE = new PermissionDenied({
-  detail: `The account of this batch is no longer configured with the same token, so it was not uploaded. ${NEW_KEY_ADVICE}`,
-});
-
-const DECLINED = new PermissionDenied({
-  detail: `An admin declined this batch at /admin/payments/pending; nothing was sent to FIO. ${NEW_KEY_ADVICE}`,
-});
-
-export type ToolFailureType = typeof ToolFailure.Type;
+type ToolFailureType = typeof ToolFailure.Type;
 
 /** The import call's success value (D14), the same shape the submit tool always returned. */
 export interface SubmitSuccess {
@@ -102,29 +63,9 @@ export interface SubmitInput {
   readonly idempotencyKey: string;
 }
 
-export interface PreviewInput {
-  readonly principal: Principal;
-  readonly payer: Payer;
-  readonly orders: ReadonlyArray<PaymentOrder>;
-}
-
-/** D18: the controls part of preview_payment_orders. */
-export interface PreviewControls {
-  readonly withinLimits: boolean;
-  readonly limits: {
-    readonly perCurrency: LimitEvaluation["perCurrency"];
-    readonly maxOrdersPerDay: number;
-    readonly ordersToday: number;
-    readonly remainingOrdersToday: number;
-    readonly problems: ReadonlyArray<string>;
-  };
-  readonly allowlist: { readonly mode: AllowlistMode; readonly unlistedPayees: ReadonlyArray<string> };
-  readonly provenanceProblems: ReadonlyArray<string>;
-}
-
 /** What one upload attempt came to (D15 with R5). */
-export interface UploadClassification {
-  readonly outcome: Exclude<AuditOutcome, "pending-confirmation">;
+interface UploadClassification {
+  readonly outcome: AuditOutcome;
   /** The parsed response, when FIO answered with one that is not a permission refusal. */
   readonly result: ImportResult | undefined;
   /** The failure to report, when there is no usable result. */
@@ -134,45 +75,11 @@ export interface UploadClassification {
   readonly reason: string | null;
 }
 
-/** A held batch with its audit row (payees, totals, grant, client). */
-export interface PendingView {
-  readonly batch: PendingBatch;
-  readonly audit: AuditRow;
-}
-
-/** The outcome of an admin approval. */
-export interface ApprovalResult {
-  readonly pendingId: string;
-  readonly auditId: string;
-  readonly outcome: Exclude<AuditOutcome, "pending-confirmation">;
-  /** Batch ids FIO reported, if any. */
-  readonly batchIds: ReadonlyArray<string>;
-  /** The message to show the admin (already redacted; FIO text marked untrusted). */
-  readonly message: string;
-}
-
 export interface PaymentControlsShape {
-  /** Runs `effect` holding the grant's lock (one submission or approval per grant at a time). */
+  /** Runs `effect` holding the grant's lock (one submission per grant at a time). */
   readonly withGrantLock: <A, E, R>(grantId: string, effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
-  /** Uploads and classifies; never fails (D15/R5). */
-  readonly uploadBatch: (account: Account, xml: string) => Effect.Effect<UploadClassification>;
   /** D14 end to end: returns the success JSON or a ToolFailure. */
   readonly submit: (input: SubmitInput) => Effect.Effect<SubmitSuccess, ToolFailureType>;
-  /** D18 data; never fails on limits, allowlist or provenance problems. */
-  readonly preview: (input: PreviewInput) => Effect.Effect<PreviewControls, PaymentAuditError>;
-  /** Held batches (after an expiry sweep), oldest first. */
-  readonly listPending: Effect.Effect<ReadonlyArray<PendingView>, PaymentAuditError>;
-  /**
-   * Uploads the held batch's exact XML once. InvalidInput when it is no
-   * longer pending; refused, uploading nothing, when `grantLive` says the
-   * submitting grant is no longer active.
-   */
-  readonly approvePending: <E>(
-    pendingId: string,
-    grantLive: (grantId: string) => Effect.Effect<boolean, E>,
-  ) => Effect.Effect<ApprovalResult, PaymentAuditError | InvalidInput | E>;
-  /** Drops the held batch; false when it was no longer pending. */
-  readonly declinePending: (pendingId: string) => Effect.Effect<boolean, PaymentAuditError>;
   /** Audit rows newest first, optionally for one grant (/admin/payments). */
   readonly listAudit: (query: AuditQuery) => Effect.Effect<ReadonlyArray<AuditRow>, PaymentAuditError>;
   /**
@@ -182,19 +89,20 @@ export interface PaymentControlsShape {
   readonly purgeBefore: (before: string) => Effect.Effect<number, PaymentAuditError | InvalidInput>;
 }
 
-/** The grant id the audit and the lock use: the OAuth grant, or "local". */
-export const auditGrantId = (principal: Principal): string => principal.subject;
-
-/** The caller's grant payment settings; the stdio and unauthenticated principals get the defaults. */
-export const grantPaymentsOf = (principal: Principal): GrantPayments => readGrantPayments(principal.settings);
-
 export const sha256Hex = (text: string): string => createHash("sha256").update(text, "utf8").digest("hex");
 
 /** Integer cents per currency of the batch. */
-export const batchTotals = (payees: ReadonlyArray<PayeeRecord>): Record<string, number> => {
-  const totals: Record<string, number> = {};
-  for (const payee of payees) totals[payee.currency] = (totals[payee.currency] ?? 0) + toCents(payee.amount);
-  return totals;
+const batchTotals = (payees: ReadonlyArray<PayeeRecord>): AuditRow["totals"] => {
+  const totals = new Map<string, bigint>();
+  for (const payee of payees) {
+    totals.set(payee.currency, (totals.get(payee.currency) ?? 0n) + toCents(payee.amount));
+  }
+  return Object.fromEntries(
+    Array.from(totals, ([currency, cents]) => [
+      currency,
+      cents > Number.MAX_SAFE_INTEGER ? cents.toString() : Number(cents),
+    ]),
+  );
 };
 
 const encodeFailure = Schema.encodeUnknownSync(ToolFailure);
@@ -259,10 +167,8 @@ const nextStepFor = (result: ImportResult): string => {
 
 export const makePaymentControls = Effect.gen(function* () {
   const ledger = yield* PaymentLedger;
-  const config = yield* AppConfig;
   const fio = yield* FioApi;
   const redactor = yield* Redactor;
-  const accounts = yield* Accounts;
 
   // One permit per grant. Created synchronously on first use, so two fibers
   // can never create two semaphores for the same grant.
@@ -280,7 +186,6 @@ export const makePaymentControls = Effect.gen(function* () {
   const failureJson = (failure: ToolFailureType): string =>
     JSON.stringify({ failure: redactor.redactDeep(encodeFailure(failure)) });
   const okJson = (value: SubmitSuccess): string => JSON.stringify({ ok: redactor.redactDeep(value) });
-  const expiredJson = failureJson(EXPIRED);
 
   /** The recorded response of an owner row (D12). A missing or unreadable one replays as unknown. */
   const replay = (row: AuditRow): Effect.Effect<SubmitSuccess, ToolFailureType> =>
@@ -383,17 +288,15 @@ export const makePaymentControls = Effect.gen(function* () {
           // The upload happened: report its real outcome even if the row could not be updated.
           Effect.catch((error) => Effect.logError("payments: audit update after upload failed", error)),
         );
-      return { classified, response };
+      return response;
   }, Effect.uninterruptible);
 
   const submit = (input: SubmitInput): Effect.Effect<SubmitSuccess, ToolFailureType> => {
-    const grantId = auditGrantId(input.principal);
-    const payments = grantPaymentsOf(input.principal);
+    const grantId = input.principal.subject;
     return withGrantLock(
       grantId,
       Effect.gen(function* () {
         const now = yield* Clock.currentTimeMillis;
-        yield* ledger.expirePending(now, expiredJson);
 
         const payees = input.orders.map((order) => payeeOf(order, input.payer.currency ?? ""));
         const xmlSha256 = sha256Hex(input.xml);
@@ -457,218 +360,18 @@ export const makePaymentControls = Effect.gen(function* () {
           );
         }
 
-        // 4. Limits (D5/D8, R1).
-        const evaluation = evaluateLimits(
-          effectiveLimits(payments.limits, config.paymentLimits),
-          payees,
-          yield* ledger.usage(grantId, pragueDateOf(now)),
-        );
-        if (!evaluation.ok) {
-          return yield* refuse(
-            `limit: ${evaluation.problems.join(" ")}`,
-            new PermissionDenied({
-              detail: `${evaluation.problems.join(" ")} Nothing was sent to FIO. ${NEW_KEY_ADVICE}`,
-            }),
-          );
-        }
-
-        // 5. Allowlist (R6/R7).
-        const unlisted = unlistedPayees(payments.allowlist, payees);
-        if (payments.allowlist.mode === "enforce" && unlisted.length > 0) {
-          return yield* refuse(
-            `allowlist: ${unlisted.join(", ")}`,
-            new PermissionDenied({
-              detail: `These payees are not on this grant's payee allowlist: ${unlisted.join(", ")}. Nothing was sent to FIO. The owner can add them at /admin/clients. ${NEW_KEY_ADVICE}`,
-            }),
-          );
-        }
-        if (payments.allowlist.mode === "confirm") {
-          const expiresAt = now + PENDING_TTL_MS;
-          let held: SubmitSuccess = {};
-          yield* ledger.hold(
-            {
-              ...row(true),
-              outcome: "pending-confirmation",
-              reason:
-                unlisted.length > 0 ? `awaiting confirmation; unlisted: ${unlisted.join(", ")}` : "awaiting confirmation",
-              responseJson: null,
-            },
-            {
-              accountId: input.account.tokenFingerprint,
-              accountName: input.account.name,
-              xml: input.xml,
-              xmlSha256,
-              expiresAt,
-            },
-            (pendingId) => {
-              held = {
-                account: input.account.name,
-                payerAccount: input.payer.accountNumber,
-                ...summary,
-                outcome: "awaiting-admin-confirmation",
-                pendingId,
-                expiresAt: new Date(expiresAt).toISOString(),
-                nextStep:
-                  "Nothing was sent to FIO yet. An admin must approve this batch at /admin/payments/pending within 24 h; only then is it uploaded to FIO, where it still has to be signed in Internetbanking. Do not submit it again: calling again with the same idempotencyKey returns this result.",
-              };
-              return okJson(held);
-            },
-          );
-          return held;
-        }
-
-        // 6-8. Record, upload, record.
         const auditId = yield* ledger.insert({
           ...row(true),
           outcome: "unknown",
           reason: "upload in progress",
           responseJson: failureJson(IN_PROGRESS),
         });
-        const { response } = yield* uploadRecorded(auditId, input.account, input.xml, success);
+        const response = yield* uploadRecorded(auditId, input.account, input.xml, success);
         if ("value" in response) return response.value;
         return yield* Effect.fail(response.failure);
       }),
     );
   };
-
-  const preview = Effect.fnUntraced(function* (input: PreviewInput) {
-      const now = yield* Clock.currentTimeMillis;
-      const grantId = auditGrantId(input.principal);
-      const payments = grantPaymentsOf(input.principal);
-      const payees = input.orders.map((order) => payeeOf(order, input.payer.currency ?? ""));
-      const evaluation = evaluateLimits(
-        effectiveLimits(payments.limits, config.paymentLimits),
-        payees,
-        yield* ledger.usage(grantId, pragueDateOf(now)),
-      );
-      const unlisted = unlistedPayees(payments.allowlist, payees);
-      return {
-        withinLimits: evaluation.ok,
-        limits: {
-          perCurrency: evaluation.perCurrency,
-          maxOrdersPerDay: evaluation.maxOrdersPerDay,
-          ordersToday: evaluation.ordersToday,
-          remainingOrdersToday: evaluation.remainingOrdersToday,
-          problems: evaluation.problems,
-        },
-        allowlist: { mode: payments.allowlist.mode, unlistedPayees: payments.allowlist.mode === "off" ? [] : unlisted },
-        provenanceProblems: provenanceProblems(input.orders),
-      } satisfies PreviewControls;
-  });
-
-  const sweep = Effect.flatMap(Clock.currentTimeMillis, (now) => ledger.expirePending(now, expiredJson));
-
-  const listPending = Effect.gen(function* () {
-    yield* sweep;
-    const now = yield* Clock.currentTimeMillis;
-    const batches = yield* ledger.pending(now);
-    const views: Array<PendingView> = [];
-    for (const batch of batches) {
-      const audit = yield* ledger.get(batch.auditId);
-      if (Option.isSome(audit)) views.push({ batch, audit: audit.value });
-    }
-    return views;
-  });
-
-  /** The grant a held batch belongs to, so approve/decline take that grant's lock (R2). */
-  const pendingGrant = (pendingId: string) =>
-    Effect.map(ledger.getPending(pendingId), Option.map((batch) => batch.grantId));
-
-  const notPending = (pendingId: string) =>
-    new InvalidInput({ detail: `Batch ${pendingId} is no longer awaiting confirmation (approved, declined or expired).` });
-
-  /**
-   * Uploads a held batch once. Under the grant's lock, the grant must still
-   * be live (`grantLive`) and the account still configured; the batch is
-   * then taken and its audit row moved to the in-flight unknown state in one
-   * transaction before dispatch (R4), so a crash never strands a pending row.
-   */
-  const approvePending = <E>(pendingId: string, grantLive: (grantId: string) => Effect.Effect<boolean, E>) =>
-    Effect.gen(function* () {
-      const held = yield* ledger.getPending(pendingId);
-      if (Option.isNone(held)) {
-        yield* sweep;
-        return yield* notPending(pendingId);
-      }
-      // A held batch's fields never change; only its presence does.
-      const batch = held.value;
-      return yield* withGrantLock(
-        batch.grantId,
-        Effect.gen(function* () {
-          yield* sweep;
-          const audit = yield* ledger.get(batch.auditId);
-          const live = yield* grantLive(batch.grantId);
-          const account = (yield* accounts.list).find((acc) => acc.tokenFingerprint === batch.accountId);
-          const now = yield* Clock.currentTimeMillis;
-          if (!live || account === undefined || Option.isNone(audit)) {
-            const failure = live ? ACCOUNT_GONE : GRANT_GONE;
-            const reason = live ? "approval: account unavailable" : "approval: grant no longer active";
-            const taken = yield* ledger.takePending(pendingId, now, {
-              outcome: "refused",
-              reason,
-              responseJson: failureJson(failure),
-            });
-            if (Option.isNone(taken)) return yield* notPending(pendingId);
-            return {
-              pendingId,
-              auditId: batch.auditId,
-              outcome: "refused",
-              batchIds: [],
-              message: failure.message,
-            } satisfies ApprovalResult;
-          }
-          const taken = yield* ledger.takePending(pendingId, now, {
-            outcome: "unknown",
-            reason: "upload in progress",
-            responseJson: failureJson(IN_PROGRESS),
-          });
-          if (Option.isNone(taken) || !taken.value.moved) return yield* notPending(pendingId);
-          // The approved upload replays like a direct one: the recorded
-          // response replaces the "awaiting confirmation" one, keeping its
-          // account and summary fields.
-          const heldResponse: Record<string, unknown> =
-            audit.value.responseJson === null
-              ? {}
-              : yield* decodeRecorded(audit.value.responseJson).pipe(
-                  Effect.map((recorded) => ("ok" in recorded ? recorded.ok : {})),
-                  Effect.orElseSucceed(() => ({})),
-                );
-          const { outcome: _outcome, pendingId: _pending, expiresAt: _expires, nextStep: _next, ...summary } = heldResponse;
-          const success = (result: ImportResult): SubmitSuccess => ({ ...summary, result, nextStep: nextStepFor(result) });
-          const { classified, response } = yield* uploadRecorded(batch.auditId, account, batch.xml, success);
-          return {
-            pendingId,
-            auditId: batch.auditId,
-            outcome: classified.outcome,
-            batchIds: classified.batchIds,
-            message: redactor.redact(
-              "value" in response ? nextStepFor(classified.result as ImportResult) : response.failure.message,
-            ),
-          } satisfies ApprovalResult;
-        }),
-      );
-    });
-
-  const declinePending = Effect.fnUntraced(function* (pendingId: string) {
-      const grantId = yield* pendingGrant(pendingId);
-      if (Option.isNone(grantId)) {
-        yield* sweep;
-        return false;
-      }
-      return yield* withGrantLock(
-        grantId.value,
-        Effect.gen(function* () {
-          yield* sweep;
-          const now = yield* Clock.currentTimeMillis;
-          const taken = yield* ledger.takePending(pendingId, now, {
-            outcome: "refused",
-            reason: "declined by admin",
-            responseJson: failureJson(DECLINED),
-          });
-          return Option.isSome(taken);
-        }),
-      );
-  });
 
   const purgeBefore = Effect.fnUntraced(function* (before: string) {
       const latest = addDays(pragueDateOf(yield* Clock.currentTimeMillis), -AUDIT_RETENTION_DAYS);
@@ -682,12 +385,7 @@ export const makePaymentControls = Effect.gen(function* () {
 
   return {
     withGrantLock,
-    uploadBatch,
     submit,
-    preview,
-    listPending,
-    approvePending,
-    declinePending,
     listAudit: ledger.list,
     purgeBefore,
   } satisfies PaymentControlsShape;
@@ -712,16 +410,9 @@ const LazyLedgerLive = Layer.effect(
       Effect.flatMap(ledger, use);
     return PaymentLedger.of({
       insert: (row) => via((l) => l.insert(row)),
-      update: (id, patch, now, expect) => via((l) => l.update(id, patch, now, expect)),
+      update: (id, patch, now) => via((l) => l.update(id, patch, now)),
       findByKey: (grantId, key) => via((l) => l.findByKey(grantId, key)),
-      get: (id) => via((l) => l.get(id)),
-      usage: (grantId, day) => via((l) => l.usage(grantId, day)),
       list: (query) => via((l) => l.list(query)),
-      hold: (row, batch, response) => via((l) => l.hold(row, batch, response)),
-      pending: (now) => via((l) => l.pending(now)),
-      getPending: (pendingId) => via((l) => l.getPending(pendingId)),
-      takePending: (pendingId, now, patch) => via((l) => l.takePending(pendingId, now, patch)),
-      expirePending: (now, responseJson) => via((l) => l.expirePending(now, responseJson)),
       purgeBefore: (day) => via((l) => l.purgeBefore(day)),
     });
   }),
@@ -730,7 +421,7 @@ const LazyLedgerLive = Layer.effect(
 export class PaymentControls extends Context.Service<PaymentControls, PaymentControlsShape>()(
   "fio-mcp/PaymentControls",
 ) {
-  /** Needs PaymentLedger, AppConfig, FioApi, Redactor and Accounts. */
+  /** Needs PaymentLedger, FioApi and Redactor. */
   static readonly Default = Layer.effect(PaymentControls, Effect.map(makePaymentControls, PaymentControls.of));
 
   /**
@@ -748,5 +439,5 @@ export class PaymentControls extends Context.Service<PaymentControls, PaymentCon
       const ledger = opensDatabase ? PaymentLedger.Default.pipe(Layer.provide(Database.Live)) : LazyLedgerLive;
       return PaymentControls.Default.pipe(Layer.provideMerge(ledger));
     }),
-  ).pipe(Layer.provide(Layer.mergeAll(AppConfig.Live, FioApi.Live, RedactorLive, Accounts.Live)));
+  ).pipe(Layer.provide(Layer.mergeAll(AppConfig.Live, FioApi.Live, RedactorLive)));
 }

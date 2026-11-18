@@ -34,7 +34,6 @@ import {
   revokeClientCommand,
   totpInitCommand,
 } from "../src/oauth/cli.js";
-import { DEFAULT_PAYMENT_LIMITS } from "../src/payment-limits.js";
 import { testConfig } from "./fixtures.js";
 import { seededConfig } from "./support/config.js";
 import { memoryDatabase } from "./support/database.js";
@@ -91,7 +90,7 @@ describe("URL rules", () => {
   });
 
   it("escapes account names in consent checkbox labels and values", () => {
-    const html = consentPage(fioOAuthApp(DEFAULT_PAYMENT_LIMITS), {
+    const html = consentPage(fioOAuthApp, {
       formId: "form-1",
       clientId: "fio_client_test",
       clientName: null,
@@ -114,7 +113,7 @@ describe("authorization endpoint request target", () => {
 
   it.effect("shows an error page for an absolute-form target that is not a URL", () =>
     Effect.gen(function* () {
-      const server = yield* makeOAuthServer(fioOAuthApp(DEFAULT_PAYMENT_LIMITS), { publicUrl: "https://fio.example.net" }).pipe(
+      const server = yield* makeOAuthServer(fioOAuthApp, { publicUrl: "https://fio.example.net" }).pipe(
         Effect.provide(adminPasswordLayer(Redacted.make(UNCHECKED_HASH))),
       );
       const authorize = server.routes.find((route) => route.method === "GET" && route.path === "/authorize");

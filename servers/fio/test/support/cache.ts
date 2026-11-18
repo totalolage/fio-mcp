@@ -7,7 +7,6 @@ import { Transactions } from "../../src/cache/service.js";
 import { makeCacheStore, type PendingRange, type SyncMode } from "../../src/cache/store.js";
 import { type AppConfigShape, type CacheConfig, DEFAULT_BACKFILL_FROM, DEFAULT_CACHE_MAX_AGE_MINUTES, DEFAULT_OVERLAP_DAYS, MAX_RESPONSE_BYTES } from "../../src/config.js";
 import type { FioApi } from "../../src/fio-api.js";
-import { DEFAULT_PAYMENT_LIMITS } from "../../src/payment-limits.js";
 import { RedactorDefault } from "../../src/redaction.js";
 import type { NormalizedStatement, Transaction } from "../../src/statement.js";
 import { seededConfig } from "./config.js";
@@ -51,7 +50,6 @@ export function config(
       dataKey: undefined,
       ...overrides.cache,
     },
-    paymentLimits: DEFAULT_PAYMENT_LIMITS,
   };
 }
 

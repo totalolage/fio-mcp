@@ -7,8 +7,6 @@ import { SqlClient } from "effect/sql";
 import { type Account, toAccount } from "../src/accounts.js";
 import { migrate, SERVER_MIGRATIONS } from "../src/cache/db.js";
 import { requireAccount, visibleAccounts } from "../src/mcp/permissions.js";
-import { grantPaymentSettings } from "../src/oauth/grant-payments.js";
-import { DEFAULT_GRANT_PAYMENTS, DEFAULT_PAYMENT_LIMITS } from "../src/payment-limits.js";
 import { PAY_TOKEN, READ_TOKEN } from "./fixtures.js";
 import { memoryDatabase } from "./support/database.js";
 
@@ -28,7 +26,7 @@ const account = (name: string, token: string): Account =>
 
 /** Stores a grant for `accounts` with a live access token, as consent does. */
 const grantFor = Effect.fnUntraced(function* (accounts: ReadonlyArray<Account>) {
-  const store = yield* makeOAuthStore(undefined, grantPaymentSettings(DEFAULT_PAYMENT_LIMITS));
+  const store = yield* makeOAuthStore();
   const now = yield* Clock.currentTimeMillis;
   const clientId = "client_identity";
   yield* store.insertClient({ clientId, clientName: null, redirectUris: ["https://a.example/cb"], createdAt: now, lastUsedAt: null }, 10);
@@ -38,7 +36,6 @@ const grantFor = Effect.fnUntraced(function* (accounts: ReadonlyArray<Account>) 
     scopes: ["fio:read"],
     resources: accounts.map((a) => a.tokenFingerprint),
     resource: RESOURCE,
-    settings: DEFAULT_GRANT_PAYMENTS,
   };
   yield* store.createGrant(grant, { codeHash: "code_identity", clientId, redirectUri: "https://a.example/cb", codeChallenge: "x", expiresAt: now + 60_000 }, now);
   yield* store.insertTokens(grant.grantId, {

@@ -8,6 +8,7 @@ import { AppConfig, MAX_RESPONSE_BYTES } from "../config.js";
 import { InvalidInput } from "../errors.js";
 import { FioApi, MERCHANT_FORMATS, MOVEMENT_FORMATS, STATEMENT_FORMATS } from "../fio-api.js";
 import { PaymentControls } from "../payment-controls.js";
+import { provenanceProblems } from "../payment-details.js";
 import { buildImportXml, PaymentOrders, summarizeOrders } from "../payments.js";
 import { RateLimiter } from "../rate-limiter.js";
 import { Redactor } from "../redaction.js";
@@ -126,7 +127,7 @@ export function makeFioToolkit(accountNames: ReadonlyArray<string>) {
   const PreviewPaymentOrders = annotateTool(
     tool(
       "preview_payment_orders",
-      `Validate payment orders locally and return the exact Fio XML that submit_payment_orders would upload, with totals. Sends nothing to the bank; FIO validates again on upload. Also reports whether the batch is within this client's payment limits (withinLimits, with today's used and remaining allowance per currency and orders left today), which payees are not on the allowlist, and any provenance problems; submit refuses a batch that fails them. Show the result to the user before submitting. ${PROVENANCE_RULE}`,
+      `Validate payment orders locally and return the exact Fio XML that submit_payment_orders would upload, with totals. Sends nothing to the bank; FIO validates again on upload. Reports provenance problems that would prevent submission. Show the result to the user before submitting. ${PROVENANCE_RULE}`,
       params({ orders: PaymentOrders }),
     ),
     { title: "Preview payment orders (dry run)", readOnly: true, openWorld: false },
@@ -135,7 +136,7 @@ export function makeFioToolkit(accountNames: ReadonlyArray<string>) {
   const SubmitPaymentOrders = annotateTool(
     tool(
       "submit_payment_orders",
-      `Upload domestic, euro (SEPA/T2), and foreign payment orders to FIO as one batch. WARNING: ${PAYMENT_WARNING} Not idempotent at Fio: never resubmit after an error or an unknown outcome until the user has checked Internetbanking. Calling again with the same idempotencyKey returns the recorded outcome and never uploads again; a used key never uploads again, so a corrected batch needs a new key. Batches above this client's payment limits, or to payees outside its allowlist, are refused or held for admin approval. ${PROVENANCE_RULE} The response lists FIO's verdict per batch and order.`,
+      `Upload domestic, euro (SEPA/T2), and foreign payment orders to FIO as one batch. WARNING: ${PAYMENT_WARNING} Not idempotent at Fio: never resubmit after an error or an unknown outcome until the user has checked Internetbanking. Calling again with the same idempotencyKey returns the recorded outcome and never uploads again; a used key never uploads again, so a corrected batch needs a new key. ${PROVENANCE_RULE} The response lists FIO's verdict per batch and order.`,
       params({
         orders: PaymentOrders,
         idempotencyKey: Schema.String.check(Schema.isPattern(IDEMPOTENCY_KEY)).annotate({
@@ -316,13 +317,12 @@ export const makeFioHandlers = Effect.fn("FioTools.handlers")(function* (toolkit
           const acc = yield* permittedAccount(accounts, account, PAYMENTS);
           const payer = yield* accounts.payer(acc);
           const xml = yield* buildImportXml(orders, payer);
-          const checks = yield* controls.preview({ principal: yield* CurrentPrincipal, payer, orders });
           return {
             account: acc.name,
             dryRun: true,
             payerAccount: payer.accountNumber,
             ...summarizeOrders(orders, payer),
-            ...checks,
+            provenanceProblems: provenanceProblems(orders),
             xml,
           };
         }),
@@ -334,7 +334,6 @@ export const makeFioHandlers = Effect.fn("FioTools.handlers")(function* (toolkit
           const acc = yield* permittedAccount(accounts, account, PAYMENTS);
           const payer = yield* accounts.payer(acc);
           const xml = yield* buildImportXml(orders, payer);
-          // Idempotency, provenance, limits, allowlist, upload and audit (D14).
           return yield* controls.submit({
             principal: yield* CurrentPrincipal,
             account: acc,

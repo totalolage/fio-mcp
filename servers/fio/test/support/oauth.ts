@@ -9,7 +9,7 @@
 
 import { createHash, randomBytes } from "node:crypto";
 import { AdminPassword, type AdminPasswordShape } from "@mcps/core/admin/password.js";
-import { adminRoutes, type SecondFactorCheck } from "@mcps/core/admin/server.js";
+import { adminRoutes } from "@mcps/core/admin/server.js";
 import { hashPassword, type PasswordHash } from "@mcps/core/oauth/crypto.js";
 import type { ThrottlePolicy } from "@mcps/core/oauth/login.js";
 import { makeOAuthStore, type OAuthStore } from "@mcps/core/oauth/store.js";
@@ -28,15 +28,12 @@ import { AccountChangesLive } from "../../src/account-runtime.js";
 import { Accounts, type AccountsShape } from "../../src/accounts.js";
 import { AdminLive, adminPasswordLayer } from "../../src/admin/live.js";
 import { SERVER_INFO, ToolsLive } from "../../src/app.js";
-import { SERVER_MIGRATIONS } from "../../src/cache/db.js";
+import { type Migrations, SERVER_MIGRATIONS } from "../../src/cache/db.js";
 import { type AppConfigShape, accountSeedOf, type HttpAuthConfig, type HttpTransportConfig } from "../../src/config.js";
 import type { FioApiShape } from "../../src/fio-api.js";
 import { parsePasswordHash } from "../../src/identity.js";
-import { grantPaymentSettings } from "../../src/oauth/grant-payments.js";
 import { PaymentControls, type PaymentControlsShape } from "../../src/payment-controls.js";
-import { PAYMENT_FIELDS, paymentFormValues } from "../../src/payment-form.js";
 import { PaymentLedger } from "../../src/payment-ledger.js";
-import { DEFAULT_GRANT_PAYMENTS, DEFAULT_PAYMENT_LIMITS, type PaymentLimits } from "../../src/payment-limits.js";
 import { fioOAuth } from "../../src/transport/auth.js";
 import { testDatabase } from "./database.js";
 import { testConfig, testServices } from "./transport.js";
@@ -129,18 +126,15 @@ export async function startOAuth(
     extraAdminRoutes?: Layer.Layer<never, never, HttpRouter.HttpRouter>;
     /** A database file instead of memory (survives `close`, for restart tests). */
     dbPath?: string;
+    migrations?: Migrations;
     /** The accounts FIO_TOKEN / FIO_ACCOUNTS would configure (default: main and savings). */
     configured?: AppConfigShape["accounts"];
     /** FIO_MCP_ADMIN_TOTP_SECRET_FILE's secret: sign-ins then need a code too. */
     totpSecret?: Redacted.Redacted<Uint8Array>;
     /** Replaces parts of the real AdminPassword, for outcomes a test cannot reach by timing (e.g. busy). */
     adminPassword?: (real: AdminPasswordShape) => AdminPasswordShape;
-    /** Server payment defaults and ceilings (default DEFAULT_PAYMENT_LIMITS). */
-    paymentLimits?: PaymentLimits;
     /** FioApi methods beyond the slot-holding fake (e.g. importXml for payment uploads). */
     fio?: Partial<FioApiShape>;
-    /** Replaces the admin's second-factor check of payment approvals. */
-    secondFactor?: SecondFactorCheck;
   } = {},
 ): Promise<InProcessHarness> {
   const hash = await passwordHash();
@@ -166,10 +160,10 @@ export async function startOAuth(
     trustedProxies,
     adminAllowedNetworks: allowedNetworks,
   };
-  const config = { ...testConfig(transport), paymentLimits: options.paymentLimits ?? DEFAULT_PAYMENT_LIMITS };
+  const config = testConfig(transport);
   const scope = await Effect.runPromise(Scope.make());
   const db: Context.Context<SqlClient.SqlClient> = await Effect.runPromise(
-    Layer.buildWithScope(testDatabase(options.dbPath ?? ":memory:", SERVER_MIGRATIONS), scope),
+    Layer.buildWithScope(testDatabase(options.dbPath ?? ":memory:", options.migrations ?? SERVER_MIGRATIONS), scope),
   );
   const release = await Effect.runPromise(Deferred.make<void>());
   const clock = new SkewedClock();
@@ -180,7 +174,7 @@ export async function startOAuth(
   // As authFromConfig builds it, with the test's throttling and scrypt parameters.
   const oauth = Layer.mergeAll(
     fioOAuth({ publicUrl: PUBLIC_URL, trustedProxies, allowedNetworks }),
-    AdminLive({ ...adminSettings, secondFactor: options.secondFactor }),
+    AdminLive(adminSettings),
     options.extraAdminRoutes === undefined ? Layer.empty : adminRoutes(adminSettings, options.extraAdminRoutes),
   ).pipe(
     Layer.provide(
@@ -245,7 +239,7 @@ export async function startOAuth(
     logs,
     store: (f) =>
       Effect.runPromise(
-        Effect.flatMap(makeOAuthStore(undefined, grantPaymentSettings(config.paymentLimits)), f).pipe(Effect.provide(Layer.succeedContext(db)), Effect.provideService(Clock.Clock, clock)),
+        Effect.flatMap(makeOAuthStore(), f).pipe(Effect.provide(Layer.succeedContext(db)), Effect.provideService(Clock.Clock, clock)),
       ),
     sql: (effect) => Effect.runPromise(effect.pipe(Effect.provide(Layer.succeedContext(db)), Effect.provideService(Clock.Clock, clock))),
     accounts: () => {
@@ -322,24 +316,10 @@ export const csrfOf = async (response: Response) => {
 export interface Consent {
   readonly accounts?: ReadonlyArray<string>;
   readonly payments?: boolean;
-  /** Payment settings fields overriding the pre-filled server defaults (sent with `payments`). */
-  readonly paymentSettings?: Readonly<Record<string, string>>;
   readonly decision?: "approve" | "deny";
   /** The authentication code for /login, when the harness has a TOTP secret. */
   readonly totp?: string;
 }
-
-/** The consent page's payment settings as pre-filled from DEFAULT_PAYMENT_LIMITS. */
-export const DEFAULT_PAYMENT_FORM: Readonly<Record<string, string>> = (() => {
-  const values = paymentFormValues(DEFAULT_GRANT_PAYMENTS, DEFAULT_PAYMENT_LIMITS);
-  return {
-    [PAYMENT_FIELDS.maxPerOrder]: values.maxPerOrder,
-    [PAYMENT_FIELDS.maxPerDay]: values.maxPerDay,
-    [PAYMENT_FIELDS.maxOrdersPerDay]: values.maxOrdersPerDay,
-    [PAYMENT_FIELDS.mode]: values.mode,
-    [PAYMENT_FIELDS.allowlist]: values.allowlist,
-  };
-})();
 
 /** Drives /authorize → /login → /consent and returns the redirect back to the client. */
 export async function authorizeInBrowser(harness: OAuthHarness, authorizationUrl: string | URL, consent: Consent = {}) {
@@ -357,9 +337,6 @@ export async function authorizeInBrowser(harness: OAuthHarness, authorizationUrl
     decision: consent.decision ?? "approve",
     account: consent.accounts ?? ["main", "savings"],
     scope: consent.payments === true ? ["fio:payments"] : [],
-    // The fields a browser submits as pre-filled (hidden unless the box is ticked).
-    ...DEFAULT_PAYMENT_FORM,
-    ...consent.paymentSettings,
   });
   if (done.status !== 303) throw new Error(`consent answered ${done.status}: ${await done.text()}`);
   return new URL(done.headers.get("location") ?? "");
