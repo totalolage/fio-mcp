@@ -413,10 +413,8 @@ describe("a separate admin listener (FIO_MCP_ADMIN_PORT)", () => {
     // The admin port serves only /admin: no MCP endpoint, no OAuth pages.
     expect((await onAdminPort.fetch(`${PUBLIC_URL}/mcp`, { method: "POST" })).status).toBe(404);
     expect((await onAdminPort.fetch(`${PUBLIC_URL}/authorize`)).status).toBe(404);
-    // ... and the payments pages with it (a sign-in redirect when signed out).
-    for (const path of ["/admin/payments", "/admin/payments/pending"]) {
-      expect((await onAdminPort.fetch(`${PUBLIC_URL}${path}`, { redirect: "manual" })).status, path).toBe(303);
-    }
+    expect((await onAdminPort.fetch(`${PUBLIC_URL}/admin/payments`, { redirect: "manual" })).status).toBe(303);
+    expect((await onAdminPort.fetch(`${PUBLIC_URL}/admin/payments/pending`, { redirect: "manual" })).status).toBe(404);
 
     const admin = new Admin(onAdminPort);
     await admin.signIn();

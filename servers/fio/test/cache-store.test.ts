@@ -94,6 +94,7 @@ describe("cache database", () => {
           [9, "payment_audit"],
           [10, "payment_pending"],
           [11, "cache_sealed_rows"],
+          [12, "retire_held_payments"],
         ]);
         const store = yield* makeCacheStore();
         const pending = (fp: string) => Effect.map(store.syncState(fp), (state) => state.pending);
