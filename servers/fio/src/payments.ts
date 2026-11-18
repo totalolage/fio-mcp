@@ -374,7 +374,9 @@ export function summarizeOrders(orders: readonly PaymentOrder[], payer: Payer) {
     Array.from(totals, ([currency, cents]) => {
       const decimal = formatCents(cents);
       const amount = Number(decimal);
-      return [currency, amount.toFixed(2) === decimal ? amount : decimal];
+      // JSON can round a number differently from toFixed(2).
+      const [whole, fraction = ""] = JSON.stringify(amount).split(".");
+      return [currency, `${whole}.${fraction.padEnd(2, "0")}` === decimal ? amount : decimal];
     }),
   );
   return { orderCount: orders.length, counts, totalsByCurrency };

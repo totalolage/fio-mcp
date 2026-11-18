@@ -582,19 +582,36 @@ describe("payment audit log (SEC-29)", () => {
     payees: [expect.objectContaining({ payee: "2212-2000000699/0300", bankCode: "0300", amount: 100, currency: "CZK" })],
   };
 
-  it("records exact audit totals for the largest batch the format allows", async () => {
+  it.each([
+    {
+      description: "the largest allowed orders",
+      firstAmount: MAX_AMOUNT - 0.01,
+      remainingAmount: MAX_AMOUNT,
+      decimal: "99999999999998.99",
+      cents: "9999999999999899",
+    },
+    {
+      description: "a total whose JSON number loses a cent",
+      firstAmount: 0.13,
+      remainingAmount: 999_999_999_999,
+      decimal: "98999999999901.13",
+      cents: "9899999999990113",
+    },
+  ])("preserves exact totals with $description", async ({ firstAmount, remainingAmount, decimal, cents }) => {
     const tools = await connectTools();
     const batch = Array.from({ length: MAX_ORDERS_PER_BATCH }, (_, index) => ({
       ...order,
-      amount: index === 0 ? MAX_AMOUNT - 0.01 : MAX_AMOUNT,
+      amount: index === 0 ? firstAmount : remainingAmount,
     }));
-    const total = { CZK: "99999999999998.99" };
+    const key = newKey();
+    const total = { CZK: decimal };
     expect((await tools.preview(batch)).totalsByCurrency).toEqual(total);
-    const result = json(await tools.submit(batch));
+    const result = json(await tools.submit(batch, key));
     expect(result.result.outcome).toBe("accepted");
     expect(result.totalsByCurrency).toEqual(total);
+    expect(json(await tools.submit(batch, key)).totalsByCurrency).toEqual(total);
     expect(await tools.uploads()).toBe(1);
-    expect((await tools.audit())[0]?.totals).toEqual({ CZK: "9999999999999899" });
+    expect((await tools.audit())[0]?.totals).toEqual({ CZK: cents });
   });
 
   it("records accepted, rejected, unknown and refused submissions without the FIO token", async () => {
