@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { TOTP_DIGITS } from "../admin/totp.js";
 import type { OAuthApp } from "./app.js";
 import { isLoopbackRedirect, originOf } from "./urls.js";
 
@@ -22,7 +23,7 @@ export function escapeHtml(value: string): string {
 const STYLE =
   "body{font-family:system-ui,sans-serif;max-width:32rem;margin:3rem auto;padding:0 1rem;color:#1b1b1b;line-height:1.45}" +
   "h1{font-size:1.4rem}fieldset{border:1px solid #ccc;border-radius:6px;margin:1rem 0;padding:.5rem 1rem}" +
-  "label{display:block;margin:.35rem 0}input[type=password]{width:100%;padding:.4rem;font-size:1rem;box-sizing:border-box}" +
+  "label{display:block;margin:.35rem 0}input[type=password],#totp{width:100%;padding:.4rem;font-size:1rem;box-sizing:border-box}" +
   "button{font-size:1rem;padding:.45rem 1.1rem;margin-right:.5rem}.warn{background:#fff4d6;border:1px solid #e0b84c;padding:.5rem .75rem;border-radius:6px}" +
   ".error{color:#a40000}code{word-break:break-all}.muted{color:#555;font-size:.9rem}";
 
@@ -68,8 +69,10 @@ export interface LoginPage {
 }
 
 /** The second-factor field of both sign-in forms (/login and /admin/login). */
-export const TOTP_FIELD = `<label for="totp">Authenticator code</label>
-<input id="totp" type="text" name="totp" inputmode="numeric" autocomplete="one-time-code" maxlength="16" required>
+export const TOTP_FIELD = `<label for="totp">${TOTP_DIGITS}-digit code from your authenticator app</label>
+<input id="totp" type="text" name="totp" inputmode="numeric" autocomplete="one-time-code" enterkeyhint="go"
+  autocorrect="off" autocapitalize="none" spellcheck="false" pattern="(?:\\s*[0-9]){${TOTP_DIGITS}}\\s*"
+  title="Enter ${TOTP_DIGITS} digits. Spaces are allowed." required>
 `;
 
 export const loginPage = (app: OAuthApp, page: LoginPage): string =>
