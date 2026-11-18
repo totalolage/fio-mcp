@@ -16,15 +16,13 @@ These hold whatever the deployment looks like, as long as the configuration belo
 | Sign-in throttle | `FIO_MCP_TRUSTED_PROXIES` | Delays and a 15-minute lockout per client address, one scrypt check at a time ("Sign-in busy, try again." with 429 otherwise). Warns at startup when the list is empty, and at the first `X-Forwarded-For` from a peer it doesn't trust. |
 | Network allowlist for the browser pages | `FIO_MCP_ADMIN_ALLOWED_CIDRS` | `/admin`, `/authorize`, `/login` and `/consent` answer 404 to other addresses. |
 | Separate admin listener | `FIO_MCP_ADMIN_PORT`, `FIO_MCP_ADMIN_HOST` | Moves `/admin` off the main port. |
-| Second factor | `FIO_MCP_ADMIN_TOTP_SECRET_FILE`, `fio-mcp totp-init` | A TOTP code at every sign-in and every approval of a held payment batch. |
+| Second factor | `FIO_MCP_ADMIN_TOTP_SECRET_FILE`, `fio-mcp totp-init` | A TOTP code at every sign-in. |
 | FIO address | `FIO_API_BASE_URL` | Only `https` on `fio.cz` or its subdomains; tokens can't be sent elsewhere by a stray setting. |
 | Bank text marked as data | always on | Counterparty names, messages and other bank text reach the model inside nonce-tagged markers with a notice to ignore instructions in them. |
 | No download-marker tools | `FIO_MCP_MARKER_TOOLS=disabled` | Removes `get_new_transactions` and `set_download_marker`. |
 | Cache encryption | `FIO_CACHE_ENCRYPT=true` | Encrypts the cached counterparty details and free text with the data key. |
 | One server per database | always on (cache or OAuth) | A lease in the database stops a second server on the same file. |
 | Payments granted explicitly | consent page | The `fio:payments` box starts unticked. |
-| Payment limits | `FIO_MCP_PAYMENT_MAX_PER_ORDER`, `_MAX_PER_DAY`, `_MAX_ORDERS_PER_DAY`, per grant | Per order, per day and orders per day; a batch over a limit is refused before upload. |
-| Payee allowlist | per grant: `off`, `enforce`, `confirm` | Refuses unlisted payees, or holds every batch for your approval at `/admin/payments/pending`. |
 | Idempotency | `idempotencyKey` on `submit_payment_orders` | A retried call never uploads the same batch twice. |
 | Uncertain uploads | always on | Any 5xx or ambiguous answer is reported as "outcome unknown", with the advice to check Internetbanking first. |
 | Audit log | `/admin/payments`, `fio-mcp payments purge` | Every submitted batch, with payees, amounts and outcome; kept at least 365 days. |
@@ -112,7 +110,6 @@ From the VPN, `https://fio.example.net/admin` shows the sign-in page.
 | `FIO_MCP_ADMIN_ALLOWED_CIDRS` | your VPN and LAN ranges, as in the proxy |
 | `FIO_MCP_ADMIN_TOTP_SECRET_FILE` | a file with the first line of `fio-mcp totp-init` |
 | `FIO_MCP_MARKER_TOOLS` | `disabled` |
-| `FIO_MCP_PAYMENT_MAX_PER_ORDER`, `FIO_MCP_PAYMENT_MAX_PER_DAY`, `FIO_MCP_PAYMENT_MAX_ORDERS_PER_DAY` | your ceilings, if the defaults (`CZK:50000,EUR:2000`, `CZK:100000,EUR:4000`, `20`) are too high |
 | `FIO_SYNC_INTERVAL_MINUTES` | optional, for example `60` (default `0`, off; at least `5`) |
 
 Mount the secret files read-only (TrueNAS uses `/run/secrets`) with mode 0440, readable by the container's group. Never put a FIO token in a Compose `environment:` value. Add the accounts at `/admin`. If you seed them once with `FIO_ACCOUNTS_FILE` or `FIO_TOKEN_FILE`, remove the variable after the first start and delete the file: the server ignores it from then on, warns about it at every start, and does not delete it for you.
@@ -202,17 +199,17 @@ Check: `get_server_status` lists only the accounts you meant to add.
 ### Granting and reviewing clients
 
 - On the consent page, check the redirect URI before you approve. The client name is whatever the client registered, so it proves nothing; approve only for a client you just started connecting yourself.
-- Tick `fio:payments` only for an agent that should prepare payments, and only on the accounts it needs. Set its limits below the server's ceilings where you can, and choose `enforce` or `confirm` for the payee allowlist. `off` is for a grant you have decided to trust with any payee. Grants made before per-grant limits existed have none of their own (they follow the server's) and the allowlist off: open `/admin/clients` and set both.
+- Tick `fio:payments` only for an agent that should prepare payments, and only on the accounts it needs.
 - Give `fio:read` alone wherever an agent doesn't need payments.
 - Once a month, review `/admin/clients` (remove clients you don't know, revoke grants nobody uses) and `/admin/payments` (every row should match something you asked for).
 
-Check: `/admin/clients` lists only known clients, and every grant with `fio:payments` shows limits and an allowlist mode you chose.
+Check: `/admin/clients` lists only known clients with the scopes and accounts you chose.
 
 ### Admin password and second factor
 
 - Use a random password of 20 characters or more, kept in a password manager and used nowhere else. The server enforces 12 to 1024 characters.
 - Change it at `/admin/password`; recover it with `reset-admin-password` (see the README's [Admin password](../README.md#admin-password)).
-- Turn on TOTP: `fio-mcp totp-init`, the first line into the `FIO_MCP_ADMIN_TOTP_SECRET_FILE` file, the second into your authenticator app (see the README's [Second factor](../README.md#second-factor-totp)). It then also guards the approval of held payment batches.
+- Turn on TOTP: `fio-mcp totp-init`, the first line into the `FIO_MCP_ADMIN_TOTP_SECRET_FILE` file, the second into your authenticator app (see the README's [Second factor](../README.md#second-factor-totp)).
 
 Check: a sign-in attempt from outside the VPN never reaches the sign-in page.
 
@@ -234,8 +231,6 @@ Before each deployment:
 
 ### The Internetbanking signature
 
-With agents allowed to submit, the signature is the one control that acts whatever the model believes. The bank-text markers, the limits, the allowlist, the idempotency key and the audit log only narrow what reaches it.
-
 - Every imported batch must be signed in Internetbanking before FIO pays anything. Never turn on a FIO setting that would let API batches run without a signature, if FIO ever offers one.
 - Before signing, check each pending batch's payee and amount against your own request and against its row at `/admin/payments`.
 - Never sign a batch you didn't ask for.
@@ -249,7 +244,7 @@ The tool texts tell the model the same: the `submit_payment_orders` description 
 1. **Revoke all** at `/admin/clients`, or `docker exec <container> node dist/main.js tokens revoke-all`.
 2. Change the admin password, and make a new TOTP secret with `fio-mcp totp-init`.
 3. Replace every FIO token (above) and delete the old ones in Internetbanking.
-4. Decline anything at `/admin/payments/pending`, and check the pending batches in Internetbanking.
+4. Check the pending batches in Internetbanking.
 5. If the data key may have leaked, replace it. There is no re-encryption command: follow the README's [Token encryption](../README.md#token-encryption) steps and add the accounts again with the new tokens.
 
 ## Checklist
@@ -262,7 +257,7 @@ The tool texts tell the model the same: the `submit_payment_orders` description 
 | Read-only, non-root, no capabilities, one replica, port bound to the proxy | [Container hardening](#container-hardening-and-a-single-replica) |
 | `/data` encrypted, key file elsewhere and out of backups | [Encrypted storage](#encrypted-storage-for-data-key-kept-apart) |
 | Dedicated FIO tokens with a deliberate level | [FIO tokens](#fio-tokens) |
-| Consent checked, payment grants with limits and an allowlist mode, monthly review | [Granting and reviewing clients](#granting-and-reviewing-clients) |
+| Consent checked, payment scopes and accounts reviewed monthly | [Granting and reviewing clients](#granting-and-reviewing-clients) |
 | Random admin password, TOTP on | [Admin password and second factor](#admin-password-and-second-factor) |
 | Backups, one offline key copy, quarterly restore test | [Backups and restore tests](#backups-and-restore-tests) |
 | Audit before each deployment, pinned images | [Dependencies and images](#dependencies-and-images) |

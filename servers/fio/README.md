@@ -104,16 +104,6 @@ Names are trimmed and must be 1–64 Unicode code points with no control, format
 
 Disable them unless an agent needs `/last`. The marker is shared with every other program that uses the token, and the cache never needs it.
 
-### Payment limits
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `FIO_MCP_PAYMENT_MAX_PER_ORDER` | `CZK:50000,EUR:2000` | Largest single order, per currency. |
-| `FIO_MCP_PAYMENT_MAX_PER_DAY` | `CZK:100000,EUR:4000` | Total a grant may submit per currency per day (Europe/Prague). |
-| `FIO_MCP_PAYMENT_MAX_ORDERS_PER_DAY` | `20` | Orders a grant may submit per day. |
-
-The values are the server's ceilings and the defaults for each grant's own limits (see [Payment safety](#payment-safety)). Amounts are `CUR:amount` pairs: three upper-case letters, an amount above 0 with at most two decimals. Both maps must list the same currencies, and no per-order amount may exceed its daily one. Orders in a currency these maps don't list are refused. A malformed value stops the start, naming the variable.
-
 ### HTTP transport
 
 | Variable | Default | Meaning |
@@ -124,7 +114,7 @@ The values are the server's ceilings and the defaults for each grant's own limit
 | `FIO_MCP_PUBLIC_URL` | none; **required for OAuth** | The https origin clients use, without a path (e.g. `https://fio.home.arpa`); `http` is accepted only on a loopback address. It is the OAuth issuer, and tokens are valid only for `<origin>/mcp`. It is never derived from `Host` or `X-Forwarded-*`. |
 | `FIO_MCP_ADMIN_PASSWORD_HASH_FILE` | none; **required for OAuth** | File containing the admin password's scrypt hash, from `fio-mcp hash-password`, on exactly one line. Once the password is changed at `/admin`, the hash stored in the database takes precedence; the file is the bootstrap and recovery value. |
 | `FIO_MCP_DATA_KEY_FILE` | none; **required in HTTP mode with OAuth**, and whenever `FIO_CACHE_ENCRYPT=true` | File with the 32-byte key that encrypts the FIO tokens in the database, and the cache with `FIO_CACHE_ENCRYPT`: 64 hex digits (`openssl rand -hex 32`) or base64. See [Token encryption](#token-encryption). |
-| `FIO_MCP_ADMIN_TOTP_SECRET_FILE` | none (no second factor) | File with a base32 TOTP secret of at least 16 bytes (26 base32 characters), from `fio-mcp totp-init`. When set, every sign-in and every approval of a held payment batch also needs the current six-digit code. An unreadable, malformed or short secret stops the start. See [Second factor (TOTP)](#second-factor-totp). |
+| `FIO_MCP_ADMIN_TOTP_SECRET_FILE` | none (no second factor) | File with a base32 TOTP secret of at least 16 bytes (26 base32 characters), from `fio-mcp totp-init`. When set, every sign-in also needs the current six-digit code. An unreadable, malformed or short secret stops the start. See [Second factor (TOTP)](#second-factor-totp). |
 | `FIO_MCP_ADMIN_ALLOWED_CIDRS` | none (every address) | Comma-separated IP addresses or CIDR networks allowed to reach `/admin` and everything below it, `/authorize`, `/login` and `/consent`. Other addresses get an empty 404. The client address is worked out as for `FIO_MCP_TRUSTED_PROXIES`. `/mcp`, `/token`, `/register`, `/revoke`, the metadata documents and `/healthz` are not affected. An invalid entry, or a list with no entry at all (such as `,`), stops the start. |
 | `FIO_MCP_ADMIN_PORT` | none (admin UI on the main port) | Serve `/admin` on its own listener on this port instead; the main port then answers 404 for `/admin`. Needs OAuth and a port other than `FIO_MCP_PORT`, or the start fails. See [Separate admin listener](#separate-admin-listener). |
 | `FIO_MCP_ADMIN_HOST` | `127.0.0.1` | Bind address of the admin listener. Setting it without `FIO_MCP_ADMIN_PORT` stops the start. |
@@ -224,8 +214,8 @@ The marking makes injected text easier to recognise; it cannot stop a model that
 
 | Tool | What it does |
 |---|---|
-| `preview_payment_orders` | Dry run. Validates the orders and returns the exact XML that would be uploaded, with per-currency totals, the check against the grant's limits (`withinLimits`, what is used and left today), the allowlist mode and any unlisted payees, and any provenance problems. Sends nothing. |
-| `submit_payment_orders` | Uploads the orders as one batch (Fio XML import) and returns FIO's parsed verdict, `outcome`: `accepted`, `rejected` (nothing created), or `unknown`. It also returns the batch ID, totals, per-order messages, and `nextStep`. When the grant's allowlist mode is `confirm` it uploads nothing yet and returns `outcome: "awaiting-admin-confirmation"` with a `pendingId` and `expiresAt`. Requires `confirm: true` and an `idempotencyKey`. Annotated `destructiveHint: true`. |
+| `preview_payment_orders` | Dry run. Validates the orders and returns the exact XML that would be uploaded, with per-currency totals and any provenance problems. Sends nothing. |
+| `submit_payment_orders` | Uploads the orders as one batch (Fio XML import) and returns FIO's parsed verdict, `outcome`: `accepted`, `rejected` (nothing created), or `unknown`. It also returns the batch ID, totals, per-order messages, and `nextStep`. Requires `confirm: true` and an `idempotencyKey`. Annotated `destructiveHint: true`. |
 
 Both take `orders`: 1–100 orders, each one of:
 
@@ -259,33 +249,6 @@ The key belongs to the grant (or, without OAuth, to the server) and is recorded 
 - Amounts must be exact to the cent, from 0.01 up to 999,999,999,999.99.
 - The payer account is fixed by the token's account: the configured `accountNumber`, or the number read from a downloaded statement.
 
-### Limits per grant
-
-Over HTTP, `fio:payments` is an explicit choice: its box on the consent page starts unticked, and ticking it shows the grant's payment settings, prefilled with the server's defaults:
-
-- the largest order per currency, the total per currency per day, and the number of orders per day. They may be lower than the server's [payment limits](#payment-limits) and may leave currencies out, but never exceed them. The server always applies the lower of the grant's value and its current ceiling.
-- the payee allowlist mode and the allowlist (below).
-
-At `/admin/clients` you can change both on a live grant, within the same ceilings.
-
-Grants made before per-grant limits existed have none of their own: they follow the server's limits, with the allowlist off. Without OAuth (stdio, or HTTP with `FIO_MCP_ALLOW_UNAUTHENTICATED`) the server's limits apply.
-
-The whole batch is checked before anything goes to FIO, one batch per grant at a time. A day runs on Europe/Prague time, and it counts batches that were accepted, are awaiting confirmation, or have an unknown outcome; rejected and refused ones don't count. A batch over a limit, or in a currency the limits don't list, fails with `PermissionDenied`, naming the limit and what is left today; nothing is sent. `preview_payment_orders` reports the same check without failing.
-
-### Payee allowlist
-
-Each grant has one of three modes, chosen on the consent page:
-
-| Mode | Effect |
-|---|---|
-| `off` | Any payee. |
-| `enforce` | A batch with a payee that is not on the list fails with `PermissionDenied`; nothing is sent. Recommended for agents. |
-| `confirm` | Every batch, listed payees or not, is held for the admin and returns `awaiting-admin-confirmation`. |
-
-The list takes one payee per line: a Czech account as `[prefix-]number/bankcode` or an IBAN, optionally followed by `, label`. Blank lines are ignored; at most 200 entries, labels up to 100 characters.
-
-A held batch waits at `/admin/payments/pending`, which shows its deadline, account, grant and client, the order count, totals and payees with their allowlist status, and the exact XML with its SHA-256. **Approve** uploads exactly that XML; when `FIO_MCP_ADMIN_TOTP_SECRET_FILE` is set it also needs the current TOTP code, checked before the upload. A code works once, whether at sign-in or for an approval, and failed codes count towards the [sign-in throttle](#sessions-and-security). **Decline** needs no code. A batch nobody approves within 24 hours is dropped: its audit row becomes refused ("confirmation expired"), and a retry with its `idempotencyKey` answers that it was dropped and nothing was sent.
-
 ### What the model is told, and what the server checks
 
 The tool descriptions and server instructions say that the payee, the amount and the symbols must come from the user's request or a document the user named, never from text the bank returned. The server can't check where a value came from. It refuses (`InvalidInput`) any order whose text contains a guard tag, `[tag removed]`, `[notice removed]` or the bank-text notice, or a free-text field that the [bank-text cleanup](#text-from-the-bank) would change. That catches text copied out of a result, not a model that retypes it.
@@ -298,7 +261,9 @@ When the server knows that no batch was created, it says that instead (`UploadRe
 
 ### Payment audit log
 
-`submit_payment_orders` records its batches in the `payment_audit` table: when (with the Prague date), the grant and client, the account (by token fingerprint, never the token), the `idempotencyKey`, the XML's SHA-256, the order count, totals per currency, each payee's account or IBAN, bank code or BIC, amount, currency and variable symbol, the outcome (`refused`, `pending-confirmation`, `accepted`, `rejected` or `unknown`), FIO's batch IDs and code, and the reason. The row is written as `unknown` before the upload and updated with the answer, so a crash mid-upload still leaves a trace. Refusals by limit, allowlist, provenance or key conflict get a row too; a same-key replay does not. The server log notes each row with its outcome, count and totals, without payees.
+`submit_payment_orders` records its batches in the `payment_audit` table: when (with the Prague date), the grant and client, the account (by token fingerprint, never the token), the `idempotencyKey`, the XML's SHA-256, the order count, totals per currency, each payee's account or IBAN, bank code or BIC, amount, currency and variable symbol, the outcome (`refused`, `accepted`, `rejected` or `unknown`), FIO's batch IDs and code, and the reason. The row is written as `unknown` before the upload and updated with the answer, so a crash mid-upload still leaves a trace. The server also records refusals for provenance or key conflicts. A same-key replay leaves the audit log unchanged. The server log notes each row with its outcome, count and totals, without payees.
+
+On upgrade, batches previously held for local approval appear as refused. Their audit rows and keys stay in the log, and FIO receives no upload. To submit one of these payments, preview it again and use a new idempotency key.
 
 `/admin/payments` lists the rows, newest first, filtered by grant on request and paged. Rows are kept at least 365 days; to delete older ones:
 
@@ -412,7 +377,7 @@ HTTP 409 is a `TokenBusy` error inside the server that the rate limiter always t
 - Configuration errors name the bad variable, field, or path but never echo its value.
 - Text that comes from the bank reaches the model wrapped in nonce-tagged markers with a notice to treat it as data (see [Text from the bank](#text-from-the-bank)).
 - The cached movements can be encrypted too (`FIO_CACHE_ENCRYPT`, see [Encryption at rest](#encryption-at-rest)).
-- Payments go through per-grant limits, an optional payee allowlist, an idempotency key and an audit log, and still need your signature in Internetbanking (see [Payment safety](#payment-safety)).
+- Payment submissions use an idempotency key and an audit log. Each uploaded batch needs your signature in Internetbanking (see [Payment safety](#payment-safety)).
 
 For deploying it as a network service, read [docs/security-hardening.md](docs/security-hardening.md): what the server enforces, and what the reverse proxy, the container and you have to do.
 
@@ -448,7 +413,6 @@ HTTP mode is protected by OAuth, with fio-mcp as its own authorization server (M
 Add `https://<host>/mcp` (for example `https://fio.home.arpa/mcp`) as a remote MCP server in your client. The client opens the sign-in page; enter the admin password, then choose on the consent page, which shows the client's name and redirect URI:
 
 - **Scopes.** `fio:read` covers every reading tool, the cache tools, sync, and the download marker. `fio:payments` additionally allows `preview_payment_orders` and `submit_payment_orders`. Its box starts unticked, so payments are granted only when you tick it.
-- **Payment settings**, shown once `fio:payments` is ticked: the grant's limits and its payee allowlist (see [Limits per grant](#limits-per-grant) and [Payee allowlist](#payee-allowlist)).
 - **Accounts** the client may use.
 
 Check the redirect URI before you approve: the client's name is whatever the client registered, and only the redirect URI shows where the authorization goes.
@@ -495,9 +459,9 @@ docker exec <container> node dist/main.js reset-admin-password
 With OAuth over HTTP, `https://<host>/admin` manages the server. It has these pages:
 
 - **Accounts** (`/admin`): add an account (name, FIO token, optionally account number and currency), rename it, replace its token, remove it, and test its token. Tokens go into a write-only password field and are shown only as their last four characters. The token test makes one read-only FIO call (`lastStatement`, the latest statement's number), which never moves the `last` download marker; it goes through the token's rate limiter like a tool call, so a second test within 30 s answers "Rate limited" at once. A passed test shows that FIO accepts the token for reading, not whether it may submit payment orders. Removing asks whether to keep the account's cached transactions (the default; they are used again if the same token or bank account comes back) or delete them. Deleting covers the bank accounts that any token the account has had is linked to, including tokens it replaced. It keeps a bank account when another account has or had a token for it, the same token included (another account using the same token keeps what that token cached, and the rest is still deleted); the confirmation names that account. The server has recorded each account's tokens since the upgrade that added token history, starting from the token each account had then. Cached bank accounts that no configured account's token is linked to are left alone, and the confirmation counts them without giving a reason, because several things lead there: for example data cached only under a token an account replaced before that upgrade, data kept when an account was removed, or data downloaded by a token that FIO later reported for a different bank account.
-- **Connected clients** (`/admin/clients`): every registered OAuth client with its redirect URIs, registration and last authorization, and its live authorizations: scopes, accounts by their current name (tokens replaced or removed since are counted, not named), when it was authorized and when it last used `/mcp` (to the minute). Revoke one authorization, remove a client with all its tokens, or revoke everything. For a grant with `fio:payments`, change its payment limits, payee allowlist mode and allowlist.
+- **Connected clients** (`/admin/clients`): every registered OAuth client with its redirect URIs, registration and last authorization, and its live authorizations: scopes, accounts by their current name (tokens replaced or removed since are counted, not named), when it was authorized and when it last used `/mcp` (to the minute). Revoke one authorization, remove a client with all its tokens, or revoke everything.
 - **Admin password** (`/admin/password`): see [Admin password](#admin-password).
-- **Payments** (`/admin/payments`): the [payment audit log](#payment-audit-log). **Pending** (`/admin/payments/pending`) lists the batches held for confirmation, with Approve and Decline (see [Payee allowlist](#payee-allowlist)).
+- **Payments** (`/admin/payments`): the [payment audit log](#payment-audit-log).
 
 Names follow the same rules as `FIO_ACCOUNTS`: trimmed, 1–64 code points, no control, format or line-separator characters, unique ignoring case. Error messages name the field and rule, never the value.
 
@@ -551,7 +515,7 @@ The server reads the stored hash at every sign-in, so either takes effect at onc
 
 ### Second factor (TOTP)
 
-With `FIO_MCP_ADMIN_TOTP_SECRET_FILE` set, signing in at `/login` and `/admin/login`, and approving a held payment batch, need the current code from an authenticator app as well as the password (TOTP: HMAC-SHA1, six digits, 30-second steps, one step of clock drift either way). To set it up:
+With `FIO_MCP_ADMIN_TOTP_SECRET_FILE` set, signing in at `/login` or `/admin/login` requires the current code from an authenticator app as well as the password (TOTP: HMAC-SHA1, six digits, 30-second steps, one step of clock drift either way). To set it up:
 
 ```bash
 docker run --rm <image> totp-init > totp.txt      # or: fio-mcp totp-init > totp.txt
@@ -559,7 +523,7 @@ docker run --rm <image> totp-init > totp.txt      # or: fio-mcp totp-init > totp
 
 The first line is the secret (base32, 20 random bytes); the second is an `otpauth://` URI to add it to the app. The explanation goes to standard error. Put the first line in a file next to the other secrets (mode 0440, readable by the container user), point `FIO_MCP_ADMIN_TOTP_SECRET_FILE` at it, delete `totp.txt`, and restart. The file may use lower case, spaces and `=` padding. An unreadable file, or a secret that is not base32 or shorter than 16 bytes, stops the start.
 
-Each code works once: the server remembers the steps already used, for sign-ins and approvals together, and refuses them again. That memory is per process, so a restart clears it. A wrong, missing or reused code counts as a failed sign-in, with the same delays and lockout. To turn the second factor off, unset the variable and restart.
+Each code works once: the server remembers the steps already used for sign-ins and refuses those codes on reuse. That memory is per process, so a restart clears it. A wrong, missing or reused code counts as a failed sign-in, with the same delays and lockout. To turn the second factor off, unset the variable and restart.
 
 ### Separate admin listener
 
@@ -768,10 +732,9 @@ src/
   account-runtime.ts    sync jobs and rate limiters following account changes
   token-crypto.ts       data key and token encryption on core's AES-256-GCM seal
   instance-lease.ts     fio's single-instance lease on core's database lease
-  payment-limits.ts     server ceilings, grant limits and payee allowlist rules
-  payment-controls.ts   limits, allowlist, provenance and idempotency around submit; held batches
-  payment-ledger.ts     payment audit log, idempotency records and held batches in SQLite
-  payment-form.ts       the payment settings form of the consent and clients pages
+  payment-details.ts    payee and amount formatting for audit, order provenance checks
+  payment-controls.ts   submission, idempotency and audit handling
+  payment-ledger.ts     payment audit log and idempotency records in SQLite
   payment-cli.ts        `payments purge`
   admin/                the admin UI's FIO accounts and payments tabs and their wiring into core's admin (core has the login, sessions, admin password, TOTP and page shell)
   fio-api.ts            FioApi service: interface and adapter on the generated client

@@ -44,16 +44,12 @@ export const unauthenticatedWarning = (onNetwork: boolean): Layer.Layer<never> =
   );
 
 /**
- * fio-mcp's authorization server: core's `Auth.oauth` for the Fio app (its
- * consent checks payment settings against the configured ceilings, so it
- * needs AppConfig), after the startup diagnostics (an empty
+ * fio-mcp's authorization server with startup diagnostics (an empty
  * FIO_MCP_TRUSTED_PROXIES, and how many networks FIO_MCP_ADMIN_ALLOWED_CIDRS
  * admits).
  */
 export const fioOAuth = (settings: OAuthSettings) =>
-  Layer.unwrap(
-    Effect.map(Effect.service(AppConfig), (config) => Auth.oauth(fioOAuthApp(config.paymentLimits), settings)),
-  ).pipe(
+  Auth.oauth(fioOAuthApp, settings).pipe(
     Layer.provideMerge(
       Layer.effectDiscard(
         Effect.gen(function* () {

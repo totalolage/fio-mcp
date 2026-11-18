@@ -353,14 +353,31 @@ export const buildImportXml = Effect.fnUntraced(function* (orders: readonly Paym
   );
 });
 
-/** Totals per currency, for the confirmation summary. */
+export const toCents = (amount: number): bigint => BigInt(Math.round(amount * 100));
+
+export const formatCents = (cents: number | string | bigint): string => {
+  const whole = BigInt(cents);
+  const abs = whole < 0n ? -whole : whole;
+  return `${whole < 0n ? "-" : ""}${abs / 100n}.${String(abs % 100n).padStart(2, "0")}`;
+};
+
+/** Totals per currency. Large totals use strings to retain every cent. */
 export function summarizeOrders(orders: readonly PaymentOrder[], payer: Payer) {
-  const totals: Record<string, number> = {};
+  const totals = new Map<string, bigint>();
   const counts = { domestic: 0, euro: 0, foreign: 0 };
   for (const order of orders) {
-    const cur = order.currency ?? payer.currency ?? "?";
-    totals[cur] = Math.round(((totals[cur] ?? 0) + order.amount) * 100) / 100;
+    const currency = order.currency ?? payer.currency ?? "?";
+    totals.set(currency, (totals.get(currency) ?? 0n) + toCents(order.amount));
     counts[order.type]++;
   }
-  return { orderCount: orders.length, counts, totalsByCurrency: totals };
+  const totalsByCurrency = Object.fromEntries(
+    Array.from(totals, ([currency, cents]) => {
+      const decimal = formatCents(cents);
+      const amount = Number(decimal);
+      // JSON can round a number differently from toFixed(2).
+      const [whole, fraction = ""] = JSON.stringify(amount).split(".");
+      return [currency, `${whole}.${fraction.padEnd(2, "0")}` === decimal ? amount : decimal];
+    }),
+  );
+  return { orderCount: orders.length, counts, totalsByCurrency };
 }

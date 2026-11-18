@@ -6,7 +6,6 @@ import type { CacheError } from "../../src/errors.js";
 import type { FioApi, FioApiShape } from "../../src/fio-api.js";
 import { ConfiguredToolPolicy } from "../../src/mcp/tool-policy.js";
 import type { PaymentControls } from "../../src/payment-controls.js";
-import { DEFAULT_PAYMENT_LIMITS } from "../../src/payment-limits.js";
 import { RateLimiter } from "../../src/rate-limiter.js";
 import { type Redactor, RedactorDefault } from "../../src/redaction.js";
 import { seededConfig } from "./config.js";
@@ -49,7 +48,6 @@ export function testConfig(transport: TransportConfig = { kind: "stdio" }): AppC
       encrypt: false,
       dataKey: undefined,
     },
-    paymentLimits: DEFAULT_PAYMENT_LIMITS,
   };
 }
 

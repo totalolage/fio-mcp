@@ -12,19 +12,12 @@ import { SERVER_MIGRATIONS } from "../src/cache/db.js";
 import { type AppConfigShape, MAX_RESPONSE_BYTES } from "../src/config.js";
 import type { InvalidInput } from "../src/errors.js";
 import { FioApi } from "../src/fio-api.js";
-import { AUDIT_RETENTION_DAYS, PaymentControls, PENDING_TTL_MS, sha256Hex } from "../src/payment-controls.js";
+import { AUDIT_RETENTION_DAYS, PaymentControls } from "../src/payment-controls.js";
 import { type AuditRow, PaymentLedger } from "../src/payment-ledger.js";
-import {
-  DEFAULT_PAYMENT_LIMITS,
-  type GrantPayments,
-  normaliseAccount,
-  OFF_ALLOWLIST,
-  type PaymentLimits,
-} from "../src/payment-limits.js";
 import { buildImportXml, type Payer, type PaymentOrder, PaymentOrders } from "../src/payments.js";
 import { RateLimiter } from "../src/rate-limiter.js";
 import { RedactorDefault } from "../src/redaction.js";
-import { IMPORT_ERROR_XML, IMPORT_OK_XML, IMPORT_PERMISSION_XML } from "./fixtures.js";
+import { IMPORT_OK_XML, IMPORT_PERMISSION_XML } from "./fixtures.js";
 import { seededConfig } from "./support/config.js";
 import { memoryDatabase } from "./support/database.js";
 import { FioHttp, html, text } from "./support/fio-http.js";
@@ -32,10 +25,7 @@ import { FioHttp, html, text } from "./support/fio-http.js";
 const TOKEN = "Tk7pQ2vX9mZr4LbN8sYw3HcJ6dFg1KaE5uVo0iRtBnMxWqSzPyGhCjDlUeAfOk2Q";
 const BASE_URL = "https://fio.test/v1/rest";
 const PAYER: Payer = { accountNumber: "2400222222", currency: "CZK" };
-const IBAN = "DE89370400440532013000";
-const OTHER_IBAN = "GB82WEST12345698765432";
-
-const config = (paymentLimits: PaymentLimits = DEFAULT_PAYMENT_LIMITS): AppConfigShape => ({
+const config = (): AppConfigShape => ({
   accounts: [{ name: "main", token: Redacted.make(TOKEN), accountNumber: "2400222222", currency: "CZK" }],
   secrets: [Redacted.make(TOKEN)],
   baseUrl: BASE_URL,
@@ -55,10 +45,9 @@ const config = (paymentLimits: PaymentLimits = DEFAULT_PAYMENT_LIMITS): AppConfi
     encrypt: false,
     dataKey: undefined,
   },
-  paymentLimits,
 });
 
-const testLayer = (paymentLimits?: PaymentLimits) =>
+const testLayer = () =>
   PaymentControls.Default.pipe(
     Layer.provideMerge(PaymentLedger.Default),
     Layer.provideMerge(FioApi.Default),
@@ -71,7 +60,7 @@ const testLayer = (paymentLimits?: PaymentLimits) =>
         memoryDatabase(SERVER_MIGRATIONS),
       ),
     ),
-    Layer.provideMerge(seededConfig(config(paymentLimits))),
+    Layer.provideMerge(seededConfig(config())),
   );
 
 const decodeOrders = Schema.decodeUnknownSync(PaymentOrders);
@@ -85,24 +74,12 @@ const domestic = (amount: number, extra: Record<string, unknown> = {}) => ({
   ...extra,
 });
 
-const euro = (amount: number, accountTo = IBAN) => ({
-  type: "euro",
-  amount,
-  currency: "EUR",
-  accountTo,
-  date: "2025-11-03",
-  benefName: "Hans Muster",
-});
-
-const principal = (payments?: GrantPayments, subject = "fio_grant_1"): Principal => ({
+const principal = (subject = "fio_grant_1"): Principal => ({
   subject,
   scopes: "all",
   resources: "all",
   clientId: "client_1",
-  ...(payments === undefined ? {} : { settings: payments }),
 });
-
-const limited = (limits: PaymentLimits): GrantPayments => ({ limits, allowlist: OFF_ALLOWLIST });
 
 const account: Effect.Effect<Account, InvalidInput, Accounts> = Effect.flatMap(Effect.service(Accounts), (accounts) =>
   accounts.resolve("main"),
@@ -141,9 +118,6 @@ const failureOf = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
       : Effect.die(new Error(`expected a failure, got ${String(exit)}`)),
   );
 
-/** Every grant is live unless a test says otherwise. */
-const live = (_grantId: string) => Effect.succeed(true);
-
 const tagOf = (error: unknown) => (error as { readonly _tag: string })._tag;
 const messageOf = (error: unknown) => (error as { readonly message: string }).message;
 
@@ -175,79 +149,6 @@ describe("PaymentControls.submit", () => {
     }).pipe(Effect.provide(testLayer())),
   );
 
-  it.effect("refuses an order above maxPerOrder without contacting FIO", () =>
-    Effect.gen(function* () {
-      const error = yield* failureOf(submit([domestic(50_000.01)]));
-      assert.strictEqual(tagOf(error), "PermissionDenied");
-      assert.match(messageOf(error), /per-order limit for CZK of 50000\.00/);
-      assert.lengthOf(yield* uploads, 0);
-      const [row] = yield* auditRows();
-      assert.strictEqual(row?.outcome, "refused");
-      assert.match(row?.reason ?? "", /^limit: /);
-      assert.deepStrictEqual(row?.totals, { CZK: 5_000_001 });
-    }).pipe(Effect.provide(testLayer())),
-  );
-
-  it.effect("refuses a currency the limits do not list", () =>
-    Effect.gen(function* () {
-      const grant = limited({ maxPerOrder: { CZK: 1000 }, maxPerDay: { CZK: 2000 }, maxOrdersPerDay: 5 });
-      const error = yield* failureOf(submit([euro(10)], { principal: principal(grant) }));
-      assert.strictEqual(tagOf(error), "PermissionDenied");
-      assert.match(messageOf(error), /EUR are not allowed/);
-      assert.lengthOf(yield* uploads, 0);
-    }).pipe(Effect.provide(testLayer())),
-  );
-
-  it.effect("refuses a batch over maxPerDay, and allows it the next Prague day", () =>
-    Effect.gen(function* () {
-      yield* FioHttp.enqueue(text(IMPORT_OK_XML), text(IMPORT_OK_XML), text(IMPORT_OK_XML));
-      yield* submit([domestic(40_000)]);
-      yield* submit([domestic(40_000)]);
-      const error = yield* failureOf(submit([domestic(30_000)]));
-      assert.strictEqual(tagOf(error), "PermissionDenied");
-      assert.include(messageOf(error), "Daily limit for CZK is 100000.00; 20000.00 remains today (Europe/Prague).");
-      assert.lengthOf(yield* uploads, 2);
-      yield* TestClock.adjust(DAY);
-      yield* submit([domestic(30_000)]);
-      assert.lengthOf(yield* uploads, 3);
-    }).pipe(Effect.provide(testLayer())),
-  );
-
-  it.effect("refuses orders beyond maxOrdersPerDay (counting orders, not batches)", () =>
-    Effect.gen(function* () {
-      const grant = principal(limited({ maxPerOrder: { CZK: 1000 }, maxPerDay: { CZK: 10_000 }, maxOrdersPerDay: 3 }));
-      yield* FioHttp.enqueue(text(IMPORT_OK_XML));
-      yield* submit([domestic(1), domestic(2)], { principal: grant });
-      const error = yield* failureOf(submit([domestic(1), domestic(2)], { principal: grant }));
-      assert.strictEqual(tagOf(error), "PermissionDenied");
-      assert.match(messageOf(error), /Daily limit is 3 orders; 1 remain/);
-      assert.lengthOf(yield* uploads, 1);
-    }).pipe(Effect.provide(testLayer())),
-  );
-
-  it.effect("applies the lower env ceiling over a grant's higher limit", () =>
-    Effect.gen(function* () {
-      const grant = principal(limited({ maxPerOrder: { CZK: 5000 }, maxPerDay: { CZK: 9000 }, maxOrdersPerDay: 10 }));
-      const error = yield* failureOf(submit([domestic(1500)], { principal: grant }));
-      assert.match(messageOf(error), /per-order limit for CZK of 1000\.00/);
-    }).pipe(
-      Effect.provide(testLayer({ maxPerOrder: { CZK: 1000 }, maxPerDay: { CZK: 100_000 }, maxOrdersPerDay: 20 })),
-    ),
-  );
-
-  it.effect("lets only one of two concurrent submissions pass the daily limit", () =>
-    Effect.gen(function* () {
-      const grant = principal(limited({ maxPerOrder: { CZK: 50_000 }, maxPerDay: { CZK: 50_000 }, maxOrdersPerDay: 10 }));
-      yield* FioHttp.enqueue(text(IMPORT_OK_XML), text(IMPORT_OK_XML));
-      const results = yield* Effect.all(
-        [Effect.exit(submit([domestic(40_000)], { principal: grant })), Effect.exit(submit([domestic(40_000)], { principal: grant }))],
-        { concurrency: "unbounded" },
-      );
-      assert.strictEqual(results.filter(Exit.isSuccess).length, 1);
-      assert.lengthOf(yield* uploads, 1);
-    }).pipe(Effect.provide(testLayer())),
-  );
-
   it.effect("withGrantLock serialises work of one grant and leaves other grants concurrent", () =>
     Effect.gen(function* () {
       const controls = yield* PaymentControls;
@@ -270,41 +171,6 @@ describe("PaymentControls.submit", () => {
       assert.isBelow(log.indexOf("c+"), log.indexOf("a-"));
       assert.isBelow(log.indexOf("a-"), log.indexOf("b+"));
       assert.lengthOf(log, 6);
-    }).pipe(Effect.provide(testLayer())),
-  );
-
-  it.effect("counts an unknown outcome towards the daily total", () =>
-    Effect.gen(function* () {
-      const grant = principal(limited({ maxPerOrder: { CZK: 50_000 }, maxPerDay: { CZK: 50_000 }, maxOrdersPerDay: 10 }));
-      yield* FioHttp.enqueue(html(500, "<html>Internal error</html>"));
-      const unknown = yield* failureOf(submit([domestic(40_000)], { principal: grant }));
-      assert.strictEqual(tagOf(unknown), "UploadOutcomeUnknown");
-      const error = yield* failureOf(submit([domestic(20_000)], { principal: grant }));
-      assert.include(messageOf(error), "10000.00 remains today");
-      assert.lengthOf(yield* uploads, 1);
-    }).pipe(Effect.provide(testLayer())),
-  );
-
-  it.effect("does not count a rejected batch", () =>
-    Effect.gen(function* () {
-      const grant = principal(limited({ maxPerOrder: { CZK: 50_000 }, maxPerDay: { CZK: 50_000 }, maxOrdersPerDay: 10 }));
-      yield* FioHttp.enqueue(text(IMPORT_ERROR_XML), text(IMPORT_OK_XML));
-      const rejected = yield* submit([domestic(40_000)], { principal: grant });
-      assert.strictEqual((rejected.result as { outcome: string }).outcome, "rejected");
-      yield* submit([domestic(40_000)], { principal: grant });
-      assert.lengthOf(yield* uploads, 2);
-      const outcomes = (yield* auditRows()).map((row) => row.outcome).sort();
-      assert.deepStrictEqual(outcomes, ["accepted", "rejected"]);
-    }).pipe(Effect.provide(testLayer())),
-  );
-
-  it.effect("limits local callers (no grant) by the server defaults", () =>
-    Effect.gen(function* () {
-      const local: Principal = { subject: "local", scopes: "all", resources: "all" };
-      const error = yield* failureOf(submit([domestic(60_000)], { principal: local }));
-      assert.strictEqual(tagOf(error), "PermissionDenied");
-      const [row] = yield* auditRows("local");
-      assert.strictEqual(row?.clientId, null);
     }).pipe(Effect.provide(testLayer())),
   );
 });
@@ -369,6 +235,20 @@ describe("SEC-06 upload classification", () => {
 });
 
 describe("idempotency keys", () => {
+  it.effect("uploads a concurrent duplicate only once", () =>
+    Effect.gen(function* () {
+      yield* FioHttp.enqueue(text(IMPORT_OK_XML), text(IMPORT_OK_XML));
+      const key = freshKey();
+      const [first, second] = yield* Effect.all(
+        [submit([domestic(10)], { key }), submit([domestic(10)], { key })],
+        { concurrency: "unbounded" },
+      );
+      assert.deepStrictEqual(second, first);
+      assert.lengthOf(yield* uploads, 1);
+      assert.lengthOf(yield* auditRows(), 1);
+    }).pipe(Effect.provide(testLayer())),
+  );
+
   it.effect("replays the same batch with the same key without a second upload", () =>
     Effect.gen(function* () {
       yield* FioHttp.enqueue(text(IMPORT_OK_XML), text(IMPORT_OK_XML));
@@ -411,8 +291,8 @@ describe("idempotency keys", () => {
   it.effect("replays a refusal for its key (keys are never released)", () =>
     Effect.gen(function* () {
       const key = freshKey();
-      const first = yield* failureOf(submit([domestic(60_000)], { key }));
-      const second = yield* failureOf(submit([domestic(60_000)], { key }));
+      const first = yield* failureOf(submit([domestic(100, { messageForRecipient: "[tag removed]" })], { key }));
+      const second = yield* failureOf(submit([domestic(100, { messageForRecipient: "[tag removed]" })], { key }));
       assert.strictEqual(messageOf(second), messageOf(first));
       assert.lengthOf(yield* auditRows(), 1);
     }).pipe(Effect.provide(testLayer())),
@@ -435,231 +315,13 @@ describe("provenance", () => {
   }
 });
 
-const allowlist = (mode: "enforce" | "confirm", ...entries: ReadonlyArray<string>): GrantPayments => ({
-  limits: null,
-  allowlist: { mode, entries: entries.map((entry) => ({ account: normaliseAccount(entry) ?? entry })) },
-});
-
-describe("payee allowlist", () => {
-  it.effect("enforce refuses an unlisted IBAN and allows a listed one written with spaces in lower case", () =>
-    Effect.gen(function* () {
-      const grant = principal(allowlist("enforce", "de89 3704 0044 0532 0130 00"));
-      const error = yield* failureOf(submit([euro(10, OTHER_IBAN)], { principal: grant }));
-      assert.strictEqual(tagOf(error), "PermissionDenied");
-      assert.include(messageOf(error), OTHER_IBAN);
-      assert.lengthOf(yield* uploads, 0);
-      const [row] = yield* auditRows();
-      assert.strictEqual(row?.reason, `allowlist: ${OTHER_IBAN}`);
-      yield* FioHttp.enqueue(text(IMPORT_OK_XML));
-      yield* submit([euro(10)], { principal: grant });
-      assert.lengthOf(yield* uploads, 1);
-    }).pipe(Effect.provide(testLayer())),
-  );
-
-  it.effect("confirm holds the batch and uploads the identical XML once after approval", () =>
-    Effect.gen(function* () {
-      const controls = yield* PaymentControls;
-      const grant = principal(allowlist("confirm", IBAN));
-      const key = freshKey();
-      const held = yield* submit([euro(10)], { principal: grant, key });
-      assert.strictEqual(held.outcome, "awaiting-admin-confirmation");
-      assert.match(String(held.pendingId), /^pend_/);
-      assert.strictEqual(held.expiresAt, "1970-01-02T00:00:00.000Z");
-      assert.lengthOf(yield* uploads, 0);
-      assert.deepStrictEqual(yield* submit([euro(10)], { principal: grant, key }), held);
-
-      const [view] = yield* controls.listPending;
-      assert.strictEqual(view?.batch.pendingId, held.pendingId);
-      assert.strictEqual(view?.audit.outcome, "pending-confirmation");
-
-      yield* FioHttp.enqueue(text(IMPORT_OK_XML));
-      const approval = yield* controls.approvePending(String(held.pendingId), live);
-      assert.strictEqual(approval.outcome, "accepted");
-      const sent = yield* uploads;
-      assert.lengthOf(sent, 1);
-      const orders = decodeOrders([euro(10)]);
-      assert.strictEqual(sent[0]?.files[0]?.text, yield* buildImportXml(orders, PAYER));
-      assert.strictEqual(view?.batch.xmlSha256, sha256Hex(sent[0]?.files[0]?.text ?? ""));
-
-      const again = yield* failureOf(controls.approvePending(String(held.pendingId), live));
-      assert.strictEqual(tagOf(again), "InvalidInput");
-      assert.lengthOf(yield* uploads, 1);
-      const replayed = yield* submit([euro(10)], { principal: grant, key });
-      assert.strictEqual((replayed.result as { outcome: string }).outcome, "accepted");
-      assert.strictEqual(replayed.account, "main");
-      assert.isUndefined(replayed.pendingId);
-      const [row] = yield* auditRows();
-      assert.strictEqual(row?.outcome, "accepted");
-    }).pipe(Effect.provide(testLayer())),
-  );
-
-  it.effect("confirm holds a batch even when every payee is listed, and counts it from submission", () =>
-    Effect.gen(function* () {
-      const grant = principal({
-        limits: { maxPerOrder: { EUR: 100 }, maxPerDay: { EUR: 100 }, maxOrdersPerDay: 5 },
-        allowlist: { mode: "confirm", entries: [{ account: IBAN }] },
-      });
-      const held = yield* submit([euro(80)], { principal: grant });
-      assert.strictEqual(held.outcome, "awaiting-admin-confirmation");
-      const error = yield* failureOf(submit([euro(30)], { principal: grant }));
-      assert.include(messageOf(error), "20.00 remains today");
-    }).pipe(Effect.provide(testLayer())),
-  );
-
-  it.effect("decline uploads nothing and stops counting the batch", () =>
-    Effect.gen(function* () {
-      const controls = yield* PaymentControls;
-      const grant = principal(allowlist("confirm"));
-      const key = freshKey();
-      const held = yield* submit([euro(10)], { principal: grant, key });
-      assert.isTrue(yield* controls.declinePending(String(held.pendingId)));
-      assert.isFalse(yield* controls.declinePending(String(held.pendingId)));
-      assert.lengthOf(yield* controls.listPending, 0);
-      assert.lengthOf(yield* uploads, 0);
-      const [row] = yield* auditRows();
-      assert.strictEqual(row?.outcome, "refused");
-      assert.strictEqual(row?.reason, "declined by admin");
-      const replay = yield* failureOf(submit([euro(10)], { principal: grant, key }));
-      assert.match(messageOf(replay), /declined/);
-    }).pipe(Effect.provide(testLayer())),
-  );
-
-  it.effect("drops a held batch after 24 h without uploading", () =>
-    Effect.gen(function* () {
-      const controls = yield* PaymentControls;
-      const held = yield* submit([euro(10)], { principal: principal(allowlist("confirm")) });
-      yield* TestClock.adjust(PENDING_TTL_MS - 1);
-      assert.lengthOf(yield* controls.listPending, 1);
-      yield* TestClock.adjust(1);
-      assert.lengthOf(yield* controls.listPending, 0);
-      const error = yield* failureOf(controls.approvePending(String(held.pendingId), live));
-      assert.strictEqual(tagOf(error), "InvalidInput");
-      assert.lengthOf(yield* uploads, 0);
-      const [row] = yield* auditRows();
-      assert.strictEqual(row?.outcome, "refused");
-      assert.strictEqual(row?.reason, "confirmation expired");
-    }).pipe(Effect.provide(testLayer())),
-  );
-});
-
-describe("held batch approval", () => {
-  it.effect("refuses approval when the grant is no longer active and uploads nothing", () =>
-    Effect.gen(function* () {
-      const controls = yield* PaymentControls;
-      const grant = principal(allowlist("confirm", IBAN));
-      const key = freshKey();
-      const held = yield* submit([euro(10)], { principal: grant, key });
-      yield* FioHttp.enqueue(text(IMPORT_OK_XML));
-      const checked: Array<string> = [];
-      const revoked = (grantId: string) => Effect.sync(() => checked.push(grantId)).pipe(Effect.as(false));
-      const approval = yield* controls.approvePending(String(held.pendingId), revoked);
-      assert.deepStrictEqual(checked, ["fio_grant_1"]);
-      assert.strictEqual(approval.outcome, "refused");
-      assert.include(approval.message, "no longer active");
-      assert.lengthOf(yield* uploads, 0);
-      assert.lengthOf(yield* controls.listPending, 0);
-      const [row] = yield* auditRows();
-      assert.strictEqual(row?.outcome, "refused");
-      assert.strictEqual(row?.reason, "approval: grant no longer active");
-      const replay = yield* failureOf(submit([euro(10)], { principal: grant, key }));
-      assert.include(messageOf(replay), "no longer active");
-      const again = yield* failureOf(controls.approvePending(String(held.pendingId), live));
-      assert.strictEqual(tagOf(again), "InvalidInput");
-      assert.lengthOf(yield* uploads, 0);
-    }).pipe(Effect.provide(testLayer())),
-  );
-
-  it.effect("takes the batch and moves its audit row in one transaction", () =>
-    Effect.gen(function* () {
-      const ledger = yield* PaymentLedger;
-      const held = yield* submit([euro(10)], { principal: principal(allowlist("confirm")) });
-      const pendingId = String(held.pendingId);
-      // The audit table's CHECK constraint rejects this outcome, failing the
-      // audit update after the batch's DELETE: the DELETE must roll back.
-      const broken = yield* failureOf(
-        ledger.takePending(pendingId, 0, { outcome: "bogus" as AuditRow["outcome"], reason: "x" }),
-      );
-      assert.strictEqual(tagOf(broken), "PaymentAuditError");
-      assert.isTrue((yield* ledger.getPending(pendingId))._tag === "Some");
-      const [stillHeld] = yield* auditRows();
-      assert.strictEqual(stillHeld?.outcome, "pending-confirmation");
-
-      const taken = yield* ledger.takePending(pendingId, 0, { outcome: "refused", reason: "declined by admin" });
-      assert.isTrue(taken._tag === "Some" && taken.value.moved);
-      assert.isTrue((yield* ledger.getPending(pendingId))._tag === "None");
-      const [row] = yield* auditRows();
-      assert.strictEqual(row?.outcome, "refused");
-    }).pipe(Effect.provide(testLayer())),
-  );
-
-  it.effect("two concurrent approvals of one batch upload it once", () =>
-    Effect.gen(function* () {
-      const controls = yield* PaymentControls;
-      const held = yield* submit([euro(10)], { principal: principal(allowlist("confirm", IBAN)) });
-      yield* FioHttp.enqueue(text(IMPORT_OK_XML));
-      yield* FioHttp.enqueue(text(IMPORT_OK_XML));
-      const approve = Effect.exit(controls.approvePending(String(held.pendingId), live));
-      const results = yield* Effect.all([approve, approve], { concurrency: "unbounded" });
-      assert.strictEqual(results.filter(Exit.isSuccess).length, 1);
-      assert.lengthOf(yield* uploads, 1);
-      const [row] = yield* auditRows();
-      assert.strictEqual(row?.outcome, "accepted");
-    }).pipe(Effect.provide(testLayer())),
-  );
-
-  it.effect("an approval racing the expiry sweep uploads at most once and leaves a consistent row", () =>
-    Effect.gen(function* () {
-      const controls = yield* PaymentControls;
-      const ledger = yield* PaymentLedger;
-      const held = yield* submit([euro(10)], { principal: principal(allowlist("confirm", IBAN)) });
-      yield* FioHttp.enqueue(text(IMPORT_OK_XML));
-      yield* TestClock.adjust(PENDING_TTL_MS - 1);
-      const [approval] = yield* Effect.all(
-        [
-          Effect.exit(controls.approvePending(String(held.pendingId), live)),
-          ledger.expirePending(PENDING_TTL_MS, JSON.stringify({ failure: null })),
-        ],
-        { concurrency: "unbounded" },
-      );
-      const sent = (yield* uploads).length;
-      const [row] = yield* auditRows();
-      assert.lengthOf(yield* ledger.pending(0), 0);
-      if (Exit.isSuccess(approval)) {
-        assert.strictEqual(sent, 1);
-        assert.strictEqual(row?.outcome, "accepted");
-      } else {
-        assert.strictEqual(sent, 0);
-        assert.strictEqual(row?.reason, "confirmation expired");
-      }
-    }).pipe(Effect.provide(testLayer())),
-  );
-});
-
-describe("preview, audit listing and purge", () => {
-  it.effect("previews the remaining allowance and problems without failing", () =>
-    Effect.gen(function* () {
-      const controls = yield* PaymentControls;
-      yield* FioHttp.enqueue(text(IMPORT_OK_XML));
-      yield* submit([domestic(30_000)]);
-      const preview = yield* controls.preview({
-        principal: principal(allowlist("enforce", IBAN)),
-        payer: PAYER,
-        orders: decodeOrders([domestic(80_000, { messageForRecipient: "[tag removed]" })]),
-      });
-      assert.isFalse(preview.withinLimits);
-      assert.strictEqual(preview.limits.perCurrency.CZK?.remainingToday, 70_000);
-      assert.strictEqual(preview.limits.ordersToday, 1);
-      assert.deepStrictEqual(preview.allowlist, { mode: "enforce", unlistedPayees: ["2212-2000000699/0300"] });
-      assert.lengthOf(preview.provenanceProblems, 1);
-    }).pipe(Effect.provide(testLayer())),
-  );
-
+describe("audit listing and purge", () => {
   it.effect("lists rows newest first and filters by grant", () =>
     Effect.gen(function* () {
       const controls = yield* PaymentControls;
-      yield* failureOf(submit([domestic(60_000)]));
+      yield* failureOf(submit([domestic(100, { messageForRecipient: "[tag removed]" })]));
       yield* TestClock.adjust(1000);
-      yield* failureOf(submit([domestic(70_000)], { principal: principal(undefined, "fio_grant_2") }));
+      yield* failureOf(submit([domestic(200, { messageForRecipient: "[tag removed]" })], { principal: principal("fio_grant_2") }));
       const all = yield* controls.listAudit({ limit: 10 });
       assert.deepStrictEqual(
         all.map((row: AuditRow) => row.grantId),
@@ -673,7 +335,7 @@ describe("preview, audit listing and purge", () => {
   it.effect("purges only rows older than the retention minimum", () =>
     Effect.gen(function* () {
       const controls = yield* PaymentControls;
-      yield* failureOf(submit([domestic(60_000)]));
+      yield* failureOf(submit([domestic(100, { messageForRecipient: "[tag removed]" })]));
       yield* TestClock.adjust((AUDIT_RETENTION_DAYS + 2) * DAY);
       const tooRecent = yield* failureOf(controls.purgeBefore("1970-01-04"));
       assert.strictEqual(tagOf(tooRecent), "InvalidInput");
